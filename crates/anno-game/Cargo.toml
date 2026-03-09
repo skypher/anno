@@ -1,0 +1,10 @@
+[package]
+name = "anno-game"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anno-audio = { workspace = true }
+anno-render = { workspace = true }
+anno-formats = { workspace = true }
+anno-sim = { workspace = true }

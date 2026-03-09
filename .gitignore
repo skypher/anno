@@ -1,0 +1,16 @@
+# Game files (copyrighted)
+extracted/
+setup_anno_1602_*
+*.bin
+
+# Ghidra project (large)
+ghidra_project/
+
+# Decompiled output (large, regeneratable)
+decompiled/
+
+# Build artifacts
+/target
+
+# Temp
+tmp/

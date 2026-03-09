@@ -1,0 +1,8 @@
+[package]
+name = "anno-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anno-formats = { workspace = true }
+sdl2 = { version = "0.37", features = ["bundled"] }

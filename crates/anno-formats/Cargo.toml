@@ -1,0 +1,8 @@
+[package]
+name = "anno-formats"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+byteorder = "1.5"
+thiserror = "2"

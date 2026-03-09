@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/anno-audio",
+    "crates/anno-render",
+    "crates/anno-formats",
+    "crates/anno-sim",
+    "crates/anno-game",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anno-audio = { path = "crates/anno-audio" }
+anno-render = { path = "crates/anno-render" }
+anno-formats = { path = "crates/anno-formats" }
+anno-sim = { path = "crates/anno-sim" }

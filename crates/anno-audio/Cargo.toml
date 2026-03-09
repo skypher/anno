@@ -1,0 +1,8 @@
+[package]
+name = "anno-audio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rodio = "0.20"
+hound = "3.5"
