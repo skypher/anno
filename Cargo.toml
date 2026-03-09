@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/anno-audio",
+    "crates/anno-net",
     "crates/anno-render",
     "crates/anno-formats",
     "crates/anno-sim",
@@ -14,6 +15,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anno-audio = { path = "crates/anno-audio" }
+anno-net = { path = "crates/anno-net" }
 anno-render = { path = "crates/anno-render" }
 anno-formats = { path = "crates/anno-formats" }
 anno-sim = { path = "crates/anno-sim" }

@@ -4,12 +4,21 @@
 //! Processes delta time in chunks of max 200ms, scaled by game speed multiplier.
 //! Dispatches to 12 subsystem update functions on independent timers.
 
-use crate::building::{BuildingDef, BuildingInstance, MAX_BUILDINGS};
+use crate::ai::{AiAction, AiController};
+use crate::building::{BuildingDef, BuildingInstance};
+use crate::carrier;
+use crate::combat::{self, DiplomacyMatrix, MilitaryUnit};
+use crate::coverage::CoverageMap;
+use crate::ocean_map::OceanMap;
 use crate::economy;
-use crate::entity::{Figure, MAX_FIGURES};
-use crate::player::{Player, MAX_PLAYERS};
+use crate::entity::{ActionType, Figure};
+use crate::island_map::IslandMap;
+use crate::population;
+use crate::player::Player;
 use crate::production;
+use crate::trade::{self, TradeRoute, TradeShip};
 use crate::types::TICKS_PER_MINUTE;
+use crate::warehouse::Warehouse;
 
 /// Maximum delta time per simulation step (prevents physics jumps).
 const MAX_STEP_MS: u32 = 200;
@@ -78,6 +87,15 @@ pub struct Simulation {
     pub buildings: Vec<BuildingInstance>,
     pub building_defs: Vec<BuildingDef>,
     pub figures: Vec<Figure>,
+    pub warehouses: Vec<Warehouse>,
+    pub island_maps: Vec<IslandMap>,
+    pub ai_controllers: Vec<AiController>,
+    pub military_units: Vec<MilitaryUnit>,
+    pub diplomacy: DiplomacyMatrix,
+    pub trade_routes: Vec<TradeRoute>,
+    pub trade_ships: Vec<TradeShip>,
+    pub coverage_maps: Vec<CoverageMap>,
+    pub ocean_map: Option<OceanMap>,
 
     pub autosave_timer_ms: u32,
 }
@@ -106,6 +124,15 @@ impl Simulation {
             buildings: Vec::new(),
             building_defs: Vec::new(),
             figures: Vec::new(),
+            warehouses: Vec::new(),
+            island_maps: Vec::new(),
+            ai_controllers: Vec::new(),
+            military_units: Vec::new(),
+            diplomacy: DiplomacyMatrix::new(),
+            trade_routes: Vec::new(),
+            trade_ships: Vec::new(),
+            coverage_maps: Vec::new(),
+            ocean_map: None,
 
             autosave_timer_ms: 0,
         }
@@ -164,9 +191,19 @@ impl Simulation {
             self.tick_diplomacy();
         }
 
-        // 5. Ships
+        // 5. Marketplace coverage
+        if self.timer_market.advance(dt_ms) {
+            self.tick_market_coverage();
+        }
+
+        // 6. Ships
         if self.timer_ships.advance(dt_ms) {
             self.tick_ships();
+        }
+
+        // 6. Military combat
+        if self.timer_military.advance(dt_ms) {
+            self.tick_military();
         }
 
         // Entity movement (every step)
@@ -178,29 +215,132 @@ impl Simulation {
     }
 
     fn tick_production(&mut self) {
-        for i in 0..self.buildings.len() {
-            if let Some(def) = self
-                .building_defs
-                .iter()
-                .find(|d| d.id == self.buildings[i].def_id)
-            {
-                let def = def.clone();
-                let produced = production::tick_building(
-                    &mut self.buildings[i],
-                    &def,
-                    self.timer_production.interval_ms,
-                );
+        let mut new_carriers = Vec::new();
 
-                if produced > 0 && production::needs_carrier(&self.buildings[i], &def) {
-                    // TODO: spawn carrier figure
+        for i in 0..self.buildings.len() {
+            let def_id = self.buildings[i].def_id;
+            if def_id as usize >= self.building_defs.len() {
+                continue;
+            }
+            let def = self.building_defs[def_id as usize].clone();
+            let produced = production::tick_building(
+                &mut self.buildings[i],
+                &def,
+                self.timer_production.interval_ms,
+            );
+
+            if produced > 0 && production::needs_carrier(&self.buildings[i], &def) {
+                // Check if this building already has an active carrier
+                let has_carrier = self.figures.iter().any(|f| {
+                    f.is_active()
+                        && f.building_idx == i as u16
+                        && matches!(
+                            f.action,
+                            ActionType::CarryingGoods | ActionType::Returning
+                        )
+                });
+
+                if !has_carrier {
+                    if let Some(mut c) =
+                        carrier::try_spawn_carrier(
+                            &mut self.buildings[i],
+                            &def,
+                            &self.warehouses,
+                            &self.island_maps,
+                        )
+                    {
+                        c.building_idx = i as u16;
+                        new_carriers.push(c);
+                    }
+                }
+            }
+        }
+
+        self.figures.extend(new_carriers);
+    }
+
+    fn tick_population(&mut self) {
+        for (i, player) in self.players.iter_mut().enumerate() {
+            // Update demands and consume goods from warehouses
+            population::update_population_demands(player, &mut self.warehouses, i as u8);
+            // Apply economy (gold balance, bankruptcy, satisfaction decay)
+            economy::tick_economy(player);
+        }
+
+        // AI decision-making
+        self.tick_ai();
+    }
+
+    fn tick_ai(&mut self) {
+        for ai_idx in 0..self.ai_controllers.len() {
+            let player_idx = self.ai_controllers[ai_idx].player_idx as usize;
+            if player_idx >= self.players.len() {
+                continue;
+            }
+
+            let actions = self.ai_controllers[ai_idx].tick(
+                &self.players[player_idx],
+                &self.buildings,
+                &self.building_defs,
+                &self.warehouses,
+            );
+
+            // Apply AI actions
+            for action in actions {
+                match action {
+                    AiAction::SetTaxRate { tier, rate } => {
+                        if (tier as usize) < 5 {
+                            self.players[player_idx].tax_rates[tier as usize] = rate;
+                        }
+                    }
+                    AiAction::RequestBuild { good, priority: _ } => {
+                        // Log the request (actual building placement requires island map integration)
+                        let _ = good; // Will be used when building placement is implemented
+                    }
+                    AiAction::RequestMilitary { unit_count: _ } => {
+                        // Military unit production not yet implemented
+                    }
+                    AiAction::SellExcess => {
+                        // Sell excess goods from warehouses for gold
+                        let owner = self.ai_controllers[ai_idx].player_idx;
+                        for wh in &mut self.warehouses {
+                            if wh.owner == owner {
+                                // Sell any goods above 20 units
+                                let stock = wh.all_stock();
+                                for (good, amount, _cap) in &stock {
+                                    if *amount > 20 {
+                                        let sell = amount - 20;
+                                        wh.withdraw(*good, sell);
+                                        // Gold per unit varies by good; approximate at 5 gold/unit
+                                        self.players[player_idx].gold += sell as i32 * 5;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn tick_population(&mut self) {
-        for player in &mut self.players {
-            economy::tick_economy(player);
+    fn tick_market_coverage(&mut self) {
+        // Collect warehouse positions per island
+        let mut wh_by_island: std::collections::HashMap<u8, Vec<(u16, u16, u16)>> =
+            std::collections::HashMap::new();
+        for wh in &self.warehouses {
+            if wh.active {
+                // Warehouse base radius = 22 (RADIUS_HQ from original binary)
+                wh_by_island
+                    .entry(wh.island_id)
+                    .or_default()
+                    .push((wh.tile_x, wh.tile_y, 22));
+            }
+        }
+
+        // Recompute coverage for each island that has a coverage map
+        for cov in &mut self.coverage_maps {
+            let whs = wh_by_island.get(&cov.island_id).map(|v| v.as_slice()).unwrap_or(&[]);
+            cov.recompute(&self.buildings, &self.building_defs, whs);
         }
     }
 
@@ -209,11 +349,52 @@ impl Simulation {
     }
 
     fn tick_ships(&mut self) {
-        // TODO: ship movement and trade routes
+        for ship_idx in 0..self.trade_ships.len() {
+            if !self.trade_ships[ship_idx].active {
+                continue;
+            }
+            let route_id = self.trade_ships[ship_idx].route_id;
+            if let Some(route) = self.trade_routes.iter().find(|r| r.id == route_id) {
+                let route = route.clone();
+                let gold = trade::tick_trade_ship(
+                    &mut self.trade_ships[ship_idx],
+                    &route,
+                    &mut self.warehouses,
+                    self.ocean_map.as_ref(),
+                );
+                // Apply gold to ship owner
+                let owner = self.trade_ships[ship_idx].owner as usize;
+                if owner < self.players.len() {
+                    self.players[owner].gold += gold;
+                }
+            }
+        }
+    }
+
+    fn tick_military(&mut self) {
+        if self.military_units.is_empty() {
+            return;
+        }
+
+        let dead = combat::tick_combat(
+            &mut self.military_units,
+            &self.diplomacy,
+            self.timer_military.interval_ms,
+        );
+
+        // Remove dead units (reverse order to preserve indices)
+        let mut dead_sorted = dead;
+        dead_sorted.sort_unstable();
+        dead_sorted.dedup();
+        for &idx in dead_sorted.iter().rev() {
+            self.military_units.swap_remove(idx);
+        }
     }
 
     fn tick_entities(&mut self, dt_ms: u32) {
-        for figure in &mut self.figures {
+        let mut despawn_indices = Vec::new();
+
+        for (idx, figure) in self.figures.iter_mut().enumerate() {
             if !figure.is_active() {
                 continue;
             }
@@ -221,8 +402,32 @@ impl Simulation {
             figure.move_timer_ms += dt_ms;
             if figure.speed > 0 && figure.move_timer_ms >= 100 {
                 figure.move_timer_ms -= 100;
-                // TODO: dispatch based on figure.action type
+
+                match figure.action {
+                    ActionType::CarryingGoods | ActionType::Returning => {
+                        let arrived = carrier::step_carrier(figure);
+                        if arrived {
+                            let should_despawn = carrier::handle_arrival(
+                                figure,
+                                &mut self.warehouses,
+                                &self.buildings,
+                                &self.island_maps,
+                            );
+                            if should_despawn {
+                                despawn_indices.push(idx);
+                            }
+                        }
+                    }
+                    _ => {
+                        // Other action types not yet implemented
+                    }
+                }
             }
+        }
+
+        // Remove despawned figures (iterate in reverse to preserve indices)
+        for &idx in despawn_indices.iter().rev() {
+            self.figures.swap_remove(idx);
         }
     }
 

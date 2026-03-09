@@ -16,6 +16,13 @@ pub struct BuildingDef {
     pub width: u8,
     pub height: u8,
     pub production_type: ProductionType,
+    /// Building kind from COD (BODEN, GEBAEUDE, HQ, etc.)
+    pub kind: String,
+    /// Production kind from COD (HANDWERK, MARKT, KONTOR, KIRCHE, etc.)
+    pub prod_kind: String,
+    /// Service radius in tiles (0 = no service area).
+    /// Used by marketplaces (extend warehouse access), churches, taverns, etc.
+    pub radius: u16,
     pub output_good: Good,
     pub input_good_1: Good,
     pub input_good_2: Good,
@@ -23,8 +30,8 @@ pub struct BuildingDef {
     pub input_1_rate: u16,
     pub input_2_rate: u16,
     pub storage_capacity: u16,
-    pub cycle_time_ms: u16,
-    pub carrier_interval_ms: u16,
+    pub cycle_time_ms: u32,
+    pub carrier_interval_ms: u32,
     pub cost_gold: u32,
     pub cost_tools: u16,
     pub cost_wood: u16,

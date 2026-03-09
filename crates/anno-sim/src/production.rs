@@ -34,12 +34,12 @@ pub fn tick_building(building: &mut BuildingInstance, def: &BuildingDef, dt_ms: 
     // Advance production timer
     building.production_timer_ms += dt_ms;
 
-    if building.production_timer_ms < def.cycle_time_ms as u32 {
+    if building.production_timer_ms < def.cycle_time_ms {
         return 0;
     }
 
     // Production cycle complete
-    building.production_timer_ms -= def.cycle_time_ms as u32;
+    building.production_timer_ms -= def.cycle_time_ms;
 
     // Consume inputs
     if def.input_1_rate > 0 {

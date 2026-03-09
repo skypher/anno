@@ -74,6 +74,12 @@ pub struct Figure {
 
     /// Base sprite index.
     pub base_sprite: u16,
+
+    /// Pre-computed path (sequence of tile positions to follow).
+    pub path: Vec<(i32, i32)>,
+
+    /// Current index into the path.
+    pub path_idx: usize,
 }
 
 impl Figure {
@@ -95,6 +101,8 @@ impl Figure {
             move_timer_ms: 0,
             sprite_set: 0,
             base_sprite: 0,
+            path: Vec::new(),
+            path_idx: 0,
         }
     }
 

@@ -38,11 +38,13 @@ pub fn tick_economy(player: &mut Player) {
         }
     }
 
-    // 2. Apply satisfaction decay
+    // 2. Apply satisfaction decay (only for tiers with population)
     for tier in 0..NUM_POP_TIERS {
-        let sat = player.satisfaction[tier] as u32;
-        player.satisfaction[tier] =
-            ((sat * SATISFACTION_DECAY_NUM) / SATISFACTION_DECAY_DEN) as u8;
+        if player.population[tier] > 0 {
+            let sat = player.satisfaction[tier] as u32;
+            player.satisfaction[tier] =
+                ((sat * SATISFACTION_DECAY_NUM) / SATISFACTION_DECAY_DEN) as u8;
+        }
     }
 
     // 3. Apply economy balance

@@ -145,6 +145,14 @@ impl StreamManager {
         if slot >= MAX_STREAM_SLOTS {
             return StreamStatus::Empty;
         }
+        // Check if a playing stream has finished naturally
+        if self.slots[slot].status == StreamStatus::Playing {
+            if let Some(ref sink) = self.slots[slot].sink {
+                if sink.empty() {
+                    return StreamStatus::Stopped;
+                }
+            }
+        }
         self.slots[slot].status
     }
 

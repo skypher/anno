@@ -95,4 +95,85 @@ impl SpriteManager {
         let idx = zoom_index * NUM_CATEGORIES + category as usize;
         self.sets.get(idx).and_then(|s| s.as_ref())
     }
+
+    /// Load all sprite sets from a game data directory.
+    ///
+    /// Expects the directory to contain GFX/, MGFX/, and SGFX/ subdirectories
+    /// with BSH files for each sprite category.
+    pub fn load_from_dir(base: &std::path::Path) -> Self {
+        let mut mgr = Self::new();
+
+        let zoom_dirs = [
+            (0, "GFX"),  // full zoom
+            (1, "MGFX"), // medium zoom
+            (2, "SGFX"), // small zoom
+        ];
+
+        let categories = [
+            (SpriteCategory::Stadtfld, "STADTFLD"),
+            (SpriteCategory::Soldat, "SOLDAT"),
+            (SpriteCategory::Ship, "SHIP"),
+            (SpriteCategory::Traeger, "TRAEGER"),
+            (SpriteCategory::Maeher, "MAEHER"),
+            (SpriteCategory::Tiere, "TIERE"),
+            (SpriteCategory::Effekte, "EFFEKTE"),
+            (SpriteCategory::Numbers, "NUMBERS"),
+            (SpriteCategory::Schatten, "SCHATTEN"),
+            (SpriteCategory::Fische, "FISCHE"),
+            (SpriteCategory::Gaukler, "GAUKLER"),
+        ];
+
+        for &(zoom_idx, zoom_dir) in &zoom_dirs {
+            let dir = base.join(zoom_dir);
+            if !dir.exists() {
+                continue;
+            }
+            for &(category, name) in &categories {
+                // Try case-insensitive match: STADTFLD.BSH, Stadtfld.bsh, etc.
+                let bsh_name = format!("{name}.BSH");
+                let path = Self::find_case_insensitive(&dir, &bsh_name);
+                if let Some(path) = path {
+                    match std::fs::read(&path) {
+                        Ok(data) => match BshFile::parse(&data) {
+                            Ok(bsh) => {
+                                let count = bsh.sprites.len();
+                                mgr.load_set(category, zoom_idx, bsh);
+                                eprintln!(
+                                    "  Loaded {}/{} ({} sprites)",
+                                    zoom_dir,
+                                    path.file_name().unwrap_or_default().to_string_lossy(),
+                                    count
+                                );
+                            }
+                            Err(e) => eprintln!("  Failed to parse {path:?}: {e}"),
+                        },
+                        Err(e) => eprintln!("  Failed to read {path:?}: {e}"),
+                    }
+                }
+            }
+        }
+
+        mgr
+    }
+
+    /// Find a file by name in a directory, case-insensitive.
+    fn find_case_insensitive(
+        dir: &std::path::Path,
+        name: &str,
+    ) -> Option<std::path::PathBuf> {
+        let name_lower = name.to_lowercase();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    == name_lower
+                {
+                    return Some(entry.path());
+                }
+            }
+        }
+        None
+    }
 }

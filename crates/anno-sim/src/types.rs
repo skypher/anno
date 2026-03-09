@@ -44,6 +44,16 @@ pub enum Good {
     TobaccoProducts = 18,
     Spices = 19,
     Cocoa = 20,
+    Grapes = 21,     // WEINTRAUBEN — raw material for wine/alcohol
+    Stone = 22,      // STEINE — quarried stone
+    Ore = 23,        // EISENERZ — iron ore (before smelting)
+    GoldOre = 24,    // GOLDERZ — gold ore (before smelting)
+    Hides = 25,      // HAEUTE — animal hides
+    Cotton = 26,     // BAUMWOLLE — cotton (alternative to wool)
+    Silk = 27,       // SEIDE — silk
+    Jewelry = 28,    // SCHMUCK — jewelry
+    Clothing = 29,   // KLEIDUNG — clothing
+    Fish = 30,       // FISCHE — fish
     // ... more goods exist in the original
 }
 

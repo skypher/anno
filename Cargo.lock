@@ -57,7 +57,12 @@ dependencies = [
  "anno-formats",
  "anno-render",
  "anno-sim",
+ "sdl2",
 ]
+
+[[package]]
+name = "anno-net"
+version = "0.1.0"
 
 [[package]]
 name = "anno-render"

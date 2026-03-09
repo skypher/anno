@@ -8,3 +8,20 @@ anno-audio = { workspace = true }
 anno-render = { workspace = true }
 anno-formats = { workspace = true }
 anno-sim = { workspace = true }
+sdl2 = { version = "0.37", features = ["bundled"] }
+
+[[bin]]
+name = "sprite-viewer"
+path = "src/bin/sprite_viewer.rs"
+
+[[bin]]
+name = "island-viewer"
+path = "src/bin/island_viewer.rs"
+
+[[bin]]
+name = "sim-test"
+path = "src/bin/sim_test.rs"
+
+[[bin]]
+name = "game"
+path = "src/bin/game.rs"
