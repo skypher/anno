@@ -48,6 +48,8 @@ pub struct BuildingDef {
     pub anim_anz: i32,
     /// Animation sprite offset per frame
     pub anim_add: i32,
+    /// Animation speed in milliseconds per frame (0 = use default 200ms)
+    pub anim_time: i32,
     /// All raw properties
     pub properties: HashMap<String, String>,
 }
@@ -63,6 +65,7 @@ impl Default for BuildingDef {
             rotate: 0,
             anim_anz: 1,
             anim_add: 0,
+            anim_time: 0,
             properties: HashMap::new(),
         }
     }
@@ -244,6 +247,12 @@ impl CodFile {
             // Parse AnimAdd
             if let Some(val_str) = line.strip_prefix("AnimAdd:") {
                 current.anim_add = Self::eval(&constants, val_str.trim());
+                continue;
+            }
+
+            // Parse AnimTime (ms per animation frame)
+            if let Some(val_str) = line.strip_prefix("AnimTime:") {
+                current.anim_time = Self::eval(&constants, val_str.trim());
                 continue;
             }
 

@@ -46,6 +46,87 @@ const BG_COLOR: (u8, u8, u8) = (0x10, 0x20, 0x40);
 const ZOOM_TILE_W: [i32; 3] = [64, 32, 16];
 const ZOOM_TILE_H: [i32; 3] = [31, 15, 7];
 
+/// Animation state for building sprites.
+/// Maps sprite indices to their animation parameters.
+struct AnimationState {
+    /// For each base sprite index: (anim_anz, anim_add, anim_time_ms)
+    /// anim_anz = number of frames, anim_add = sprite offset per frame
+    entries: Vec<AnimEntry>,
+    /// Elapsed time in ms (wraps at u32::MAX)
+    elapsed_ms: u32,
+}
+
+struct AnimEntry {
+    /// Base sprite index (COD gfx field)
+    base_gfx: i32,
+    /// Number of animation frames
+    anim_anz: i32,
+    /// Sprite offset per frame
+    anim_add: i32,
+    /// Milliseconds per frame (default 200)
+    anim_time: i32,
+    /// Total sprite range occupied by this building (for all rotations)
+    total_sprites: i32,
+}
+
+impl AnimationState {
+    fn new(cod: &CodFile) -> Self {
+        let mut entries = Vec::new();
+        for b in &cod.buildings {
+            if b.gfx >= 0 && b.anim_anz > 1 && b.anim_add > 0 {
+                let total = b.rotate.max(1) * b.anim_anz * b.anim_add;
+                entries.push(AnimEntry {
+                    base_gfx: b.gfx,
+                    anim_anz: b.anim_anz,
+                    anim_add: b.anim_add,
+                    anim_time: if b.anim_time > 0 { b.anim_time } else { 200 },
+                    total_sprites: total,
+                });
+            }
+        }
+        // Sort by base_gfx for binary search
+        entries.sort_by_key(|e| e.base_gfx);
+        Self {
+            entries,
+            elapsed_ms: 0,
+        }
+    }
+
+    fn tick(&mut self, dt_ms: u32) {
+        self.elapsed_ms = self.elapsed_ms.wrapping_add(dt_ms);
+    }
+
+    /// Given a static sprite index, return the animated sprite index.
+    fn animate(&self, sprite_idx: u16) -> u16 {
+        let idx = sprite_idx as i32;
+        // Find which building owns this sprite via binary search
+        let pos = self.entries.partition_point(|e| e.base_gfx <= idx);
+        if pos == 0 {
+            return sprite_idx;
+        }
+        let entry = &self.entries[pos - 1];
+        // Check if this sprite is within the building's sprite range
+        if idx >= entry.base_gfx && idx < entry.base_gfx + entry.total_sprites {
+            let offset_from_base = idx - entry.base_gfx;
+            // Which rotation variant is this tile in?
+            let sprites_per_rotation = entry.anim_anz * entry.anim_add;
+            if sprites_per_rotation <= 0 {
+                return sprite_idx;
+            }
+            let rotation_offset = offset_from_base % sprites_per_rotation;
+            let rotation_base = idx - rotation_offset;
+            // The tile's position within the rotation (which sub-tile)
+            let tile_in_frame = rotation_offset % entry.anim_add;
+            // Current animation frame based on time
+            let frame = ((self.elapsed_ms / entry.anim_time as u32) % entry.anim_anz as u32) as i32;
+            let animated = rotation_base + frame * entry.anim_add + tile_in_frame;
+            animated as u16
+        } else {
+            sprite_idx
+        }
+    }
+}
+
 /// A building type available for placement.
 struct BuildableBuilding {
     /// Index into building_defs / cod.buildings.
@@ -316,6 +397,10 @@ fn main() {
     // Initialize building placer
     let mut placer = BuildingPlacer::new(&cod, &defs);
     println!("Building placer: {} buildable types", placer.buildable.len());
+
+    // Initialize animation state
+    let mut anim_state = AnimationState::new(&cod);
+    let mut last_anim_gen: u32 = 0; // tracks when animation frames change
 
     // Mutable copy of islands for adding placed building tiles
     let mut islands = szs.islands.clone();
@@ -748,6 +833,14 @@ fn main() {
         last_tick = now;
         if dt_ms > 0 && dt_ms < 1000 {
             sim.tick(dt_ms);
+            anim_state.tick(dt_ms);
+            // Check if animation frames changed (triggers terrain re-render)
+            // Use a coarse generation: changes every ~100ms
+            let anim_gen = anim_state.elapsed_ms / 100;
+            if anim_gen != last_anim_gen {
+                last_anim_gen = anim_gen;
+                needs_redraw = true;
+            }
         }
 
         // Audio tick: cleanup finished sounds, auto-advance music
@@ -779,7 +872,7 @@ fn main() {
             let tile_h = ZOOM_TILE_H[sprite_zoom];
             if world_mode {
                 let (rgba, w, h, ox, oy) =
-                    render_world(&islands, sprites, num_sprites, tile_w, tile_h);
+                    render_world(&islands, sprites, num_sprites, tile_w, tile_h, &anim_state);
                 rendered = Some(RenderState {
                     rgba,
                     width: w,
@@ -792,7 +885,7 @@ fn main() {
             } else {
                 let island = &islands[current_island];
                 let (rgba, w, h, ox, oy) =
-                    render_island(island, sprites, num_sprites, tile_w, tile_h);
+                    render_island(island, sprites, num_sprites, tile_w, tile_h, &anim_state);
                 rendered = Some(RenderState {
                     rgba,
                     width: w,
@@ -1331,6 +1424,7 @@ fn render_world(
     num_sprites: usize,
     tile_w: i32,
     tile_h: i32,
+    anim: &AnimationState,
 ) -> (Vec<u8>, u32, u32, i32, i32) {
     let max_world_x = islands
         .iter()
@@ -1381,7 +1475,7 @@ fn render_world(
                 let sx = origin_x + (wx - wy) * s_half_tw;
                 let sy = origin_y + (wx + wy) * s_half_th;
 
-                let sprite_idx = tile.building_id as usize;
+                let sprite_idx = anim.animate(tile.building_id) as usize;
                 if sprite_idx < num_sprites {
                     let (sw, sh, ref sdata) = sprites[sprite_idx];
                     if sw > 0 && sh > 0 {
@@ -1440,7 +1534,7 @@ fn render_world(
         let sx = origin_x + (wx - wy) * half_tw;
         let sy = origin_y + (wx + wy) * half_th;
 
-        let sprite_idx = building_id as usize;
+        let sprite_idx = anim.animate(building_id) as usize;
         if sprite_idx >= num_sprites {
             continue;
         }
@@ -1463,6 +1557,7 @@ fn render_island(
     num_sprites: usize,
     tile_w: i32,
     tile_h: i32,
+    anim: &AnimationState,
 ) -> (Vec<u8>, u32, u32, i32, i32) {
     let iw = island.width as i32;
     let ih = island.height as i32;
@@ -1488,7 +1583,7 @@ fn render_island(
         let sx = origin_x + (tx - ty) * half_tw;
         let sy = origin_y + (tx + ty) * half_th;
 
-        let sprite_idx = tile.building_id as usize;
+        let sprite_idx = anim.animate(tile.building_id) as usize;
         if sprite_idx >= num_sprites {
             continue;
         }

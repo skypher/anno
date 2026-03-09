@@ -46,6 +46,7 @@
 20. **Sprite Y-offset fix** — building sprites (up to 286px tall) now drawn with base aligned to isometric tile diamond via `sy - (sprite_height - tile_height)` offset
 21. **Sound integration** — AudioEngine (rodio backend) integrated into game binary, 21 music tracks auto-discovered from MUSIC8/, background music with auto-advance, M=toggle N=next V=volume controls, building placement sound effects, per-frame audio cleanup
 22. **Multiplayer protocol** — Maxnet.dll fully decompiled (77 functions), DirectPlay-based protocol reverse-engineered: 12 message types (GameData/Pause/Resume/Ack/PlayerSync/SessionInfo/Chat/FragContinuation/Disconnect), confirmed send with ACK flow control, 4-player sessions, pause bitmask sync. `anno-net` crate implements TCP replacement with host/client architecture, non-blocking I/O, message fragmentation
+23. **Sprite animation** — buildings with multiple animation frames (windmills, workshops, etc.) now cycle through frames in real-time using COD AnimAnz/AnimAdd/AnimTime parameters, ~100ms redraw interval, binary-search sprite→building lookup for efficient frame computation
 
 ### What's missing / next
 
