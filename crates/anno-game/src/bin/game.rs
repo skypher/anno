@@ -486,6 +486,9 @@ fn main() {
 
     let mut mouse_x: i32 = 0;
     let mut mouse_y: i32 = 0;
+    let mut minimap_clicked = false;
+    let mut minimap_click_x: i32 = 0;
+    let mut minimap_click_y: i32 = 0;
 
     'main: loop {
         for event in event_pump.poll_iter() {
@@ -665,7 +668,25 @@ fn main() {
                     y,
                     ..
                 } => {
-                    if placer.active && !world_mode {
+                    // Check if click is on the minimap (bottom-right corner)
+                    let on_minimap = if let Some(ref rs) = rendered {
+                        let sx = 200.0 / rs.width as f64;
+                        let sy = 150.0 / rs.height as f64;
+                        let ms = sx.min(sy).min(1.0);
+                        let mw = (rs.width as f64 * ms) as i32;
+                        let mh = (rs.height as f64 * ms) as i32;
+                        let mx = WINDOW_W as i32 - mw - 8;
+                        let my = WINDOW_H as i32 - mh - 8;
+                        x >= mx && x < mx + mw && y >= my && y < my + mh
+                    } else {
+                        false
+                    };
+
+                    if on_minimap {
+                        minimap_clicked = true;
+                        minimap_click_x = x;
+                        minimap_click_y = y;
+                    } else if placer.active && !world_mode {
                         // Try to place a building
                         if let (Some(rs), Some(bb)) =
                             (&rendered, placer.selected_building())
@@ -1011,6 +1032,113 @@ fn main() {
                         Some(Rect::new(dst_x, dst_y, dst_w, dst_h)),
                     )
                     .ok();
+
+                // Draw minimap in the bottom-right corner
+                let minimap_max_w = 200u32;
+                let minimap_max_h = 150u32;
+                let minimap_margin = 8i32;
+
+                // Scale to fit minimap bounds while preserving aspect ratio
+                let scale_x = minimap_max_w as f64 / rs.width as f64;
+                let scale_y = minimap_max_h as f64 / rs.height as f64;
+                let mini_scale = scale_x.min(scale_y).min(1.0);
+                let mini_w = (rs.width as f64 * mini_scale) as u32;
+                let mini_h = (rs.height as f64 * mini_scale) as u32;
+
+                if mini_w > 0 && mini_h > 0 {
+                    // Render downscaled minimap RGBA
+                    let mut mini_rgba = vec![0x20u8; (mini_w * mini_h * 4) as usize];
+                    for my in 0..mini_h {
+                        for mx in 0..mini_w {
+                            let src_x = (mx as f64 / mini_scale) as u32;
+                            let src_y = (my as f64 / mini_scale) as u32;
+                            if src_x < rs.width && src_y < rs.height {
+                                let src_off = ((src_y * rs.width + src_x) * 4) as usize;
+                                let dst_off = ((my * mini_w + mx) * 4) as usize;
+                                if src_off + 3 < frame.len() && dst_off + 3 < mini_rgba.len() {
+                                    mini_rgba[dst_off] = frame[src_off];
+                                    mini_rgba[dst_off + 1] = frame[src_off + 1];
+                                    mini_rgba[dst_off + 2] = frame[src_off + 2];
+                                    mini_rgba[dst_off + 3] = if frame[src_off + 3] > 0 { 220 } else { 80 };
+                                }
+                            }
+                        }
+                    }
+
+                    // Draw viewport rectangle on minimap
+                    // The viewport in texture coords:
+                    let vp_left = ((-scroll_x) as f64 / display_zoom as f64 * mini_scale) as i32;
+                    let vp_top = ((-scroll_y) as f64 / display_zoom as f64 * mini_scale) as i32;
+                    let vp_w = (WINDOW_W as f64 / display_zoom as f64 * mini_scale) as i32;
+                    let vp_h = (WINDOW_H as f64 / display_zoom as f64 * mini_scale) as i32;
+
+                    // Adjust for centering offset
+                    let center_off_x = ((WINDOW_W as i32 - dst_w as i32) / 2) as f64
+                        / display_zoom as f64 * mini_scale;
+                    let center_off_y = ((WINDOW_H as i32 - dst_h as i32) / 2) as f64
+                        / display_zoom as f64 * mini_scale;
+                    let vp_x = vp_left - center_off_x as i32;
+                    let vp_y = vp_top - center_off_y as i32;
+
+                    // Draw viewport rect border (white)
+                    let white = [0xFF, 0xFF, 0xFF, 0xFF];
+                    for px in vp_x.max(0)..=(vp_x + vp_w).min(mini_w as i32 - 1) {
+                        for &py in &[vp_y, vp_y + vp_h] {
+                            if py >= 0 && py < mini_h as i32 {
+                                let off = ((py as u32 * mini_w + px as u32) * 4) as usize;
+                                if off + 3 < mini_rgba.len() {
+                                    mini_rgba[off..off + 4].copy_from_slice(&white);
+                                }
+                            }
+                        }
+                    }
+                    for py in vp_y.max(0)..=(vp_y + vp_h).min(mini_h as i32 - 1) {
+                        for &px in &[vp_x, vp_x + vp_w] {
+                            if px >= 0 && px < mini_w as i32 {
+                                let off = ((py as u32 * mini_w + px as u32) * 4) as usize;
+                                if off + 3 < mini_rgba.len() {
+                                    mini_rgba[off..off + 4].copy_from_slice(&white);
+                                }
+                            }
+                        }
+                    }
+
+                    // Blit minimap to a texture and draw it
+                    if let Ok(mut mini_tex) = texture_creator
+                        .create_texture_streaming(PixelFormatEnum::RGBA32, mini_w, mini_h)
+                    {
+                        mini_tex.update(None, &mini_rgba, (mini_w * 4) as usize).ok();
+                        mini_tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                        let mini_x = WINDOW_W as i32 - mini_w as i32 - minimap_margin;
+                        let mini_y = WINDOW_H as i32 - mini_h as i32 - minimap_margin;
+
+                        // Draw dark background behind minimap
+                        canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 180));
+                        canvas.fill_rect(Rect::new(
+                            mini_x - 2, mini_y - 2,
+                            mini_w + 4, mini_h + 4,
+                        )).ok();
+
+                        canvas.copy(
+                            &mini_tex,
+                            None,
+                            Some(Rect::new(mini_x, mini_y, mini_w, mini_h)),
+                        ).ok();
+
+                        // Handle minimap clicks — clicking the minimap scrolls the main view
+                        if minimap_clicked {
+                            // Convert minimap click to texture coordinates
+                            let click_tex_x = (minimap_click_x - mini_x) as f64 / mini_scale;
+                            let click_tex_y = (minimap_click_y - mini_y) as f64 / mini_scale;
+                            // Center the viewport on the clicked point
+                            scroll_x = -(click_tex_x as i32 * display_zoom)
+                                + WINDOW_W as i32 / 2;
+                            scroll_y = -(click_tex_y as i32 * display_zoom)
+                                + WINDOW_H as i32 / 2;
+                            minimap_clicked = false;
+                        }
+                    }
+                }
             }
         }
 
