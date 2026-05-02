@@ -8,7 +8,9 @@ anno-audio = { workspace = true }
 anno-render = { workspace = true }
 anno-formats = { workspace = true }
 anno-sim = { workspace = true }
+anno-net = { workspace = true }
 sdl2 = { version = "0.37", features = ["bundled"] }
+bincode = "1.3"
 
 [[bin]]
 name = "sprite-viewer"

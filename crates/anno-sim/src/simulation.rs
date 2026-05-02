@@ -12,6 +12,7 @@ use crate::coverage::CoverageMap;
 use crate::ocean_map::OceanMap;
 use crate::economy;
 use crate::entity::{ActionType, Figure};
+use crate::history::EconomyHistory;
 use crate::island_map::IslandMap;
 use crate::population;
 use crate::player::Player;
@@ -98,6 +99,9 @@ pub struct Simulation {
     pub ocean_map: Option<OceanMap>,
 
     pub autosave_timer_ms: u32,
+
+    /// Rolling economy/population history for the human player (slot 0).
+    pub history: EconomyHistory,
 }
 
 impl Simulation {
@@ -135,6 +139,8 @@ impl Simulation {
             ocean_map: None,
 
             autosave_timer_ms: 0,
+
+            history: EconomyHistory::new(),
         }
     }
 
@@ -247,6 +253,7 @@ impl Simulation {
                             &def,
                             &self.warehouses,
                             &self.island_maps,
+                            &self.coverage_maps,
                         )
                     {
                         c.building_idx = i as u16;
@@ -260,11 +267,33 @@ impl Simulation {
     }
 
     fn tick_population(&mut self) {
+        // Refresh building maintenance totals per player so the economy
+        // tick has up-to-date running costs.
+        let mut maintenance: Vec<u32> = vec![0; self.players.len()];
+        for b in &self.buildings {
+            if !b.active || !b.is_built() { continue; }
+            let owner = b.owner as usize;
+            if owner >= maintenance.len() { continue; }
+            let def_id = b.def_id as usize;
+            if def_id < self.building_defs.len() {
+                maintenance[owner] = maintenance[owner]
+                    .saturating_add(self.building_defs[def_id].maintenance_cost as u32);
+            }
+        }
         for (i, player) in self.players.iter_mut().enumerate() {
+            player.building_maintenance = maintenance[i];
             // Update demands and consume goods from warehouses
             population::update_population_demands(player, &mut self.warehouses, i as u8);
             // Apply economy (gold balance, bankruptcy, satisfaction decay)
             economy::tick_economy(player);
+            // Grow / shrink population by tier and promote satisfied tiers up.
+            population::update_population_growth(player);
+        }
+
+        // Sample player 0 (the human) into the rolling history (gold,
+        // pop, satisfaction, income/costs, AND per-good warehouse stocks).
+        if let Some(p0) = self.players.first() {
+            self.history.record_full(p0, &self.warehouses, 0);
         }
 
         // AI decision-making
@@ -294,11 +323,167 @@ impl Simulation {
                         }
                     }
                     AiAction::RequestBuild { good, priority: _ } => {
-                        // Log the request (actual building placement requires island map integration)
-                        let _ = good; // Will be used when building placement is implemented
+                        // Collect every def producing the requested good
+                        // that the AI can afford, then prefer the one we
+                        // don't already have (variety > monoculture). Ties
+                        // break on cost so cheaper alternatives still win.
+                        let owner = self.ai_controllers[ai_idx].player_idx;
+                        let gold = self.players[player_idx].gold;
+                        let mut counts: std::collections::HashMap<u16, u32> =
+                            std::collections::HashMap::new();
+                        for b in &self.buildings {
+                            if b.owner == owner {
+                                *counts.entry(b.def_id).or_insert(0) += 1;
+                            }
+                        }
+                        let pick = self.building_defs.iter().enumerate()
+                            .filter(|(_, d)| d.output_good == good
+                                && d.cost_gold as i32 <= gold)
+                            .min_by_key(|(idx, d)| {
+                                let n = counts.get(&(*idx as u16)).copied().unwrap_or(0);
+                                (n, d.cost_gold)
+                            });
+                        if let Some((def_id, def)) = pick {
+                            // Find an AI warehouse to anchor near, then a spot
+                            // on that island where the footprint fits.
+                            let wh = self.warehouses.iter().find(|w| {
+                                w.active && w.owner == owner
+                            });
+                            if let Some(wh) = wh {
+                                let island_id = wh.island_id;
+                                let cx = wh.tile_x;
+                                let cy = wh.tile_y;
+                                let w = def.width as u16;
+                                let h = def.height as u16;
+                                let cost = def.cost_gold;
+                                let footprint = (w as u32) * (h as u32);
+                                let build_ms = (2_000u32 * footprint).max(2_000);
+                                let map_idx = self.island_maps.iter()
+                                    .position(|m| m.island_id == island_id);
+                                if let Some(idx) = map_idx {
+                                    let spot = self.island_maps[idx]
+                                        .find_open_spot(cx, cy, w, h, 12);
+                                    if let Some((bx, by)) = spot {
+                                        // Mark footprint blocked
+                                        for dy in 0..h {
+                                            for dx in 0..w {
+                                                self.island_maps[idx]
+                                                    .set_walkable(bx + dx, by + dy, false);
+                                            }
+                                        }
+                                        let mut inst = BuildingInstance::new(
+                                            def_id as u16, island_id, bx, by, owner,
+                                        );
+                                        inst.construction_ms_total = build_ms;
+                                        inst.construction_ms_remaining = build_ms;
+                                        self.buildings.push(inst);
+                                        self.players[player_idx].gold -= cost as i32;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    AiAction::RequestMilitary { unit_count: _ } => {
-                        // Military unit production not yet implemented
+                    AiAction::RequestMilitary { unit_count } => {
+                        // Spawn `unit_count` Swordsmen near the AI's first
+                        // active warehouse, capped by gold (100 / unit).
+                        let owner = self.ai_controllers[ai_idx].player_idx;
+                        const SWORDSMAN_COST: i32 = 100;
+                        let spawn = self.warehouses.iter().find(|w| {
+                            w.active && w.owner == owner
+                        });
+                        if let Some(spawn) = spawn {
+                            let (sx, sy) = (spawn.tile_x as i32, spawn.tile_y as i32);
+                            let mut spent = 0;
+                            for k in 0..(unit_count as i32) {
+                                if self.players[player_idx].gold < SWORDSMAN_COST {
+                                    break;
+                                }
+                                self.players[player_idx].gold -= SWORDSMAN_COST;
+                                spent += 1;
+                                // Stagger spawn positions in a small ring.
+                                let dx = (k % 3) - 1;
+                                let dy = (k / 3) % 3 - 1;
+                                self.military_units.push(MilitaryUnit::new(
+                                    crate::combat::UnitType::Swordsman,
+                                    owner,
+                                    sx + dx,
+                                    sy + dy,
+                                ));
+                            }
+                            self.players[player_idx].military_maintenance =
+                                self.players[player_idx]
+                                    .military_maintenance
+                                    .saturating_add((spent * 2) as u32);
+                        }
+                    }
+                    AiAction::EstablishTradeRoute => {
+                        let owner = self.ai_controllers[ai_idx].player_idx;
+                        // Pick at most 4 of the AI's warehouses across
+                        // distinct islands and turn them into a route.
+                        let mut by_island: std::collections::HashMap<u8, (u16, u16)> =
+                            std::collections::HashMap::new();
+                        for wh in &self.warehouses {
+                            if wh.active && wh.owner == owner {
+                                by_island.entry(wh.island_id)
+                                    .or_insert((wh.tile_x, wh.tile_y));
+                            }
+                        }
+                        if by_island.len() < 2 { continue; }
+                        let mut stops: Vec<(u8, u16, u16)> = by_island
+                            .into_iter()
+                            .map(|(iid, (x, y))| (iid, x, y))
+                            .collect();
+                        stops.sort_by_key(|s| s.0);
+                        stops.truncate(4);
+
+                        const SHIP_COST: i32 = 1000;
+                        if self.players[player_idx].gold < SHIP_COST {
+                            continue;
+                        }
+                        self.players[player_idx].gold -= SHIP_COST;
+
+                        // Match the human-side trade-route editor: every stop
+                        // loads/unloads every known good — the trade tick only
+                        // moves what's actually there.
+                        use crate::trade::{RouteStop, TradeRoute, TradeShip};
+                        let all_goods = [
+                            crate::types::Good::Wood, crate::types::Good::Iron,
+                            crate::types::Good::Ore, crate::types::Good::Gold,
+                            crate::types::Good::Wool, crate::types::Good::Sugar,
+                            crate::types::Good::Tobacco, crate::types::Good::Cattle,
+                            crate::types::Good::Grain, crate::types::Good::Flour,
+                            crate::types::Good::Food, crate::types::Good::Alcohol,
+                            crate::types::Good::Cloth, crate::types::Good::Clothing,
+                            crate::types::Good::Jewelry, crate::types::Good::Tools,
+                            crate::types::Good::Bricks, crate::types::Good::Swords,
+                            crate::types::Good::Cannons, crate::types::Good::Muskets,
+                            crate::types::Good::Stone, crate::types::Good::Cocoa,
+                            crate::types::Good::Spices, crate::types::Good::Hides,
+                            crate::types::Good::Cotton, crate::types::Good::Silk,
+                            crate::types::Good::Fish, crate::types::Good::Grapes,
+                            crate::types::Good::GoldOre,
+                            crate::types::Good::TobaccoProducts,
+                        ];
+                        let next_id = self.trade_routes.iter()
+                            .map(|r| r.id).max().map(|m| m + 1).unwrap_or(1);
+                        let mut route = TradeRoute::new(next_id, owner);
+                        for &(iid, wx, wy) in &stops {
+                            route.add_stop(RouteStop {
+                                island_id: iid,
+                                warehouse_x: wx,
+                                warehouse_y: wy,
+                                load_goods: all_goods.iter()
+                                    .map(|&g| (g, 50)).collect(),
+                                unload_goods: all_goods.to_vec(),
+                            });
+                        }
+                        route.activate();
+                        let route_id = route.id;
+                        let (sx, sy) = (stops[0].1 as i32, stops[0].2 as i32);
+                        self.trade_routes.push(route);
+                        self.trade_ships.push(TradeShip::new(
+                            owner, route_id, sx, sy,
+                        ));
                     }
                     AiAction::SellExcess => {
                         // Sell excess goods from warehouses for gold
@@ -311,8 +496,8 @@ impl Simulation {
                                     if *amount > 20 {
                                         let sell = amount - 20;
                                         wh.withdraw(*good, sell);
-                                        // Gold per unit varies by good; approximate at 5 gold/unit
-                                        self.players[player_idx].gold += sell as i32 * 5;
+                                        let price = crate::prices::price_of(*good).sell;
+                                        self.players[player_idx].gold += sell as i32 * price;
                                     }
                                 }
                             }
@@ -345,7 +530,148 @@ impl Simulation {
     }
 
     fn tick_diplomacy(&mut self) {
-        // TODO: AI diplomacy decisions
+        // Score each player slot: military weight + a fraction of gold.
+        // Used by AI controllers to decide war / peace based on power.
+        let mut scores = vec![0i64; self.players.len()];
+        for u in &self.military_units {
+            if u.is_alive() {
+                let i = u.owner as usize;
+                if i < scores.len() { scores[i] += 10; }
+            }
+        }
+        for (i, p) in self.players.iter().enumerate() {
+            scores[i] += (p.gold.max(0) as i64) / 200;
+        }
+
+        for ctrl_idx in 0..self.ai_controllers.len() {
+            let me = self.ai_controllers[ctrl_idx].player_idx as usize;
+            if me >= scores.len() { continue; }
+            // Only Military and Balanced personalities flip relations.
+            let personality = self.ai_controllers[ctrl_idx].personality;
+            use crate::ai::AiPersonality;
+            use crate::combat::Diplomacy;
+            use crate::player::PlayerState;
+
+            let aggressor = matches!(
+                personality,
+                AiPersonality::Military | AiPersonality::Balanced,
+            );
+            let pacifist = matches!(personality, AiPersonality::Economic);
+
+            let my_score = scores[me];
+            for other in 0..scores.len() {
+                if other == me { continue; }
+                // Ignore empty / defeated slots.
+                if let Some(p) = self.players.get(other) {
+                    if matches!(p.state, PlayerState::Empty | PlayerState::Defeated) {
+                        continue;
+                    }
+                } else { continue; }
+                let other_score = scores[other];
+                let cur = self.diplomacy.get(me as u8, other as u8);
+
+                // Declare war on a clearly weaker neutral neighbor.
+                if aggressor
+                    && cur == Diplomacy::Neutral
+                    && my_score >= 20
+                    && other_score * 2 <= my_score
+                {
+                    self.diplomacy.set(me as u8, other as u8, Diplomacy::War);
+                    continue;
+                }
+                // Sue for peace if outmatched (any personality).
+                if cur == Diplomacy::War && other_score >= my_score * 2 {
+                    self.diplomacy.set(me as u8, other as u8, Diplomacy::Neutral);
+                    continue;
+                }
+                // Pacifist AIs back out of any war they aren't winning.
+                if pacifist && cur == Diplomacy::War && other_score >= my_score {
+                    self.diplomacy.set(me as u8, other as u8, Diplomacy::Neutral);
+                }
+            }
+
+            // Reactive defense: scan AI warehouses for nearby hostile
+            // military and spawn defenders if any are within 8 tiles.
+            const DEFENDER_COST: i32 = 100;
+            const DEFENDER_RADIUS: i32 = 8;
+            const DEFENDERS_PER_THREAT: u32 = 2;
+            let owner = me as u8;
+            let warehouse_targets: Vec<(u16, u16, u8)> = self.warehouses.iter()
+                .filter(|w| w.active && w.owner == owner)
+                .map(|w| (w.tile_x, w.tile_y, w.island_id))
+                .collect();
+            for (wx, wy, _wh_island) in warehouse_targets {
+                // Is there a hostile military unit within radius?
+                let threat = self.military_units.iter().any(|u| {
+                    if !u.is_alive() || u.owner == owner { return false; }
+                    if self.diplomacy.get(owner, u.owner) != Diplomacy::War {
+                        return false;
+                    }
+                    let dx = (u.tile_x - wx as i32).abs();
+                    let dy = (u.tile_y - wy as i32).abs();
+                    dx.max(dy) <= DEFENDER_RADIUS
+                });
+                if !threat { continue; }
+                // Don't keep spawning if we already have defenders nearby.
+                let existing = self.military_units.iter().filter(|u| {
+                    u.is_alive() && u.owner == owner
+                        && (u.tile_x - wx as i32).abs() <= DEFENDER_RADIUS
+                        && (u.tile_y - wy as i32).abs() <= DEFENDER_RADIUS
+                }).count();
+                if existing >= DEFENDERS_PER_THREAT as usize { continue; }
+                if self.players[me].gold < DEFENDER_COST { continue; }
+                let needed = DEFENDERS_PER_THREAT as i32 - existing as i32;
+                for k in 0..needed.max(1) {
+                    if self.players[me].gold < DEFENDER_COST { break; }
+                    self.players[me].gold -= DEFENDER_COST;
+                    let dx = (k % 3) - 1;
+                    let dy = (k / 3) - 1;
+                    self.military_units.push(MilitaryUnit::new(
+                        crate::combat::UnitType::Swordsman,
+                        owner,
+                        wx as i32 + dx,
+                        wy as i32 + dy,
+                    ));
+                }
+            }
+
+            // Offensive raids: aggressors with a clear advantage send half
+            // their idle units toward an enemy warehouse on the same island.
+            if aggressor {
+                for enemy in 0..scores.len() {
+                    if enemy as u8 == owner { continue; }
+                    if self.diplomacy.get(owner, enemy as u8) != Diplomacy::War {
+                        continue;
+                    }
+                    if scores[me] <= scores[enemy] { continue; }
+                    // Pick a target warehouse: the enemy's first active one.
+                    let target = self.warehouses.iter().find(|w| {
+                        w.active && w.owner == enemy as u8
+                    });
+                    let Some(target) = target else { continue; };
+                    let tx = target.tile_x as i32;
+                    let ty = target.tile_y as i32;
+                    // Find this AI's idle units — those whose current
+                    // target is roughly their own tile.
+                    let mut idle_indices: Vec<usize> = Vec::new();
+                    for (i, u) in self.military_units.iter().enumerate() {
+                        if !u.is_alive() || u.owner != owner { continue; }
+                        let stuck = u.target_x == u.tile_x && u.target_y == u.tile_y;
+                        if stuck && u.combat_target < 0 {
+                            idle_indices.push(i);
+                        }
+                    }
+                    let send = (idle_indices.len() / 2).max(1).min(idle_indices.len());
+                    for i in idle_indices.into_iter().take(send) {
+                        self.military_units[i].target_x = tx;
+                        self.military_units[i].target_y = ty;
+                        self.military_units[i].combat_target = -1;
+                        self.military_units[i].move_timer_ms = 0;
+                    }
+                    break; // One front per tick
+                }
+            }
+        }
     }
 
     fn tick_ships(&mut self) {
@@ -392,6 +718,17 @@ impl Simulation {
     }
 
     fn tick_entities(&mut self, dt_ms: u32) {
+        // Move military units toward player-issued targets (every step).
+        combat::tick_unit_orders(&mut self.military_units, dt_ms);
+
+        // Advance construction on placed-but-unfinished buildings.
+        for b in self.buildings.iter_mut() {
+            if b.construction_ms_remaining > 0 {
+                b.construction_ms_remaining =
+                    b.construction_ms_remaining.saturating_sub(dt_ms);
+            }
+        }
+
         let mut despawn_indices = Vec::new();
 
         for (idx, figure) in self.figures.iter_mut().enumerate() {
@@ -436,5 +773,403 @@ impl Simulation {
         let minutes = self.game_clock / TICKS_PER_MINUTE;
         let seconds = (self.game_clock % TICKS_PER_MINUTE) / 10;
         (minutes, seconds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiController, AiPersonality, Difficulty};
+
+    #[test]
+    fn ai_request_build_places_building() {
+        use crate::ai::AiAction;
+        use crate::types::{Good, ProductionType};
+        use crate::building::BuildingDef;
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[1].gold = 5_000;
+        // One open island map for AI.
+        sim.island_maps.push(IslandMap::new_open(0, 30, 30));
+        sim.warehouses.push(Warehouse::new(0, 1, 15, 15));
+        // A single buildable def: a Tools workshop.
+        sim.building_defs.push(BuildingDef {
+            id: 0, category: 0, width: 2, height: 2,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::Tools, input_good_1: Good::Iron,
+            input_good_2: Good::None,
+            output_rate: 1, input_1_rate: 1, input_2_rate: 0,
+            storage_capacity: 50, cycle_time_ms: 1000, carrier_interval_ms: 0,
+            cost_gold: 500, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+        });
+        // Drive the build path manually.
+        let action = AiAction::RequestBuild { good: Good::Tools, priority: 0 };
+        // Inline the dispatch loop (tick_ai runs the controller too, which
+        // would emit its own actions; we want a focused single-action test).
+        let owner = 1u8;
+        let player_idx = owner as usize;
+        let gold_before = sim.players[player_idx].gold;
+        match action {
+            AiAction::RequestBuild { good, .. } => {
+                let pick = sim.building_defs.iter().enumerate()
+                    .filter(|(_, d)| d.output_good == good
+                        && d.cost_gold as i32 <= sim.players[player_idx].gold)
+                    .min_by_key(|(_, d)| d.cost_gold);
+                let (def_id, def) = pick.unwrap();
+                let wh = sim.warehouses.iter().find(|w| w.owner == owner).unwrap();
+                let cx = wh.tile_x; let cy = wh.tile_y;
+                let w = def.width as u16; let h = def.height as u16;
+                let cost = def.cost_gold;
+                let map_idx = sim.island_maps.iter()
+                    .position(|m| m.island_id == wh.island_id).unwrap();
+                let spot = sim.island_maps[map_idx]
+                    .find_open_spot(cx, cy, w, h, 12).unwrap();
+                for dy in 0..h {
+                    for dx in 0..w {
+                        sim.island_maps[map_idx].set_walkable(spot.0 + dx, spot.1 + dy, false);
+                    }
+                }
+                let mut inst = BuildingInstance::new(
+                    def_id as u16, wh.island_id, spot.0, spot.1, owner,
+                );
+                inst.construction_ms_total = 8_000;
+                inst.construction_ms_remaining = 8_000;
+                sim.buildings.push(inst);
+                sim.players[player_idx].gold -= cost as i32;
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(sim.buildings.len(), 1);
+        assert_eq!(sim.buildings[0].owner, owner);
+        assert!(sim.players[player_idx].gold < gold_before);
+        assert!(!sim.buildings[0].is_built()); // construction in progress
+    }
+
+    #[test]
+    fn ai_defends_warehouse_when_threatened() {
+        use crate::ai::{AiController, AiPersonality, Difficulty};
+        use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        // Drain p0's starting gold and pump the AI's so the diplomacy
+        // tick won't sue for peace before reaching the defense block.
+        sim.players[0].gold = 0;
+        sim.players[1].gold = 5_000;
+        sim.warehouses.push(Warehouse::new(0, 1, 30, 30));
+        sim.diplomacy.set(0, 1, Diplomacy::War);
+        // Hostile unit within 8 tiles of the AI's warehouse.
+        sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 0, 32, 32));
+        sim.ai_controllers.push(AiController::new(
+            1, AiPersonality::Military, Difficulty::Hard,
+        ));
+        sim.tick_diplomacy();
+        let ai_units: usize = sim.military_units.iter()
+            .filter(|u| u.owner == 1 && u.is_alive())
+            .count();
+        assert!(ai_units >= 1, "AI should have spawned at least one defender");
+        assert!(sim.players[1].gold < 5_000);
+    }
+
+    #[test]
+    fn ai_marches_units_at_enemy_warehouse_when_winning() {
+        use crate::ai::{AiController, AiPersonality, Difficulty};
+        use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[0].gold = 0;
+        sim.players[1].gold = 5_000;
+        // Enemy warehouse at (50,50), AI's at (10,10).
+        sim.warehouses.push(Warehouse::new(0, 0, 50, 50));
+        sim.warehouses.push(Warehouse::new(0, 1, 10, 10));
+        sim.diplomacy.set(0, 1, Diplomacy::War);
+        // 4 idle AI units sitting near their warehouse.
+        for k in 0..4 {
+            let mut u = MilitaryUnit::new(UnitType::Swordsman, 1, 10 + k, 10);
+            u.target_x = u.tile_x;
+            u.target_y = u.tile_y;
+            sim.military_units.push(u);
+        }
+        sim.ai_controllers.push(AiController::new(
+            1, AiPersonality::Military, Difficulty::Hard,
+        ));
+        sim.tick_diplomacy();
+        // At least half of the AI's units should now be marching toward
+        // the enemy warehouse (50,50).
+        let marching = sim.military_units.iter().filter(|u| {
+            u.owner == 1 && u.target_x == 50 && u.target_y == 50
+        }).count();
+        assert!(marching >= 2, "expected ≥2 units marching, got {marching}");
+    }
+
+    #[test]
+    fn ai_does_not_defend_against_neutral() {
+        use crate::ai::{AiController, AiPersonality, Difficulty};
+        use crate::combat::{MilitaryUnit, UnitType};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[1].gold = 1_000;
+        sim.warehouses.push(Warehouse::new(0, 1, 30, 30));
+        // Neutral player walking near the warehouse — not a threat.
+        sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 0, 32, 32));
+        sim.ai_controllers.push(AiController::new(
+            1, AiPersonality::Military, Difficulty::Hard,
+        ));
+        sim.tick_diplomacy();
+        let ai_units: usize = sim.military_units.iter()
+            .filter(|u| u.owner == 1 && u.is_alive())
+            .count();
+        assert_eq!(ai_units, 0);
+    }
+
+    #[test]
+    fn ai_request_build_prefers_variety() {
+        use crate::ai::{AiController, AiPersonality, Difficulty};
+        use crate::types::{Good, ProductionType};
+        use crate::building::BuildingDef;
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[1].gold = 10_000;
+        sim.players[1].population[1] = 150; // make AI tick fire
+        sim.players[1].total_population = 150;
+        sim.island_maps.push(IslandMap::new_open(0, 60, 60));
+        sim.warehouses.push(Warehouse::new(0, 1, 30, 30));
+
+        let mk_def = |cost: u32| BuildingDef {
+            id: 0, category: 0, width: 2, height: 2,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::Food, input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 50, cycle_time_ms: 1000, carrier_interval_ms: 0,
+            cost_gold: cost, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+        };
+        // Two defs producing the same Good. Cheaper one would always win
+        // under the old logic.
+        sim.building_defs.push(mk_def(500));   // def 0 (cheap)
+        sim.building_defs.push(mk_def(800));   // def 1 (expensive)
+
+        sim.ai_controllers.push(AiController::new(
+            1, AiPersonality::Economic, Difficulty::Hard,
+        ));
+        // Drive tick_ai twice, resetting cooldowns between so we get
+        // back-to-back builds.
+        sim.tick_ai();
+        sim.ai_controllers[0].build_cooldown = 0;
+        sim.tick_ai();
+
+        let mut def_ids: Vec<u16> = sim.buildings
+            .iter()
+            .filter(|b| b.owner == 1)
+            .map(|b| b.def_id)
+            .collect();
+        def_ids.sort();
+        assert_eq!(def_ids.len(), 2, "expected two AI builds, got {def_ids:?}");
+        assert_eq!(def_ids, vec![0, 1],
+            "AI should diversify across both defs, got {def_ids:?}");
+    }
+
+    #[test]
+    fn ai_establishes_trade_route_when_eligible() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[1].gold = 5_000;
+        // Two warehouses on different islands so the AI is eligible.
+        sim.warehouses.push(Warehouse::new(0, 1, 10, 10));
+        sim.warehouses.push(Warehouse::new(1, 1, 50, 50));
+        sim.ai_controllers.push(AiController::new(
+            1, AiPersonality::Economic, Difficulty::Hard,
+        ));
+        // Drive AI tick.
+        sim.tick_ai();
+        assert!(!sim.trade_routes.is_empty(), "AI should have created a route");
+        assert!(!sim.trade_ships.is_empty(), "AI should have spawned a ship");
+        assert_eq!(sim.trade_routes[0].owner, 1);
+        assert_eq!(sim.trade_routes[0].stops.len(), 2);
+        // Ship cost was deducted.
+        assert!(sim.players[1].gold < 5_000);
+    }
+
+    #[test]
+    fn ai_skips_trade_route_with_one_island() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[1].gold = 5_000;
+        // Only one island warehouse — not eligible.
+        sim.warehouses.push(Warehouse::new(0, 1, 10, 10));
+        sim.ai_controllers.push(AiController::new(
+            1, AiPersonality::Economic, Difficulty::Hard,
+        ));
+        sim.tick_ai();
+        assert!(sim.trade_routes.is_empty());
+        assert!(sim.trade_ships.is_empty());
+    }
+
+    #[test]
+    fn building_maintenance_aggregates_per_player() {
+        use crate::types::{Good, ProductionType};
+        use crate::building::{BuildingDef, BuildingInstance};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        let mk_def = |maint: u16| BuildingDef {
+            id: 0, category: 0, width: 1, height: 1,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::Tools, input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 50, cycle_time_ms: 1000, carrier_interval_ms: 0,
+            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: maint,
+        };
+        sim.building_defs.push(mk_def(5)); // def 0 cost 5
+        sim.building_defs.push(mk_def(8)); // def 1 cost 8
+        // Player 0: 2× def0 + 1× def1 → 5+5+8 = 18
+        sim.buildings.push(BuildingInstance::new(0, 0, 0, 0, 0));
+        sim.buildings.push(BuildingInstance::new(0, 0, 1, 1, 0));
+        sim.buildings.push(BuildingInstance::new(1, 0, 2, 2, 0));
+        // Player 1: 1× def1 → 8
+        sim.buildings.push(BuildingInstance::new(1, 0, 3, 3, 1));
+        // Make all "built" so they count.
+        for b in &mut sim.buildings { b.construction_ms_remaining = 0; }
+        sim.tick_population();
+        assert_eq!(sim.players[0].building_maintenance, 18);
+        assert_eq!(sim.players[1].building_maintenance, 8);
+    }
+
+    #[test]
+    fn unfinished_buildings_do_not_pay_maintenance() {
+        use crate::types::{Good, ProductionType};
+        use crate::building::{BuildingDef, BuildingInstance};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.building_defs.push(BuildingDef {
+            id: 0, category: 0, width: 1, height: 1,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::Tools, input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 0, cycle_time_ms: 1000, carrier_interval_ms: 0,
+            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 7,
+        });
+        // One under construction, one finished.
+        let mut bb = BuildingInstance::new(0, 0, 0, 0, 0);
+        bb.construction_ms_total = 5_000;
+        bb.construction_ms_remaining = 5_000;
+        sim.buildings.push(bb);
+        sim.buildings.push(BuildingInstance::new(0, 0, 1, 1, 0));
+        sim.tick_population();
+        // Only the finished building should be counted.
+        assert_eq!(sim.players[0].building_maintenance, 7);
+    }
+
+    #[test]
+    fn ai_declares_war_on_weak_neighbor() {
+        use crate::ai::{AiController, AiPersonality, Difficulty};
+        use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        // Drain the human player's default starting gold so AI(1) clearly
+        // outscores them on the (units * 10 + gold/200) heuristic.
+        sim.players[0].gold = 0;
+        sim.players[1].gold = 5_000;
+        // AI(1) is Military and beefy; player 0 is weak.
+        for _ in 0..10 {
+            sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 1, 0, 0));
+        }
+        sim.ai_controllers.push(AiController::new(
+            1, AiPersonality::Military, Difficulty::Hard,
+        ));
+        sim.tick_diplomacy();
+        assert_eq!(sim.diplomacy.get(1, 0), Diplomacy::War);
+        // Symmetric.
+        assert_eq!(sim.diplomacy.get(0, 1), Diplomacy::War);
+    }
+
+    #[test]
+    fn ai_sues_for_peace_when_outmatched() {
+        use crate::ai::{AiController, AiPersonality, Difficulty};
+        use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        // Start at war.
+        sim.diplomacy.set(1, 0, Diplomacy::War);
+        // Player 0 vastly outmuscles AI(1).
+        for _ in 0..30 {
+            sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 0, 0, 0));
+        }
+        sim.ai_controllers.push(AiController::new(
+            1, AiPersonality::Military, Difficulty::Hard,
+        ));
+        sim.tick_diplomacy();
+        assert_eq!(sim.diplomacy.get(1, 0), Diplomacy::Neutral);
+    }
+
+    #[test]
+    fn economic_ai_does_not_declare_war() {
+        use crate::ai::{AiController, AiPersonality, Difficulty};
+        use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[0].gold = 0;
+        sim.players[1].gold = 5_000;
+        for _ in 0..10 {
+            sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 1, 0, 0));
+        }
+        sim.ai_controllers.push(AiController::new(
+            1, AiPersonality::Economic, Difficulty::Hard,
+        ));
+        sim.tick_diplomacy();
+        // Economic AI shouldn't have flipped to war even with the upper hand.
+        assert_eq!(sim.diplomacy.get(1, 0), Diplomacy::Neutral);
+    }
+
+    #[test]
+    fn ai_request_military_spawns_units() {
+        let mut sim = Simulation::new();
+        // Player slot 1 is the AI we're driving.
+        sim.players.push(Player::new_human(0)); // slot 0 (unused for this test)
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[1].gold = 5_000;
+        sim.players[1].total_population = 200;
+        sim.players[1].population[1] = 200; // make calculate_costs etc. sane
+        // AI needs a warehouse to spawn near.
+        sim.warehouses.push(Warehouse::new(0, 1, 30, 40));
+        // Wire an AI controller bound to slot 1 with the Military personality
+        // running on Hard so its target unit count is reasonable.
+        sim.ai_controllers.push(AiController::new(
+            1, AiPersonality::Military, Difficulty::Hard,
+        ));
+        // Force-trigger the AI tick once.
+        sim.tick_ai();
+        // Expect at least one swordsman spawned for player 1.
+        let owned: usize = sim.military_units.iter()
+            .filter(|u| u.owner == 1 && u.is_alive())
+            .count();
+        assert!(owned > 0, "AI should have spawned at least one unit, got {owned}");
+        // And paid for them.
+        assert!(sim.players[1].gold < 5_000);
     }
 }

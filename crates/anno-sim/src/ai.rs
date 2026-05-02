@@ -120,6 +120,16 @@ impl AiController {
             self.trade_cooldown -= 1;
         }
 
+        // Rich-AI reinvestment: a stockpile larger than 15k gold means
+        // the AI is sitting idle. Halve every cooldown so it spends
+        // faster — buildings, military, and trade ships all kick in
+        // sooner instead of letting gold rot in the treasury.
+        if player.gold >= 15_000 {
+            self.build_cooldown /= 2;
+            self.military_cooldown /= 2;
+            self.trade_cooldown /= 2;
+        }
+
         match self.personality {
             AiPersonality::Economic => {
                 self.tick_economic(player, buildings, building_defs, warehouses, &mut actions);
@@ -141,6 +151,9 @@ impl AiController {
 
         // Gold management
         self.manage_gold(player, &mut actions);
+
+        // Trade route expansion (any personality once it has the warehouses).
+        self.tick_trade(player, warehouses, &mut actions);
 
         actions
     }
@@ -261,6 +274,36 @@ impl AiController {
         }
     }
 
+    /// Decide whether to start a new trade route.
+    /// Triggered when:
+    ///   - trade_cooldown has elapsed,
+    ///   - the AI has at least 2 warehouses on different islands,
+    ///   - it can afford a ship (1000 gold buffer above subsistence).
+    /// The dispatcher picks the actual stops; we just emit the request.
+    pub(crate) fn tick_trade(
+        &mut self,
+        player: &Player,
+        warehouses: &[Warehouse],
+        actions: &mut Vec<AiAction>,
+    ) {
+        if self.trade_cooldown > 0 { return; }
+        if player.gold < 2000 { return; }
+        let mut islands: Vec<u8> = warehouses.iter()
+            .filter(|w| w.active && w.owner == self.player_idx)
+            .map(|w| w.island_id)
+            .collect();
+        islands.sort();
+        islands.dedup();
+        if islands.len() < 2 { return; }
+        actions.push(AiAction::EstablishTradeRoute);
+        self.trade_cooldown = match self.difficulty {
+            Difficulty::Easy => 30,
+            Difficulty::Medium => 20,
+            Difficulty::Hard => 12,
+            Difficulty::Expert => 8,
+        };
+    }
+
     /// Build interval depends on difficulty (faster on higher difficulty).
     fn build_interval(&self) -> u32 {
         match self.difficulty {
@@ -291,12 +334,42 @@ pub enum AiAction {
     },
     /// Sell excess warehouse goods for gold.
     SellExcess,
+    /// Establish a trade route across the AI's owned warehouses (the
+    /// dispatcher picks the actual stops + spawns a ship).
+    EstablishTradeRoute,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::player::Player;
+
+    #[test]
+    fn rich_ai_halves_cooldowns_each_tick() {
+        let mut ai = AiController::new(1, AiPersonality::Economic, Difficulty::Medium);
+        ai.build_cooldown = 8;
+        ai.military_cooldown = 4;
+        ai.trade_cooldown = 6;
+        let mut player = Player::new_ai(1, 0);
+        player.gold = 20_000; // > 15k threshold
+        // Tick once with no buildings; cooldowns should drop by 1 then halve.
+        let _ = ai.tick(&player, &[], &[], &[]);
+        // 8 -> 7 -> 3 (then halved); 4 -> 3 -> 1; 6 -> 5 -> 2
+        assert_eq!(ai.build_cooldown, 3);
+        assert_eq!(ai.military_cooldown, 1);
+        assert_eq!(ai.trade_cooldown, 2);
+    }
+
+    #[test]
+    fn poor_ai_does_not_halve_cooldowns() {
+        let mut ai = AiController::new(1, AiPersonality::Economic, Difficulty::Medium);
+        ai.build_cooldown = 8;
+        let mut player = Player::new_ai(1, 0);
+        player.gold = 5_000;
+        let _ = ai.tick(&player, &[], &[], &[]);
+        // Just the normal -1 decrement.
+        assert_eq!(ai.build_cooldown, 7);
+    }
 
     #[test]
     fn economic_ai_requests_food_first() {

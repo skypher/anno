@@ -124,6 +124,42 @@ impl IslandMap {
         }
     }
 
+    /// True iff the entire `w × h` footprint anchored at `(x, y)` is walkable.
+    pub fn can_fit(&self, x: i32, y: i32, w: u16, h: u16) -> bool {
+        if x < 0 || y < 0 { return false; }
+        if (x as u32) + w as u32 > self.width as u32 { return false; }
+        if (y as u32) + h as u32 > self.height as u32 { return false; }
+        for dy in 0..h as i32 {
+            for dx in 0..w as i32 {
+                if !self.is_walkable(x + dx, y + dy) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Spiral search around `(cx, cy)` (warehouse, typically) for the first
+    /// position where `w × h` fits. Returns top-left tile or None.
+    pub fn find_open_spot(
+        &self, cx: u16, cy: u16, w: u16, h: u16, max_radius: u16,
+    ) -> Option<(u16, u16)> {
+        for r in 0..=max_radius as i32 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    // Only the ring at the current radius (skip interior).
+                    if dx.abs() != r && dy.abs() != r { continue; }
+                    let x = cx as i32 + dx;
+                    let y = cy as i32 + dy;
+                    if self.can_fit(x, y, w, h) {
+                        return Some((x as u16, y as u16));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Create an empty map (all walkable) for testing or when no tile data is available.
     pub fn new_open(island_id: u8, width: u16, height: u16) -> Self {
         let size = width as usize * height as usize;
@@ -159,5 +195,33 @@ mod tests {
         assert!(map.is_walkable(5, 5));
         map.set_walkable(5, 5, false);
         assert!(!map.is_walkable(5, 5));
+    }
+
+    #[test]
+    fn can_fit_respects_bounds_and_blocks() {
+        let mut map = IslandMap::new_open(0, 10, 10);
+        assert!(map.can_fit(0, 0, 3, 3));
+        assert!(!map.can_fit(8, 8, 3, 3)); // would overflow
+        map.set_walkable(2, 2, false);
+        assert!(!map.can_fit(0, 0, 3, 3)); // blocker hits the footprint
+        assert!(map.can_fit(3, 3, 3, 3));  // clear away from blocker
+    }
+
+    #[test]
+    fn find_open_spot_spirals_around_blocked_center() {
+        let mut map = IslandMap::new_open(0, 10, 10);
+        // Wall the 2x2 around (5,5).
+        for x in 4..=6 {
+            for y in 4..=6 {
+                map.set_walkable(x, y, false);
+            }
+        }
+        let pos = map.find_open_spot(5, 5, 2, 2, 5).expect("found spot");
+        // Picked footprint must be walkable.
+        assert!(map.can_fit(pos.0 as i32, pos.1 as i32, 2, 2));
+        // And must lie outside the blocked block.
+        let in_blocked = (pos.0 as i32) >= 3 && (pos.0 as i32) <= 6
+            && (pos.1 as i32) >= 3 && (pos.1 as i32) <= 6;
+        assert!(!in_blocked, "got {:?} which overlaps the 2x2 wall", pos);
     }
 }

@@ -12,6 +12,7 @@
 //!   5. Despawns when back at building
 
 use crate::building::{BuildingDef, BuildingInstance};
+use crate::coverage::CoverageMap;
 use crate::entity::{ActionType, Figure};
 use crate::island_map::IslandMap;
 use crate::pathfinding;
@@ -28,6 +29,7 @@ pub fn try_spawn_carrier(
     def: &BuildingDef,
     warehouses: &[Warehouse],
     island_maps: &[IslandMap],
+    coverage_maps: &[CoverageMap],
 ) -> Option<Figure> {
     if def.output_good == Good::None || def.storage_capacity == 0 {
         return None;
@@ -36,6 +38,32 @@ pub fn try_spawn_carrier(
     // Only spawn when output exceeds half capacity
     if building.output_stock <= def.storage_capacity / 2 {
         return None;
+    }
+
+    // Marketplace adjacency: a production building only ships goods if at
+    // least one of its footprint tiles is inside the island's service
+    // coverage (warehouse base radius + marketplace overlays). If the
+    // island has a coverage map but the building falls outside, the
+    // carrier won't spawn — output backs up and efficiency tanks until
+    // the player builds a closer warehouse / marketplace.
+    if let Some(cov) = coverage_maps.iter().find(|c| c.island_id == building.island_id) {
+        let bx = building.tile_x;
+        let by = building.tile_y;
+        let bw = def.width as u16;
+        let bh = def.height as u16;
+        let mut any = false;
+        for dy in 0..bh.max(1) {
+            for dx in 0..bw.max(1) {
+                if cov.is_covered(bx + dx, by + dy) {
+                    any = true;
+                    break;
+                }
+            }
+            if any { break; }
+        }
+        if !any {
+            return None;
+        }
     }
 
     // Find nearest warehouse on same island
@@ -86,6 +114,9 @@ pub fn step_carrier(figure: &mut Figure) -> bool {
     if figure.speed == 0 {
         return false;
     }
+
+    // Advance animation frame on each step
+    figure.anim_frame = figure.anim_frame.wrapping_add(1) % 8;
 
     // Follow pre-computed path
     if figure.path_idx < figure.path.len() {
@@ -248,5 +279,62 @@ fn good_from_u8(val: u8) -> Good {
         29 => Good::Clothing,
         30 => Good::Fish,
         _ => Good::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ProductionType;
+
+    fn def_for_tools() -> BuildingDef {
+        BuildingDef {
+            id: 0, category: 0, width: 1, height: 1,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::Tools, input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 50, cycle_time_ms: 1000, carrier_interval_ms: 0,
+            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+        }
+    }
+
+    #[test]
+    fn carrier_skipped_when_outside_coverage() {
+        let def = def_for_tools();
+        let mut b = BuildingInstance::new(0, 0, 50, 50, 0);
+        b.output_stock = 40; // > capacity / 2
+        let warehouses = vec![Warehouse::new(0, 0, 1, 1)];
+        let cov = CoverageMap::new(0, 60, 60); // empty: nothing covered
+        assert!(try_spawn_carrier(&mut b, &def, &warehouses, &[], &[cov]).is_none());
+    }
+
+    #[test]
+    fn carrier_dispatched_when_covered() {
+        let def = def_for_tools();
+        let mut b = BuildingInstance::new(0, 0, 5, 5, 0);
+        b.output_stock = 40;
+        let warehouses = vec![Warehouse::new(0, 0, 4, 4)];
+        // Build a coverage map where the building tile IS covered.
+        let mut cov = CoverageMap::new(0, 60, 60);
+        cov.recompute(&[b.clone()], &[def.clone()], &[(4, 4, 22)]);
+        // sanity check
+        assert!(cov.is_covered(5, 5));
+        let result = try_spawn_carrier(&mut b, &def, &warehouses, &[], &[cov]);
+        assert!(result.is_some(), "should dispatch when covered");
+    }
+
+    #[test]
+    fn no_coverage_map_means_no_gating() {
+        // Backwards-compat: islands without a coverage map keep the old
+        // behaviour where carriers spawn unconditionally on full output.
+        let def = def_for_tools();
+        let mut b = BuildingInstance::new(0, 0, 5, 5, 0);
+        b.output_stock = 40;
+        let warehouses = vec![Warehouse::new(0, 0, 1, 1)];
+        assert!(try_spawn_carrier(&mut b, &def, &warehouses, &[], &[]).is_some());
     }
 }

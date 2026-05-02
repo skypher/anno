@@ -299,6 +299,23 @@ impl NetHost {
     pub fn session(&self) -> &Session {
         &self.session
     }
+
+    /// Local socket address (resolved after bind, including kernel-picked port).
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    #[cfg(test)]
+    fn peer_count_for_test(&self) -> PeerCount {
+        PeerCount(self.peers.len())
+    }
+}
+
+#[cfg(test)]
+struct PeerCount(usize);
+#[cfg(test)]
+impl PeerCount {
+    fn is_zero(&self) -> bool { self.0 == 0 }
 }
 
 /// Client-side connection to a host.
@@ -389,5 +406,53 @@ impl NetClient {
     /// Get current session state.
     pub fn session(&self) -> &Session {
         &self.session
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::NetMessage;
+    use std::time::{Duration, Instant};
+
+    /// Spin a loopback host+client and verify a GameData payload round-trips.
+    #[test]
+    fn host_broadcast_reaches_client() {
+        // Bind on port 0 so the kernel picks a free one.
+        let mut host = NetHost::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            "test-session",
+        ).unwrap();
+        let bound = host.local_addr().expect("host bound");
+
+        let mut client = NetClient::connect(bound, "tester").unwrap();
+
+        // Pump host until peer is registered, then send.
+        let payload = vec![0xAAu8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got = false;
+        while Instant::now() < deadline {
+            host.poll();
+            if !host.peer_count_for_test().is_zero() {
+                let msg = NetMessage::game_data(payload.clone());
+                host.send_to_all(&msg);
+                // Drain client until it sees the GameData event.
+                for _ in 0..50 {
+                    let evs = client.poll();
+                    for ev in evs {
+                        if let SessionEvent::GameData { data, .. } = ev {
+                            assert_eq!(data, payload);
+                            got = true;
+                            break;
+                        }
+                    }
+                    if got { break; }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(got, "client did not receive broadcast within 2s");
     }
 }

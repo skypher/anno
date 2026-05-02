@@ -40,7 +40,7 @@ pub struct BuildingDef {
 }
 
 /// An active building instance in the world.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BuildingInstance {
     pub def_id: u16,
     pub island_id: u8,
@@ -62,6 +62,18 @@ pub struct BuildingInstance {
 
     /// Accumulated production work.
     pub total_work: u16,
+
+    /// Construction time remaining in ms. While > 0 the building is placed
+    /// but not yet operational: production is gated, carriers are not
+    /// dispatched, and the renderer applies a blue tint with a progress bar.
+    /// Set to 0 (default) for fully-built buildings.
+    #[serde(default)]
+    pub construction_ms_remaining: u32,
+
+    /// Total construction duration in ms (for progress %, copied from def
+    /// at placement time). 0 means instant build.
+    #[serde(default)]
+    pub construction_ms_total: u32,
 }
 
 impl BuildingInstance {
@@ -79,6 +91,22 @@ impl BuildingInstance {
             output_stock: 0,
             production_timer_ms: 0,
             total_work: 0,
+            construction_ms_remaining: 0,
+            construction_ms_total: 0,
         }
+    }
+
+    /// Returns true if the building is finished and operational.
+    pub fn is_built(&self) -> bool {
+        self.construction_ms_remaining == 0
+    }
+
+    /// Construction progress in 0..=128 (matches efficiency scale).
+    pub fn construction_progress_128(&self) -> u8 {
+        if self.construction_ms_total == 0 {
+            return 128;
+        }
+        let done = self.construction_ms_total - self.construction_ms_remaining;
+        ((done as u64 * 128) / self.construction_ms_total as u64).min(128) as u8
     }
 }

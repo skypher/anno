@@ -7,7 +7,7 @@
 pub const MAX_FIGURES: usize = 2550;
 
 /// Figure action types (the 16-case switch from FUN_00451890).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum ActionType {
     None = 0,
@@ -34,7 +34,7 @@ pub enum ActionType {
 }
 
 /// A figure/entity in the world.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Figure {
     pub action: ActionType,
     pub owner: u8,

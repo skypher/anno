@@ -5,3 +5,5 @@ edition.workspace = true
 
 [dependencies]
 anno-formats = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"

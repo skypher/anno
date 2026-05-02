@@ -20,7 +20,7 @@ pub const MIN_EFFICIENCY: u8 = 64;
 /// Update production for a single building.
 /// Returns the amount of goods produced this tick (0 if not producing).
 pub fn tick_building(building: &mut BuildingInstance, def: &BuildingDef, dt_ms: u32) -> u16 {
-    if !building.active {
+    if !building.active || !building.is_built() {
         return 0;
     }
 
@@ -86,6 +86,64 @@ pub fn needs_carrier(building: &BuildingInstance, def: &BuildingDef) -> bool {
     if def.storage_capacity == 0 {
         return false;
     }
+    if !building.is_built() {
+        return false;
+    }
     // Dispatch when output exceeds half capacity
     building.output_stock > def.storage_capacity / 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Good, ProductionType};
+
+    fn test_def() -> BuildingDef {
+        BuildingDef {
+            id: 1, category: 0, width: 1, height: 1,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::Tools, input_good_1: Good::Iron,
+            input_good_2: Good::None,
+            output_rate: 1, input_1_rate: 1, input_2_rate: 0,
+            storage_capacity: 50, cycle_time_ms: 1000, carrier_interval_ms: 0,
+            cost_gold: 100, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+        }
+    }
+
+    #[test]
+    fn unfinished_building_does_not_produce() {
+        let def = test_def();
+        let mut b = BuildingInstance::new(1, 0, 0, 0, 0);
+        b.input_1_stock = 50; // full input
+        b.construction_ms_remaining = 5_000;
+        b.construction_ms_total = 5_000;
+        let produced = tick_building(&mut b, &def, 1_500);
+        assert_eq!(produced, 0);
+        assert!(!b.is_built());
+    }
+
+    #[test]
+    fn finished_building_produces() {
+        let def = test_def();
+        let mut b = BuildingInstance::new(1, 0, 0, 0, 0);
+        b.input_1_stock = 50;
+        // Already built (defaults)
+        let produced = tick_building(&mut b, &def, 2_000);
+        assert!(produced > 0);
+    }
+
+    #[test]
+    fn construction_progress_scales_to_128() {
+        let mut b = BuildingInstance::new(1, 0, 0, 0, 0);
+        b.construction_ms_total = 4_000;
+        b.construction_ms_remaining = 4_000;
+        assert_eq!(b.construction_progress_128(), 0);
+        b.construction_ms_remaining = 2_000;
+        assert_eq!(b.construction_progress_128(), 64);
+        b.construction_ms_remaining = 0;
+        assert_eq!(b.construction_progress_128(), 128);
+    }
 }

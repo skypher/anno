@@ -18,7 +18,7 @@ pub const BANKRUPTCY_THRESHOLD: i32 = -1001;
 pub const BANKRUPTCY_GAME_OVER_TICKS: u32 = 40;
 
 /// Player state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum PlayerState {
     HumanActive = 0,
@@ -30,7 +30,7 @@ pub enum PlayerState {
 }
 
 /// Per-demand-category tracking.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DemandSlot {
     pub demand: u32,
     pub supply: u32,
@@ -39,7 +39,7 @@ pub struct DemandSlot {
 }
 
 /// Player data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Player {
     pub state: PlayerState,
     pub gold: i32,

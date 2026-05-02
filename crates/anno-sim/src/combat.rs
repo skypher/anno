@@ -16,7 +16,7 @@ const DETECTION_RANGE: u32 = 6;
 const ATTACK_RANGE: u32 = 3;
 
 /// Military unit types (from FUN_00451890 switch cases).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum UnitType {
     Pikeman = 1,
@@ -160,7 +160,7 @@ impl UnitType {
 }
 
 /// A military unit in the world.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MilitaryUnit {
     pub unit_type: UnitType,
     pub owner: u8,
@@ -171,6 +171,8 @@ pub struct MilitaryUnit {
     pub target_y: i32,
     pub direction: u8,
     pub attack_timer_ms: u32,
+    /// Movement accumulator for player-issued move orders.
+    pub move_timer_ms: u32,
     /// Index of the unit this is currently fighting (-1 = none).
     pub combat_target: i32,
     pub active: bool,
@@ -189,6 +191,7 @@ impl MilitaryUnit {
             target_y: tile_y,
             direction: 0,
             attack_timer_ms: 0,
+            move_timer_ms: 0,
             combat_target: -1,
             active: true,
         }
@@ -200,7 +203,7 @@ impl MilitaryUnit {
 }
 
 /// Diplomacy state between two players.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum Diplomacy {
     /// Cannot fight (allied or same team).
@@ -213,7 +216,7 @@ pub enum Diplomacy {
 
 /// Nation interaction matrix (who can fight whom).
 /// Original: DAT_005b7770, indexed by (attacker_nation * 0x50 + defender_nation) * 8.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiplomacyMatrix {
     /// 7×7 matrix (max 7 players).
     relations: [[Diplomacy; 7]; 7],
@@ -347,6 +350,54 @@ pub fn tick_combat(
     }
 
     dead
+}
+
+/// Move units toward their player-issued (target_x, target_y) when not in combat.
+/// One tile per `step_interval_ms` where step_interval = 1000 / move_speed (min 100ms).
+pub fn tick_unit_orders(units: &mut [MilitaryUnit], dt_ms: u32) {
+    for u in units.iter_mut() {
+        if !u.is_alive() || u.combat_target >= 0 {
+            continue;
+        }
+        if u.tile_x == u.target_x && u.tile_y == u.target_y {
+            u.move_timer_ms = 0;
+            continue;
+        }
+        let speed = u.unit_type.stats().move_speed.max(1) as u32;
+        let step_ms = (1000 / speed).max(100);
+        u.move_timer_ms = u.move_timer_ms.saturating_add(dt_ms);
+        while u.move_timer_ms >= step_ms {
+            u.move_timer_ms -= step_ms;
+            let dx = u.target_x - u.tile_x;
+            let dy = u.target_y - u.tile_y;
+            if dx == 0 && dy == 0 {
+                break;
+            }
+            // 8-direction step: prefer the larger axis but allow diagonals
+            let sx = dx.signum();
+            let sy = dy.signum();
+            if dx.abs() > 0 && dy.abs() > 0 {
+                u.tile_x += sx;
+                u.tile_y += sy;
+            } else if dx.abs() > 0 {
+                u.tile_x += sx;
+            } else {
+                u.tile_y += sy;
+            }
+            // Update direction (0=N, 1=NE, 2=E, ... 7=NW). Use sx,sy.
+            u.direction = match (sx, sy) {
+                (0, -1) => 0,
+                (1, -1) => 1,
+                (1, 0) => 2,
+                (1, 1) => 3,
+                (0, 1) => 4,
+                (-1, 1) => 5,
+                (-1, 0) => 6,
+                (-1, -1) => 7,
+                _ => u.direction,
+            };
+        }
+    }
 }
 
 /// Find the nearest enemy unit within detection range.
@@ -490,6 +541,31 @@ mod tests {
             !units[0].is_alive() || !units[1].is_alive(),
             "After 200 ticks, one unit should be dead"
         );
+    }
+
+    #[test]
+    fn tick_unit_orders_moves_toward_target() {
+        let mut units = vec![MilitaryUnit::new(UnitType::Swordsman, 0, 0, 0)];
+        units[0].target_x = 5;
+        units[0].target_y = 5;
+        // Swordsman move_speed = 3 → step_ms = 333; advance many steps.
+        for _ in 0..40 {
+            tick_unit_orders(&mut units, 100);
+        }
+        assert_eq!(units[0].tile_x, 5);
+        assert_eq!(units[0].tile_y, 5);
+    }
+
+    #[test]
+    fn tick_unit_orders_skipped_during_combat() {
+        let mut units = vec![MilitaryUnit::new(UnitType::Swordsman, 0, 0, 0)];
+        units[0].target_x = 5;
+        units[0].target_y = 0;
+        units[0].combat_target = 7; // Pretend we're engaged
+        for _ in 0..20 {
+            tick_unit_orders(&mut units, 100);
+        }
+        assert_eq!(units[0].tile_x, 0); // Did not move under orders
     }
 
     #[test]

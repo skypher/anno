@@ -21,13 +21,11 @@ pub const MAX_ROUTE_STOPS: usize = 8;
 /// Maximum cargo capacity per ship.
 pub const SHIP_CARGO_CAPACITY: u16 = 50;
 
-/// Gold earned per unit of goods sold.
-const SELL_PRICE_PER_UNIT: i32 = 8;
-/// Gold spent per unit of goods bought.
-const BUY_PRICE_PER_UNIT: i32 = 6;
+// Per-good buy/sell prices live in `crate::prices`. The flat constants that
+// used to live here (8 sell / 6 buy) have been replaced with `price_of`.
 
 /// A single stop in a trade route.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RouteStop {
     /// Target island ID.
     pub island_id: u8,
@@ -41,7 +39,7 @@ pub struct RouteStop {
 }
 
 /// A trade route connecting multiple warehouses.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeRoute {
     pub id: u16,
     pub owner: u8,
@@ -73,13 +71,17 @@ impl TradeRoute {
 }
 
 /// A trading ship executing a route.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeShip {
     pub owner: u8,
     pub route_id: u16,
     /// Current position (world coordinates).
     pub world_x: i32,
     pub world_y: i32,
+    /// Compass heading 0..8 (N, NE, E, SE, S, SW, W, NW), updated as the
+    /// ship moves; used to pick the right rotation sprite at render time.
+    #[serde(default)]
+    pub heading: u8,
     /// Movement speed in tiles per ship tick.
     pub speed: u16,
     /// Current stop index in route.
@@ -100,7 +102,7 @@ pub struct TradeShip {
 }
 
 /// Ship operating states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShipState {
     /// Traveling toward next stop.
     Sailing,
@@ -119,6 +121,7 @@ impl TradeShip {
             route_id,
             world_x,
             world_y,
+            heading: 0,
             speed: 2,
             current_stop: 0,
             state: ShipState::Idle,
@@ -199,6 +202,8 @@ pub fn tick_trade_ship(
             if !ship.path.is_empty() && ship.path_idx < ship.path.len() {
                 // Follow pre-computed ocean path
                 let steps = ship.speed as usize;
+                let prev_x = ship.world_x;
+                let prev_y = ship.world_y;
                 for _ in 0..steps {
                     if ship.path_idx >= ship.path.len() {
                         break;
@@ -208,6 +213,9 @@ pub fn tick_trade_ship(
                     ship.world_y = ny;
                     ship.path_idx += 1;
                 }
+                ship.heading = compass_heading(
+                    ship.world_x - prev_x, ship.world_y - prev_y, ship.heading,
+                );
 
                 // Check if we reached end of path (near destination)
                 if ship.path_idx >= ship.path.len() {
@@ -233,6 +241,7 @@ pub fn tick_trade_ship(
                     } else {
                         ship.world_y += dy.signum() * steps.min(dy.abs());
                     }
+                    ship.heading = compass_heading(dx, dy, ship.heading);
                 }
             }
         }
@@ -251,7 +260,7 @@ pub fn tick_trade_ship(
                     if amount > 0 {
                         let deposited = wh.deposit(good, amount);
                         ship.unload(good, deposited);
-                        gold_delta += deposited as i32 * SELL_PRICE_PER_UNIT;
+                        gold_delta += deposited as i32 * crate::prices::price_of(good).sell;
                     }
                 }
 
@@ -266,7 +275,7 @@ pub fn tick_trade_ship(
                         if loaded < withdrawn {
                             wh.deposit(good, withdrawn - loaded);
                         }
-                        gold_delta -= loaded as i32 * BUY_PRICE_PER_UNIT;
+                        gold_delta -= loaded as i32 * crate::prices::price_of(good).buy;
                     }
                 }
             }
@@ -286,6 +295,28 @@ pub fn tick_trade_ship(
 
     ship.profit += gold_delta;
     gold_delta
+}
+
+/// Map a (dx, dy) movement vector to an 8-direction compass heading
+/// (0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW). Returns `prev` when
+/// the delta is zero so a stalled ship keeps facing the same way.
+pub(crate) fn compass_heading(dx: i32, dy: i32, prev: u8) -> u8 {
+    if dx == 0 && dy == 0 {
+        return prev;
+    }
+    let sx = dx.signum();
+    let sy = dy.signum();
+    match (sx, sy) {
+        (0, -1) => 0,
+        (1, -1) => 1,
+        (1, 0) => 2,
+        (1, 1) => 3,
+        (0, 1) => 4,
+        (-1, 1) => 5,
+        (-1, 0) => 6,
+        (-1, -1) => 7,
+        _ => prev,
+    }
 }
 
 /// Compute an ocean A* path from ship's current position to the next route stop.
@@ -383,6 +414,20 @@ mod tests {
     }
 
     #[test]
+    fn compass_heading_8way() {
+        assert_eq!(compass_heading(0, -1, 0), 0);  // N
+        assert_eq!(compass_heading(1, -1, 0), 1);  // NE
+        assert_eq!(compass_heading(1, 0, 0), 2);   // E
+        assert_eq!(compass_heading(1, 1, 0), 3);   // SE
+        assert_eq!(compass_heading(0, 1, 0), 4);   // S
+        assert_eq!(compass_heading(-1, 1, 0), 5);  // SW
+        assert_eq!(compass_heading(-1, 0, 0), 6);  // W
+        assert_eq!(compass_heading(-1, -1, 0), 7); // NW
+        // Stalled ships keep their previous heading
+        assert_eq!(compass_heading(0, 0, 5), 5);
+    }
+
+    #[test]
     fn ship_cargo_load_unload() {
         let mut ship = TradeShip::new(0, 0, 0, 0);
         assert_eq!(ship.load(Good::Food, 10), 10);
@@ -435,6 +480,55 @@ mod tests {
         // Ship should have executed at least one complete trade cycle
         assert!(ship.profit != 0 || ship.cargo_total > 0 || total_gold != 0,
             "Ship should have traded something");
+    }
+
+    #[test]
+    fn trade_uses_per_good_prices() {
+        // Round-trip 10 Wood through a route and verify the gold delta
+        // matches `price_of(Wood).sell - price_of(Wood).buy` per unit, not
+        // the old flat 8-vs-6 numbers.
+        use crate::prices::price_of;
+        let mut wh_a = make_warehouse(0, 0, 10, 10);
+        wh_a.set_capacity(Good::Wood, 100);
+        wh_a.deposit(Good::Wood, 50);
+
+        let mut wh_b = make_warehouse(1, 0, 50, 50);
+        wh_b.set_capacity(Good::Wood, 100);
+
+        let mut warehouses = vec![wh_a, wh_b];
+        let mut route = TradeRoute::new(0, 0);
+        route.add_stop(RouteStop {
+            island_id: 0,
+            warehouse_x: 10,
+            warehouse_y: 10,
+            load_goods: vec![(Good::Wood, 10)],
+            unload_goods: vec![],
+        });
+        route.add_stop(RouteStop {
+            island_id: 1,
+            warehouse_x: 50,
+            warehouse_y: 50,
+            load_goods: vec![],
+            unload_goods: vec![Good::Wood],
+        });
+        route.activate();
+
+        let mut ship = TradeShip::new(0, 0, 10, 10);
+        // Run enough ticks for ship to reach stop 0, load, then stop 1, unload.
+        let mut total_gold = 0i32;
+        for _ in 0..200 {
+            total_gold += tick_trade_ship(&mut ship, &route, &mut warehouses, None);
+            if ship.profit != 0
+                && warehouses[1].stock(Good::Wood) > 0
+                && ship.cargo_total == 0
+            {
+                break;
+            }
+        }
+        let p = price_of(Good::Wood);
+        // Bought 10 (-10*buy), sold 10 (+10*sell).
+        let expected = 10 * (p.sell - p.buy);
+        assert_eq!(total_gold, expected, "want {expected} gold, got {total_gold}");
     }
 
     #[test]

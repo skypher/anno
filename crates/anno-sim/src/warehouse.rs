@@ -13,7 +13,7 @@ use std::collections::HashMap;
 pub const MAX_GOOD_TYPES: usize = 32;
 
 /// A warehouse on an island, tracking inventory for one player.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Warehouse {
     pub island_id: u8,
     pub owner: u8,

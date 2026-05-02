@@ -4,7 +4,7 @@
 //! in the decompiled binary.
 
 /// Population tiers (5 levels).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum PopTier {
     Pioneer = 0,
@@ -18,7 +18,7 @@ pub const NUM_POP_TIERS: usize = 5;
 
 /// Goods/resource types.
 /// The original engine has 59 goods entries; these are the most important ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum Good {
     None = 0,
@@ -68,7 +68,7 @@ pub enum MilitaryUnit {
 }
 
 /// Production building type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum ProductionType {
     Craft = 1,
