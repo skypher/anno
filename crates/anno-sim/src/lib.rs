@@ -8,6 +8,7 @@ pub mod coverage;
 pub mod data_bridge;
 pub mod economy;
 pub mod entity;
+pub mod exploration;
 pub mod history;
 pub mod island_map;
 pub mod objectives;

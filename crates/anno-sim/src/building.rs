@@ -96,7 +96,17 @@ pub struct BuildingInstance {
     pub tools_needed: u16,
     #[serde(default)]
     pub bricks_needed: u16,
+
+    /// Consecutive production ticks this building produced 0 output.
+    /// When the count reaches the idle threshold, the building's
+    /// maintenance contribution is halved (and pings back up to full
+    /// once production resumes).
+    #[serde(default)]
+    pub idle_ticks: u32,
 }
+
+/// Production ticks a building must idle before its maintenance halves.
+pub const IDLE_MAINTENANCE_THRESHOLD: u32 = 5;
 
 fn default_building_health() -> u16 { BUILDING_MAX_HEALTH }
 pub const BUILDING_MAX_HEALTH: u16 = 100;
@@ -123,6 +133,7 @@ impl BuildingInstance {
             wood_needed: 0,
             tools_needed: 0,
             bricks_needed: 0,
+            idle_ticks: 0,
         }
     }
 

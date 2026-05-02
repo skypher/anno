@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// On-disk save format version. Bump on incompatible changes.
-pub const SAVE_VERSION: u32 = 11;
+pub const SAVE_VERSION: u32 = 12;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";

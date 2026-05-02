@@ -127,6 +127,9 @@ pub struct Simulation {
     /// on aggregate warehouse stock — a glut drives sell prices down,
     /// scarcity drives buy prices up.
     pub current_prices: Vec<crate::prices::GoodPrice>,
+
+    /// Per-island fog-of-war bitmap. Lazily allocated on first sighting.
+    pub exploration: Vec<crate::exploration::ExplorationMap>,
 }
 
 impl Simulation {
@@ -173,6 +176,8 @@ impl Simulation {
             objective_completions: Vec::new(),
 
             rng_state: 0xCBF29CE484222325,
+
+            exploration: Vec::new(),
 
             current_prices: (0..31u8)
                 .map(|i| {
@@ -386,6 +391,16 @@ impl Simulation {
                 &def,
                 self.timer_production.interval_ms,
             );
+            // Track idle streak for maintenance scaling. Built but
+            // non-producing buildings accumulate; producers reset.
+            if self.buildings[i].is_built() && def.output_good != crate::types::Good::None {
+                if produced == 0 {
+                    self.buildings[i].idle_ticks =
+                        self.buildings[i].idle_ticks.saturating_add(1);
+                } else {
+                    self.buildings[i].idle_ticks = 0;
+                }
+            }
 
             if produced > 0 && production::needs_carrier(&self.buildings[i], &def) {
                 // Check if this building already has an active carrier
@@ -449,8 +464,11 @@ impl Simulation {
             if owner >= maintenance.len() { continue; }
             let def_id = b.def_id as usize;
             if def_id < self.building_defs.len() {
-                maintenance[owner] = maintenance[owner]
-                    .saturating_add(self.building_defs[def_id].maintenance_cost as u32);
+                let mut cost = self.building_defs[def_id].maintenance_cost as u32;
+                if b.idle_ticks >= crate::building::IDLE_MAINTENANCE_THRESHOLD {
+                    cost /= 2;
+                }
+                maintenance[owner] = maintenance[owner].saturating_add(cost);
                 let kind = self.building_defs[def_id].kind.as_str();
                 let pk = self.building_defs[def_id].prod_kind.as_str();
                 if kind == "WOHN" || pk == "WOHN" {
@@ -722,6 +740,65 @@ impl Simulation {
 
         // Refresh dynamic market prices on the same cadence.
         self.tick_market_prices();
+        // Reveal tiles around player-owned entities.
+        self.tick_exploration();
+    }
+
+    fn tick_exploration(&mut self) {
+        const PLAYER: u8 = 0;
+        const SIGHT_RADIUS: i32 = 5;
+        // Helper: get-or-create the per-island exploration map.
+        let ensure = |sim: &mut Simulation, island_id: u8| -> usize {
+            if let Some(idx) = sim.exploration.iter()
+                .position(|e| e.island_id == island_id)
+            {
+                return idx;
+            }
+            // Pull dimensions from the island map if it exists, else default.
+            let (w, h) = sim.island_maps.iter()
+                .find(|m| m.island_id == island_id)
+                .map(|m| (m.width, m.height))
+                .unwrap_or((128, 128));
+            sim.exploration.push(
+                crate::exploration::ExplorationMap::new(island_id, w, h),
+            );
+            sim.exploration.len() - 1
+        };
+        // Buildings.
+        let bldg_seeds: Vec<(u8, i32, i32)> = self.buildings.iter()
+            .filter(|b| b.owner == PLAYER && b.active)
+            .map(|b| (b.island_id, b.tile_x as i32, b.tile_y as i32))
+            .collect();
+        for (iid, x, y) in bldg_seeds {
+            let idx = ensure(self, iid);
+            self.exploration[idx].mark_radius(x, y, SIGHT_RADIUS);
+        }
+        // Warehouses.
+        let wh_seeds: Vec<(u8, i32, i32)> = self.warehouses.iter()
+            .filter(|w| w.owner == PLAYER && w.active)
+            .map(|w| (w.island_id, w.tile_x as i32, w.tile_y as i32))
+            .collect();
+        for (iid, x, y) in wh_seeds {
+            let idx = ensure(self, iid);
+            self.exploration[idx].mark_radius(x, y, SIGHT_RADIUS);
+        }
+        // Military units (land only — naval roams the world map, no
+        // island-tile coords meaningful to per-island bitmap).
+        let unit_seeds: Vec<(u8, i32, i32)> = self.military_units.iter()
+            .filter(|u| u.is_alive() && u.owner == PLAYER
+                && !u.unit_type.stats().is_naval)
+            .map(|u| {
+                // Try to find which island this unit is on by walkability map.
+                let island_id = self.island_maps.iter()
+                    .find(|m| m.is_walkable(u.tile_x, u.tile_y))
+                    .map(|m| m.island_id).unwrap_or(0);
+                (island_id, u.tile_x, u.tile_y)
+            })
+            .collect();
+        for (iid, x, y) in unit_seeds {
+            let idx = ensure(self, iid);
+            self.exploration[idx].mark_radius(x, y, SIGHT_RADIUS);
+        }
     }
 
     fn tick_diplomacy(&mut self) {
@@ -1263,6 +1340,53 @@ mod tests {
             .count();
         assert!(ai_units >= 1, "AI should have spawned at least one defender");
         assert!(sim.players[1].gold < 5_000);
+    }
+
+    #[test]
+    fn exploration_reveals_around_player_warehouse() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.island_maps.push(IslandMap::new_open(0, 30, 30));
+        sim.warehouses.push(Warehouse::new(0, 0, 15, 15));
+        sim.tick_exploration();
+        let m = sim.exploration.iter()
+            .find(|e| e.island_id == 0).unwrap();
+        // Tile right at the warehouse must be revealed.
+        assert!(m.is_explored(15, 15));
+        // Tile far away must not be (default radius 5).
+        assert!(!m.is_explored(0, 0));
+    }
+
+    #[test]
+    fn idle_building_maintenance_halves() {
+        use crate::types::{Good, ProductionType};
+        use crate::building::{BuildingDef, BuildingInstance, IDLE_MAINTENANCE_THRESHOLD};
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.building_defs.push(BuildingDef {
+            id: 0, category: 0, width: 1, height: 1,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::Tools, input_good_1: Good::Iron,
+            input_good_2: Good::None,
+            output_rate: 1, input_1_rate: 1, input_2_rate: 0,
+            storage_capacity: 50, cycle_time_ms: 1000, carrier_interval_ms: 0,
+            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 10,
+        });
+        let mut b = BuildingInstance::new(0, 0, 0, 0, 0);
+        b.idle_ticks = IDLE_MAINTENANCE_THRESHOLD; // already qualifies
+        sim.buildings.push(b);
+        sim.tick_population();
+        // Idle threshold met → maintenance halved (10 → 5).
+        assert_eq!(sim.players[0].building_maintenance, 5);
+
+        // Reset idle ticks → full maintenance.
+        sim.buildings[0].idle_ticks = 0;
+        sim.tick_population();
+        assert_eq!(sim.players[0].building_maintenance, 10);
     }
 
     #[test]

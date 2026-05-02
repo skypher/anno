@@ -28,6 +28,7 @@
 //!   A: open market (buy/sell goods at first warehouse — Left/Right by 10)
 //!   U: open warehouse table (per-warehouse stock columns for current island)
 //!   J: open fleet panel (active ships' route, state, cargo, profit)
+//!   Q: open build queue panel (in-progress buildings + outstanding materials)
 //!   Shift+R: open active-routes panel (Up/Down + Bksp to delete)
 //!   ?: open scenario objectives panel
 //!   Enter: open chat input (multiplayer); type then Enter to send, Esc cancels
@@ -893,6 +894,7 @@ fn main() {
     let mut show_paths = false;
     let mut route_list_panel = false;
     let mut route_list_sel: usize = 0;
+    let mut queue_panel = false;
     let mut wh_panel = false;
     let mut ship_panel = false;
     let mut obj_panel = false;
@@ -1021,6 +1023,8 @@ fn main() {
                         wh_panel = false;
                     } else if ship_panel {
                         ship_panel = false;
+                    } else if queue_panel {
+                        queue_panel = false;
                     } else if obj_panel {
                         obj_panel = false;
                     } else if placer.active {
@@ -1662,6 +1666,9 @@ fn main() {
                             Keycode::J => {
                                 ship_panel = !ship_panel;
                             }
+                            Keycode::Q => {
+                                queue_panel = !queue_panel;
+                            }
                             Keycode::Question | Keycode::Slash => {
                                 obj_panel = !obj_panel;
                             }
@@ -1946,6 +1953,24 @@ fn main() {
                             let climate_ok = anno_sim::climate::allows_production(
                                 climate, def.output_good,
                             );
+                            // Fisheries require any footprint tile to be on
+                            // the coast (i.e. adjacent to the island edge).
+                            let needs_coast = def.output_good == Good::Fish;
+                            let coast_ok = if needs_coast {
+                                if let Some(idx) = island_map_idx {
+                                    let map = &sim.island_maps[idx];
+                                    let mut any = false;
+                                    for dy in 0..bld_h as i32 {
+                                        for dx in 0..bld_w as i32 {
+                                            if map.is_coastal(tile_x + dx, tile_y + dy) {
+                                                any = true; break;
+                                            }
+                                        }
+                                        if any { break; }
+                                    }
+                                    any
+                                } else { false }
+                            } else { true };
                             if !climate_ok {
                                 save_banner = Some((
                                     format!(
@@ -1957,6 +1982,12 @@ fn main() {
                                         },
                                         climate.label(),
                                     ),
+                                    std::time::Instant::now(),
+                                ));
+                            } else if !coast_ok {
+                                save_banner = Some((
+                                    "build FAILED: Fisheries must be placed on the coast"
+                                        .to_string(),
                                     std::time::Instant::now(),
                                 ));
                             } else if let Some(map_idx) = island_map_idx {
@@ -2620,7 +2651,7 @@ fn main() {
             || market_panel || wh_panel || ship_panel || save_panel
             || scenario_picker || tax_panel || diplomacy_panel
             || trade_route_mode || obj_panel || settings_panel
-            || context_menu.is_some() || route_list_panel;
+            || context_menu.is_some() || route_list_panel || queue_panel;
         if any_modal != prev_modal_open {
             if any_modal {
                 if !sim.paused {
@@ -4183,6 +4214,73 @@ fn main() {
                 tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                 let tx = menu.screen_x.min(WINDOW_W as i32 - panel_w as i32 - 4);
                 let ty = menu.screen_y.min(WINDOW_H as i32 - panel_h as i32 - 4);
+                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+            }
+        }
+
+        // Construction queue panel (Q): list every player-owned building
+        // that's not yet built — progress + outstanding materials.
+        if queue_panel {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 460u32;
+            let header_h = 30i32;
+            let pending: Vec<&anno_sim::building::BuildingInstance> = sim
+                .buildings.iter()
+                .filter(|b| b.owner == 0 && b.active && !b.is_built())
+                .collect();
+            let visible = pending.len().max(1);
+            let panel_h = (header_h + visible as i32 * line_h + 12) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 220;
+            }
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4, "BUILD QUEUE (Q/Esc close) — name pos prog W/T/B",
+                [0xFF, 0xD7, 0x00, 0xFF], 1,
+            );
+            if pending.is_empty() {
+                tiny_font::draw_str(
+                    &mut buf, panel_w, panel_h,
+                    4, header_h, "(no buildings under construction)",
+                    [0x88, 0x88, 0x88, 0xFF], scale,
+                );
+            } else {
+                for (i, b) in pending.iter().enumerate() {
+                    let name = cod.buildings[b.def_id as usize]
+                        .properties
+                        .get("Name")
+                        .cloned()
+                        .unwrap_or_else(|| format!("Bldg#{}", b.def_id));
+                    let pct = b.construction_progress_128() as u32 * 100 / 128;
+                    let line = format!(
+                        "{:<14} ({:>2},{:>2}) {:>3}%  W{} T{} B{}",
+                        if name.len() > 14 { name[..14].to_string() } else { name },
+                        b.tile_x, b.tile_y, pct,
+                        b.wood_needed, b.tools_needed, b.bricks_needed,
+                    );
+                    let ready = b.wood_needed == 0 && b.tools_needed == 0
+                        && b.bricks_needed == 0;
+                    let color = if ready {
+                        [0xCC, 0xFF, 0xCC, 0xFF] // materials all in
+                    } else {
+                        [0xFF, 0xCC, 0x66, 0xFF] // waiting on supply
+                    };
+                    tiny_font::draw_str(&mut buf, panel_w, panel_h,
+                        4, header_h + i as i32 * line_h, &line, color, scale);
+                }
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                let ty = 60i32;
                 canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
             }
         }

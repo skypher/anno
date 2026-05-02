@@ -124,6 +124,23 @@ impl IslandMap {
         }
     }
 
+    /// A tile is "coastal" if it's walkable AND at least one of its
+    /// 4-neighbours is out of bounds — i.e. it sits on the perimeter of
+    /// the island's walkable region. Fisheries can only go on coastal tiles.
+    pub fn is_coastal(&self, x: i32, y: i32) -> bool {
+        if !self.is_walkable(x, y) { return false; }
+        for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+            let nx = x + dx;
+            let ny = y + dy;
+            if nx < 0 || ny < 0
+                || nx >= self.width as i32 || ny >= self.height as i32
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// True iff the entire `w × h` footprint anchored at `(x, y)` is walkable.
     pub fn can_fit(&self, x: i32, y: i32, w: u16, h: u16) -> bool {
         if x < 0 || y < 0 { return false; }
@@ -268,6 +285,17 @@ mod tests {
         map.set_walkable(2, 2, false);
         assert!(!map.can_fit(0, 0, 3, 3)); // blocker hits the footprint
         assert!(map.can_fit(3, 3, 3, 3));  // clear away from blocker
+    }
+
+    #[test]
+    fn coastal_tiles_are_on_the_perimeter() {
+        let map = IslandMap::new_open(0, 5, 5);
+        // Corners and edges are coastal.
+        assert!(map.is_coastal(0, 0));
+        assert!(map.is_coastal(2, 0));
+        assert!(map.is_coastal(4, 4));
+        // Interior tile is not.
+        assert!(!map.is_coastal(2, 2));
     }
 
     #[test]
