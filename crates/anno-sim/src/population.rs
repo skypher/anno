@@ -227,7 +227,10 @@ fn growth_delta(pop: u32, sat: u8) -> i32 {
 ///   - When a tier is fully satisfied (sat ≥ 96) AND the next tier exists,
 ///     2% of that tier promotes to the next (Pioneer → Settler → … → Aristocrat).
 ///   - When a tier is starving (sat < 32) and pop > 0, 1% emigrates entirely.
-pub fn update_population_growth(player: &mut Player) {
+///   - Total population is capped at `housing_cap` (0 means uncapped). When
+///     the cap is exceeded, every tier is scaled proportionally so the
+///     surplus simply doesn't materialise this tick.
+pub fn update_population_growth(player: &mut Player, housing_cap: u32) {
     let mut new_pop = player.population;
 
     // 1. Growth / decay
@@ -252,6 +255,16 @@ pub fn update_population_growth(player: &mut Player) {
         if player.satisfaction[tier] < 32 && new_pop[tier] > 0 {
             let leaving = (new_pop[tier] / 100).max(1);
             new_pop[tier] = new_pop[tier].saturating_sub(leaving);
+        }
+    }
+
+    // 4. Housing cap: scale every tier down proportionally if we'd exceed
+    //    the player's total housing capacity. 0 means uncapped.
+    let total: u32 = new_pop.iter().sum();
+    if housing_cap > 0 && total > housing_cap {
+        for tier in 0..NUM_POP_TIERS {
+            new_pop[tier] = ((new_pop[tier] as u64 * housing_cap as u64)
+                / total as u64) as u32;
         }
     }
 
@@ -289,7 +302,7 @@ mod tests {
         p.population[0] = 1000;
         p.satisfaction[0] = 128;
         let before_pioneer = p.population[0];
-        update_population_growth(&mut p);
+        update_population_growth(&mut p, 0);
         // Some pioneers promoted to settlers.
         assert!(p.population[1] > 0, "should have promoted some to settlers");
         // And the pioneer count moved (either net up from growth or down from promotion).
@@ -303,7 +316,7 @@ mod tests {
         let mut p = Player::new_human(0);
         p.population[2] = 200; // citizens
         p.satisfaction[2] = 0;
-        update_population_growth(&mut p);
+        update_population_growth(&mut p, 0);
         assert!(p.population[2] < 200, "starving citizens should leave");
     }
 
@@ -322,10 +335,24 @@ mod tests {
     }
 
     #[test]
+    fn housing_cap_clamps_total() {
+        let mut p = Player::new_human(0);
+        p.population = [200, 200, 200, 0, 0]; // total 600
+        for s in &mut p.satisfaction { *s = 64; } // par; no growth/decay
+        update_population_growth(&mut p, 300);
+        let total: u32 = p.population.iter().sum();
+        assert!(total <= 300, "got {total}");
+        // Proportions roughly preserved (each tier scaled by 0.5).
+        assert!(p.population[0] < 200);
+        assert!(p.population[1] < 200);
+        assert!(p.population[2] < 200);
+    }
+
+    #[test]
     fn empty_tier_stays_empty() {
         let mut p = Player::new_human(0);
         // sat is 128 by default but pop is 0
-        update_population_growth(&mut p);
+        update_population_growth(&mut p, 0);
         assert_eq!(p.population.iter().sum::<u32>(), 0);
     }
 }

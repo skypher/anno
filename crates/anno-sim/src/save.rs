@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// On-disk save format version. Bump on incompatible changes.
-pub const SAVE_VERSION: u32 = 6;
+pub const SAVE_VERSION: u32 = 10;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -38,6 +38,8 @@ pub struct SaveState {
     pub trade_ships: Vec<TradeShip>,
     #[serde(default)]
     pub history: EconomyHistory,
+    #[serde(default)]
+    pub objectives: crate::objectives::ObjectiveSet,
 }
 
 #[derive(Debug)]
@@ -85,6 +87,7 @@ impl Simulation {
             trade_routes: self.trade_routes.clone(),
             trade_ships: self.trade_ships.clone(),
             history: self.history.clone(),
+            objectives: self.objectives.clone(),
         }
     }
 
@@ -105,6 +108,7 @@ impl Simulation {
         self.trade_routes = s.trade_routes;
         self.trade_ships = s.trade_ships;
         self.history = s.history;
+        self.objectives = s.objectives;
     }
 }
 

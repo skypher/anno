@@ -28,10 +28,13 @@
 //!   A: open market (buy/sell goods at first warehouse — Left/Right by 10)
 //!   U: open warehouse table (per-warehouse stock columns for current island)
 //!   J: open fleet panel (active ships' route, state, cargo, profit)
+//!   ?: open scenario objectives panel
 //!   Enter: open chat input (multiplayer); type then Enter to send, Esc cancels
 //!   F2: open scenario picker (Up/Down, Enter to relaunch with chosen .szs)
 //!   F3: open save-slot picker (Up/Down, S to save, L to load)
+//!   F4: build a TradeShip at the first warehouse (1000 gold)
 //!   F6: toggle path-debug overlay (carrier A* paths + ship ocean paths)
+//!   F7: found a colony (drop a Kontor) on the current island (500 gold)
 //!   F5: quicksave (writes saves/<scenario>.quicksave.bin)
 //!   F9: quickload
 //!
@@ -759,9 +762,18 @@ fn main() {
         }
     }
 
-    // Load building placement sound effect
+    // Load sound effects. Slots are reused from SPEECH8/MUSIC8 pools.
     let place_sound_slot = audio.waves.load("SPEECH8/1000.WAV")
         .or_else(|| audio.waves.load("1000.WAV"));
+    let event_destroy_slot = audio.waves.load("SPEECH8/1010.WAV")
+        .or_else(|| audio.waves.load("1010.WAV"))
+        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
+    let event_obj_done_slot = audio.waves.load("SPEECH8/1020.WAV")
+        .or_else(|| audio.waves.load("1020.WAV"))
+        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
+    let event_war_slot = audio.waves.load("SPEECH8/1030.WAV")
+        .or_else(|| audio.waves.load("1030.WAV"))
+        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
 
     // SDL2 setup
     let sdl = sdl2::init().expect("SDL2 init failed");
@@ -876,6 +888,7 @@ fn main() {
     let mut show_paths = false;
     let mut wh_panel = false;
     let mut ship_panel = false;
+    let mut obj_panel = false;
     // Auto-pause-while-menu-open: when any modal panel is opened we
     // pause the sim so the player can read it; we only unpause on close
     // if we were the ones who paused (i.e. the player didn't manually
@@ -977,6 +990,8 @@ fn main() {
                         wh_panel = false;
                     } else if ship_panel {
                         ship_panel = false;
+                    } else if obj_panel {
+                        obj_panel = false;
                     } else if placer.active {
                         placer.active = false;
                     } else if demolish_mode {
@@ -1488,11 +1503,128 @@ fn main() {
                             Keycode::J => {
                                 ship_panel = !ship_panel;
                             }
+                            Keycode::Question | Keycode::Slash => {
+                                obj_panel = !obj_panel;
+                            }
                             Keycode::F2 => {
                                 scenario_picker = !scenario_picker;
                             }
                             Keycode::F3 => {
                                 save_panel = !save_panel;
+                            }
+                            Keycode::F7 => {
+                                // Found a colony: drop a Kontor on the
+                                // active island if the player has none
+                                // there yet. Costs 500 gold.
+                                if !world_mode {
+                                    let island = &islands[current_island];
+                                    let island_id = island.number;
+                                    const COLONY_COST: i32 = 500;
+                                    let already = sim.warehouses.iter().any(|w| {
+                                        w.active && w.owner == 0
+                                            && w.island_id == island_id
+                                    });
+                                    if already {
+                                        save_banner = Some((
+                                            "colony FAILED: already have a Kontor here"
+                                                .to_string(),
+                                            std::time::Instant::now(),
+                                        ));
+                                    } else if sim.players[0].gold < COLONY_COST {
+                                        save_banner = Some((
+                                            "colony FAILED: need 500 gold"
+                                                .to_string(),
+                                            std::time::Instant::now(),
+                                        ));
+                                    } else {
+                                        // Find a walkable spot near the
+                                        // island center for the new Kontor.
+                                        let map_idx = sim.island_maps.iter()
+                                            .position(|m| m.island_id == island_id);
+                                        if let Some(idx) = map_idx {
+                                            let cx = (island.width / 2) as u16;
+                                            let cy = (island.height / 2) as u16;
+                                            let spot = sim.island_maps[idx]
+                                                .find_open_spot(cx, cy, 2, 2, 20);
+                                            if let Some((bx, by)) = spot {
+                                                sim.players[0].gold -= COLONY_COST;
+                                                let mut wh = anno_sim::warehouse::Warehouse::new(
+                                                    island_id, 0, bx, by,
+                                                );
+                                                // Seed initial capacities so
+                                                // carriers can deposit goods.
+                                                for g in [
+                                                    Good::Wood, Good::Iron, Good::Tools,
+                                                    Good::Food, Good::Cloth, Good::Bricks,
+                                                    Good::Stone, Good::Grain, Good::Flour,
+                                                    Good::Wool, Good::Sugar, Good::Tobacco,
+                                                ] {
+                                                    wh.set_capacity(g, 100);
+                                                }
+                                                sim.warehouses.push(wh);
+                                                // Initialize coverage for this island.
+                                                if !sim.coverage_maps.iter()
+                                                    .any(|c| c.island_id == island_id)
+                                                {
+                                                    sim.coverage_maps.push(
+                                                        anno_sim::coverage::CoverageMap::new(
+                                                            island_id,
+                                                            island.width as u16,
+                                                            island.height as u16,
+                                                        ),
+                                                    );
+                                                }
+                                                let msg = format!(
+                                                    "Colony founded on island {} at ({},{})",
+                                                    island_id, bx, by,
+                                                );
+                                                println!("{msg}");
+                                                save_banner = Some((msg, std::time::Instant::now()));
+                                                needs_redraw = true;
+                                            } else {
+                                                save_banner = Some((
+                                                    "colony FAILED: no buildable spot found"
+                                                        .to_string(),
+                                                    std::time::Instant::now(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Keycode::F4 => {
+                                // Buy a TradeShip at the player's first
+                                // active warehouse (1000 gold).
+                                const TRADE_SHIP_COST: i32 = 1000;
+                                if sim.players.first().map(|p| p.gold).unwrap_or(0)
+                                    < TRADE_SHIP_COST
+                                {
+                                    save_banner = Some((
+                                        "ship build FAILED: not enough gold (1000 needed)"
+                                            .to_string(),
+                                        std::time::Instant::now(),
+                                    ));
+                                } else if let Some(wh) = sim.warehouses.iter()
+                                    .find(|w| w.active && w.owner == 0)
+                                {
+                                    let (sx, sy) = (wh.tile_x as i32, wh.tile_y as i32);
+                                    sim.players[0].gold -= TRADE_SHIP_COST;
+                                    let ship = anno_sim::trade::TradeShip::new(
+                                        0, 0, sx, sy,
+                                    );
+                                    let msg = format!(
+                                        "Built TradeShip at ({sx},{sy}) — assign via R"
+                                    );
+                                    println!("{msg}");
+                                    save_banner = Some((msg, std::time::Instant::now()));
+                                    sim.trade_ships.push(ship);
+                                } else {
+                                    save_banner = Some((
+                                        "ship build FAILED: no warehouse"
+                                            .to_string(),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
                             }
                             Keycode::F6 => {
                                 show_paths = !show_paths;
@@ -1620,7 +1752,30 @@ fn main() {
                                 .iter()
                                 .position(|m| m.island_id == island_number);
 
-                            if let Some(map_idx) = island_map_idx {
+                            // Climate gate: refuse to place a plantation
+                            // building whose output_good doesn't match the
+                            // island's climate.
+                            let isl = &islands[current_island];
+                            let climate = anno_sim::climate::climate_for_y(
+                                isl.y_pos as u32, 512,
+                            );
+                            let climate_ok = anno_sim::climate::allows_production(
+                                climate, def.output_good,
+                            );
+                            if !climate_ok {
+                                save_banner = Some((
+                                    format!(
+                                        "build FAILED: {:?} needs {} climate (this island is {})",
+                                        def.output_good,
+                                        match climate {
+                                            anno_sim::climate::Climate::North => "South",
+                                            anno_sim::climate::Climate::South => "North",
+                                        },
+                                        climate.label(),
+                                    ),
+                                    std::time::Instant::now(),
+                                ));
+                            } else if let Some(map_idx) = island_map_idx {
                                 if can_place_building(
                                     &islands[current_island], &sim.island_maps[map_idx],
                                     tile_x, tile_y, bld_w, bld_h,
@@ -2201,7 +2356,7 @@ fn main() {
         let any_modal = graph_panel || prod_panel || roster_panel
             || market_panel || wh_panel || ship_panel || save_panel
             || scenario_picker || tax_panel || diplomacy_panel
-            || trade_route_mode;
+            || trade_route_mode || obj_panel;
         if any_modal != prev_modal_open {
             if any_modal {
                 if !sim.paused {
@@ -2221,6 +2376,47 @@ fn main() {
         if dt_ms > 0 && dt_ms < 1000 {
             if net_client.is_none() {
                 sim.tick(dt_ms);
+            }
+            // Drain objective completions for the chat log.
+            if !sim.objective_completions.is_empty() {
+                let drained: Vec<usize> = sim.objective_completions.drain(..).collect();
+                for idx in drained {
+                    if let Some((obj, _)) = sim.objectives.items.get(idx) {
+                        let line = format!("[obj] complete: {}", obj.label());
+                        chat_log.push_back((line, std::time::Instant::now()));
+                        if chat_log.len() > 8 { chat_log.pop_front(); }
+                    }
+                }
+                if let (Some(sfx), Some(handle)) = (event_obj_done_slot, &audio.stream_handle) {
+                    audio.waves.play_once(sfx, WINDOW_W as i32 / 2, WINDOW_H as i32 / 2, handle);
+                }
+            }
+            // Drain combat-destroyed buildings: clear matching island tiles
+            // so the static renderer no longer paints the dead footprint.
+            if !sim.tile_clears.is_empty() {
+                let drained: Vec<_> = sim.tile_clears.drain(..).collect();
+                for (island_id, bx, by, bw, bh) in drained {
+                    if let Some(island) = islands.iter_mut()
+                        .find(|i| i.number == island_id)
+                    {
+                        island.tiles.retain(|t| {
+                            let in_footprint = t.x as u16 >= bx
+                                && (t.x as u16) < bx + bw as u16
+                                && t.y as u16 >= by
+                                && (t.y as u16) < by + bh as u16;
+                            !in_footprint
+                        });
+                    }
+                    chat_log.push_back((
+                        format!("[combat] building at ({bx},{by}) on island {island_id} destroyed"),
+                        std::time::Instant::now(),
+                    ));
+                    if chat_log.len() > 8 { chat_log.pop_front(); }
+                }
+                if let (Some(sfx), Some(handle)) = (event_destroy_slot, &audio.stream_handle) {
+                    audio.waves.play_once(sfx, WINDOW_W as i32 / 2, WINDOW_H as i32 / 2, handle);
+                }
+                needs_redraw = true;
             }
             // Animation cycles regardless of net role so visuals don't freeze.
             anim_state.tick(dt_ms);
@@ -2248,6 +2444,18 @@ fn main() {
                         let line = format!("[diplo] p{i} ↔ p{j} → {label}");
                         chat_log.push_back((line, std::time::Instant::now()));
                         if chat_log.len() > 8 { chat_log.pop_front(); }
+                        if cur == Diplomacy::War {
+                            if let (Some(sfx), Some(handle)) =
+                                (event_war_slot, &audio.stream_handle)
+                            {
+                                audio.waves.play_once(
+                                    sfx,
+                                    WINDOW_W as i32 / 2,
+                                    WINDOW_H as i32 / 2,
+                                    handle,
+                                );
+                            }
+                        }
                         prev_diplomacy[i as usize][j as usize] = cur;
                         prev_diplomacy[j as usize][i as usize] = cur;
                     }
@@ -2979,6 +3187,21 @@ fn main() {
         // `inspection` state that drives the title-bar summary.
         if let Some(ref insp) = inspection {
             let mut lines: Vec<(String, [u8; 4])> = Vec::new();
+            // Climate badge for the active island so the player can see at
+            // a glance what plantations are buildable here.
+            if !world_mode {
+                let isl = &islands[current_island];
+                let climate = anno_sim::climate::climate_for_y(
+                    isl.y_pos as u32, 512,
+                );
+                lines.push((
+                    format!("Climate: {}", climate.label()),
+                    match climate {
+                        anno_sim::climate::Climate::North => [0xAA, 0xCC, 0xFF, 0xFF],
+                        anno_sim::climate::Climate::South => [0xFF, 0xCC, 0x88, 0xFF],
+                    },
+                ));
+            }
             // Header.
             if let Some(bi) = insp.building_idx {
                 let b = &sim.buildings[bi];
@@ -3774,6 +3997,50 @@ fn main() {
                     "(all warehouses empty)",
                     [0x88, 0x88, 0x88, 0xFF], scale,
                 );
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                let ty = 60i32;
+                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+            }
+        }
+
+        // Objectives panel (?). Read-only — pulls live from sim.objectives.
+        if obj_panel {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 360u32;
+            let header_h = 28i32;
+            let n = sim.objectives.items.len() as i32;
+            let panel_h = (header_h + n * line_h + 12) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 220;
+            }
+            let (done, total) = sim.objectives.progress();
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4,
+                &format!("OBJECTIVES {}/{} (?/Esc close)", done, total),
+                [0xFF, 0xD7, 0x00, 0xFF], 2,
+            );
+            for (i, (obj, done_flag)) in sim.objectives.items.iter().enumerate() {
+                let y = header_h + i as i32 * line_h;
+                let mark = if *done_flag { "[x]" } else { "[ ]" };
+                let line = format!("{} {}", mark, obj.label());
+                let color = if *done_flag {
+                    [0x66, 0xFF, 0x66, 0xFF]
+                } else {
+                    [0xCC, 0xCC, 0xCC, 0xFF]
+                };
+                tiny_font::draw_str(&mut buf, panel_w, panel_h, 4, y, &line, color, scale);
             }
             if let Ok(mut tex) = texture_creator
                 .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)

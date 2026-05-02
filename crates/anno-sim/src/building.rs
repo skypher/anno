@@ -74,7 +74,22 @@ pub struct BuildingInstance {
     /// at placement time). 0 means instant build.
     #[serde(default)]
     pub construction_ms_total: u32,
+
+    /// Hit points for combat damage. Decremented by adjacent enemy units
+    /// each military tick; building is removed when health reaches 0.
+    #[serde(default = "default_building_health")]
+    pub health: u16,
+
+    /// Residence tier for `WOHN` buildings: 0=Pioneer, 1=Settler, 2=Citizen,
+    /// 3=Merchant, 4=Aristocrat. Promoted when its tier is fully
+    /// satisfied. Higher tiers grant more housing capacity. Unused for
+    /// non-WOHN buildings.
+    #[serde(default)]
+    pub house_tier: u8,
 }
+
+fn default_building_health() -> u16 { BUILDING_MAX_HEALTH }
+pub const BUILDING_MAX_HEALTH: u16 = 100;
 
 impl BuildingInstance {
     pub fn new(def_id: u16, island_id: u8, tile_x: u16, tile_y: u16, owner: u8) -> Self {
@@ -93,6 +108,8 @@ impl BuildingInstance {
             total_work: 0,
             construction_ms_remaining: 0,
             construction_ms_total: 0,
+            health: BUILDING_MAX_HEALTH,
+            house_tier: 0,
         }
     }
 

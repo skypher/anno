@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod building;
 pub mod carrier;
+pub mod climate;
 pub mod combat;
 pub mod coverage;
 pub mod data_bridge;
@@ -8,6 +9,7 @@ pub mod economy;
 pub mod entity;
 pub mod history;
 pub mod island_map;
+pub mod objectives;
 pub mod ocean_map;
 pub mod pathfinding;
 pub mod player;

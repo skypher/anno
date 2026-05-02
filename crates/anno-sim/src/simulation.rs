@@ -102,6 +102,21 @@ pub struct Simulation {
 
     /// Rolling economy/population history for the human player (slot 0).
     pub history: EconomyHistory,
+
+    /// Footprint cleanup events from buildings destroyed in combat.
+    /// `(island_id, tile_x, tile_y, width, height)`. The renderer drains
+    /// this each frame to clear `Island::tiles` for the destroyed
+    /// footprint and refresh display.
+    pub tile_clears: Vec<(u8, u16, u16, u8, u8)>,
+
+    /// Active scenario objectives for the human player. Re-evaluated each
+    /// economy tick. The renderer reads `progress()` and the per-item
+    /// `done` flag to draw the objectives panel.
+    pub objectives: crate::objectives::ObjectiveSet,
+
+    /// Indices of objectives that flipped to done since last drain.
+    /// Game binary consumes these to push events into the chat log.
+    pub objective_completions: Vec<usize>,
 }
 
 impl Simulation {
@@ -141,6 +156,11 @@ impl Simulation {
             autosave_timer_ms: 0,
 
             history: EconomyHistory::new(),
+
+            tile_clears: Vec::new(),
+
+            objectives: crate::objectives::ObjectiveSet::default_starter(),
+            objective_completions: Vec::new(),
         }
     }
 
@@ -268,8 +288,29 @@ impl Simulation {
 
     fn tick_population(&mut self) {
         // Refresh building maintenance totals per player so the economy
-        // tick has up-to-date running costs.
+        // tick has up-to-date running costs. Also compute per-player
+        // housing capacity from completed WOHN residences, scaled by
+        // each residence's `house_tier` (Pioneer 4 → Aristocrat 20).
+        const HOUSING_BY_TIER: [u32; 5] = [4, 8, 12, 16, 20];
         let mut maintenance: Vec<u32> = vec![0; self.players.len()];
+        let mut housing: Vec<u32> = vec![0; self.players.len()];
+        // Promotion pass: WOHN buildings whose tier is fully satisfied
+        // upgrade up. Done before maintenance/cap so the housing cap
+        // immediately reflects the new sizes.
+        for b in self.buildings.iter_mut() {
+            if !b.active || !b.is_built() { continue; }
+            let def_id = b.def_id as usize;
+            if def_id >= self.building_defs.len() { continue; }
+            let def = &self.building_defs[def_id];
+            let is_residence = def.kind == "WOHN" || def.prod_kind == "WOHN";
+            if !is_residence { continue; }
+            let owner = b.owner as usize;
+            let Some(p) = self.players.get(owner) else { continue; };
+            let t = b.house_tier as usize;
+            if t < 4 && p.satisfaction[t] >= 100 {
+                b.house_tier += 1;
+            }
+        }
         for b in &self.buildings {
             if !b.active || !b.is_built() { continue; }
             let owner = b.owner as usize;
@@ -278,6 +319,13 @@ impl Simulation {
             if def_id < self.building_defs.len() {
                 maintenance[owner] = maintenance[owner]
                     .saturating_add(self.building_defs[def_id].maintenance_cost as u32);
+                let kind = self.building_defs[def_id].kind.as_str();
+                let pk = self.building_defs[def_id].prod_kind.as_str();
+                if kind == "WOHN" || pk == "WOHN" {
+                    let t = (b.house_tier as usize).min(4);
+                    housing[owner] = housing[owner]
+                        .saturating_add(HOUSING_BY_TIER[t]);
+                }
             }
         }
         for (i, player) in self.players.iter_mut().enumerate() {
@@ -286,14 +334,20 @@ impl Simulation {
             population::update_population_demands(player, &mut self.warehouses, i as u8);
             // Apply economy (gold balance, bankruptcy, satisfaction decay)
             economy::tick_economy(player);
-            // Grow / shrink population by tier and promote satisfied tiers up.
-            population::update_population_growth(player);
+            // Grow / shrink population by tier and promote satisfied tiers up,
+            // clamped to current housing capacity.
+            population::update_population_growth(player, housing[i]);
         }
 
         // Sample player 0 (the human) into the rolling history (gold,
         // pop, satisfaction, income/costs, AND per-good warehouse stocks).
         if let Some(p0) = self.players.first() {
             self.history.record_full(p0, &self.warehouses, 0);
+            // Re-evaluate scenario objectives against the human player.
+            let just_done = self.objectives.evaluate(
+                p0, &self.buildings, &self.building_defs, &self.warehouses, 0,
+            );
+            self.objective_completions.extend(just_done);
         }
 
         // AI decision-making
@@ -635,6 +689,51 @@ impl Simulation {
                 }
             }
 
+            // Naval escort: each AI trade ship gets a shadowing SmallWarship
+            // when the AI is at war with anyone. If no idle warship is
+            // available and the AI has gold, spawn one near the trade ship.
+            const ESCORT_COST: i32 = 500;
+            let at_war = (0..scores.len()).any(|j| {
+                j as u8 != owner
+                    && self.diplomacy.get(owner, j as u8) == Diplomacy::War
+            });
+            if at_war {
+                let ship_indices: Vec<(usize, i32, i32)> = self.trade_ships
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.active && s.owner == owner)
+                    .map(|(i, s)| (i, s.world_x, s.world_y))
+                    .collect();
+                for (ship_idx, sx, sy) in ship_indices {
+                    let already_escorted = self.military_units.iter().any(|u| {
+                        u.is_alive() && u.owner == owner
+                            && u.escort_ship == ship_idx as i32
+                    });
+                    if already_escorted { continue; }
+                    // Look for an idle warship to assign.
+                    let idle_warship = self.military_units.iter_mut().find(|u| {
+                        u.is_alive() && u.owner == owner
+                            && u.unit_type.stats().is_naval
+                            && u.escort_ship < 0
+                    });
+                    if let Some(u) = idle_warship {
+                        u.escort_ship = ship_idx as i32;
+                        continue;
+                    }
+                    // Otherwise spawn a fresh SmallWarship beside the ship.
+                    if self.players[me].gold < ESCORT_COST { continue; }
+                    self.players[me].gold -= ESCORT_COST;
+                    let mut unit = MilitaryUnit::new(
+                        crate::combat::UnitType::SmallWarship,
+                        owner,
+                        sx,
+                        sy,
+                    );
+                    unit.escort_ship = ship_idx as i32;
+                    self.military_units.push(unit);
+                }
+            }
+
             // Offensive raids: aggressors with a clear advantage send half
             // their idle units toward an enemy warehouse on the same island.
             if aggressor {
@@ -708,6 +807,36 @@ impl Simulation {
             self.timer_military.interval_ms,
         );
 
+        // Building damage from adjacent hostile land units.
+        let destroyed = combat::tick_building_damage(
+            &self.military_units,
+            &mut self.buildings,
+            &self.diplomacy,
+            &self.building_defs,
+        );
+        // Remove destroyed buildings (in reverse) and emit tile-clear events.
+        for &bi in destroyed.iter().rev() {
+            let b = &self.buildings[bi];
+            let def = &self.building_defs[b.def_id as usize];
+            let island_id = b.island_id;
+            let bx = b.tile_x;
+            let by = b.tile_y;
+            let bw = def.width;
+            let bh = def.height;
+            // Free tiles in the island walkability map.
+            if let Some(map) = self.island_maps.iter_mut()
+                .find(|m| m.island_id == island_id)
+            {
+                for dy in 0..bh as u16 {
+                    for dx in 0..bw as u16 {
+                        map.set_walkable(bx + dx, by + dy, true);
+                    }
+                }
+            }
+            self.tile_clears.push((island_id, bx, by, bw, bh));
+            self.buildings.swap_remove(bi);
+        }
+
         // Remove dead units (reverse order to preserve indices)
         let mut dead_sorted = dead;
         dead_sorted.sort_unstable();
@@ -718,6 +847,12 @@ impl Simulation {
     }
 
     fn tick_entities(&mut self, dt_ms: u32) {
+        // Refresh escort targets so warships stay glued to their assigned
+        // trade ship before move orders are stepped.
+        let positions: Vec<(bool, i32, i32)> = self.trade_ships.iter()
+            .map(|s| (s.active, s.world_x, s.world_y))
+            .collect();
+        combat::tick_escort_targets(&mut self.military_units, &positions);
         // Move military units toward player-issued targets (every step).
         combat::tick_unit_orders(&mut self.military_units, dt_ms);
 
@@ -877,6 +1012,134 @@ mod tests {
     }
 
     #[test]
+    fn buildings_destroyed_by_adjacent_enemy_units() {
+        use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
+        use crate::types::{Good, ProductionType};
+        use crate::building::{BuildingDef, BuildingInstance};
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.diplomacy.set(0, 1, Diplomacy::War);
+        sim.island_maps.push(IslandMap::new_open(0, 30, 30));
+        sim.building_defs.push(BuildingDef {
+            id: 0, category: 0, width: 2, height: 2,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::Tools, input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 0, cycle_time_ms: 1000, carrier_interval_ms: 0,
+            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+        });
+        let b = BuildingInstance::new(0, 0, 10, 10, 0); // player 0 owns
+        sim.buildings.push(b);
+        // Enemy unit standing right next to the footprint.
+        sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 1, 11, 12));
+        // Run several military ticks until building dies.
+        for _ in 0..30 {
+            sim.tick_military();
+            if sim.buildings.is_empty() { break; }
+        }
+        assert!(sim.buildings.is_empty(), "building should have been destroyed");
+        // Tile-clear event was queued.
+        assert!(!sim.tile_clears.is_empty());
+        // IslandMap walkability restored.
+        assert!(sim.island_maps[0].is_walkable(10, 10));
+    }
+
+    #[test]
+    fn buildings_safe_from_neutral_units() {
+        use crate::combat::{MilitaryUnit, UnitType};
+        use crate::types::{Good, ProductionType};
+        use crate::building::{BuildingDef, BuildingInstance};
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.island_maps.push(IslandMap::new_open(0, 30, 30));
+        sim.building_defs.push(BuildingDef {
+            id: 0, category: 0, width: 2, height: 2,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::Tools, input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 0, cycle_time_ms: 1000, carrier_interval_ms: 0,
+            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+        });
+        sim.buildings.push(BuildingInstance::new(0, 0, 10, 10, 0));
+        sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 1, 11, 12));
+        // No diplomacy edit → relation stays Neutral, no damage.
+        for _ in 0..30 {
+            sim.tick_military();
+        }
+        assert_eq!(sim.buildings.len(), 1);
+        assert_eq!(sim.buildings[0].health, crate::building::BUILDING_MAX_HEALTH);
+    }
+
+    #[test]
+    fn ai_spawns_escort_warship_for_trade_ship_when_at_war() {
+        use crate::ai::{AiController, AiPersonality, Difficulty};
+        use crate::combat::Diplomacy;
+        use crate::trade::TradeShip;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[0].gold = 0;
+        sim.players[1].gold = 5_000;
+        sim.warehouses.push(Warehouse::new(0, 1, 10, 10));
+        sim.diplomacy.set(0, 1, Diplomacy::War);
+        // AI has a trade ship.
+        sim.trade_ships.push(TradeShip::new(1, 0, 50, 60));
+        sim.ai_controllers.push(AiController::new(
+            1, AiPersonality::Military, Difficulty::Hard,
+        ));
+        sim.tick_diplomacy();
+        let escorts: Vec<&_> = sim.military_units.iter()
+            .filter(|u| u.owner == 1 && u.escort_ship == 0).collect();
+        assert!(!escorts.is_empty(), "expected an escort warship");
+        assert!(escorts[0].unit_type.stats().is_naval);
+        assert!(sim.players[1].gold < 5_000);
+    }
+
+    #[test]
+    fn escort_targets_track_their_ship() {
+        use crate::combat::{MilitaryUnit, UnitType};
+        use crate::trade::TradeShip;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.trade_ships.push(TradeShip::new(0, 0, 100, 200));
+        let mut warship = MilitaryUnit::new(UnitType::SmallWarship, 0, 50, 50);
+        warship.escort_ship = 0;
+        sim.military_units.push(warship);
+        sim.tick_entities(50);
+        let u = &sim.military_units[0];
+        assert_eq!(u.target_x, 100);
+        assert_eq!(u.target_y, 200);
+    }
+
+    #[test]
+    fn escort_clears_when_ship_inactive() {
+        use crate::combat::{MilitaryUnit, UnitType};
+        use crate::trade::TradeShip;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        let mut s = TradeShip::new(0, 0, 5, 5);
+        s.active = false;
+        sim.trade_ships.push(s);
+        let mut warship = MilitaryUnit::new(UnitType::SmallWarship, 0, 50, 50);
+        warship.escort_ship = 0;
+        sim.military_units.push(warship);
+        sim.tick_entities(50);
+        assert_eq!(sim.military_units[0].escort_ship, -1);
+    }
+
+    #[test]
     fn ai_marches_units_at_enemy_warehouse_when_winning() {
         use crate::ai::{AiController, AiPersonality, Difficulty};
         use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
@@ -1017,6 +1280,33 @@ mod tests {
         sim.tick_ai();
         assert!(sim.trade_routes.is_empty());
         assert!(sim.trade_ships.is_empty());
+    }
+
+    #[test]
+    fn residence_promotes_when_tier_fully_satisfied() {
+        use crate::building::{BuildingDef, BuildingInstance};
+        use crate::types::{Good, ProductionType};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        // Make tier 0 (Pioneer) fully satisfied so the WOHN gets
+        // promoted to Settler tier on the next tick_population.
+        sim.players[0].satisfaction[0] = 128;
+        sim.building_defs.push(BuildingDef {
+            id: 0, category: 0, width: 1, height: 1,
+            production_type: ProductionType::Residence,
+            kind: "WOHN".into(), prod_kind: "WOHN".into(),
+            radius: 0,
+            output_good: Good::None, input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 0, cycle_time_ms: 0, carrier_interval_ms: 0,
+            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+        });
+        sim.buildings.push(BuildingInstance::new(0, 0, 0, 0, 0));
+        assert_eq!(sim.buildings[0].house_tier, 0);
+        sim.tick_population();
+        assert_eq!(sim.buildings[0].house_tier, 1);
     }
 
     #[test]

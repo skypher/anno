@@ -176,7 +176,13 @@ pub struct MilitaryUnit {
     /// Index of the unit this is currently fighting (-1 = none).
     pub combat_target: i32,
     pub active: bool,
+    /// Index into `Simulation::trade_ships` this unit is escorting. -1 if
+    /// none. Updated each tick so the unit's `target` shadows the ship.
+    #[serde(default = "default_escort_ship")]
+    pub escort_ship: i32,
 }
+
+fn default_escort_ship() -> i32 { -1 }
 
 impl MilitaryUnit {
     pub fn new(unit_type: UnitType, owner: u8, tile_x: i32, tile_y: i32) -> Self {
@@ -194,6 +200,7 @@ impl MilitaryUnit {
             move_timer_ms: 0,
             combat_target: -1,
             active: true,
+            escort_ship: -1,
         }
     }
 
@@ -350,6 +357,78 @@ pub fn tick_combat(
     }
 
     dead
+}
+
+/// Damage to enemy buildings from adjacent military units. Called each
+/// military tick. Returns the indices of buildings that hit 0 HP.
+///
+/// Per tick: 5 hp drained per adjacent enemy land unit (within 2 tiles
+/// of the building's footprint). Naval units don't damage land buildings.
+pub fn tick_building_damage(
+    units: &[MilitaryUnit],
+    buildings: &mut [crate::building::BuildingInstance],
+    diplomacy: &DiplomacyMatrix,
+    defs: &[crate::building::BuildingDef],
+) -> Vec<usize> {
+    const DMG_PER_ENEMY: u16 = 5;
+    let mut destroyed = Vec::new();
+    for (bi, b) in buildings.iter_mut().enumerate() {
+        if !b.active { continue; }
+        if (b.def_id as usize) >= defs.len() { continue; }
+        let def = &defs[b.def_id as usize];
+        let bx = b.tile_x as i32;
+        let by = b.tile_y as i32;
+        let bw = def.width as i32;
+        let bh = def.height as i32;
+        let mut hostile = 0u16;
+        for u in units.iter() {
+            if !u.is_alive() || u.owner == b.owner { continue; }
+            if u.unit_type.stats().is_naval { continue; }
+            if diplomacy.get(u.owner, b.owner) != Diplomacy::War { continue; }
+            // Adjacent if within 2 tiles of the footprint.
+            let dx = if u.tile_x < bx { bx - u.tile_x }
+                     else if u.tile_x >= bx + bw { u.tile_x - (bx + bw - 1) }
+                     else { 0 };
+            let dy = if u.tile_y < by { by - u.tile_y }
+                     else if u.tile_y >= by + bh { u.tile_y - (by + bh - 1) }
+                     else { 0 };
+            if dx.max(dy) <= 2 {
+                hostile = hostile.saturating_add(1);
+            }
+        }
+        if hostile == 0 { continue; }
+        let total = DMG_PER_ENEMY.saturating_mul(hostile);
+        if b.health <= total {
+            b.health = 0;
+            b.active = false;
+            destroyed.push(bi);
+        } else {
+            b.health -= total;
+        }
+    }
+    destroyed
+}
+
+/// Refresh each escort unit's `target_x/target_y` from the ship it's
+/// shadowing so naval movement orders stay current. Cleared if the
+/// referenced ship is gone or inactive.
+pub fn tick_escort_targets(
+    units: &mut [MilitaryUnit],
+    ship_positions: &[(bool, i32, i32)], // (active, world_x, world_y)
+) {
+    for u in units.iter_mut() {
+        if u.escort_ship < 0 { continue; }
+        let idx = u.escort_ship as usize;
+        match ship_positions.get(idx) {
+            Some(&(true, sx, sy)) => {
+                u.target_x = sx;
+                u.target_y = sy;
+            }
+            _ => {
+                u.escort_ship = -1;
+            }
+        }
+    }
 }
 
 /// Move units toward their player-issued (target_x, target_y) when not in combat.
