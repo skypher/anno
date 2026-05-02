@@ -28,6 +28,7 @@
 //!   A: open market (buy/sell goods at first warehouse — Left/Right by 10)
 //!   U: open warehouse table (per-warehouse stock columns for current island)
 //!   J: open fleet panel (active ships' route, state, cargo, profit)
+//!   Shift+R: open active-routes panel (Up/Down + Bksp to delete)
 //!   ?: open scenario objectives panel
 //!   Enter: open chat input (multiplayer); type then Enter to send, Esc cancels
 //!   F2: open scenario picker (Up/Down, Enter to relaunch with chosen .szs)
@@ -890,6 +891,8 @@ fn main() {
     let mut market_panel = false;
     let mut market_sel: usize = 0;
     let mut show_paths = false;
+    let mut route_list_panel = false;
+    let mut route_list_sel: usize = 0;
     let mut wh_panel = false;
     let mut ship_panel = false;
     let mut obj_panel = false;
@@ -1004,6 +1007,8 @@ fn main() {
                         chat_input.clear();
                     } else if context_menu.is_some() {
                         context_menu = None;
+                    } else if route_list_panel {
+                        route_list_panel = false;
                     } else if scenario_picker {
                         scenario_picker = false;
                     } else if save_panel {
@@ -1045,6 +1050,33 @@ fn main() {
                 } => {
                     if matches!(key, Keycode::LShift | Keycode::RShift) {
                         shift_held = true;
+                    }
+                    if route_list_panel {
+                        let routes: Vec<u16> = sim.trade_routes.iter()
+                            .filter(|r| r.owner == 0)
+                            .map(|r| r.id)
+                            .collect();
+                        match key {
+                            Keycode::Up => {
+                                if route_list_sel > 0 { route_list_sel -= 1; }
+                            }
+                            Keycode::Down => {
+                                if route_list_sel + 1 < routes.len() {
+                                    route_list_sel += 1;
+                                }
+                            }
+                            Keycode::Backspace | Keycode::Delete => {
+                                if let Some(&rid) = routes.get(route_list_sel) {
+                                    sim.trade_routes.retain(|r| r.id != rid);
+                                    sim.trade_ships.retain(|s| s.route_id != rid);
+                                    if route_list_sel > 0 { route_list_sel -= 1; }
+                                }
+                            }
+                            Keycode::R if shift_held => { route_list_panel = false; }
+                            Keycode::Escape => { route_list_panel = false; }
+                            _ => {}
+                        }
+                        continue;
                     }
                     if let Some(menu) = context_menu.as_mut() {
                         match key {
@@ -1190,35 +1222,27 @@ fn main() {
                                 }
                             }
                             Keycode::Right => {
-                                // Sell 10 of selected good from first
-                                // player-owned active warehouse.
+                                // Sell selected good. Plain Right=10,
+                                // Shift+Right=100. Routed through
+                                // apply_command so it uses live market
+                                // prices and works in multiplayer.
                                 if let Some(g) = GOODS.get(market_sel).copied() {
-                                    if let Some(wh) = sim.warehouses.iter_mut()
-                                        .find(|w| w.active && w.owner == 0)
-                                    {
-                                        let withdrew = wh.withdraw(g, 10);
-                                        if withdrew > 0 {
-                                            let price = anno_sim::prices::price_of(g).sell;
-                                            sim.players[0].gold += withdrew as i32 * price;
-                                        }
-                                    }
+                                    let qty = if shift_held { 100 } else { 10 };
+                                    sim.apply_command(
+                                        &anno_sim::commands::Command::Sell {
+                                            player: 0, good: g, qty,
+                                        },
+                                    );
                                 }
                             }
                             Keycode::Left => {
-                                // Buy 10 of selected good into first warehouse,
-                                // capped by gold and remaining capacity.
                                 if let Some(g) = GOODS.get(market_sel).copied() {
-                                    let price = anno_sim::prices::price_of(g).buy;
-                                    let max_affordable = (sim.players[0].gold / price).max(0);
-                                    let want = 10.min(max_affordable as i32) as u16;
-                                    if want > 0 {
-                                        if let Some(wh) = sim.warehouses.iter_mut()
-                                            .find(|w| w.active && w.owner == 0)
-                                        {
-                                            let deposited = wh.deposit(g, want);
-                                            sim.players[0].gold -= deposited as i32 * price;
-                                        }
-                                    }
+                                    let qty = if shift_held { 100 } else { 10 };
+                                    sim.apply_command(
+                                        &anno_sim::commands::Command::Buy {
+                                            player: 0, good: g, qty,
+                                        },
+                                    );
                                 }
                             }
                             Keycode::A | Keycode::Escape => {
@@ -1482,6 +1506,9 @@ fn main() {
                                     demolish_mode = false;
                                     tax_panel = false;
                                 }
+                            }
+                            Keycode::R if shift_held => {
+                                route_list_panel = !route_list_panel;
                             }
                             Keycode::R => {
                                 trade_route_mode = !trade_route_mode;
@@ -1937,23 +1964,11 @@ fn main() {
                                     &islands[current_island], &sim.island_maps[map_idx],
                                     tile_x, tile_y, bld_w, bld_h,
                                 ) {
-                                    // Need both gold AND construction
-                                    // materials drawn from warehouse.
-                                    let cw = def.cost_wood;
-                                    let ct = def.cost_tools;
-                                    let cb = def.cost_bricks;
-                                    let materials_ok = sim.warehouse_pay_materials(
-                                        island_number, 0, cw, ct, cb,
-                                    );
-                                    if !materials_ok {
-                                        save_banner = Some((
-                                            format!(
-                                                "build FAILED: need {} wood, {} tools, {} bricks",
-                                                cw, ct, cb,
-                                            ),
-                                            std::time::Instant::now(),
-                                        ));
-                                    } else if sim.players[0].gold >= cost as i32 {
+                                    // Materials are now trickled in by
+                                    // the entity tick — we just record
+                                    // what the building still needs and
+                                    // pay gold up front.
+                                    if sim.players[0].gold >= cost as i32 {
                                         sim.players[0].gold -= cost as i32;
 
                                         // Per-rotation sprite stride: each
@@ -2013,6 +2028,12 @@ fn main() {
                                         let build_ms = (2_000u32 * footprint).max(2_000);
                                         instance.construction_ms_total = build_ms;
                                         instance.construction_ms_remaining = build_ms;
+                                        // Trickle materials: warehouses
+                                        // will be drained as construction
+                                        // proceeds (entity tick).
+                                        instance.wood_needed = def.cost_wood;
+                                        instance.tools_needed = def.cost_tools;
+                                        instance.bricks_needed = def.cost_bricks;
                                         sim.buildings.push(instance);
 
                                         println!(
@@ -2599,7 +2620,7 @@ fn main() {
             || market_panel || wh_panel || ship_panel || save_panel
             || scenario_picker || tax_panel || diplomacy_panel
             || trade_route_mode || obj_panel || settings_panel
-            || context_menu.is_some();
+            || context_menu.is_some() || route_list_panel;
         if any_modal != prev_modal_open {
             if any_modal {
                 if !sim.paused {
@@ -3935,7 +3956,7 @@ fn main() {
                 } else {
                     label_full
                 };
-                let p = anno_sim::prices::price_of(*g);
+                let p = sim.current_price(*g);
                 let row = format!(
                     "{:<9} {:>2}  {:>3}%  {:>5}  {:>3}/{:<3}",
                     label, n, eff_pct, stock, p.buy, p.sell,
@@ -4162,6 +4183,64 @@ fn main() {
                 tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                 let tx = menu.screen_x.min(WINDOW_W as i32 - panel_w as i32 - 4);
                 let ty = menu.screen_y.min(WINDOW_H as i32 - panel_h as i32 - 4);
+                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+            }
+        }
+
+        // Route list panel (Shift+R): list of player-owned trade routes
+        // with stop count + ship count; Backspace deletes the selected
+        // route and any ships running it.
+        if route_list_panel {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 380u32;
+            let header_h = 28i32;
+            let routes: Vec<&anno_sim::trade::TradeRoute> = sim.trade_routes
+                .iter().filter(|r| r.owner == 0).collect();
+            let visible = routes.len().max(1);
+            let panel_h = (header_h + visible as i32 * line_h + 12) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 220;
+            }
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4, "ROUTES (Shift+R close, Up/Dn pick, Bksp delete)",
+                [0xFF, 0xD7, 0x00, 0xFF], 1,
+            );
+            if routes.is_empty() {
+                tiny_font::draw_str(
+                    &mut buf, panel_w, panel_h,
+                    4, header_h, "(no active routes)",
+                    [0x88, 0x88, 0x88, 0xFF], scale,
+                );
+            } else {
+                for (i, r) in routes.iter().enumerate() {
+                    let ships = sim.trade_ships.iter()
+                        .filter(|s| s.route_id == r.id && s.active)
+                        .count();
+                    let arrow = if i == route_list_sel { ">" } else { " " };
+                    let line = format!(
+                        "{} route {}  stops:{}  ships:{}  active:{}",
+                        arrow, r.id, r.stops.len(), ships, r.active,
+                    );
+                    let color = if i == route_list_sel {
+                        [0xFF, 0xFF, 0x00, 0xFF]
+                    } else { [0xCC, 0xCC, 0xCC, 0xFF] };
+                    tiny_font::draw_str(&mut buf, panel_w, panel_h,
+                        4, header_h + i as i32 * line_h, &line, color, scale);
+                }
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                let ty = 60i32;
                 canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
             }
         }
@@ -4533,7 +4612,7 @@ fn main() {
             }
             tiny_font::draw_str(
                 &mut buf, panel_w, panel_h,
-                4, 4, "MARKET (A close, Up/Dn pick, Lt buy 10, Rt sell 10)",
+                4, 4, "MARKET (A close  Up/Dn pick  Lt/Rt ±10  Shift=±100)",
                 [0xFF, 0xD7, 0x00, 0xFF], 1,
             );
             let gold_now = sim.players.first().map(|p| p.gold).unwrap_or(0);
@@ -4560,7 +4639,7 @@ fn main() {
             };
             for (row, idx) in (start..(start + max_visible).min(total)).enumerate() {
                 let g = GOODS[idx];
-                let price = anno_sim::prices::price_of(g);
+                let price = sim.current_price(g);
                 let stock = stock_for(g);
                 let label_full = format!("{:?}", g);
                 let label = if label_full.len() > 9 {

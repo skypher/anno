@@ -86,6 +86,16 @@ pub struct BuildingInstance {
     /// non-WOHN buildings.
     #[serde(default)]
     pub house_tier: u8,
+
+    /// Materials still owed before construction can finish. Drained by
+    /// the entity tick from the player's island warehouses. While any
+    /// remain > 0, `construction_ms_remaining` doesn't decrement.
+    #[serde(default)]
+    pub wood_needed: u16,
+    #[serde(default)]
+    pub tools_needed: u16,
+    #[serde(default)]
+    pub bricks_needed: u16,
 }
 
 fn default_building_health() -> u16 { BUILDING_MAX_HEALTH }
@@ -110,12 +120,18 @@ impl BuildingInstance {
             construction_ms_total: 0,
             health: BUILDING_MAX_HEALTH,
             house_tier: 0,
+            wood_needed: 0,
+            tools_needed: 0,
+            bricks_needed: 0,
         }
     }
 
     /// Returns true if the building is finished and operational.
     pub fn is_built(&self) -> bool {
         self.construction_ms_remaining == 0
+            && self.wood_needed == 0
+            && self.tools_needed == 0
+            && self.bricks_needed == 0
     }
 
     /// Construction progress in 0..=128 (matches efficiency scale).

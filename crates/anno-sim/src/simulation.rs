@@ -548,17 +548,8 @@ impl Simulation {
                                     .position(|m| m.island_id == island_id);
                                 if let Some(idx) = map_idx {
                                     let spot = self.island_maps[idx]
-                                        .find_open_spot(cx, cy, w, h, 12);
+                                        .find_reachable_spot(cx, cy, w, h, 12, (cx, cy));
                                     if let Some((bx, by)) = spot {
-                                        let cw = def.cost_wood;
-                                        let ct = def.cost_tools;
-                                        let cb = def.cost_bricks;
-                                        if !self.warehouse_pay_materials(
-                                            island_id, owner, cw, ct, cb,
-                                        ) {
-                                            // Skip silently — AI will retry next tick.
-                                            continue;
-                                        }
                                         // Mark footprint blocked
                                         for dy in 0..h {
                                             for dx in 0..w {
@@ -571,6 +562,12 @@ impl Simulation {
                                         );
                                         inst.construction_ms_total = build_ms;
                                         inst.construction_ms_remaining = build_ms;
+                                        // Defer materials: the entity tick
+                                        // will trickle them in from
+                                        // warehouses as construction proceeds.
+                                        inst.wood_needed = def.cost_wood;
+                                        inst.tools_needed = def.cost_tools;
+                                        inst.bricks_needed = def.cost_bricks;
                                         self.buildings.push(inst);
                                         self.players[player_idx].gold -= cost as i32;
                                     }
@@ -1000,9 +997,36 @@ impl Simulation {
         // Move military units toward player-issued targets (every step).
         combat::tick_unit_orders(&mut self.military_units, dt_ms);
 
-        // Advance construction on placed-but-unfinished buildings.
+        // Trickle construction materials from the player's warehouses,
+        // then decrement the construction timer only once the materials
+        // for this building are done.
+        use crate::types::Good;
+        let mut take_one = |island_id: u8, owner: u8, good: Good| -> bool {
+            for w in self.warehouses.iter_mut().filter(|w| {
+                w.active && w.owner == owner && w.island_id == island_id
+            }) {
+                if w.withdraw(good, 1) > 0 { return true; }
+            }
+            false
+        };
         for b in self.buildings.iter_mut() {
-            if b.construction_ms_remaining > 0 {
+            if b.is_built() { continue; }
+            // Try to consume one unit of each pending material from a
+            // warehouse on the same island. If a line is short, that
+            // material simply isn't drawn this tick — construction stalls.
+            if b.wood_needed > 0 && take_one(b.island_id, b.owner, Good::Wood) {
+                b.wood_needed -= 1;
+            }
+            if b.tools_needed > 0 && take_one(b.island_id, b.owner, Good::Tools) {
+                b.tools_needed -= 1;
+            }
+            if b.bricks_needed > 0 && take_one(b.island_id, b.owner, Good::Bricks) {
+                b.bricks_needed -= 1;
+            }
+            // Construction time only flows once all materials are met.
+            if b.wood_needed == 0 && b.tools_needed == 0 && b.bricks_needed == 0
+                && b.construction_ms_remaining > 0
+            {
                 b.construction_ms_remaining =
                     b.construction_ms_remaining.saturating_sub(dt_ms);
             }
@@ -1239,6 +1263,67 @@ mod tests {
             .count();
         assert!(ai_units >= 1, "AI should have spawned at least one defender");
         assert!(sim.players[1].gold < 5_000);
+    }
+
+    #[test]
+    fn construction_stalls_without_materials() {
+        use crate::types::{Good, ProductionType};
+        use crate::building::{BuildingDef, BuildingInstance};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.building_defs.push(BuildingDef {
+            id: 0, category: 0, width: 1, height: 1,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::Tools, input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 0, cycle_time_ms: 0, carrier_interval_ms: 0,
+            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+        });
+        let mut b = BuildingInstance::new(0, 0, 0, 0, 0);
+        b.construction_ms_total = 1_000;
+        b.construction_ms_remaining = 1_000;
+        b.wood_needed = 5; // demands wood we don't have
+        sim.buildings.push(b);
+
+        // No warehouse has wood. Tick entities; construction must NOT advance.
+        sim.tick_entities(500);
+        assert_eq!(sim.buildings[0].construction_ms_remaining, 1_000);
+        assert_eq!(sim.buildings[0].wood_needed, 5);
+    }
+
+    #[test]
+    fn construction_trickles_materials_from_warehouse() {
+        use crate::types::Good;
+        use crate::building::BuildingInstance;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        let mut wh = Warehouse::new(0, 0, 0, 0);
+        wh.set_capacity(Good::Wood, 100);
+        wh.deposit(Good::Wood, 10);
+        sim.warehouses.push(wh);
+        let mut b = BuildingInstance::new(0, 0, 5, 5, 0);
+        b.construction_ms_total = 1_000;
+        b.construction_ms_remaining = 1_000;
+        b.wood_needed = 3;
+        sim.buildings.push(b);
+
+        // 1st tick: drain 1 wood, construction stays paused (need still 2).
+        sim.tick_entities(50);
+        assert_eq!(sim.buildings[0].wood_needed, 2);
+        assert_eq!(sim.buildings[0].construction_ms_remaining, 1_000);
+        // 2nd tick: 1 more drained.
+        sim.tick_entities(50);
+        assert_eq!(sim.buildings[0].wood_needed, 1);
+        // 3rd: drained, materials done; this tick the timer also
+        // decrements by dt_ms.
+        sim.tick_entities(50);
+        assert_eq!(sim.buildings[0].wood_needed, 0);
+        assert!(sim.buildings[0].construction_ms_remaining < 1_000);
+        assert_eq!(sim.warehouses[0].stock(Good::Wood), 7);
     }
 
     #[test]
