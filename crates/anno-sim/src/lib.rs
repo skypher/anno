@@ -2,6 +2,7 @@ pub mod ai;
 pub mod building;
 pub mod carrier;
 pub mod climate;
+pub mod commands;
 pub mod combat;
 pub mod coverage;
 pub mod data_bridge;

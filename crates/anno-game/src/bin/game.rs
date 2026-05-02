@@ -948,7 +948,8 @@ fn main() {
     // Trade route editor: while in this mode, LMB on a warehouse adds it
     // as a stop in the draft route; Enter commits, Esc cancels.
     let mut trade_route_mode = false;
-    let mut draft_route_stops: Vec<(u8, u16, u16)> = Vec::new(); // (island_id, x, y)
+    /// (island_id, x, y, mode) where mode: 0=LOAD only, 1=UNLOAD only, 2=BOTH.
+    let mut draft_route_stops: Vec<(u8, u16, u16, u8)> = Vec::new();
     let mut next_route_id: u16 = sim
         .trade_routes
         .iter()
@@ -1231,16 +1232,27 @@ fn main() {
                             Keycode::Down => {
                                 if tax_tier < 4 { tax_tier += 1; }
                             }
-                            Keycode::Left => {
-                                if let Some(p) = sim.players.first_mut() {
-                                    p.tax_rates[tax_tier] =
-                                        p.tax_rates[tax_tier].saturating_sub(8);
-                                }
-                            }
-                            Keycode::Right => {
-                                if let Some(p) = sim.players.first_mut() {
-                                    p.tax_rates[tax_tier] =
-                                        p.tax_rates[tax_tier].saturating_add(8).min(128);
+                            Keycode::Left | Keycode::Right => {
+                                let new_rate = sim.players.first()
+                                    .map(|p| {
+                                        let r = p.tax_rates[tax_tier];
+                                        if matches!(key, Keycode::Right) {
+                                            r.saturating_add(8).min(128)
+                                        } else {
+                                            r.saturating_sub(8)
+                                        }
+                                    })
+                                    .unwrap_or(64);
+                                let cmd = anno_sim::commands::Command::SetTaxRate {
+                                    player: 0, tier: tax_tier as u8, rate: new_rate,
+                                };
+                                if let Some(client) = net_client.as_mut() {
+                                    let payload = cmd.encode();
+                                    let msg = anno_net::protocol::NetMessage
+                                        ::game_data(payload);
+                                    let _ = client.send(&msg);
+                                } else {
+                                    sim.apply_command(&cmd);
                                 }
                             }
                             Keycode::T | Keycode::Escape => {
@@ -1330,6 +1342,21 @@ fn main() {
                                     sim.speed_multiplier += 1;
                                 }
                             }
+                            Keycode::L if trade_route_mode => {
+                                if let Some(last) = draft_route_stops.last_mut() {
+                                    last.3 = 0; // LOAD only
+                                }
+                            }
+                            Keycode::U if trade_route_mode => {
+                                if let Some(last) = draft_route_stops.last_mut() {
+                                    last.3 = 1; // UNLOAD only
+                                }
+                            }
+                            Keycode::B if trade_route_mode => {
+                                if let Some(last) = draft_route_stops.last_mut() {
+                                    last.3 = 2; // BOTH
+                                }
+                            }
                             Keycode::B => {
                                 if !world_mode {
                                     demolish_mode = false;
@@ -1391,16 +1418,25 @@ fn main() {
                                         Good::GoldOre, Good::TobaccoProducts,
                                     ];
                                     let mut route = TradeRoute::new(next_route_id, 0);
-                                    for &(island_id, wx, wy) in &draft_route_stops {
+                                    for &(island_id, wx, wy, mode) in &draft_route_stops {
+                                        let (load, unload): (Vec<(Good, u16)>, Vec<Good>) =
+                                            match mode {
+                                                0 => (
+                                                    all_goods.iter().map(|&g| (g, 50)).collect(),
+                                                    Vec::new(),
+                                                ),
+                                                1 => (Vec::new(), all_goods.to_vec()),
+                                                _ => (
+                                                    all_goods.iter().map(|&g| (g, 50)).collect(),
+                                                    all_goods.to_vec(),
+                                                ),
+                                            };
                                         route.add_stop(RouteStop {
                                             island_id,
                                             warehouse_x: wx,
                                             warehouse_y: wy,
-                                            load_goods: all_goods
-                                                .iter()
-                                                .map(|&g| (g, 50))
-                                                .collect(),
-                                            unload_goods: all_goods.to_vec(),
+                                            load_goods: load,
+                                            unload_goods: unload,
                                         });
                                     }
                                     route.activate();
@@ -1976,14 +2012,29 @@ fn main() {
                                     && (w.tile_y as i32 - tile_y).abs() <= 2
                             });
                             if let Some(w) = wh {
-                                let stop = (w.island_id, w.tile_x, w.tile_y);
-                                // Skip duplicate of last stop
-                                if draft_route_stops.last() != Some(&stop) {
+                                // First stop defaults to LOAD-only
+                                // (origin); subsequent stops default to
+                                // UNLOAD-only. Player can override via L/U/B.
+                                let default_mode = if draft_route_stops.is_empty() {
+                                    0 // LOAD
+                                } else {
+                                    1 // UNLOAD
+                                };
+                                let stop = (
+                                    w.island_id, w.tile_x, w.tile_y, default_mode,
+                                );
+                                let dup = draft_route_stops.last()
+                                    .map(|&(iid, x, y, _)| {
+                                        (iid, x, y) == (stop.0, stop.1, stop.2)
+                                    })
+                                    .unwrap_or(false);
+                                if !dup {
                                     draft_route_stops.push(stop);
+                                    let mode_str = ["LOAD", "UNLOAD", "BOTH"][stop.3 as usize];
                                     println!(
-                                        "Route stop {}: island {} ({},{})",
+                                        "Route stop {}: island {} ({},{}) [{}]",
                                         draft_route_stops.len(),
-                                        stop.0, stop.1, stop.2,
+                                        stop.0, stop.1, stop.2, mode_str,
                                     );
                                 }
                             } else {
@@ -2313,6 +2364,17 @@ fn main() {
                         let msg = anno_net::protocol::NetMessage::chat(&text);
                         host.send_to_all(&msg);
                     }
+                    anno_net::session::SessionEvent::GameData { from_player, data } => {
+                        // Tag-prefixed payloads are commands from clients;
+                        // anything else is a stray broadcast we ignore.
+                        if let Some(cmd) = anno_sim::commands::Command::decode(&data) {
+                            let applied = sim.apply_command(&cmd);
+                            println!(
+                                "[cmd] from p{from_player}: {:?} (applied={applied})",
+                                cmd,
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2332,6 +2394,12 @@ fn main() {
             for ev in evs {
                 match ev {
                     anno_net::session::SessionEvent::GameData { data, .. } => {
+                        // Defensive: ignore command-tagged payloads at the
+                        // client (the host never broadcasts those, but if
+                        // they arrived bincode would garble the SaveState).
+                        if data.first().copied() == Some(anno_sim::commands::COMMAND_TAG) {
+                            continue;
+                        }
                         if let Ok(snap) = bincode::deserialize::<anno_sim::save::SaveState>(&data) {
                             sim.apply_snapshot(snap);
                             needs_redraw = true;
@@ -2820,7 +2888,7 @@ fn main() {
                     let island_id = islands[current_island].number;
                     let half_tw = rs.tile_w / 2;
                     let half_th = rs.tile_h / 2;
-                    for (i, &(iid, wx, wy)) in draft_route_stops.iter().enumerate() {
+                    for (i, &(iid, wx, wy, _mode)) in draft_route_stops.iter().enumerate() {
                         if iid != island_id {
                             continue;
                         }
@@ -4307,9 +4375,13 @@ fn main() {
         let zoom_label = ["GFX", "MGFX", "SGFX"][sprite_zoom];
 
         let title = if trade_route_mode {
+            let last_mode = draft_route_stops.last()
+                .map(|s| ["LOAD", "UNLOAD", "BOTH"][s.3 as usize])
+                .unwrap_or("—");
             format!(
-                "TRADE ROUTE — click warehouses to add stops (have {}) — Enter=commit Esc=cancel",
+                "TRADE ROUTE — click warehouses ({} stops, last={}) — L/U/B=last-stop mode Enter=commit Esc=cancel",
                 draft_route_stops.len(),
+                last_mode,
             )
         } else if tax_panel {
             format!(

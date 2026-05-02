@@ -117,6 +117,10 @@ pub struct Simulation {
     /// Indices of objectives that flipped to done since last drain.
     /// Game binary consumes these to push events into the chat log.
     pub objective_completions: Vec<usize>,
+
+    /// xorshift RNG state for the event ticker. Persisted as a sim field
+    /// only; not serialized into save files (each load reseeds).
+    rng_state: u64,
 }
 
 impl Simulation {
@@ -161,7 +165,50 @@ impl Simulation {
 
             objectives: crate::objectives::ObjectiveSet::default_starter(),
             objective_completions: Vec::new(),
+
+            rng_state: 0xCBF29CE484222325,
         }
+    }
+
+    fn next_rand(&mut self) -> u64 {
+        if self.rng_state == 0 { self.rng_state = 0xCBF29CE484222325; }
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        x
+    }
+
+    fn tick_events(&mut self) {
+        // Pirates only spawn when there is an active player trade ship to
+        // hunt — otherwise the world is too empty for it to matter.
+        let target_ship = self.trade_ships.iter()
+            .find(|s| s.active && s.owner == 0);
+        let Some(ship) = target_ship else { return; };
+        let (sx, sy) = (ship.world_x, ship.world_y);
+
+        // 1-in-3 chance per event tick.
+        let r = self.next_rand();
+        if r % 3 != 0 { return; }
+
+        // Pirate appears on the closest map edge ~30 tiles from the ship.
+        let dx = ((r >> 8) as i32 % 60) - 30;
+        let dy = ((r >> 16) as i32 % 60) - 30;
+        let px = (sx + dx).max(0);
+        let py = (sy + dy).max(0);
+
+        // Slot 6 is the pirate faction. Make them at war with everyone
+        // else (idempotent — set on every spawn).
+        use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
+        const PIRATE: u8 = 6;
+        for j in 0..6u8 {
+            self.diplomacy.set(PIRATE, j, Diplomacy::War);
+        }
+        let mut pirate = MilitaryUnit::new(UnitType::SmallWarship, PIRATE, px, py);
+        pirate.target_x = sx;
+        pirate.target_y = sy;
+        self.military_units.push(pirate);
     }
 
     /// Main simulation tick, called with real-time delta in milliseconds.
@@ -230,6 +277,11 @@ impl Simulation {
         // 6. Military combat
         if self.timer_military.advance(dt_ms) {
             self.tick_military();
+        }
+
+        // 7. Random events (pirates, etc.)
+        if self.timer_events.advance(dt_ms) {
+            self.tick_events();
         }
 
         // Entity movement (every step)
@@ -903,6 +955,54 @@ impl Simulation {
         }
     }
 
+    /// Apply a player-issued command to the authoritative state.
+    /// Returns true if it was applied successfully.
+    pub fn apply_command(&mut self, cmd: &crate::commands::Command) -> bool {
+        use crate::commands::Command;
+        match *cmd {
+            Command::SetTaxRate { player, tier, rate } => {
+                let pi = player as usize;
+                let ti = tier as usize;
+                if pi >= self.players.len() || ti >= 5 { return false; }
+                self.players[pi].tax_rates[ti] = rate;
+                true
+            }
+            Command::SetDiplomacy { a, b, state } => {
+                self.diplomacy.set(a, b, state);
+                true
+            }
+            Command::Buy { player, good, qty } => {
+                let pi = player as usize;
+                if pi >= self.players.len() { return false; }
+                let price = crate::prices::price_of(good).buy;
+                let max_aff = (self.players[pi].gold / price).max(0) as u16;
+                let want = qty.min(max_aff);
+                if want == 0 { return false; }
+                if let Some(wh) = self.warehouses.iter_mut()
+                    .find(|w| w.active && w.owner == player)
+                {
+                    let dep = wh.deposit(good, want);
+                    self.players[pi].gold -= dep as i32 * price;
+                    return dep > 0;
+                }
+                false
+            }
+            Command::Sell { player, good, qty } => {
+                let pi = player as usize;
+                if pi >= self.players.len() { return false; }
+                let price = crate::prices::price_of(good).sell;
+                if let Some(wh) = self.warehouses.iter_mut()
+                    .find(|w| w.active && w.owner == player)
+                {
+                    let took = wh.withdraw(good, qty);
+                    self.players[pi].gold += took as i32 * price;
+                    return took > 0;
+                }
+                false
+            }
+        }
+    }
+
     /// Get the displayed game time as (minutes, seconds).
     pub fn display_time(&self) -> (u32, u32) {
         let minutes = self.game_clock / TICKS_PER_MINUTE;
@@ -1009,6 +1109,38 @@ mod tests {
             .count();
         assert!(ai_units >= 1, "AI should have spawned at least one defender");
         assert!(sim.players[1].gold < 5_000);
+    }
+
+    #[test]
+    fn pirates_eventually_spawn_to_attack_player_trade_ships() {
+        use crate::trade::TradeShip;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.trade_ships.push(TradeShip::new(0, 0, 100, 100));
+        // Drive event ticks until a pirate appears (1-in-3 odds; cap to
+        // keep the test bounded).
+        let mut spawned = false;
+        for _ in 0..30 {
+            sim.tick_events();
+            if sim.military_units.iter().any(|u| u.owner == 6) {
+                spawned = true;
+                break;
+            }
+        }
+        assert!(spawned, "expected at least one pirate spawn within 30 ticks");
+        // Pirate is at war with player 0.
+        use crate::combat::Diplomacy;
+        assert_eq!(sim.diplomacy.get(6, 0), Diplomacy::War);
+    }
+
+    #[test]
+    fn pirates_skip_spawn_when_no_player_trade_ships() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        for _ in 0..30 {
+            sim.tick_events();
+        }
+        assert!(sim.military_units.iter().all(|u| u.owner != 6));
     }
 
     #[test]
