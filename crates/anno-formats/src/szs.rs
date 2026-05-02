@@ -55,6 +55,17 @@ pub struct SzsFile {
 
 const CHUNK_HEADER_SIZE: usize = 20;
 
+/// Write a single chunk (16-byte zero-padded name + 4-byte LE size + body).
+fn write_chunk(out: &mut Vec<u8>, name: &str, body: &[u8]) {
+    let mut name_bytes = [0u8; 16];
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(16);
+    name_bytes[..n].copy_from_slice(&bytes[..n]);
+    out.extend_from_slice(&name_bytes);
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(body);
+}
+
 impl SzsFile {
     pub fn parse(data: &[u8]) -> Result<Self, SzsError> {
         if data.len() < CHUNK_HEADER_SIZE {
@@ -126,6 +137,39 @@ impl SzsFile {
         Ok(SzsFile { chunks, islands })
     }
 
+    /// Encode an SZS file from a list of `Island`s. Generates one
+    /// `INSEL5` + `INSELHAUS` chunk pair per island. The result round-
+    /// trips through `SzsFile::parse` for the islands payload (other
+    /// chunks aren't reconstructed since this writer is intended for the
+    /// scenario-editor flow, not full save fidelity).
+    pub fn encode_islands(islands: &[Island]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for island in islands {
+            // INSEL5 chunk: 8-byte body matching the parser.
+            let mut body = Vec::with_capacity(8);
+            body.push(island.number);
+            body.push(island.width);
+            body.push(island.height);
+            body.push(0); // padding byte
+            body.extend_from_slice(&island.x_pos.to_le_bytes());
+            body.extend_from_slice(&island.y_pos.to_le_bytes());
+            write_chunk(&mut out, "INSEL5", &body);
+
+            // INSELHAUS chunk: tile records.
+            let mut tile_body = Vec::with_capacity(island.tiles.len() * 8);
+            for t in &island.tiles {
+                tile_body.extend_from_slice(&t.building_id.to_le_bytes());
+                tile_body.push(t.x);
+                tile_body.push(t.y);
+                tile_body.push(t.orientation);
+                tile_body.push(t.anim_count);
+                tile_body.extend_from_slice(&t.flags.to_le_bytes());
+            }
+            write_chunk(&mut out, "INSELHAUS", &tile_body);
+        }
+        out
+    }
+
     fn parse_insel5(data: &[u8]) -> Island {
         Island {
             number: data[0],
@@ -168,6 +212,49 @@ impl SzsFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round_trip_encoded_islands() {
+        let islands = vec![
+            Island {
+                number: 3,
+                width: 50,
+                height: 30,
+                x_pos: 100,
+                y_pos: 200,
+                tiles: vec![
+                    IslandTile {
+                        building_id: 1234, x: 5, y: 7,
+                        orientation: 1, anim_count: 0, flags: 0,
+                    },
+                    IslandTile {
+                        building_id: 42, x: 9, y: 9,
+                        orientation: 0, anim_count: 2, flags: 1,
+                    },
+                ],
+            },
+            Island {
+                number: 4, width: 60, height: 40,
+                x_pos: 500, y_pos: 600,
+                tiles: vec![],
+            },
+        ];
+        let bytes = SzsFile::encode_islands(&islands);
+        let parsed = SzsFile::parse(&bytes).expect("parse");
+        assert_eq!(parsed.islands.len(), 2);
+        let i0 = &parsed.islands[0];
+        assert_eq!(i0.number, 3);
+        assert_eq!(i0.width, 50);
+        assert_eq!(i0.height, 30);
+        assert_eq!(i0.x_pos, 100);
+        assert_eq!(i0.y_pos, 200);
+        assert_eq!(i0.tiles.len(), 2);
+        assert_eq!(i0.tiles[0].building_id, 1234);
+        assert_eq!(i0.tiles[0].orientation, 1);
+        let i1 = &parsed.islands[1];
+        assert_eq!(i1.number, 4);
+        assert!(i1.tiles.is_empty());
+    }
 
     #[test]
     fn parse_scenario() {

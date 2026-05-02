@@ -35,6 +35,8 @@
 //!   F4: build a TradeShip at the first warehouse (1000 gold)
 //!   F6: toggle path-debug overlay (carrier A* paths + ship ocean paths)
 //!   F7: found a colony (drop a Kontor) on the current island (500 gold)
+//!   F8: export current islands as `.szs` to saves/<scenario>.export.szs
+//!   F10: open settings panel (volumes, default zoom)
 //!   F5: quicksave (writes saves/<scenario>.quicksave.bin)
 //!   F9: quickload
 //!
@@ -889,6 +891,9 @@ fn main() {
     let mut wh_panel = false;
     let mut ship_panel = false;
     let mut obj_panel = false;
+    let mut settings = anno_sim::settings::Settings::load_default();
+    let mut settings_panel = false;
+    let mut settings_sel: usize = 0;
     // Auto-pause-while-menu-open: when any modal panel is opened we
     // pause the sim so the player can read it; we only unpause on close
     // if we were the ones who paused (i.e. the player didn't manually
@@ -985,6 +990,8 @@ fn main() {
                         scenario_picker = false;
                     } else if save_panel {
                         save_panel = false;
+                    } else if settings_panel {
+                        settings_panel = false;
                     } else if market_panel {
                         market_panel = false;
                     } else if wh_panel {
@@ -1020,6 +1027,31 @@ fn main() {
                 } => {
                     if matches!(key, Keycode::LShift | Keycode::RShift) {
                         shift_held = true;
+                    }
+                    if settings_panel {
+                        match key {
+                            Keycode::Up => {
+                                if settings_sel > 0 { settings_sel -= 1; }
+                            }
+                            Keycode::Down => {
+                                if settings_sel + 1 < anno_sim::settings::Settings::COUNT {
+                                    settings_sel += 1;
+                                }
+                            }
+                            Keycode::Left => {
+                                settings.adjust(settings_sel, -5);
+                                let _ = settings.save_default();
+                            }
+                            Keycode::Right => {
+                                settings.adjust(settings_sel, 5);
+                                let _ = settings.save_default();
+                            }
+                            Keycode::F10 | Keycode::Escape => {
+                                settings_panel = false;
+                            }
+                            _ => {}
+                        }
+                        continue;
                     }
                     if save_panel {
                         match key {
@@ -1547,6 +1579,28 @@ fn main() {
                             }
                             Keycode::F3 => {
                                 save_panel = !save_panel;
+                            }
+                            Keycode::F10 => {
+                                settings_panel = !settings_panel;
+                            }
+                            Keycode::F8 => {
+                                // Export the current island layout to an
+                                // .szs file. Useful for scenario authoring
+                                // — modify in-game, then F8 to persist.
+                                let path = save_dir.join(format!("{scenario_name}.export.szs"));
+                                let bytes = anno_formats::szs::SzsFile::encode_islands(&islands);
+                                if let Some(parent) = path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                let msg = match std::fs::write(&path, &bytes) {
+                                    Ok(()) => format!(
+                                        "exported {} islands → {}",
+                                        islands.len(), path.display(),
+                                    ),
+                                    Err(e) => format!("export FAILED: {e}"),
+                                };
+                                println!("{msg}");
+                                save_banner = Some((msg, std::time::Instant::now()));
                             }
                             Keycode::F7 => {
                                 // Found a colony: drop a Kontor on the
@@ -2424,7 +2478,7 @@ fn main() {
         let any_modal = graph_panel || prod_panel || roster_panel
             || market_panel || wh_panel || ship_panel || save_panel
             || scenario_picker || tax_panel || diplomacy_panel
-            || trade_route_mode || obj_panel;
+            || trade_route_mode || obj_panel || settings_panel;
         if any_modal != prev_modal_open {
             if any_modal {
                 if !sim.paused {
@@ -3911,6 +3965,52 @@ fn main() {
                     &mut buf, panel_w, panel_h,
                     4, y, &line, color, 1,
                 );
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                let ty = 60i32;
+                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+            }
+        }
+
+        // Settings panel (F10). Up/Down picks a row, Left/Right adjusts;
+        // each edit auto-persists to ~/.config/anno/settings.toml.
+        if settings_panel {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 360u32;
+            let header_h = 30i32;
+            let n = anno_sim::settings::Settings::COUNT as i32;
+            let panel_h = (header_h + n * line_h + 12) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 220;
+            }
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4,
+                "SETTINGS (Up/Dn pick, Left/Right ±5, F10/Esc close)",
+                [0xFF, 0xD7, 0x00, 0xFF], 1,
+            );
+            for i in 0..n {
+                let y = header_h + i * line_h;
+                let label = anno_sim::settings::Settings::label(i as usize);
+                let value = settings.value(i as usize);
+                let arrow = if i as usize == settings_sel { ">" } else { " " };
+                let line = format!("{arrow} {:<14} {:>3}", label, value);
+                let color = if i as usize == settings_sel {
+                    [0xFF, 0xFF, 0x00, 0xFF]
+                } else {
+                    [0xCC, 0xCC, 0xCC, 0xFF]
+                };
+                tiny_font::draw_str(&mut buf, panel_w, panel_h, 4, y, &line, color, scale);
             }
             if let Ok(mut tex) = texture_creator
                 .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
