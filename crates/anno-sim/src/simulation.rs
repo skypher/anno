@@ -121,6 +121,12 @@ pub struct Simulation {
     /// xorshift RNG state for the event ticker. Persisted as a sim field
     /// only; not serialized into save files (each load reseeds).
     rng_state: u64,
+
+    /// Per-good current market prices (indexed by `Good as u8`). Drifts
+    /// from the static base in `prices::price_of` each market tick based
+    /// on aggregate warehouse stock — a glut drives sell prices down,
+    /// scarcity drives buy prices up.
+    pub current_prices: Vec<crate::prices::GoodPrice>,
 }
 
 impl Simulation {
@@ -167,6 +173,80 @@ impl Simulation {
             objective_completions: Vec::new(),
 
             rng_state: 0xCBF29CE484222325,
+
+            current_prices: (0..31u8)
+                .map(|i| {
+                    let g = match i {
+                        0 => crate::types::Good::None,
+                        1 => crate::types::Good::Wood, 2 => crate::types::Good::Iron,
+                        3 => crate::types::Good::Gold, 4 => crate::types::Good::Wool,
+                        5 => crate::types::Good::Sugar, 6 => crate::types::Good::Tobacco,
+                        7 => crate::types::Good::Cattle, 8 => crate::types::Good::Grain,
+                        9 => crate::types::Good::Flour, 10 => crate::types::Good::Tools,
+                        11 => crate::types::Good::Bricks, 12 => crate::types::Good::Swords,
+                        13 => crate::types::Good::Muskets, 14 => crate::types::Good::Cannons,
+                        15 => crate::types::Good::Food, 16 => crate::types::Good::Cloth,
+                        17 => crate::types::Good::Alcohol,
+                        18 => crate::types::Good::TobaccoProducts,
+                        19 => crate::types::Good::Spices, 20 => crate::types::Good::Cocoa,
+                        21 => crate::types::Good::Grapes, 22 => crate::types::Good::Stone,
+                        23 => crate::types::Good::Ore, 24 => crate::types::Good::GoldOre,
+                        25 => crate::types::Good::Hides, 26 => crate::types::Good::Cotton,
+                        27 => crate::types::Good::Silk, 28 => crate::types::Good::Jewelry,
+                        29 => crate::types::Good::Clothing, 30 => crate::types::Good::Fish,
+                        _ => crate::types::Good::None,
+                    };
+                    crate::prices::price_of(g)
+                })
+                .collect(),
+        }
+    }
+
+    /// Live price for a good, applying the market-dynamics modifier when
+    /// available, falling back to the static base otherwise.
+    pub fn current_price(&self, good: crate::types::Good) -> crate::prices::GoodPrice {
+        let i = good as u8 as usize;
+        self.current_prices.get(i).copied()
+            .unwrap_or_else(|| crate::prices::price_of(good))
+    }
+
+    /// Recompute `current_prices` from aggregate warehouse stocks.
+    /// Each good's price scales by `factor = clamp(BASE_STOCK / total, 0.5, 2.0)`
+    /// where `BASE_STOCK = 100`. Called from `tick_market_coverage`.
+    fn tick_market_prices(&mut self) {
+        const BASE_STOCK: u32 = 100;
+        let goods = [
+            crate::types::Good::Wood, crate::types::Good::Iron,
+            crate::types::Good::Gold, crate::types::Good::Wool,
+            crate::types::Good::Sugar, crate::types::Good::Tobacco,
+            crate::types::Good::Cattle, crate::types::Good::Grain,
+            crate::types::Good::Flour, crate::types::Good::Tools,
+            crate::types::Good::Bricks, crate::types::Good::Swords,
+            crate::types::Good::Muskets, crate::types::Good::Cannons,
+            crate::types::Good::Food, crate::types::Good::Cloth,
+            crate::types::Good::Alcohol, crate::types::Good::TobaccoProducts,
+            crate::types::Good::Spices, crate::types::Good::Cocoa,
+            crate::types::Good::Grapes, crate::types::Good::Stone,
+            crate::types::Good::Ore, crate::types::Good::GoldOre,
+            crate::types::Good::Hides, crate::types::Good::Cotton,
+            crate::types::Good::Silk, crate::types::Good::Jewelry,
+            crate::types::Good::Clothing, crate::types::Good::Fish,
+        ];
+        for g in goods {
+            let total: u32 = self.warehouses.iter()
+                .filter(|w| w.active)
+                .map(|w| w.stock(g) as u32)
+                .sum();
+            let denom = total.max(1);
+            // factor in tenths: 10 = 1.0×, 5 = 0.5×, 20 = 2.0×.
+            let factor_tenths = ((BASE_STOCK * 10) / denom).clamp(5, 20);
+            let base = crate::prices::price_of(g);
+            let buy = (base.buy * factor_tenths as i32 / 10).max(1);
+            let sell = (base.sell * factor_tenths as i32 / 10).max(1);
+            let i = g as u8 as usize;
+            if let Some(slot) = self.current_prices.get_mut(i) {
+                *slot = crate::prices::GoodPrice { buy, sell };
+            }
         }
     }
 
@@ -470,6 +550,15 @@ impl Simulation {
                                     let spot = self.island_maps[idx]
                                         .find_open_spot(cx, cy, w, h, 12);
                                     if let Some((bx, by)) = spot {
+                                        let cw = def.cost_wood;
+                                        let ct = def.cost_tools;
+                                        let cb = def.cost_bricks;
+                                        if !self.warehouse_pay_materials(
+                                            island_id, owner, cw, ct, cb,
+                                        ) {
+                                            // Skip silently — AI will retry next tick.
+                                            continue;
+                                        }
                                         // Mark footprint blocked
                                         for dy in 0..h {
                                             for dx in 0..w {
@@ -633,6 +722,9 @@ impl Simulation {
             let whs = wh_by_island.get(&cov.island_id).map(|v| v.as_slice()).unwrap_or(&[]);
             cov.recompute(&self.buildings, &self.building_defs, whs);
         }
+
+        // Refresh dynamic market prices on the same cadence.
+        self.tick_market_prices();
     }
 
     fn tick_diplomacy(&mut self) {
@@ -955,6 +1047,44 @@ impl Simulation {
         }
     }
 
+    /// Try to deduct construction materials from the player's warehouses
+    /// on `island_id`. Returns true if every required cost was withdrawn,
+    /// false (with no withdrawals applied) when any line is short.
+    pub fn warehouse_pay_materials(
+        &mut self,
+        island_id: u8,
+        owner: u8,
+        cost_wood: u16,
+        cost_tools: u16,
+        cost_bricks: u16,
+    ) -> bool {
+        use crate::types::Good;
+        let total = |good: Good| -> u16 {
+            self.warehouses.iter()
+                .filter(|w| w.active && w.owner == owner && w.island_id == island_id)
+                .map(|w| w.stock(good))
+                .sum::<u16>()
+        };
+        if total(Good::Wood) < cost_wood
+            || total(Good::Tools) < cost_tools
+            || total(Good::Bricks) < cost_bricks
+        {
+            return false;
+        }
+        let mut take = |good: Good, mut amount: u16| {
+            for w in self.warehouses.iter_mut().filter(|w| {
+                w.active && w.owner == owner && w.island_id == island_id
+            }) {
+                if amount == 0 { break; }
+                amount -= w.withdraw(good, amount);
+            }
+        };
+        take(Good::Wood, cost_wood);
+        take(Good::Tools, cost_tools);
+        take(Good::Bricks, cost_bricks);
+        true
+    }
+
     /// Apply a player-issued command to the authoritative state.
     /// Returns true if it was applied successfully.
     pub fn apply_command(&mut self, cmd: &crate::commands::Command) -> bool {
@@ -974,7 +1104,7 @@ impl Simulation {
             Command::Buy { player, good, qty } => {
                 let pi = player as usize;
                 if pi >= self.players.len() { return false; }
-                let price = crate::prices::price_of(good).buy;
+                let price = self.current_price(good).buy;
                 let max_aff = (self.players[pi].gold / price).max(0) as u16;
                 let want = qty.min(max_aff);
                 if want == 0 { return false; }
@@ -990,7 +1120,7 @@ impl Simulation {
             Command::Sell { player, good, qty } => {
                 let pi = player as usize;
                 if pi >= self.players.len() { return false; }
-                let price = crate::prices::price_of(good).sell;
+                let price = self.current_price(good).sell;
                 if let Some(wh) = self.warehouses.iter_mut()
                     .find(|w| w.active && w.owner == player)
                 {
@@ -1109,6 +1239,68 @@ mod tests {
             .count();
         assert!(ai_units >= 1, "AI should have spawned at least one defender");
         assert!(sim.players[1].gold < 5_000);
+    }
+
+    #[test]
+    fn warehouse_pay_materials_consumes_when_sufficient() {
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        let mut w = Warehouse::new(0, 0, 0, 0);
+        w.set_capacity(Good::Wood, 100);
+        w.set_capacity(Good::Tools, 100);
+        w.set_capacity(Good::Bricks, 100);
+        w.deposit(Good::Wood, 50);
+        w.deposit(Good::Tools, 30);
+        w.deposit(Good::Bricks, 20);
+        sim.warehouses.push(w);
+        assert!(sim.warehouse_pay_materials(0, 0, 10, 5, 8));
+        let wh = &sim.warehouses[0];
+        assert_eq!(wh.stock(Good::Wood), 40);
+        assert_eq!(wh.stock(Good::Tools), 25);
+        assert_eq!(wh.stock(Good::Bricks), 12);
+    }
+
+    #[test]
+    fn warehouse_pay_materials_refuses_when_short() {
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        let mut w = Warehouse::new(0, 0, 0, 0);
+        w.set_capacity(Good::Wood, 100);
+        w.deposit(Good::Wood, 5);
+        sim.warehouses.push(w);
+        // Need 10 wood, only have 5 → no withdrawal.
+        assert!(!sim.warehouse_pay_materials(0, 0, 10, 0, 0));
+        assert_eq!(sim.warehouses[0].stock(Good::Wood), 5);
+    }
+
+    #[test]
+    fn market_prices_drop_when_glutted() {
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        let mut w = Warehouse::new(0, 0, 0, 0);
+        w.set_capacity(Good::Wood, 10_000);
+        w.deposit(Good::Wood, 5_000); // huge surplus
+        sim.warehouses.push(w);
+        let base = crate::prices::price_of(Good::Wood);
+        sim.tick_market_coverage();
+        let now = sim.current_price(Good::Wood);
+        // Glut should at least halve the price (factor floor is 0.5).
+        assert!(now.buy <= base.buy / 2 + 1, "got {now:?}");
+    }
+
+    #[test]
+    fn market_prices_rise_when_scarce() {
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        // No warehouse, so total stock = 0 → factor capped at 2.0
+        let base = crate::prices::price_of(Good::Tools);
+        sim.tick_market_coverage();
+        let now = sim.current_price(Good::Tools);
+        assert!(now.buy >= base.buy * 2 - 1, "got {now:?} vs base {base:?}");
     }
 
     #[test]

@@ -37,6 +37,7 @@
 //!   F7: found a colony (drop a Kontor) on the current island (500 gold)
 //!   F8: export current islands as `.szs` to saves/<scenario>.export.szs
 //!   F10: open settings panel (volumes, default zoom)
+//!   F12: toggle perf overlay (sim/render/frame microseconds + FPS)
 //!   F5: quicksave (writes saves/<scenario>.quicksave.bin)
 //!   F9: quickload
 //!
@@ -46,6 +47,7 @@
 //!   Left-click on military unit: select (Shift+click adds to selection)
 //!   Right-click (with units selected): move-to order
 //!   Right-click (no selection): inspect building/tile
+//!   Shift+Right-click: open context menu (Inspect / Move / Demolish)
 //!   Escape: quit (or close inspection / cancel build or demolish mode)
 
 use anno_audio::engine::AudioEngine;
@@ -894,6 +896,20 @@ fn main() {
     let mut settings = anno_sim::settings::Settings::load_default();
     let mut settings_panel = false;
     let mut settings_sel: usize = 0;
+    let mut show_perf = false;
+    let mut perf_history: std::collections::VecDeque<(u32, u32, u32)>
+        = std::collections::VecDeque::with_capacity(60);
+    let mut frame_started = std::time::Instant::now();
+    /// Right-click context menu: position + tile + action list.
+    struct ContextMenu {
+        screen_x: i32,
+        screen_y: i32,
+        tile_x: i32,
+        tile_y: i32,
+        actions: Vec<&'static str>,
+        sel: usize,
+    }
+    let mut context_menu: Option<ContextMenu> = None;
     // Auto-pause-while-menu-open: when any modal panel is opened we
     // pause the sim so the player can read it; we only unpause on close
     // if we were the ones who paused (i.e. the player didn't manually
@@ -986,6 +1002,8 @@ fn main() {
                     if chat_active {
                         chat_active = false;
                         chat_input.clear();
+                    } else if context_menu.is_some() {
+                        context_menu = None;
                     } else if scenario_picker {
                         scenario_picker = false;
                     } else if save_panel {
@@ -1027,6 +1045,52 @@ fn main() {
                 } => {
                     if matches!(key, Keycode::LShift | Keycode::RShift) {
                         shift_held = true;
+                    }
+                    if let Some(menu) = context_menu.as_mut() {
+                        match key {
+                            Keycode::Up => {
+                                if menu.sel > 0 { menu.sel -= 1; }
+                            }
+                            Keycode::Down => {
+                                if menu.sel + 1 < menu.actions.len() {
+                                    menu.sel += 1;
+                                }
+                            }
+                            Keycode::Return | Keycode::KpEnter => {
+                                let act = menu.actions[menu.sel];
+                                let (tx, ty) = (menu.tile_x, menu.tile_y);
+                                context_menu = None;
+                                match act {
+                                    "Inspect" => {
+                                        inspection = Some(Inspection {
+                                            tile_x: tx, tile_y: ty,
+                                            building_idx: None,
+                                            warehouse_idx: None,
+                                            info: format!("Tile ({tx},{ty})"),
+                                        });
+                                    }
+                                    "Move selected here" => {
+                                        for &ui in &selected_units {
+                                            if let Some(u) = sim.military_units.get_mut(ui) {
+                                                if u.is_alive() {
+                                                    u.target_x = tx;
+                                                    u.target_y = ty;
+                                                    u.combat_target = -1;
+                                                    u.move_timer_ms = 0;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    "Demolish" => {
+                                        demolish_mode = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Keycode::Escape => { context_menu = None; }
+                            _ => {}
+                        }
+                        continue;
                     }
                     if settings_panel {
                         match key {
@@ -1583,6 +1647,9 @@ fn main() {
                             Keycode::F10 => {
                                 settings_panel = !settings_panel;
                             }
+                            Keycode::F12 => {
+                                show_perf = !show_perf;
+                            }
                             Keycode::F8 => {
                                 // Export the current island layout to an
                                 // .szs file. Useful for scenario authoring
@@ -1870,8 +1937,23 @@ fn main() {
                                     &islands[current_island], &sim.island_maps[map_idx],
                                     tile_x, tile_y, bld_w, bld_h,
                                 ) {
-                                    // Deduct construction costs
-                                    if sim.players[0].gold >= cost as i32 {
+                                    // Need both gold AND construction
+                                    // materials drawn from warehouse.
+                                    let cw = def.cost_wood;
+                                    let ct = def.cost_tools;
+                                    let cb = def.cost_bricks;
+                                    let materials_ok = sim.warehouse_pay_materials(
+                                        island_number, 0, cw, ct, cb,
+                                    );
+                                    if !materials_ok {
+                                        save_banner = Some((
+                                            format!(
+                                                "build FAILED: need {} wood, {} tools, {} bricks",
+                                                cw, ct, cb,
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                    } else if sim.players[0].gold >= cost as i32 {
                                         sim.players[0].gold -= cost as i32;
 
                                         // Per-rotation sprite stride: each
@@ -2151,6 +2233,44 @@ fn main() {
                     y,
                     ..
                 } => {
+                    // Shift + RMB: open context menu at the cursor.
+                    if shift_held && !world_mode {
+                        if let Some(ref rs) = rendered {
+                            let dst_w = rs.width as i32 * display_zoom;
+                            let dst_h = rs.height as i32 * display_zoom;
+                            let dst_x = (WINDOW_W as i32 - dst_w) / 2 + scroll_x;
+                            let dst_y = (WINDOW_H as i32 - dst_h) / 2 + scroll_y;
+                            let tex_x = (x - dst_x) / display_zoom;
+                            let tex_y = (y - dst_y) / display_zoom;
+                            let (tile_x, tile_y) = screen_to_tile(
+                                tex_x, tex_y, rs.origin_x, rs.origin_y,
+                                rs.tile_w, rs.tile_h,
+                            );
+                            // Compose action list based on what's at the tile.
+                            let mut actions: Vec<&'static str> = vec!["Inspect"];
+                            if !selected_units.is_empty() {
+                                actions.push("Move selected here");
+                            }
+                            let island_id = islands[current_island].number;
+                            let has_player_building = sim.buildings.iter().any(|b| {
+                                b.owner == 0 && b.island_id == island_id && {
+                                    let def = &defs[b.def_id as usize];
+                                    let bx = b.tile_x as i32;
+                                    let by = b.tile_y as i32;
+                                    tile_x >= bx && tile_x < bx + def.width as i32
+                                        && tile_y >= by && tile_y < by + def.height as i32
+                                }
+                            });
+                            if has_player_building { actions.push("Demolish"); }
+                            actions.push("Cancel");
+                            context_menu = Some(ContextMenu {
+                                screen_x: x, screen_y: y,
+                                tile_x, tile_y,
+                                actions, sel: 0,
+                            });
+                        }
+                        continue;
+                    }
                     // If units are selected: issue a move order to that tile.
                     if !world_mode && !selected_units.is_empty() {
                         if let Some(ref rs) = rendered {
@@ -2478,7 +2598,8 @@ fn main() {
         let any_modal = graph_panel || prod_panel || roster_panel
             || market_panel || wh_panel || ship_panel || save_panel
             || scenario_picker || tax_panel || diplomacy_panel
-            || trade_route_mode || obj_panel || settings_panel;
+            || trade_route_mode || obj_panel || settings_panel
+            || context_menu.is_some();
         if any_modal != prev_modal_open {
             if any_modal {
                 if !sim.paused {
@@ -2495,6 +2616,7 @@ fn main() {
             auto_paused = false;
         }
 
+        let perf_sim_start = std::time::Instant::now();
         if dt_ms > 0 && dt_ms < 1000 {
             if net_client.is_none() {
                 sim.tick(dt_ms);
@@ -3112,6 +3234,37 @@ fn main() {
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // Day/night tint: one full cycle per 3000 game ticks
+                // (~5 in-game minutes). Warm dusk/dawn tints, deep blue at
+                // midnight, no tint at midday.
+                {
+                    let cycle = 3000u32;
+                    let phase = (sim.game_clock % cycle) as f32 / cycle as f32;
+                    let two_pi = std::f32::consts::TAU;
+                    let dayness = (phase * two_pi).sin(); // -1..=1
+                    if dayness < 0.95 {
+                        // Map dayness to RGBA tint:
+                        //   dayness =  1 → no overlay
+                        //   dayness =  0 → warm orange dusk
+                        //   dayness = -1 → dark blue night
+                        let warm = (1.0 - dayness.abs()).max(0.0); // 0..1
+                        let dark = (-dayness).max(0.0);            // 0..1
+                        let r = (90.0 * warm + 5.0 * dark) as u16;
+                        let g = (40.0 * warm + 10.0 * dark) as u16;
+                        let b = (10.0 * warm + 60.0 * dark) as u16;
+                        let alpha = ((warm * 60.0) + (dark * 90.0)) as u16;
+                        let alpha = alpha.min(120) as u16;
+                        if alpha > 0 {
+                            let inv = 255 - alpha;
+                            for px in frame.chunks_exact_mut(4) {
+                                px[0] = ((px[0] as u16 * inv + r * alpha) / 255) as u8;
+                                px[1] = ((px[1] as u16 * inv + g * alpha) / 255) as u8;
+                                px[2] = ((px[2] as u16 * inv + b * alpha) / 255) as u8;
                             }
                         }
                     }
@@ -3977,6 +4130,42 @@ fn main() {
             }
         }
 
+        // Context menu (Shift+RMB). Floats at the cursor; Up/Dn picks,
+        // Enter activates the action, Esc closes.
+        if let Some(ref menu) = context_menu {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 160u32;
+            let panel_h = (menu.actions.len() as i32 * line_h + 8) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 230;
+            }
+            for (i, &act) in menu.actions.iter().enumerate() {
+                let arrow = if i == menu.sel { ">" } else { " " };
+                let line = format!("{arrow} {}", act);
+                let color = if i == menu.sel {
+                    [0xFF, 0xFF, 0x00, 0xFF]
+                } else {
+                    [0xCC, 0xCC, 0xCC, 0xFF]
+                };
+                tiny_font::draw_str(&mut buf, panel_w, panel_h,
+                    4, 4 + i as i32 * line_h, &line, color, scale);
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = menu.screen_x.min(WINDOW_W as i32 - panel_w as i32 - 4);
+                let ty = menu.screen_y.min(WINDOW_H as i32 - panel_h as i32 - 4);
+                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+            }
+        }
+
         // Settings panel (F10). Up/Down picks a row, Left/Right adjusts;
         // each edit auto-persists to ~/.config/anno/settings.toml.
         if settings_panel {
@@ -4590,7 +4779,62 @@ fn main() {
         };
         canvas.window_mut().set_title(&title).ok();
 
+        // Perf overlay (F12). Drawn last so it lands on top of everything.
+        if show_perf {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 200u32;
+            let panel_h = (line_h * 4 + 8) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x00;
+                buf[i * 4 + 3] = 200;
+            }
+            let n = perf_history.len() as u32;
+            let avg = |idx: usize| -> u32 {
+                if n == 0 { return 0; }
+                let s: u64 = perf_history.iter()
+                    .map(|s| match idx { 0 => s.0, 1 => s.1, _ => s.2 } as u64)
+                    .sum();
+                (s / n as u64) as u32
+            };
+            let lines = [
+                format!("PERF (F12) n={}", n),
+                format!("sim {:>5} us", avg(0)),
+                format!("render {:>5} us", avg(1)),
+                format!("frame {:>5} us  {} fps",
+                    avg(2),
+                    if avg(2) == 0 { 0 } else { 1_000_000 / avg(2) },
+                ),
+            ];
+            for (i, line) in lines.iter().enumerate() {
+                tiny_font::draw_str(&mut buf, panel_w, panel_h,
+                    4, 4 + i as i32 * line_h, line,
+                    [0xCC, 0xFF, 0xCC, 0xFF], scale);
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = WINDOW_W as i32 - panel_w as i32 - 8;
+                let ty = WINDOW_H as i32 - panel_h as i32 - 8;
+                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+            }
+        }
+
         canvas.present();
+
+        // Sample perf for next-frame overlay.
+        let frame_us = frame_started.elapsed().as_micros() as u32;
+        frame_started = std::time::Instant::now();
+        let sim_us = perf_sim_start.elapsed().as_micros() as u32;
+        // Render us is approximate: total frame minus the sim portion.
+        let render_us = frame_us.saturating_sub(sim_us);
+        if perf_history.len() >= 60 { perf_history.pop_front(); }
+        perf_history.push_back((sim_us, render_us, frame_us));
     }
 }
 
