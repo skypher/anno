@@ -598,6 +598,137 @@ fn can_place_building(
     true
 }
 
+/// Outcome of a placement attempt. The caller drives banners/sound
+/// off these so the placement helper stays free of UI dependencies.
+enum PlaceOutcome {
+    Placed,
+    NotEnoughGold { need: u32, have: i32 },
+    BlockedByTerrain,
+    WrongClimate { needs: anno_sim::climate::Climate,
+                   actual: anno_sim::climate::Climate },
+    NotCoastal,
+    NoIslandMap,
+    NoBuildingSelected,
+}
+
+/// Attempt to place the placer's currently-selected building at
+/// `(tile_x, tile_y)` on `current_island`. Mirrors the original
+/// click-place flow: climate gate, fishery coast gate, walkability,
+/// gold cost, materials trickle. Side-effecting helper used by both
+/// the click handler and the drag-place loop.
+fn try_place_building(
+    sim: &mut anno_sim::simulation::Simulation,
+    islands: &mut [Island],
+    current_island: usize,
+    defs: &[anno_sim::building::BuildingDef],
+    cod: &CodFile,
+    placer: &BuildingPlacer,
+    tile_x: i32,
+    tile_y: i32,
+) -> PlaceOutcome {
+    let bb = match placer.selected_building() {
+        Some(b) => b,
+        None => return PlaceOutcome::NoBuildingSelected,
+    };
+    let def_idx = bb.def_idx;
+    let sprite_idx = bb.sprite_idx;
+    let def = &defs[def_idx];
+    let island_number = islands[current_island].number;
+    let bld_w = def.width;
+    let bld_h = def.height;
+    let cost = def.cost_gold;
+    let input1 = def.input_good_1;
+    let input2 = def.input_good_2;
+    let storage = def.storage_capacity;
+
+    let island_map_idx = sim.island_maps.iter()
+        .position(|m| m.island_id == island_number);
+
+    // Climate gate.
+    let isl = &islands[current_island];
+    let climate = anno_sim::climate::climate_for_y(isl.y_pos as u32, 512);
+    if !anno_sim::climate::allows_production(climate, def.output_good) {
+        let needs = match climate {
+            anno_sim::climate::Climate::North => anno_sim::climate::Climate::South,
+            anno_sim::climate::Climate::South => anno_sim::climate::Climate::North,
+        };
+        return PlaceOutcome::WrongClimate { needs, actual: climate };
+    }
+
+    // Fishery coast gate.
+    if def.output_good == Good::Fish {
+        let coast_ok = if let Some(idx) = island_map_idx {
+            let map = &sim.island_maps[idx];
+            (0..bld_h as i32).any(|dy| (0..bld_w as i32)
+                .any(|dx| map.is_coastal(tile_x + dx, tile_y + dy)))
+        } else { false };
+        if !coast_ok { return PlaceOutcome::NotCoastal; }
+    }
+
+    let map_idx = match island_map_idx {
+        Some(i) => i,
+        None => return PlaceOutcome::NoIslandMap,
+    };
+    if !can_place_building(
+        &islands[current_island], &sim.island_maps[map_idx],
+        tile_x, tile_y, bld_w, bld_h,
+    ) {
+        return PlaceOutcome::BlockedByTerrain;
+    }
+    if sim.players[0].gold < cost as i32 {
+        return PlaceOutcome::NotEnoughGold {
+            need: cost, have: sim.players[0].gold,
+        };
+    }
+
+    // All gates passed — apply the placement.
+    sim.players[0].gold -= cost as i32;
+    let cod_b = &cod.buildings[def_idx];
+    let rot_count = cod_b.rotate.max(1) as u8;
+    let orient = placer.orientation % rot_count;
+    let stride = (cod_b.anim_anz.max(1) * cod_b.anim_add.max(1)) as usize;
+    let rot_offset = orient as usize * stride;
+
+    for dy in 0..bld_h as u8 {
+        for dx in 0..bld_w as u8 {
+            let tx = tile_x as u8 + dx;
+            let ty = tile_y as u8 + dy;
+            let tile_sprite = sprite_idx
+                + rot_offset
+                + dy as usize * bld_w as usize
+                + dx as usize;
+            islands[current_island].tiles.push(IslandTile {
+                x: tx,
+                y: ty,
+                building_id: tile_sprite as u16,
+                orientation: orient,
+                anim_count: 0,
+                flags: 0,
+            });
+            sim.island_maps[map_idx].set_walkable(tx as u16, ty as u16, false);
+        }
+    }
+
+    let mut instance = BuildingInstance::new(
+        def_idx as u16,
+        island_number,
+        tile_x as u16,
+        tile_y as u16,
+        0,
+    );
+    if input1 != Good::None { instance.input_1_stock = storage; }
+    if input2 != Good::None { instance.input_2_stock = storage; }
+    let footprint = (def.width as u32) * (def.height as u32);
+    let build_ms = (2_000u32 * footprint).max(2_000);
+    instance.construction_ms_total = build_ms;
+    instance.construction_ms_remaining = build_ms;
+    instance.wood_needed = def.cost_wood;
+    instance.tools_needed = def.cost_tools;
+    instance.bricks_needed = def.cost_bricks;
+    sim.buildings.push(instance);
+    PlaceOutcome::Placed
+}
+
 fn main() {
     let base_dir = find_data_dir();
 
@@ -919,6 +1050,15 @@ fn main() {
     // on a non-empty tile sets this; the renderer paints a small info
     // card at top-left.
     let mut selected_building_idx: Option<usize> = None;
+    // Mass-place: while LMB is held in placer mode, every new tile the
+    // cursor enters gets a fresh placement attempt. Matches the
+    // original's drag-place for roads and fields. `drag_placing` is
+    // set on a successful initial click so we don't place during the
+    // drag-pan-on-empty-space gesture; `last_drag_place_tile` is the
+    // tile we most-recently placed on, so we don't re-fire on the
+    // same tile during a held click.
+    let mut drag_placing = false;
+    let mut last_drag_place_tile: Option<(i32, i32)> = None;
 
     /// Inspection state — what the player has right-clicked on.
     struct Inspection {
@@ -1982,187 +2122,69 @@ fn main() {
                         minimap_click_x = x;
                         minimap_click_y = y;
                     } else if placer.active && !world_mode {
-                        // Try to place a building
-                        if let (Some(rs), Some(bb)) =
-                            (&rendered, placer.selected_building())
-                        {
-                            let def_idx = bb.def_idx;
-                            let sprite_idx = bb.sprite_idx;
-                            let def = &defs[def_idx];
-                            let island_number = islands[current_island].number;
-                            let bld_w = def.width;
-                            let bld_h = def.height;
-                            let cost = def.cost_gold;
-                            let input1 = def.input_good_1;
-                            let input2 = def.input_good_2;
-                            let storage = def.storage_capacity;
-
-                            // Convert screen coords to texture coords
+                        if let Some(ref rs) = rendered {
                             let dst_w = rs.width as i32 * display_zoom;
                             let dst_h = rs.height as i32 * display_zoom;
                             let dst_x = (WINDOW_W as i32 - dst_w) / 2 + scroll_x;
                             let dst_y = (WINDOW_H as i32 - dst_h) / 2 + scroll_y;
                             let tex_x = (x - dst_x) / display_zoom;
                             let tex_y = (y - dst_y) / display_zoom;
-
                             let (tile_x, tile_y) = screen_to_tile(
-                                tex_x, tex_y, rs.origin_x, rs.origin_y, rs.tile_w, rs.tile_h,
+                                tex_x, tex_y, rs.origin_x, rs.origin_y,
+                                rs.tile_w, rs.tile_h,
                             );
-
-                            // Find the island map for validation
-                            let island_map_idx = sim
-                                .island_maps
-                                .iter()
-                                .position(|m| m.island_id == island_number);
-
-                            // Climate gate: refuse to place a plantation
-                            // building whose output_good doesn't match the
-                            // island's climate.
-                            let isl = &islands[current_island];
-                            let climate = anno_sim::climate::climate_for_y(
-                                isl.y_pos as u32, 512,
+                            let outcome = try_place_building(
+                                &mut sim, &mut islands, current_island,
+                                &defs, &cod, &placer, tile_x, tile_y,
                             );
-                            let climate_ok = anno_sim::climate::allows_production(
-                                climate, def.output_good,
-                            );
-                            // Fisheries require any footprint tile to be on
-                            // the coast (i.e. adjacent to the island edge).
-                            let needs_coast = def.output_good == Good::Fish;
-                            let coast_ok = if needs_coast {
-                                if let Some(idx) = island_map_idx {
-                                    let map = &sim.island_maps[idx];
-                                    let mut any = false;
-                                    for dy in 0..bld_h as i32 {
-                                        for dx in 0..bld_w as i32 {
-                                            if map.is_coastal(tile_x + dx, tile_y + dy) {
-                                                any = true; break;
-                                            }
-                                        }
-                                        if any { break; }
-                                    }
-                                    any
-                                } else { false }
-                            } else { true };
-                            if !climate_ok {
-                                save_banner = Some((
-                                    format!(
-                                        "build FAILED: {:?} needs {} climate (this island is {})",
-                                        def.output_good,
-                                        match climate {
-                                            anno_sim::climate::Climate::North => "South",
-                                            anno_sim::climate::Climate::South => "North",
-                                        },
-                                        climate.label(),
-                                    ),
-                                    std::time::Instant::now(),
-                                ));
-                            } else if !coast_ok {
-                                save_banner = Some((
-                                    "build FAILED: Fisheries must be placed on the coast"
-                                        .to_string(),
-                                    std::time::Instant::now(),
-                                ));
-                            } else if let Some(map_idx) = island_map_idx {
-                                if can_place_building(
-                                    &islands[current_island], &sim.island_maps[map_idx],
-                                    tile_x, tile_y, bld_w, bld_h,
-                                ) {
-                                    // Materials are now trickled in by
-                                    // the entity tick — we just record
-                                    // what the building still needs and
-                                    // pay gold up front.
-                                    if sim.players[0].gold >= cost as i32 {
-                                        sim.players[0].gold -= cost as i32;
-
-                                        // Per-rotation sprite stride: each
-                                        // rotation slice occupies anim_anz *
-                                        // anim_add sprites (typically =
-                                        // footprint when not animated).
-                                        let cod_b = &cod.buildings[def_idx];
-                                        let rot_count = cod_b.rotate.max(1) as u8;
-                                        let orient = placer.orientation % rot_count;
-                                        let stride = (cod_b.anim_anz.max(1)
-                                            * cod_b.anim_add.max(1)) as usize;
-                                        let rot_offset = orient as usize * stride;
-
-                                        // Add tile records to the island for rendering
-                                        for dy in 0..bld_h as u8 {
-                                            for dx in 0..bld_w as u8 {
-                                                let tx = tile_x as u8 + dx;
-                                                let ty = tile_y as u8 + dy;
-                                                let tile_sprite = sprite_idx
-                                                    + rot_offset
-                                                    + dy as usize * bld_w as usize
-                                                    + dx as usize;
-                                                islands[current_island].tiles.push(IslandTile {
-                                                    x: tx,
-                                                    y: ty,
-                                                    building_id: tile_sprite as u16,
-                                                    orientation: orient,
-                                                    anim_count: 0,
-                                                    flags: 0,
-                                                });
-                                                // Mark tile as non-walkable
-                                                sim.island_maps[map_idx].set_walkable(
-                                                    tx as u16, ty as u16, false,
-                                                );
-                                            }
-                                        }
-
-                                        // Add building instance to simulation
-                                        let mut instance = BuildingInstance::new(
-                                            def_idx as u16,
-                                            island_number,
-                                            tile_x as u16,
-                                            tile_y as u16,
-                                            0, // human player
+                            match outcome {
+                                PlaceOutcome::Placed => {
+                                    println!(
+                                        "Placed {} at ({},{})",
+                                        &placer.buildable[placer.selected].name,
+                                        tile_x, tile_y,
+                                    );
+                                    if let (Some(sfx), Some(handle)) =
+                                        (place_sound_slot, &audio.stream_handle)
+                                    {
+                                        audio.waves.play_once(
+                                            sfx,
+                                            WINDOW_W as i32 / 2,
+                                            WINDOW_H as i32 / 2,
+                                            handle,
                                         );
-                                        // Seed input materials for production
-                                        if input1 != Good::None {
-                                            instance.input_1_stock = storage;
-                                        }
-                                        if input2 != Good::None {
-                                            instance.input_2_stock = storage;
-                                        }
-                                        // Construction time scales with footprint
-                                        // (larger buildings take longer): 2s per tile.
-                                        let footprint = (def.width as u32)
-                                            * (def.height as u32);
-                                        let build_ms = (2_000u32 * footprint).max(2_000);
-                                        instance.construction_ms_total = build_ms;
-                                        instance.construction_ms_remaining = build_ms;
-                                        // Trickle materials: warehouses
-                                        // will be drained as construction
-                                        // proceeds (entity tick).
-                                        instance.wood_needed = def.cost_wood;
-                                        instance.tools_needed = def.cost_tools;
-                                        instance.bricks_needed = def.cost_bricks;
-                                        sim.buildings.push(instance);
-
-                                        println!(
-                                            "Placed {} at ({},{}) on island {} [cost: {} gold]",
-                                            &placer.buildable[placer.selected].name,
-                                            tile_x, tile_y,
-                                            island_number,
-                                            cost,
-                                        );
-                                        // Play placement sound
-                                        if let (Some(sfx), Some(handle)) =
-                                            (place_sound_slot, &audio.stream_handle)
-                                        {
-                                            audio.waves.play_once(
-                                                sfx,
-                                                WINDOW_W as i32 / 2,
-                                                WINDOW_H as i32 / 2,
-                                                handle,
-                                            );
-                                        }
-                                        needs_redraw = true;
-                                    } else {
-                                        println!("Not enough gold! Need {}, have {}",
-                                            cost, sim.players[0].gold);
                                     }
+                                    needs_redraw = true;
+                                    last_drag_place_tile = Some((tile_x, tile_y));
+                                    drag_placing = true;
                                 }
+                                PlaceOutcome::NotEnoughGold { need, have } => {
+                                    save_banner = Some((
+                                        format!("Not enough gold (need {need}, have {have})"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                PlaceOutcome::WrongClimate { needs, actual } => {
+                                    save_banner = Some((
+                                        format!(
+                                            "build FAILED: needs {} climate (island is {})",
+                                            needs.label(), actual.label(),
+                                        ),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                PlaceOutcome::NotCoastal => {
+                                    save_banner = Some((
+                                        "build FAILED: Fisheries must be placed on the coast".into(),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                PlaceOutcome::BlockedByTerrain => {
+                                    // Silent — common case while
+                                    // dragging across mixed terrain.
+                                }
+                                PlaceOutcome::NoIslandMap
+                                | PlaceOutcome::NoBuildingSelected => {}
                             }
                         }
                     } else if demolish_mode && !world_mode {
@@ -2557,6 +2579,8 @@ fn main() {
                     ..
                 } => {
                     dragging = false;
+                    drag_placing = false;
+                    last_drag_place_tile = None;
                 }
 
                 Event::KeyUp { keycode: Some(k), .. }
@@ -2577,6 +2601,39 @@ fn main() {
                     if dragging && !placer.active {
                         scroll_x = x - drag_start.0;
                         scroll_y = y - drag_start.1;
+                    } else if drag_placing && placer.active && !world_mode {
+                        // Mass-place: each new tile under the cursor
+                        // gets a fresh placement attempt. Same gates
+                        // as a click; failures are silent (skipped
+                        // tiles let the player paint over mixed
+                        // terrain without spamming banners).
+                        if let Some(ref rs) = rendered {
+                            let dst_w = rs.width as i32 * display_zoom;
+                            let dst_h = rs.height as i32 * display_zoom;
+                            let dst_x = (WINDOW_W as i32 - dst_w) / 2 + scroll_x;
+                            let dst_y = (WINDOW_H as i32 - dst_h) / 2 + scroll_y;
+                            let tex_x = (x - dst_x) / display_zoom;
+                            let tex_y = (y - dst_y) / display_zoom;
+                            let (tile_x, tile_y) = screen_to_tile(
+                                tex_x, tex_y, rs.origin_x, rs.origin_y,
+                                rs.tile_w, rs.tile_h,
+                            );
+                            if last_drag_place_tile != Some((tile_x, tile_y)) {
+                                let outcome = try_place_building(
+                                    &mut sim, &mut islands, current_island,
+                                    &defs, &cod, &placer, tile_x, tile_y,
+                                );
+                                if matches!(outcome, PlaceOutcome::Placed) {
+                                    needs_redraw = true;
+                                    last_drag_place_tile = Some((tile_x, tile_y));
+                                } else {
+                                    // Track the cursor anyway so we
+                                    // don't keep retrying the same
+                                    // failed tile every motion event.
+                                    last_drag_place_tile = Some((tile_x, tile_y));
+                                }
+                            }
+                        }
                     }
                 }
 
