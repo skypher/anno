@@ -51,7 +51,7 @@ pub const FREE_TRADER_SLOT: u8 = 5;
 pub const NATIVE_SLOT: u8 = 4;
 
 // Visit count and dock duration. Anno 1602 manual section 8.1
-// "Free traders" + section 11.4.3 "Placing ships" tell us:
+// "Free traders" + section 11.4.3 "Placing ships" + binary RE:
 //
 //   - Traders keep circulating between Kontors as long as there are
 //     two or more warehouses in the island chain. They don't pick a
@@ -59,23 +59,27 @@ pub const NATIVE_SLOT: u8 = 4;
 //     dynamically when their target changes (see `1602_exe.c:50289`
 //     returning `&DAT_004cf358 + iVar3 * 0x218` after
 //     `FUN_004488d0` picks a new target).
+//   - `1602_exe.c:58597 FUN_004547e0` (port-finder helper) iterates
+//     up to `0x4b` (75) candidate slots by walking
+//     `&DAT_005dbafa` with stride 600 bytes. It keeps the 12 nearest
+//     ports (`if (local_68 < 0xc)`) sorted by Manhattan distance
+//     `(dx + dy/4)` (the `>> 2` quartering matches Anno's vertical-
+//     compression-aware metric).
+//   - `1602_exe.c:58701 FUN_004549f0` is the per-port profit
+//     scorer: for each good 2..0x19 (25 goods, matching the
+//     `text.cod [WARE]` block) it sums
+//     `(supply * 0xa6 >> 7 - other) * qty + (sell - buy) * qty`.
+//     The 0xa6 (= 166) is the base trade multiplier. The trader
+//     picks the highest-scoring port.
 //   - Per-good exchange amounts come from the player's buy/sell
-//     sliders set at the warehouse: section 8.1 explains that the
-//     player sets a sell-floor ("everything left of the mark stays
-//     in the warehouse, while everything to the right of it will be
-//     sold") and a buy-ceiling ("the free traders will keep selling
-//     you the chosen product, up to the desired amount").
+//     sliders (manual 8.1).
 //
-// We honour the per-warehouse sliders directly (`Warehouse::sell_offer`
-// / `Warehouse::buy_demand`). `VISITS_BEFORE_LEAVING` is a soft cap
-// so the same ship doesn't loop forever in our simplified world; the
-// pool size is enforced by `Simulation::tick_free_traders` matching
-// `target_traders = active_kontors / 2`.
-//
-// `DOCK_TICKS` is how many ticks the ship stays at each Kontor
-// before sailing on. Tick rate is 10 Hz / 600 per minute (decoded
-// from `1602_exe.c:98053`); 5 dock-ticks = 0.5 s.
-const VISITS_BEFORE_LEAVING: u8 = 3;
+// `VISITS_BEFORE_LEAVING = 12` matches the binary's `local_68 < 0xc`
+// candidate-ports cap. `DOCK_TICKS = 5` is the dwell time in our
+// 10 Hz tick rate (= 0.5 s) — the binary's exact dwell counter
+// hasn't been located but the per-tick `(rand() & 3) == 0`
+// re-target gate at `:57713` already enforces a stochastic dwell.
+const VISITS_BEFORE_LEAVING: u8 = 12;
 const DOCK_TICKS: u8 = 5;
 
 /// Initial inventory of a freshly-spawned free trader.

@@ -955,6 +955,20 @@ fn main() {
     let voice_attack_slot = audio.waves.load("SAMPLES/piraten.wav")
         .or_else(|| audio.waves.load("SAMPLES/Piraten.wav"))
         .or_else(|| voice_stockpile_slot);
+    // Volcano eruption — RE: `1602_exe.c:106445-447` loads
+    // vulkan1.wav .. vulkan3.wav into DAT_005b5ed4..5edc; the
+    // figuren.cod VULKAN figure plays one of them via `WAV_VULKAN1, 3`
+    // (the `, 3` is the random-pick range). We pick #1 deterministically
+    // since our event_log doesn't yet propagate the per-event RNG.
+    let voice_volcano_slot = audio.waves.load("SAMPLES/vulkan1.wav")
+        .or_else(|| audio.waves.load("SAMPLES/Vulkan1.wav"))
+        .or_else(|| audio.waves.load("SAMPLES/vulkan2.wav"))
+        .or_else(|| voice_stockpile_slot);
+    // Fire — no dedicated vulkan-style sample; reuse the generic
+    // event.wav alert. Manual sec. fire is a building-level disaster
+    // signalled by the BRANDMARKT figure (visual) plus the event
+    // sound; no specific WAV exists in SAMPLES/ for it.
+    let voice_fire_slot = voice_stockpile_slot;
 
     // SDL2 setup
     let sdl = sdl2::init().expect("SDL2 init failed");
@@ -2826,10 +2840,23 @@ fn main() {
                         voice_trader_slot
                     } else if line.starts_with("[combat]") || line.contains("attack") {
                         voice_attack_slot
+                    } else if line.starts_with("[volcano]") {
+                        voice_volcano_slot
+                    } else if line.starts_with("[fire]") {
+                        voice_fire_slot
                     } else if line.contains("treasury") || line.contains("bankrupt") {
                         voice_treasury_slot
                     } else if line.starts_with("[supply]") || line.contains("low on") {
                         voice_stockpile_slot
+                    } else if line.starts_with("[diplo]")
+                        || line.starts_with("[outcome]")
+                        || line.starts_with("[obj]")
+                    {
+                        voice_trader_slot // triumph.wav for positive
+                                          // diplomacy / objective /
+                                          // victory events
+                    } else if line.starts_with("[defeat]") {
+                        voice_attack_slot
                     } else {
                         None
                     };

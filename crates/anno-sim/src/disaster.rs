@@ -15,11 +15,17 @@
 //!   pipeline (`combat::DamageEvent`, `BuildingInstance::health`)
 //!   instead of adding a separate ruin record.
 //!
-//! Cadences are SPECULATIVE — the binary's exact eruption /
-//! ignition probabilities live in functions not yet decoded. We use
-//! a low per-tick chance keyed off the existing event-tick rate
-//! (`tick_events` 10 000 ms) so disasters are rare but possible
-//! through a long game.
+//! Per-building fire damage cap is RE-cited:
+//! - `haeuser.cod` building defaults `Maxbrand: 4` — the per-
+//!   building maximum number of fire-damage ticks before the
+//!   building burns out. The COD parser at `1602_exe.c:68086`
+//!   (`s_Maxbrand_0049a288`) reads this field at HAUS_PRODTYP
+//!   level. Below: `MAX_BRAND_DAMAGE_TICKS = 4`.
+//!
+//! Eruption / ignition probabilities remain SPECULATIVE — those
+//! live in dispatcher functions not yet located. We gate spawns on
+//! the existing event-tick rate (`tick_events` 10 000 ms) so the
+//! disaster cadence stays sane in long games.
 
 use crate::building::BuildingInstance;
 use crate::combat::DamageEvent;
@@ -30,6 +36,13 @@ pub const FIRE_IGNITION_GATE: u64 = 8;
 
 /// Damage applied to a building when fire ticks. SPECULATIVE.
 pub const FIRE_TICK_DAMAGE: u16 = 5;
+
+/// Maximum fire damage ticks a single building can absorb before
+/// burnout. RE: `haeuser.cod` default `Maxbrand: 4` (parsed at
+/// `1602_exe.c:68086`). Each `ignite_building` call counts as one
+/// tick; multiplied by `FIRE_TICK_DAMAGE` this caps total fire hp
+/// loss per ignition cycle at 20.
+pub const MAX_BRAND_DAMAGE_TICKS: u16 = 4;
 
 /// Probability gate (1-in-N) that a fire on a building this tick
 /// extinguishes naturally. SPECULATIVE.
