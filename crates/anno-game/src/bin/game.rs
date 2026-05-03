@@ -498,6 +498,32 @@ impl BuildingPlacer {
 
 /// Convert screen pixel coordinates to isometric tile coordinates.
 /// Returns (tile_x, tile_y) relative to the island origin.
+/// Apply a `figuren.cod` formation to the selected military units,
+/// anchored at the formation leader's current tile (offset 0). Each
+/// unit's `target_x/y` is set to its slot in the formation; the
+/// existing `combat::tick_unit_orders_with_ocean` then walks them
+/// into shape.
+fn apply_formation(
+    units: &mut [anno_sim::combat::MilitaryUnit],
+    selected: &[usize],
+    formation: anno_sim::formation::Formation,
+) {
+    let anchor = match selected.first().and_then(|&i| units.get(i)) {
+        Some(u) => (u.tile_x, u.tile_y),
+        None => return,
+    };
+    for (slot, &i) in selected.iter().enumerate() {
+        if let Some(u) = units.get_mut(i) {
+            if !u.is_alive() { continue; }
+            let (tx, ty) = formation.place(slot, anchor.0, anchor.1);
+            u.target_x = tx;
+            u.target_y = ty;
+            u.combat_target = -1;
+            u.move_timer_ms = 0;
+        }
+    }
+}
+
 fn screen_to_tile(
     screen_x: i32,
     screen_y: i32,
@@ -889,6 +915,10 @@ fn main() {
     let mut minimap_clicked = false;
     let mut minimap_click_x: i32 = 0;
     let mut minimap_click_y: i32 = 0;
+    // Anno-style "click a building to see its info window". Left-click
+    // on a non-empty tile sets this; the renderer paints a small info
+    // card at top-left.
+    let mut selected_building_idx: Option<usize> = None;
 
     /// Inspection state — what the player has right-clicked on.
     struct Inspection {
@@ -1041,6 +1071,8 @@ fn main() {
                         draft_route_stops.clear();
                     } else if !selected_units.is_empty() {
                         selected_units.clear();
+                    } else if selected_building_idx.is_some() {
+                        selected_building_idx = None;
                     } else if inspection.is_some() {
                         inspection = None;
                     } else {
@@ -1416,6 +1448,35 @@ fn main() {
                                         a: 0,
                                         b: diplomacy_target,
                                         state: next,
+                                    },
+                                );
+                            }
+                            Keycode::G => {
+                                // "Pay tribute" — gift 500 gold to
+                                // the selected target. Manual section
+                                // on diplomacy: tribute is a per-
+                                // diplomacy-panel action, not a
+                                // separate menu.
+                                let amount = if shift_held { 5_000 } else { 500 };
+                                sim.apply_command(
+                                    &anno_sim::commands::Command::GiftGold {
+                                        from: 0,
+                                        to: diplomacy_target,
+                                        amount,
+                                    },
+                                );
+                            }
+                            Keycode::T => {
+                                // Gift 25 Tools (or 100 with Shift)
+                                // to the selected target — convenient
+                                // for early-game alliance support.
+                                let qty = if shift_held { 100 } else { 25 };
+                                sim.apply_command(
+                                    &anno_sim::commands::Command::GiftGoods {
+                                        from: 0,
+                                        to: diplomacy_target,
+                                        good: Good::Tools,
+                                        qty,
                                     },
                                 );
                             }
@@ -1856,19 +1917,37 @@ fn main() {
                                 display_zoom = (display_zoom - 1).max(1);
                             }
                             Keycode::Num1 => {
-                                if sprite_zoom != 0 {
+                                if !selected_units.is_empty() {
+                                    apply_formation(
+                                        &mut sim.military_units,
+                                        &selected_units,
+                                        anno_sim::formation::Formation::Hori,
+                                    );
+                                } else if sprite_zoom != 0 {
                                     sprite_zoom = 0;
                                     needs_redraw = true;
                                 }
                             }
                             Keycode::Num2 => {
-                                if sprite_zoom != 1 && !sprites_by_zoom[1].is_empty() {
+                                if !selected_units.is_empty() {
+                                    apply_formation(
+                                        &mut sim.military_units,
+                                        &selected_units,
+                                        anno_sim::formation::Formation::Vert,
+                                    );
+                                } else if sprite_zoom != 1 && !sprites_by_zoom[1].is_empty() {
                                     sprite_zoom = 1;
                                     needs_redraw = true;
                                 }
                             }
                             Keycode::Num3 => {
-                                if sprite_zoom != 2 && !sprites_by_zoom[2].is_empty() {
+                                if !selected_units.is_empty() {
+                                    apply_formation(
+                                        &mut sim.military_units,
+                                        &selected_units,
+                                        anno_sim::formation::Formation::Quad,
+                                    );
+                                } else if sprite_zoom != 2 && !sprites_by_zoom[2].is_empty() {
                                     sprite_zoom = 2;
                                     needs_redraw = true;
                                 }
@@ -2257,17 +2336,56 @@ fn main() {
                                 selected_units.clear();
                                 selected_units.push(ui);
                             }
+                            selected_building_idx = None;
                             println!(
                                 "Selected {} unit(s)",
                                 selected_units.len(),
                             );
                         } else {
-                            // Empty-area click clears selection, then starts drag
-                            if !selected_units.is_empty() {
-                                selected_units.clear();
+                            // No unit hit — try a building hit to open
+                            // the Anno-style info card. Falls through
+                            // to drag-pan if no building is under the
+                            // cursor either.
+                            let mut hit_building: Option<usize> = None;
+                            if !world_mode {
+                                if let Some(ref rs) = rendered {
+                                    let dst_w = rs.width as i32 * display_zoom;
+                                    let dst_h = rs.height as i32 * display_zoom;
+                                    let dst_x = (WINDOW_W as i32 - dst_w) / 2 + scroll_x;
+                                    let dst_y = (WINDOW_H as i32 - dst_h) / 2 + scroll_y;
+                                    let tex_x = (x - dst_x) / display_zoom;
+                                    let tex_y = (y - dst_y) / display_zoom;
+                                    let (tile_x, tile_y) = screen_to_tile(
+                                        tex_x, tex_y, rs.origin_x, rs.origin_y,
+                                        rs.tile_w, rs.tile_h,
+                                    );
+                                    let island_id = islands[current_island].number;
+                                    hit_building = sim.buildings.iter().position(|b| {
+                                        b.active && b.island_id == island_id && {
+                                            let def = &defs[b.def_id as usize];
+                                            let bx = b.tile_x as i32;
+                                            let by = b.tile_y as i32;
+                                            tile_x >= bx
+                                                && tile_x < bx + def.width as i32
+                                                && tile_y >= by
+                                                && tile_y < by + def.height as i32
+                                        }
+                                    });
+                                }
                             }
-                            dragging = true;
-                            drag_start = (x - scroll_x, y - scroll_y);
+                            if hit_building.is_some() {
+                                selected_building_idx = hit_building;
+                                if !selected_units.is_empty() {
+                                    selected_units.clear();
+                                }
+                            } else {
+                                selected_building_idx = None;
+                                if !selected_units.is_empty() {
+                                    selected_units.clear();
+                                }
+                                dragging = true;
+                                drag_start = (x - scroll_x, y - scroll_y);
+                            }
                         }
                     }
                 }
@@ -3907,7 +4025,7 @@ fn main() {
             tiny_font::draw_str(
                 &mut buf, panel_w, panel_h,
                 4, 4 + line_h,
-                "Up/Down=player Left/Right=cycle",
+                "Up/Dn pick  Lt/Rt cycle  G gold  T tools",
                 [0xAA, 0xAA, 0xAA, 0xFF], dscale,
             );
             // Per-counterpart rows
@@ -4232,6 +4350,100 @@ fn main() {
                 let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
                 let ty = 60i32;
                 canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+            }
+        }
+
+        // Building info card. Anno surfaced building info this way:
+        // click a building, see a small floating window with name +
+        // production status. Closes when the player clicks something
+        // else, presses Esc, or the building is destroyed.
+        if let Some(bi) = selected_building_idx {
+            if bi >= sim.buildings.len() || !sim.buildings[bi].active {
+                selected_building_idx = None;
+            } else {
+                let b = &sim.buildings[bi];
+                let def = &defs[b.def_id as usize];
+                let name = cod.buildings.get(b.def_id as usize)
+                    .and_then(|p| p.properties.get("Name").cloned())
+                    .unwrap_or_else(|| format!("Bldg#{}", b.def_id));
+                let mut lines: Vec<String> = vec![
+                    format!("{} (Esc close)", name),
+                    format!("at ({},{}) island {} owner {}",
+                        b.tile_x, b.tile_y, b.island_id, b.owner),
+                    format!("size {}x{}  hp {}/{}",
+                        def.width, def.height, b.health,
+                        anno_sim::building::BUILDING_MAX_HEALTH),
+                ];
+                if !b.is_built() {
+                    let pct = if def.cost_wood + def.cost_tools + def.cost_bricks == 0 {
+                        100
+                    } else {
+                        let needed = (b.wood_needed + b.tools_needed + b.bricks_needed) as u32;
+                        let total = (def.cost_wood + def.cost_tools + def.cost_bricks) as u32;
+                        100 - (needed * 100 / total.max(1))
+                    };
+                    lines.push(format!("under construction ({}%)", pct));
+                    lines.push(format!("needs wood:{} tools:{} bricks:{}",
+                        b.wood_needed, b.tools_needed, b.bricks_needed));
+                }
+                if def.output_good != Good::None {
+                    lines.push(format!(
+                        "produces {:?}: {}/{}  eff {}%",
+                        def.output_good, b.output_stock, def.storage_capacity,
+                        b.efficiency as u32 * 100 / 128,
+                    ));
+                    if def.input_good_1 != Good::None {
+                        lines.push(format!(
+                            "in1 {:?}: {}",
+                            def.input_good_1, b.input_1_stock,
+                        ));
+                    }
+                    if def.input_good_2 != Good::None {
+                        lines.push(format!(
+                            "in2 {:?}: {}",
+                            def.input_good_2, b.input_2_stock,
+                        ));
+                    }
+                }
+                if def.prod_kind == "WOHN" {
+                    let tier_name = match b.house_tier {
+                        0 => "Pioneer", 1 => "Settler", 2 => "Citizen",
+                        3 => "Merchant", _ => "Aristocrat",
+                    };
+                    lines.push(format!("residence tier: {}", tier_name));
+                }
+                if def.maintenance_cost > 0 {
+                    lines.push(format!("upkeep: {}/tick", def.maintenance_cost));
+                }
+                let scale = 1u32;
+                let line_h = (5 * scale + 3) as i32;
+                let panel_w = 280u32;
+                let panel_h = (8 + line_h * lines.len() as i32) as u32;
+                let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+                for i in 0..(panel_w * panel_h) as usize {
+                    buf[i * 4] = 0;
+                    buf[i * 4 + 1] = 0;
+                    buf[i * 4 + 2] = 0x18;
+                    buf[i * 4 + 3] = 220;
+                }
+                tiny_font::draw_str(
+                    &mut buf, panel_w, panel_h,
+                    4, 4, &lines[0], [0xFF, 0xD7, 0x00, 0xFF], scale,
+                );
+                for (i, line) in lines.iter().enumerate().skip(1) {
+                    tiny_font::draw_str(
+                        &mut buf, panel_w, panel_h,
+                        4, 4 + i as i32 * line_h, line,
+                        [0xCC, 0xCC, 0xCC, 0xFF], scale,
+                    );
+                }
+                if let Ok(mut tex) = texture_creator
+                    .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+                {
+                    tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                    tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                    canvas.copy(&tex, None, Some(Rect::new(8, 60, panel_w, panel_h))).ok();
+                }
             }
         }
 

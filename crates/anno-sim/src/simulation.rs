@@ -1547,6 +1547,55 @@ impl Simulation {
                 }
                 false
             }
+            Command::GiftGold { from, to, amount } => {
+                if amount <= 0 { return false; }
+                let fi = from as usize;
+                let ti = to as usize;
+                if fi >= self.players.len() || ti >= self.players.len()
+                    || fi == ti
+                {
+                    return false;
+                }
+                let send = amount.min(self.players[fi].gold.max(0));
+                if send <= 0 { return false; }
+                self.players[fi].gold -= send;
+                self.players[ti].gold += send;
+                self.event_log.push(format!(
+                    "[gift] p{from} sent {send} gold to p{to}",
+                ));
+                true
+            }
+            Command::GiftGoods { from, to, good, qty } => {
+                if qty == 0 || from == to { return false; }
+                // Withdraw from sender's first warehouse with stock.
+                let from_idx = self.warehouses.iter().position(|w| {
+                    w.active && w.owner == from && w.stock(good) > 0
+                });
+                let Some(fi) = from_idx else { return false; };
+                let took = self.warehouses[fi].withdraw(good, qty);
+                if took == 0 { return false; }
+                // Deposit into recipient's first active warehouse with
+                // free space; refund any remainder to the sender.
+                let to_idx = self.warehouses.iter().position(|w| {
+                    w.active && w.owner == to
+                });
+                if let Some(ti) = to_idx {
+                    let placed = self.warehouses[ti].deposit(good, took);
+                    let leftover = took - placed;
+                    if leftover > 0 {
+                        // Recipient was full — return what didn't fit.
+                        self.warehouses[fi].deposit(good, leftover);
+                    }
+                    self.event_log.push(format!(
+                        "[gift] p{from} sent {placed} {good:?} to p{to}",
+                    ));
+                    placed > 0
+                } else {
+                    // No recipient warehouse — refund and fail.
+                    self.warehouses[fi].deposit(good, took);
+                    false
+                }
+            }
         }
     }
 
@@ -2278,6 +2327,61 @@ mod tests {
 
         sim.evaluate_outcomes();
         assert_eq!(sim.outcome, GameOutcome::Victory);
+    }
+
+    #[test]
+    fn gift_gold_transfers_and_clamps_to_balance() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[0].gold = 5_000;
+        sim.players[1].gold = 100;
+        let ok = sim.apply_command(&crate::commands::Command::GiftGold {
+            from: 0, to: 1, amount: 1_500,
+        });
+        assert!(ok);
+        assert_eq!(sim.players[0].gold, 3_500);
+        assert_eq!(sim.players[1].gold, 1_600);
+        // Clamp to balance.
+        let _ = sim.apply_command(&crate::commands::Command::GiftGold {
+            from: 0, to: 1, amount: 999_999,
+        });
+        assert_eq!(sim.players[0].gold, 0);
+        assert_eq!(sim.players[1].gold, 5_100);
+    }
+
+    #[test]
+    fn gift_goods_moves_between_warehouses() {
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
+        sim.warehouses.push(Warehouse::new(1, 1, 60, 60));
+        sim.warehouses[0].deposit(Good::Tools, 25);
+        let ok = sim.apply_command(&crate::commands::Command::GiftGoods {
+            from: 0, to: 1, good: Good::Tools, qty: 20,
+        });
+        assert!(ok);
+        assert_eq!(sim.warehouses[0].stock(Good::Tools), 5);
+        assert_eq!(sim.warehouses[1].stock(Good::Tools), 20);
+    }
+
+    #[test]
+    fn gift_self_or_zero_rejected() {
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players[0].gold = 5_000;
+        assert!(!sim.apply_command(&crate::commands::Command::GiftGold {
+            from: 0, to: 0, amount: 100,
+        }));
+        assert!(!sim.apply_command(&crate::commands::Command::GiftGoods {
+            from: 0, to: 0, good: Good::Tools, qty: 1,
+        }));
+        assert!(!sim.apply_command(&crate::commands::Command::GiftGold {
+            from: 0, to: 1, amount: 0,
+        }));
     }
 
     #[test]

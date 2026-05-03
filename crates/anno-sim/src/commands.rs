@@ -23,6 +23,15 @@ pub enum Command {
     Buy { player: u8, good: Good, qty: u16 },
     /// Sell `qty` of `good` at the current market price (credits gold).
     Sell { player: u8, good: Good, qty: u16 },
+    /// Send a gift of gold from `from` to `to`. Anno 1602 manual:
+    /// `Pay tribute` action in the diplomacy panel — players may
+    /// transfer gold to another player at any time. We allow only
+    /// non-negative amounts and clamp to the sender's balance.
+    GiftGold { from: u8, to: u8, amount: i32 },
+    /// Send a gift of `qty` `good` from `from` to `to` via their
+    /// active warehouses. Drains from the sender's first matching
+    /// warehouse, deposits into the recipient's first matching one.
+    GiftGoods { from: u8, to: u8, good: Good, qty: u16 },
 }
 
 impl Command {
