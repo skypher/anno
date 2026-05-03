@@ -117,12 +117,51 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         }
     };
 
+    // Map COD building Kind / HAUS_PRODTYP Kind to internal category
+    // and ProductionType. Kinds enumerated from haeuser.cod (top-level
+    // `Kind:` values).
+    use crate::types::ProductionType;
+    let category: u8 = match cod_building.kind.as_str() {
+        // Terrain / nature.
+        "BODEN" | "WALD" | "FELS" | "STRAND" | "MEER" | "FLUSS"
+        | "FLUSSECK" | "MUENDUNG" | "HANG" | "HANGECK" | "HANGQUELL"
+        | "BRANDUNG" | "BRANDECK" | "STRANDECKA" | "STRANDECKI"
+        | "STRANDMUND" | "STRANDRUINE" | "STRANDVARI" | "STRANDHAUS"
+        | "WEIDETIER" | "MAUERSTRAND" | "TURMSTRAND" => 0,
+        // Residential.
+        "WOHNUNG" | "PIRATWOHN" => 1,
+        // Production / industry / raw materials.
+        "HANDWERK" | "PLANTAGE" | "ROHSTOFF" | "ROHSTERZ"
+        | "ROHSTWACHS" | "BERGWERK" | "STEINBRUCH" | "MINE"
+        | "JAGDHAUS" | "FISCHEREI" | "WMUEHLE" => 2,
+        // Public services and culture.
+        "KAPELLE" | "KIRCHE" | "SCHULE" | "HOCHSCHULE" | "THEATER"
+        | "BADEHAUS" | "BRUNNEN" | "WIRT" | "DENKMAL" | "TRIUMPH"
+        | "KLINIK" | "GALGEN" | "MARKT" | "PLATZ" => 3,
+        // Trade / harbour.
+        "KONTOR" | "HAFEN" | "WERFT" | "PIER" => 4,
+        // Military.
+        "MILITAR" | "MAUER" | "TOR" | "TURM" | "WACHTURM" | "SCHLOSS" => 5,
+        // Transport.
+        "STRASSE" | "BRUECKE" => 6,
+        // Generic / catch-all.
+        _ => 7,
+    };
+    let production_type = match prod_kind_str {
+        "HANDWERK" | "BAECKER" => ProductionType::Craft,
+        "PLANTAGE" | "ROHSTOFF" | "ROHSTERZ" | "ROHSTWACHS"
+        | "JAGDHAUS" | "FISCHEREI" | "WEIDETIER" => ProductionType::Plantation,
+        "BERGWERK" | "STEINBRUCH" | "MINE" => ProductionType::Mine,
+        "WOHNUNG" => ProductionType::Residence,
+        _ => ProductionType::Craft,
+    };
+
     BuildingDef {
         id: cod_building.nummer as u16,
-        category: 0, // TODO: map from Kind
+        category,
         width: cod_building.size.0 as u8,
         height: cod_building.size.1 as u8,
-        production_type: crate::types::ProductionType::Craft, // TODO: map from Kind
+        production_type,
         kind: cod_building.kind.clone(),
         prod_kind: prod_kind_str.to_string(),
         radius,
@@ -295,6 +334,27 @@ mod tests {
         assert!(
             production.len() >= 20,
             "expected >= 20 production buildings"
+        );
+
+        // Sanity-check the category/production_type mapping landed.
+        let any_residence = defs.iter().any(|d|
+            d.production_type == crate::types::ProductionType::Residence
+        );
+        let any_plantation = defs.iter().any(|d|
+            d.production_type == crate::types::ProductionType::Plantation
+        );
+        let any_mine = defs.iter().any(|d|
+            d.production_type == crate::types::ProductionType::Mine
+        );
+        assert!(any_residence, "expected at least one Residence");
+        assert!(any_plantation, "expected at least one Plantation");
+        assert!(any_mine, "expected at least one Mine");
+        let cat_used: std::collections::HashSet<u8> =
+            defs.iter().map(|d| d.category).collect();
+        assert!(
+            cat_used.len() >= 4,
+            "category mapping should produce multiple categories, got {:?}",
+            cat_used,
         );
     }
 

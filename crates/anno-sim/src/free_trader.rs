@@ -212,12 +212,17 @@ pub fn dock_trade(
     // 1. Sell from trader stock → warehouse, capped by the player's
     //    buy-slider ceiling (manual 8.1 "the free traders will keep
     //    selling you the chosen product, up to the desired amount").
+    //    Honour the player's optional buy-price override: trader will
+    //    not sell to the player below its standard ask.
     let stock_snapshot: Vec<(Good, u16)> = trader.stock.clone();
     for (good, available) in stock_snapshot {
         if available == 0 { continue; }
         let demand = wh.buy_demand(good);
         if demand == 0 { continue; }
-        let price = crate::prices::price_of(good).buy as i32;
+        let standard_buy = crate::prices::price_of(good).buy as i32;
+        let offered_price = wh.slider(good).buy_price.unwrap_or(standard_buy);
+        if offered_price < standard_buy { continue; }
+        let price = offered_price;
         if *player_gold < price { continue; }
         let max_aff = (*player_gold / price.max(1)) as u16;
         let qty = available.min(demand).min(max_aff);
@@ -232,7 +237,9 @@ pub fn dock_trade(
     // 2. Buy surplus from warehouse → trader, down to the player's
     //    sell-slider floor (manual 8.1 "everything left of the mark
     //    you set with the slider will remain in the warehouse, while
-    //    everything to the right of it will be sold").
+    //    everything to the right of it will be sold"). The trader
+    //    only accepts the player's ask if it's at-or-below its
+    //    standard sell-price.
     let offers: Vec<(Good, u16)> = wh
         .all_stock()
         .into_iter()
@@ -242,7 +249,10 @@ pub fn dock_trade(
         })
         .collect();
     for (good, qty) in offers {
-        let price = crate::prices::price_of(good).sell as i32;
+        let standard_sell = crate::prices::price_of(good).sell as i32;
+        let asked_price = wh.slider(good).sell_price.unwrap_or(standard_sell);
+        if asked_price > standard_sell { continue; }
+        let price = asked_price;
         let withdrawn = wh.withdraw(good, qty);
         if withdrawn > 0 {
             trader.deposit_stock(good, withdrawn);
@@ -390,6 +400,41 @@ mod tests {
         assert!(trader.stock_amount(Good::Wool) > 0);
         assert_eq!(whs[0].stock(Good::Wool), 30);
         assert!(gold > 0);
+    }
+
+    #[test]
+    fn dock_trade_rejects_underpaid_buy_offer() {
+        // Player offers less than the trader's standard buy price for
+        // Tools — trader walks away (no sale).
+        let mut whs = vec![mk_wh(0, 0, 5, 5)];
+        whs[0].set_buy_max_stock(Good::Tools, Some(20));
+        let standard = crate::prices::price_of(Good::Tools).buy as i32;
+        whs[0].set_buy_price(Good::Tools, Some(standard - 1));
+        let mut trader = FreeTrader::spawn_at(5, 5);
+        trader.target_warehouse = Some(0);
+        let mut gold = 5_000;
+        let _ = dock_trade(&mut trader, &mut whs, &mut gold);
+        assert_eq!(whs[0].stock(Good::Tools), 0);
+        assert_eq!(gold, 5_000);
+    }
+
+    #[test]
+    fn dock_trade_rejects_overpriced_sell_offer() {
+        // Player asks more than the trader's standard sell price for
+        // Wool — trader walks away.
+        let mut whs = vec![mk_wh(0, 0, 5, 5)];
+        whs[0].set_capacity(Good::Wool, 200);
+        whs[0].deposit(Good::Wool, 200);
+        whs[0].set_sell_min_keep(Good::Wool, Some(30));
+        let standard = crate::prices::price_of(Good::Wool).sell as i32;
+        whs[0].set_sell_price(Good::Wool, Some(standard + 1));
+        let mut trader = FreeTrader::spawn_at(5, 5);
+        trader.target_warehouse = Some(0);
+        trader.stock.clear();
+        let mut gold = 0;
+        let _ = dock_trade(&mut trader, &mut whs, &mut gold);
+        assert_eq!(trader.stock_amount(Good::Wool), 0);
+        assert_eq!(gold, 0);
     }
 
     #[test]

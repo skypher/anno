@@ -18,6 +18,12 @@ pub enum Objective {
     AccumulateGold { amount: i32 },
     /// Player has at least `qty` of `good` summed across active warehouses.
     StockGood { good: Good, qty: u32 },
+    /// Player holds a simultaneous monopoly on every listed good. A
+    /// player has a monopoly on a good when they are the only player
+    /// with at least one production building producing it. Manual
+    /// section 11.7.2.4: "You may also set the attainment of two
+    /// monopolies simultaneously as the assignment goal."
+    Monopolies { goods: Vec<Good> },
 }
 
 impl Objective {
@@ -38,6 +44,11 @@ impl Objective {
             }
             Objective::StockGood { good, qty } => {
                 format!("Stockpile {qty} {:?}", good)
+            }
+            Objective::Monopolies { goods } => {
+                let names: Vec<String> = goods.iter()
+                    .map(|g| format!("{g:?}")).collect();
+                format!("Monopoly: {}", names.join(" + "))
             }
         }
     }
@@ -91,6 +102,23 @@ impl ObjectiveSet {
                         .sum();
                     total >= *qty
                 }
+                Objective::Monopolies { goods } => {
+                    // For every listed good: the owner produces it
+                    // somewhere, and no other player does.
+                    goods.iter().all(|g| {
+                        let mut me = false;
+                        let mut other = false;
+                        for b in buildings {
+                            if !b.active || !b.is_built() { continue; }
+                            let def_id = b.def_id as usize;
+                            if def_id >= defs.len() { continue; }
+                            if defs[def_id].output_good != *g { continue; }
+                            if b.owner == owner { me = true; }
+                            else { other = true; }
+                        }
+                        me && !other
+                    })
+                }
             };
             if met {
                 *done = true;
@@ -137,6 +165,50 @@ mod tests {
         let done = set.evaluate(&p, &[], &[], &[], 0);
         assert_eq!(done, vec![0]);
         assert_eq!(set.progress(), (1, 1));
+    }
+
+    #[test]
+    fn monopoly_completes_when_only_owner_produces() {
+        use crate::building::{BuildingDef, BuildingInstance};
+        use crate::types::ProductionType;
+        let mk_def = |out: Good| BuildingDef {
+            id: 0, category: 2, width: 1, height: 1,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: out, input_good_1: Good::None, input_good_2: Good::None,
+            output_rate: 1, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 0, cycle_time_ms: 0, carrier_interval_ms: 0,
+            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+        };
+        let defs = vec![mk_def(Good::Tools), mk_def(Good::Cloth)];
+        let mk_b = |def_id: u16, owner: u8| {
+            let mut b = BuildingInstance::new(def_id, 0, 1, 1, owner);
+            b.construction_ms_remaining = 0;
+            b
+        };
+        let buildings = vec![
+            mk_b(0, 0), // owner 0: Tools
+            mk_b(1, 0), // owner 0: Cloth
+        ];
+        let p = Player::new_human(0);
+        let mut set = ObjectiveSet::new(vec![
+            Objective::Monopolies {
+                goods: vec![Good::Tools, Good::Cloth],
+            },
+        ]);
+        let done = set.evaluate(&p, &buildings, &defs, &[], 0);
+        assert_eq!(done, vec![0]);
+
+        // If a rival also builds Tools, the monopoly is broken — but
+        // the objective doesn't revert (objectives are sticky).
+        let mut set2 = ObjectiveSet::new(vec![
+            Objective::Monopolies { goods: vec![Good::Tools] },
+        ]);
+        let buildings2 = vec![mk_b(0, 0), mk_b(0, 1)];
+        let done2 = set2.evaluate(&p, &buildings2, &defs, &[], 0);
+        assert!(done2.is_empty(), "rival production blocks monopoly");
     }
 
     #[test]

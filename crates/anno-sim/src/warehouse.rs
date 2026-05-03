@@ -38,6 +38,13 @@ pub struct Warehouse {
 }
 
 /// Per-good free-trader sliders. See `Warehouse::sliders` doc-comment.
+///
+/// Manual section 8.1 lets the player drag *two* sliders per
+/// storeroom: one for the price and one for the quantity. We model
+/// both: the quantity sliders gate which goods the trader trades and
+/// at what threshold; the price overrides nudge the player's
+/// effective buy/sell rates above or below the standard
+/// `prices::price_of` values.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct TradeSlider {
     /// Sell-to-trader floor: keep at least this many in stock.
@@ -46,6 +53,16 @@ pub struct TradeSlider {
     /// Buy-from-trader ceiling: top up to at most this many in stock.
     /// `None` = don't buy this good.
     pub buy_max_stock: Option<u16>,
+    /// Optional override for the price the player asks when selling
+    /// this good to the trader. `None` = use `prices::price_of`. The
+    /// trader will only buy when this is at-or-below its standard
+    /// sell price (otherwise it walks away).
+    pub sell_price: Option<i32>,
+    /// Optional override for the price the player offers when buying
+    /// this good from the trader. `None` = use `prices::price_of`.
+    /// The trader will only sell when this is at-or-above its
+    /// standard buy price.
+    pub buy_price: Option<i32>,
 }
 
 impl Warehouse {
@@ -76,6 +93,20 @@ impl Warehouse {
     pub fn set_buy_max_stock(&mut self, good: Good, max_stock: Option<u16>) {
         let s = self.sliders.entry(good).or_default();
         s.buy_max_stock = max_stock;
+    }
+
+    /// Player's asking price when selling `good` to the trader.
+    /// `None` clears the override.
+    pub fn set_sell_price(&mut self, good: Good, price: Option<i32>) {
+        let s = self.sliders.entry(good).or_default();
+        s.sell_price = price;
+    }
+
+    /// Player's offered price when buying `good` from the trader.
+    /// `None` clears the override.
+    pub fn set_buy_price(&mut self, good: Good, price: Option<i32>) {
+        let s = self.sliders.entry(good).or_default();
+        s.buy_price = price;
     }
 
     /// How much of `good` we are willing to sell to the trader right
