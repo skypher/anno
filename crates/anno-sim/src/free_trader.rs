@@ -45,25 +45,52 @@ use crate::warehouse::Warehouse;
 /// for the trader by convention rather than direct mapping.
 pub const FREE_TRADER_SLOT: u8 = 5;
 
-// SPECULATIVE — no RE reference yet for these cadences. The original
-// trader's visit count and dock duration will be located in the
-// dispatcher function (TBD).
+// Visit count and dock duration. The Anno 1602 manual (section 8.1
+// "Free traders") describes traders as roaming around buying surplus
+// and selling needed goods at every player-set buy/sell slider.
+// Traders don't have a fixed "visits before leaving" — in the
+// original they keep circulating between active Kontors as long as
+// there are at least two warehouses on the island chain (manual
+// section 11.4.3). To match that behaviour we treat
+// `VISITS_BEFORE_LEAVING` as a soft per-spawn cap so the same ship
+// doesn't loop forever (the binary recreates trader ships
+// dynamically — see `1602_exe.c:50289` returning `&DAT_004cf358 +
+// iVar3 * 0x218` after `FUN_004488d0` picks a new target).
+//
+// `DOCK_TICKS` and `TRADE_BATCH` control how long a trader stays at
+// each Kontor and how much it exchanges per dock-tick. The original
+// uses player-set slider amounts (manual 8.1: "Use one slider to
+// set the selling price and the other to set the maximum amount you
+// want to sell."), which we simplify into a fixed batch since our
+// warehouse model doesn't yet track per-good buy/sell sliders.
+//
+// Tick rate is 10 Hz / 600 per minute (decoded from `:98053`); 5
+// dock-ticks = 0.5 s in our model.
 const VISITS_BEFORE_LEAVING: u8 = 3;
 const DOCK_TICKS: u8 = 5;
 const TRADE_BATCH: u16 = 5;
 
 /// Initial inventory of a freshly-spawned free trader.
-/// SPECULATIVE — the original game's per-trader stock list and amounts
-/// are in a data table not yet located. Goods chosen for plausibility
-/// (high-tier wares the player typically wants to import).
+///
+/// Source: original Anno 1602 manual, section 8.1 "Free traders":
+/// > "Tools and raw materials, such as iron ore, may be scarce at the
+/// > beginning, and the traders carry a supply of such items."
+///
+/// And confirmed by Tim Howgego's gameplay notes
+/// (timhowgego.wordpress.com/anno_1602/gameplay/trade_diplomacy/):
+/// > "Tools and ore (after the first player started mining it) are
+/// > always for sale. All other goods will be sold only if someone
+/// > sells them to the Free Traders."
+///
+/// So the trader's default stock is `Tools` and `Ore` — every other
+/// good is added dynamically when a player sells some to the trader,
+/// which we don't yet model (would require a persistent trader-stock
+/// table tracked across visits). Per-good inventory amounts aren't
+/// quoted in the manual.
 pub fn default_stock() -> Vec<(Good, u16)> {
     vec![
         (Good::Tools, 30),
-        (Good::Cloth, 30),
-        (Good::Wood, 40),
-        (Good::Bricks, 30),
-        (Good::Cannons, 8),
-        (Good::Spices, 20),
+        (Good::Ore, 40),
     ]
 }
 

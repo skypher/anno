@@ -200,19 +200,29 @@ with RE references where available:
 - **#101 Free trader as roaming ship** — `crates/anno-sim/src/free_trader.rs`.
   Spawns at the world edge, sails to player Kontors via the existing
   ocean A*, docks for several ticks exchanging goods at standard
-  `prices::price_of` rates, then leaves. RE references in module
-  doc-comment: `1602_exe.c:83179` (free-trader player slot 4 with
-  1M gold), `:11248` `s_HANDLER_004982c8` (object-type tag `0x35`),
-  `:47208` (object-ref resolver `&DAT_005e6bcc[island][tile]`),
-  `:50190 FUN_004487e0` (per-ship efficiency tick), `:50245
-  FUN_004488d0` (port selector — iterates `&DAT_005b7680` player
-  slots stride `0xa0`, scores via `FUN_00475c60`, picks lowest with
-  random tiebreaker), `:57713` (`(rand() & 3) == 0` — 1-in-4
-  per-tick re-target gate, used as both spawn rate and re-target
-  rate). Tick rate of 10 Hz / 600 ticks-per-minute decoded from
-  `:98053` time-display `sprintf`. Visit count, dock duration, and
-  stock list remain SPECULATIVE — at-Kontor dialog handler not yet
-  located.
+  `prices::price_of` rates, then leaves.
+  - **Spawn rule** — Anno 1602 manual section 11.4.3 "Placing ships":
+    *"A free traders' ship will automatically be placed as soon as
+    two warehouses have been built in your island chain. … the more
+    warehouses built in your chain of islands, no matter which colour
+    player has built them, the more free traders there will be."* So
+    `target_traders = active_kontors / 2`, capped at 8.
+  - **Default stock** — manual section 8.1 *"Tools and raw materials,
+    such as iron ore, may be scarce at the beginning, and the traders
+    carry a supply of such items."* Trader carries `Tools` and `Ore`;
+    other goods are added when players sell them to the trader (not
+    yet modelled).
+  - **Per-tick spawn gate** — `1602_exe.c:57713`'s `(rand() & 3) == 0`
+    re-target probability used as the new-trader spawn rate.
+  - **Object identity** — type tag `0x35 = HANDLER`
+    (`:11248 s_HANDLER_004982c8`, `:47208` resolver), per-ship struct
+    stride `0x86` at `&DAT_004cf358` (`:50190 FUN_004487e0`).
+  - **Player slot** — `:83179` confirms slot 4 with 1M starting gold
+    and ID `0xd`.
+  - **Tick rate** — 10 Hz / 600 ticks-per-minute decoded from `:98053`
+    time-display `sprintf("%02d:%02d", DAT_005b6040 / 600, …)`.
+  - Per-good `DOCK_TICKS` / `TRADE_BATCH` constants are simplifications
+    of the original's per-warehouse slider amounts (manual 8.1).
 - **#100 Civilian wanderers** — `crates/anno-sim/src/civilian.rs`.
   Per-residence tick (piggy-backs on the production tick, matching
   the original's per-building 4999 ms cycle) spawns one of eight

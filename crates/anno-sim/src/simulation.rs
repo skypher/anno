@@ -1034,23 +1034,30 @@ impl Simulation {
             self.free_trader_cooldown -= 1;
         }
 
-        // Free trader is a single object-tag-0x35 ("HANDLER") ship in
-        // the original (`1602_exe.c:11248 s_HANDLER_004982c8`,
-        // `:47208` returns the trader from `&DAT_005e6bcc[island][tile]`).
-        // We model the "single ship at a time" invariant by spawning
-        // when none is active. The spawn-rate gate uses a 1-in-4
-        // random per ship tick — the same `(rand() & 3) == 0` gate
-        // the binary uses at `:57713` for the trader's "seek next
-        // target" decision. That gate is per-tick (not per-spawn),
-        // so we apply it both as the spawn frequency and as the
-        // re-target frequency once docked.
-        if self.free_traders.iter().all(|t| !t.active)
-            && self.free_trader_cooldown == 0
-            && self.warehouses.iter().any(|w| w.active && w.owner < 4)
-        {
+        // Free-trader population from the original Anno 1602 manual
+        // (section 11.4.3 "Placing ships"):
+        //   "A free traders' ship will automatically be placed as soon
+        //   as two warehouses have been built in your island chain.
+        //   This means that the more warehouses built in your chain of
+        //   islands, no matter which color player has built them, the
+        //   more free traders there will be."
+        // So the count of free-trader ships scales with the total
+        // warehouse count: roughly one ship per two warehouses,
+        // counting all colours.
+        let total_active_kontors = self.warehouses.iter()
+            .filter(|w| w.active && w.owner < 4)
+            .count();
+        let target_traders = (total_active_kontors / 2).min(8);
+        let alive_traders = self.free_traders.iter().filter(|t| t.active).count();
+        let need_one_more = alive_traders < target_traders
+            && self.free_trader_cooldown == 0;
+
+        // Per-tick spawn gate: `1602_exe.c:57713 (rand() & 3) == 0`
+        // (1-in-4 chance per ship tick), the same probability the
+        // binary uses for the trader's "seek next target" decision.
+        if need_one_more {
             let r = self.next_rand();
             if (r & 3) != 0 {
-                // 1-in-4 spawn gate per ship tick (`:57713`).
                 return;
             }
             // Spawn at a random map edge.
