@@ -200,11 +200,19 @@ with RE references where available:
 - **#101 Free trader as roaming ship** — `crates/anno-sim/src/free_trader.rs`.
   Spawns at the world edge, sails to player Kontors via the existing
   ocean A*, docks for several ticks exchanging goods at standard
-  `prices::price_of` rates, then leaves. RE: `decompiled/1602_exe.c:83179`
-  (`s_Trader_d_0049ae30`, free-trader player slot 4 with 1 000 000
-  starting gold), `figuren.cod` `Nummer: HANDEL1` (ship sprite set
-  reused at render time). Visit count, dock duration, stock list
-  marked SPECULATIVE in source — original dispatcher RE pending.
+  `prices::price_of` rates, then leaves. RE references in module
+  doc-comment: `1602_exe.c:83179` (free-trader player slot 4 with
+  1M gold), `:11248` `s_HANDLER_004982c8` (object-type tag `0x35`),
+  `:47208` (object-ref resolver `&DAT_005e6bcc[island][tile]`),
+  `:50190 FUN_004487e0` (per-ship efficiency tick), `:50245
+  FUN_004488d0` (port selector — iterates `&DAT_005b7680` player
+  slots stride `0xa0`, scores via `FUN_00475c60`, picks lowest with
+  random tiebreaker), `:57713` (`(rand() & 3) == 0` — 1-in-4
+  per-tick re-target gate, used as both spawn rate and re-target
+  rate). Tick rate of 10 Hz / 600 ticks-per-minute decoded from
+  `:98053` time-display `sprintf`. Visit count, dock duration, and
+  stock list remain SPECULATIVE — at-Kontor dialog handler not yet
+  located.
 - **#100 Civilian wanderers** — `crates/anno-sim/src/civilian.rs`.
   Per-residence tick (piggy-backs on the production tick, matching
   the original's per-building 4999 ms cycle) spawns one of eight
@@ -226,13 +234,18 @@ with RE references where available:
   silhouette is generic. Renderer in `game.rs` now picks anim 1 when
   the figure's action is `CarryingGoods`, anim 0 when `Returning`.
   No "letter chip"; the sprite swap IS the indicator.
-- **#105 / #44 Voice announcements** — `crates/anno-game/src/bin/game.rs`
-  loads four SPEECH8 voice slots (stockpile, treasury, trader,
-  attack) and plays one per drained `event_log` line keyed by line
-  prefix. RE: `text.cod` `[SPEECHKIND]` block lists the announcement
-  categories the original engine used. Specific WAV file numbers
-  marked SPECULATIVE — speech-to-WAV mapping not yet decoded; each
-  slot falls back to `1000.WAV`.
+- **#105 / #44 Event audio cues** — `crates/anno-game/src/bin/game.rs`
+  loads three RE-cited SAMPLES/*.wav files used by the original
+  for in-game alerts and plays them per drained `event_log` line
+  keyed by line prefix:
+    - `event.wav` (`1602_exe.c:106460` `_DAT_005b5e4c =
+      _MaxwaveLoad_4(s_event_wav_…)`) — generic alert ping for
+      stockpile / treasury lines.
+    - `piraten.wav` (`:106441`) — pirate / hostile-attack warning.
+    - `triumph.wav` (`:106444`) — successful trade / treaty / victory.
+  The numbered SPEECH8 WAVs are voice sentences (used elsewhere for
+  citizen-demand speech); per-event playback uses the named SAMPLES
+  files above.
 - **#106 Tutorial scenario instead of first-launch banner** — the
   five `Tutorial0..4.szs` scenarios shipped with the original under
   `extracted/Szenes/` are already enumerated by the F2 picker; they

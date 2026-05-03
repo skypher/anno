@@ -780,26 +780,24 @@ fn main() {
     let event_war_slot = audio.waves.load("SPEECH8/1030.WAV")
         .or_else(|| audio.waves.load("1030.WAV"))
         .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
-    // Voice announcements: stockpile-low, treasury, trader, attack.
-    // SPECULATIVE — `text.cod` exposes a `[SPEECHKIND]` section listing
-    // the announcement categories (Events, Island status, Fellow
-    // players, Trade, Battles, Orders, Diplomacy) but the WAV-file
-    // numbering used by the original engine is not yet decoded. Each
-    // slot falls back to 1000.WAV so something is always audible;
-    // replace the exact filenames once the speech mapping is
-    // reverse-engineered.
-    let voice_stockpile_slot = audio.waves.load("SPEECH8/1040.WAV")
-        .or_else(|| audio.waves.load("SPEECH8/107.WAV"))
-        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
-    let voice_treasury_slot = audio.waves.load("SPEECH8/1050.WAV")
-        .or_else(|| audio.waves.load("SPEECH8/109.WAV"))
-        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
-    let voice_trader_slot = audio.waves.load("SPEECH8/1060.WAV")
-        .or_else(|| audio.waves.load("SPEECH8/111.WAV"))
-        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
-    let voice_attack_slot = audio.waves.load("SPEECH8/1070.WAV")
-        .or_else(|| audio.waves.load("SPEECH8/113.WAV"))
-        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
+    // Per-event sample slots. The original loads named WAV files from
+    // `SAMPLES/` via `_MaxwaveLoad@4` at startup
+    // (`decompiled/1602_exe.c:106397-106479`); the relevant ones are:
+    //   - `event.wav`    → `DAT_005b5e4c` (generic alert ping; line 106460)
+    //   - `piraten.wav`  → `_DAT_005b5eac` (pirate sighting / hostile,  106441)
+    //   - `triumph.wav`  → `_DAT_005b5ebc` (success / treaty / victory, 106444)
+    // These are the actual event audio cues the original used.
+    // The numbered SPEECH8 WAVs are voice-line speech (e.g. citizens
+    // demanding new goods); the per-event playback uses SAMPLES/*.wav.
+    let voice_stockpile_slot = audio.waves.load("SAMPLES/event.wav")
+        .or_else(|| audio.waves.load("SAMPLES/Event.wav"));
+    let voice_treasury_slot = voice_stockpile_slot;
+    let voice_trader_slot = audio.waves.load("SAMPLES/triumph.wav")
+        .or_else(|| audio.waves.load("SAMPLES/Triumph.wav"))
+        .or_else(|| voice_stockpile_slot);
+    let voice_attack_slot = audio.waves.load("SAMPLES/piraten.wav")
+        .or_else(|| audio.waves.load("SAMPLES/Piraten.wav"))
+        .or_else(|| voice_stockpile_slot);
 
     // SDL2 setup
     let sdl = sdl2::init().expect("SDL2 init failed");

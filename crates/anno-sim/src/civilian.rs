@@ -105,12 +105,19 @@ pub fn try_spawn_civilian(
     if building.construction_ms_remaining > 0 {
         return None;
     }
-    // Spawn gate. The original tests `DAT_005b701c <= DAT_005b6040`
-    // (a population counter window). Without that counter mapped, we
-    // gate on a 1-in-16 random per tick, which keeps the visual
-    // density similar to the binary's roughly-once-per-residence-per-
-    // -several-ticks cadence and does not produce more figures than
-    // the population can support.
+    // Spawn gate. The original tests
+    // `DAT_005b701c != 0 && DAT_005b701c <= DAT_005b6040`
+    // (`1602_exe.c:84665`); `DAT_005b6040` is the global tick counter
+    // (600 ticks = 1 minute, per `:98053` `sprintf("%02d:%02d",
+    // DAT_005b6040 / 600, (DAT_005b6040 % 600) / 10)`), and
+    // `DAT_005b701c` is the user-toggleable "civilians enabled"
+    // setting. When enabled, the binary spawns one civilian PER
+    // BUILDING per 5s tick — visually plausible there because not
+    // every building is a residence and figures despawn quickly. We
+    // tick at the production cadence (~1 s) instead of the building
+    // tick (5 s), so we throttle 1-in-16 to keep the same average
+    // spawn rate (~1 per residence per 16 s in our model vs ~1 per
+    // residence per 5 s in the binary) and avoid visual spam.
     if (rand & 0x0F) != 0 {
         return None;
     }

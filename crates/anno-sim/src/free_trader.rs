@@ -2,20 +2,38 @@
 //! warehouses, exchanging goods at standard prices. Replaces the
 //! teleport-deposit free trader removed in the authenticity audit.
 //!
-//! RE references:
+//! RE references for the trader ship:
 //! - `decompiled/1602_exe.c:83179` — `sprintf(..., s_Trader_d_0049ae30, 4)`,
 //!   confirming the free trader occupies a fixed player slot and starts
-//!   with `_DAT_005b8084 = 1000000` gold.
+//!   with `_DAT_005b8084 = 1000000` gold and ID `0xd`.
+//! - `decompiled/1602_exe.c:11248` — `s_HANDLER_004982c8`, the figure-
+//!   name string. Free-trader ship is object-type tag `0x35`
+//!   ("HANDLER") in the object-reference system (`FUN_00443e60`
+//!   case `0x35` at line 47208 returns `(undefined4 *)
+//!   (&DAT_005e6bcc)[island * 0x2c0 + tile]` — i.e. the trader ship
+//!   is a building-tile-resident object).
+//! - `decompiled/1602_exe.c:50190 FUN_004487e0` — the per-ship
+//!   per-tick efficiency / cargo-load update for trader ships
+//!   (stride `0x86` = 134-byte ship records in `&DAT_004cf358`).
+//! - `decompiled/1602_exe.c:50245 FUN_004488d0` — TARGET selector:
+//!   iterates `&DAT_005b7680` (player slots, stride `0xa0`) testing
+//!   `state == 0` or `state == 0xc`, calls `FUN_00475c60` to score
+//!   the slot, picks the lowest-scoring suitable slot via a list of
+//!   tiles `aiStack_258[150]`, returns one chosen by `rand() % count`.
+//! - `decompiled/1602_exe.c:57709-57714` — periodic re-target gate:
+//!   `if (*param_1 == '\x03') { uVar18 = rand(); if (((uVar18 & 3)
+//!   == 0) && (iVar21 = FUN_004488d0(puVar2), ...))` — when the
+//!   ship is in state 3 ("seeking next target"), it has a **1-in-4
+//!   chance per ship tick** to invoke the target selector. New
+//!   sail-target assigned via `FUN_00445350(&local_3ec, 0x37,
+//!   target_x, target_y)`.
 //! - `figuren.cod` `Nummer: HANDEL1` — the ship sprite/animation set
-//!   used for trade ships, which the free trader reuses in render.
-//! - General gameplay observation: the original ship sails between
-//!   player Kontors offering high-end wares at standard prices.
+//!   the free trader reuses in render.
 //!
-//! The detailed numeric constants below (`VISITS_BEFORE_LEAVING`,
-//! `DOCK_TICKS`, `TRADE_BATCH`, default stock list) are SPECULATIVE
-//! placeholders — the corresponding RE sites have not yet been
-//! identified. Conservative defaults; replace once the dispatcher
-//! function is located in the binary.
+//! The exact dock-duration, stock-list, and visit-count constants
+//! sit elsewhere (the trader's at-Kontor dialog handler isn't yet
+//! located) and remain SPECULATIVE; values below are conservative
+//! defaults pending that RE.
 
 use crate::trade::compass_heading;
 use crate::types::Good;

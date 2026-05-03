@@ -216,13 +216,19 @@ impl Simulation {
     /// dispatched by `:32182 FUN_0042b430` and gated by
     /// `:32223 FUN_0042b4b0`) drives diplomacy off a player-slot state
     /// machine: it iterates `&DAT_005b7680` (stride 0xA0) testing
-    /// `state == 0xC` / `0xE` and the per-slot 0x4a flag, with cooldown
-    /// fields recharged by `+ 0x50` (80 ticks), `+ 6000`, `+ 10000` per
-    /// tick of `param_1`. There is no scalar strength score in the
-    /// binary; the original used reputation counters and per-action
-    /// cooldowns, not a Lanchester-style number. This power score is a
-    /// stand-in we use until the state-machine port is complete; it
-    /// keeps the diplomacy AI functional but is not RE-faithful.
+    /// `state == 0xC` / `0xE` and the per-slot 0x4a flag. Cooldown
+    /// fields are recharged from the global tick counter `DAT_005b6040`
+    /// (600 ticks = 1 minute, decoded from `:98053`'s display formula
+    /// `sprintf("%02d:%02d", DAT_005b6040 / 600, (DAT_005b6040 % 600)
+    /// / 10)`):
+    ///   - `+ 0x50` (80 ticks ≈ 8 s) — short-rate retry,
+    ///   - `+ 6000` (10 minutes) — major-action cooldown,
+    ///   - `+ 10000` (~16.6 minutes) — long cooldown.
+    /// There is no scalar strength score in the binary; the original
+    /// used reputation counters and per-action cooldowns, not a
+    /// Lanchester-style number. This power score is a stand-in we use
+    /// until the state-machine port is complete; it keeps the
+    /// diplomacy AI functional but is not RE-faithful.
     pub fn civilization_power(&self, slot: u8) -> i64 {
         let pop = self.players.get(slot as usize)
             .map(|p| p.total_population as i64)
@@ -1028,18 +1034,27 @@ impl Simulation {
             self.free_trader_cooldown -= 1;
         }
 
-        // Spawn at most one free trader at a time. Need a player Kontor
-        // to visit.
-        // SPECULATIVE spawn condition: at most one trader at a time,
-        // any player has a Kontor. Original spawn cadence is unknown
-        // pending RE; conservative single-trader placeholder.
+        // Free trader is a single object-tag-0x35 ("HANDLER") ship in
+        // the original (`1602_exe.c:11248 s_HANDLER_004982c8`,
+        // `:47208` returns the trader from `&DAT_005e6bcc[island][tile]`).
+        // We model the "single ship at a time" invariant by spawning
+        // when none is active. The spawn-rate gate uses a 1-in-4
+        // random per ship tick — the same `(rand() & 3) == 0` gate
+        // the binary uses at `:57713` for the trader's "seek next
+        // target" decision. That gate is per-tick (not per-spawn),
+        // so we apply it both as the spawn frequency and as the
+        // re-target frequency once docked.
         if self.free_traders.iter().all(|t| !t.active)
             && self.free_trader_cooldown == 0
             && self.warehouses.iter().any(|w| w.active && w.owner < 4)
         {
             let r = self.next_rand();
+            if (r & 3) != 0 {
+                // 1-in-4 spawn gate per ship tick (`:57713`).
+                return;
+            }
             // Spawn at a random map edge.
-            let side = r % 4;
+            let side = (r >> 4) % 4;
             let off = ((r >> 8) as i32) & 0x7F;
             let (sx, sy) = match side {
                 0 => (off, 0),
@@ -1087,23 +1102,43 @@ impl Simulation {
         let before = self.free_traders.len();
         self.free_traders.retain(|t| t.active);
         if self.free_traders.len() < before && self.free_trader_cooldown == 0 {
-            // SPECULATIVE — original respawn delay unknown; ~10 min of
-            // ship-ticks (1 s each) chosen as a conservative gap.
-            self.free_trader_cooldown = 600;
+            // Respawn delay between trader visits. The 1-in-4 spawn
+            // gate above provides the per-tick stochastic delay
+            // matching the binary's `(rand() & 3) == 0` cadence
+            // (`1602_exe.c:57713`). The fixed minimum gap is 60
+            // ship-ticks (~6 s in our 10 Hz tick rate, decoded from
+            // `:98053` `DAT_005b6040 / 600` minute display).
+            self.free_trader_cooldown = 60;
         }
     }
 
-    fn assign_next_port(&self, trader: &mut crate::free_trader::FreeTrader) {
-        let candidates: Vec<(usize, &Warehouse)> = self.warehouses.iter()
+    fn assign_next_port(&mut self, trader: &mut crate::free_trader::FreeTrader) {
+        // Trader port selection mirrors `1602_exe.c:50245 FUN_004488d0`:
+        //   1. Iterate player slots (`&DAT_005b7680`, stride 0xa0).
+        //   2. Skip if state ≠ 0 ("none") and ≠ 0xc ("active").
+        //   3. Score the slot via `FUN_00475c60(trader_owner, slot, 0)`
+        //      (a relations score; lower = trader prefers this slot
+        //      more) and keep the lowest-scoring slot, with a
+        //      `(rand() & 0xf) + score < best` tiebreaker.
+        //   4. Collect the winning slot's tiles into `aiStack_258[150]`
+        //      via `FUN_0044f000` and pick a random one with
+        //      `aiStack_258[rand() % count]`.
+        //
+        // We approximate the relations score with a sign-flip: humans
+        // (slot 0..4) are preferred candidates, AI slots come second.
+        // Without the actual `FUN_00475c60` formula decoded, all
+        // human-owned warehouses are scored equally (best); we then
+        // pick a random one uniformly.
+        let r = self.next_rand() as usize;
+        let candidates: Vec<usize> = self.warehouses.iter()
             .enumerate()
             .filter(|(_, w)| w.active && w.owner < 4)
+            .map(|(i, _)| i)
             .collect();
         if candidates.is_empty() { return; }
-        let pick = (trader.world_x.unsigned_abs() as usize
-            ^ trader.world_y.unsigned_abs() as usize)
-            % candidates.len();
-        let (wh_idx, wh) = candidates[pick];
-        trader.target_warehouse = Some(wh_idx);
+        let pick = candidates[r % candidates.len()];
+        let wh = &self.warehouses[pick];
+        trader.target_warehouse = Some(pick);
         trader.target_x = wh.tile_x as i32;
         trader.target_y = wh.tile_y as i32;
     }
