@@ -220,6 +220,7 @@ mod tests {
             cost_wood: 0,
             cost_bricks: 0,
             maintenance_cost: 0,
+            native: false,
         }
     }
 

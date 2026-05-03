@@ -1666,6 +1666,38 @@ impl Simulation {
                     false
                 }
             }
+            Command::DispatchCart {
+                player, from_warehouse, to_warehouse, good, qty,
+            } => {
+                // KARREN Maxtrag = 6 (figuren.cod `Nummer: KARREN`).
+                let qty = qty.min(6);
+                if qty == 0 || from_warehouse == to_warehouse {
+                    return false;
+                }
+                let fi = from_warehouse as usize;
+                let ti = to_warehouse as usize;
+                if fi >= self.warehouses.len() || ti >= self.warehouses.len() {
+                    return false;
+                }
+                if !self.warehouses[fi].active
+                    || !self.warehouses[ti].active
+                    || self.warehouses[fi].owner != player
+                    || self.warehouses[ti].owner != player
+                {
+                    return false;
+                }
+                let took = self.warehouses[fi].withdraw(good, qty);
+                if took == 0 { return false; }
+                let placed = self.warehouses[ti].deposit(good, took);
+                let leftover = took - placed;
+                if leftover > 0 {
+                    self.warehouses[fi].deposit(good, leftover);
+                }
+                self.event_log.push(format!(
+                    "[cart] {placed} {good:?} → warehouse #{ti}",
+                ));
+                placed > 0
+            }
         }
     }
 
@@ -1707,6 +1739,7 @@ mod tests {
             storage_capacity: 50, cycle_time_ms: 1000, carrier_interval_ms: 0,
             cost_gold: 500, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
+            native: false,
         });
         // Drive the build path manually.
         let action = AiAction::RequestBuild { good: Good::Tools, priority: 0 };
@@ -1809,6 +1842,7 @@ mod tests {
             storage_capacity: 0, cycle_time_ms: 0, carrier_interval_ms: 0,
             cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
+            native: false,
         });
         let mut b = BuildingInstance::new(0, 0, 0, 0, 0);
         b.construction_ms_total = 1_000;
@@ -1941,6 +1975,7 @@ mod tests {
             storage_capacity: 0, cycle_time_ms: 1000, carrier_interval_ms: 0,
             cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
+            native: false,
         });
         let b = BuildingInstance::new(0, 0, 10, 10, 0); // player 0 owns
         sim.buildings.push(b);
@@ -1979,6 +2014,7 @@ mod tests {
             storage_capacity: 0, cycle_time_ms: 1000, carrier_interval_ms: 0,
             cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
+            native: false,
         });
         sim.buildings.push(BuildingInstance::new(0, 0, 10, 10, 0));
         sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 1, 11, 12));
@@ -2126,6 +2162,7 @@ mod tests {
             storage_capacity: 50, cycle_time_ms: 1000, carrier_interval_ms: 0,
             cost_gold: cost, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
+            native: false,
         };
         // Two defs producing the same Good. Cheaper one would always win
         // under the old logic.
@@ -2210,6 +2247,7 @@ mod tests {
             storage_capacity: 0, cycle_time_ms: 0, carrier_interval_ms: 0,
             cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
+            native: false,
         });
         sim.buildings.push(BuildingInstance::new(0, 0, 0, 0, 0));
         assert_eq!(sim.buildings[0].house_tier, 0);
@@ -2235,6 +2273,7 @@ mod tests {
             storage_capacity: 50, cycle_time_ms: 1000, carrier_interval_ms: 0,
             cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: maint,
+            native: false,
         };
         sim.building_defs.push(mk_def(5)); // def 0 cost 5
         sim.building_defs.push(mk_def(8)); // def 1 cost 8
@@ -2268,6 +2307,7 @@ mod tests {
             storage_capacity: 0, cycle_time_ms: 1000, carrier_interval_ms: 0,
             cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 7,
+            native: false,
         });
         // One under construction, one finished.
         let mut bb = BuildingInstance::new(0, 0, 0, 0, 0);
@@ -2372,6 +2412,41 @@ mod tests {
     }
 
     #[test]
+    fn cart_transfers_clamped_to_six() {
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
+        sim.warehouses.push(Warehouse::new(0, 0, 60, 60));
+        sim.warehouses[0].deposit(Good::Tools, 25);
+        let ok = sim.apply_command(&crate::commands::Command::DispatchCart {
+            player: 0, from_warehouse: 0, to_warehouse: 1,
+            good: Good::Tools, qty: 100,
+        });
+        assert!(ok);
+        // Capped at Maxtrag = 6.
+        assert_eq!(sim.warehouses[0].stock(Good::Tools), 19);
+        assert_eq!(sim.warehouses[1].stock(Good::Tools), 6);
+    }
+
+    #[test]
+    fn cart_rejects_cross_owner() {
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
+        sim.warehouses.push(Warehouse::new(1, 1, 60, 60));
+        sim.warehouses[0].deposit(Good::Tools, 5);
+        let ok = sim.apply_command(&crate::commands::Command::DispatchCart {
+            player: 0, from_warehouse: 0, to_warehouse: 1,
+            good: Good::Tools, qty: 5,
+        });
+        assert!(!ok);
+        assert_eq!(sim.warehouses[0].stock(Good::Tools), 5);
+    }
+
+    #[test]
     fn pirate_spawns_from_hideout_when_present() {
         use crate::building::BuildingInstance;
         use crate::trade::TradeShip;
@@ -2390,6 +2465,7 @@ mod tests {
             storage_capacity: 0, cycle_time_ms: 0, carrier_interval_ms: 0,
             cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
+            native: false,
         });
         // Place a hideout at a known tile.
         let mut h = BuildingInstance::new(0, 0, 7, 11, 6);

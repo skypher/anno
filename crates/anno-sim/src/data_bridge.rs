@@ -216,6 +216,7 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         cost_wood,
         cost_bricks,
         maintenance_cost: maintenance,
+        native: prop("Nativflg") == "1",
     }
 }
 

@@ -37,6 +37,12 @@ pub struct BuildingDef {
     pub cost_wood: u16,
     pub cost_bricks: u16,
     pub maintenance_cost: u16,
+    /// Native-village flag (`Nativflg: 1` inside HAUS_PRODTYP).
+    /// Identifies buildings belonging to the indigenous-village
+    /// faction (chief's hut, native plantations, native guard huts).
+    /// Used to gate civilian spawning, friendly-faction trade UI,
+    /// and the manual sec. 7.5/8.6 native-trade behaviour.
+    pub native: bool,
 }
 
 /// An active building instance in the world.

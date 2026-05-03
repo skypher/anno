@@ -4149,7 +4149,9 @@ fn main() {
                 "Up/Dn pick  Lt/Rt cycle  G gold  T tools",
                 [0xAA, 0xAA, 0xAA, 0xFF], dscale,
             );
-            // Per-counterpart rows
+            // Per-counterpart rows. Slot 4 is the natives faction
+            // (`Nativflg: 1` buildings; manual sec. 7.5/8.6),
+            // slot 5 the free trader, slot 6 the pirates.
             for tgt in 1u8..=6 {
                 let y = 4 + (tgt as i32 + 1) * line_h;
                 let rel = sim.diplomacy.get(0, tgt);
@@ -4164,8 +4166,14 @@ fn main() {
                     .map(|p| p.state != anno_sim::player::PlayerState::Empty
                             && p.state != anno_sim::player::PlayerState::Defeated)
                     .unwrap_or(false);
+                let label = match tgt {
+                    4 => "Natives",
+                    5 => "Free Trader",
+                    6 => "Pirates",
+                    _ => "Player",
+                };
                 let suffix = if alive { "" } else { " (no player)" };
-                let line = format!("{}Player {}: {}{}", arrow, tgt, rel_str, suffix);
+                let line = format!("{}{} {}: {}{}", arrow, label, tgt, rel_str, suffix);
                 let color = if selected {
                     [0xFF, 0xFF, 0x00, 0xFF]
                 } else {

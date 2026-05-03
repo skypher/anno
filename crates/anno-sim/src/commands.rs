@@ -32,6 +32,21 @@ pub enum Command {
     /// active warehouses. Drains from the sender's first matching
     /// warehouse, deposits into the recipient's first matching one.
     GiftGoods { from: u8, to: u8, good: Good, qty: u16 },
+    /// Market-wagon trade: transfer `qty` of `good` between two of
+    /// `player`'s active warehouses (by index). Manual section 8.2
+    /// "Trading with other cities on your island": the KARREN
+    /// figure (figuren.cod `Nummer: KARREN`, `Maxtrag: 6`) is the
+    /// player-driven overland transport between warehouses on the
+    /// same island chain. We model the gameplay effect (goods move
+    /// between warehouses) without yet simulating the wagon's walk;
+    /// per-trip `qty` is clamped to KARREN's 6-good capacity.
+    DispatchCart {
+        player: u8,
+        from_warehouse: u16,
+        to_warehouse: u16,
+        good: Good,
+        qty: u16,
+    },
 }
 
 impl Command {

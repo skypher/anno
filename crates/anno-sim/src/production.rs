@@ -110,6 +110,7 @@ mod tests {
             storage_capacity: 50, cycle_time_ms: 1000, carrier_interval_ms: 0,
             cost_gold: 100, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
+            native: false,
         }
     }
 
