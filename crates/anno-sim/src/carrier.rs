@@ -311,6 +311,8 @@ mod tests {
             cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
         }
     }
 

@@ -28,8 +28,19 @@ pub fn tick_building(building: &mut BuildingInstance, def: &BuildingDef, dt_ms: 
     building.efficiency = calculate_efficiency(building, def);
 
     if building.efficiency < MIN_EFFICIENCY {
+        // Track consecutive idle ticks. Once we've been short of
+        // input materials for `max_no_input_ticks` cycles
+        // (haeuser.cod `Maxnorohst`, default 6), keep the
+        // production timer reset so a sudden refill doesn't pop
+        // out a finished cycle immediately — the building has to
+        // genuinely "warm back up".
+        building.idle_ticks = building.idle_ticks.saturating_add(1);
+        if building.idle_ticks as u8 >= def.max_no_input_ticks {
+            building.production_timer_ms = 0;
+        }
         return 0;
     }
+    building.idle_ticks = 0;
 
     // Advance production timer
     building.production_timer_ms += dt_ms;
@@ -111,6 +122,8 @@ mod tests {
             cost_gold: 100, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
         }
     }
 

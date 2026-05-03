@@ -43,6 +43,21 @@ pub struct BuildingDef {
     /// Used to gate civilian spawning, friendly-faction trade UI,
     /// and the manual sec. 7.5/8.6 native-trade behaviour.
     pub native: bool,
+    /// Required infrastructure level. RE: haeuser.cod `Bauinfra`
+    /// field whose values follow `INFRA_STUFE_<tier><letter>`
+    /// (`STUFE_1A` → Pioneer, `_2*` → Settler, `_3*` → Citizen,
+    /// `_4*` → Merchant, `_5*` → Aristocrat). Special tags
+    /// (`INFRA_BURG_*`, `INFRA_KONTOR_*`, `INFRA_WACHTURM`,
+    /// `INFRA_MUSKETE`, `INFRA_KANON`) gate upgrade chains.
+    /// `min_tier = 0` → no infrastructure requirement.
+    pub min_tier: u8,
+    /// Maximum consecutive production cycles a building will run
+    /// without input materials before going idle. RE: haeuser.cod
+    /// `Maxnorohst` field. Distribution in haeuser.cod (12× value
+    /// 6, 4× value 8, 1× value 5) — defaults to 6 in our parser.
+    /// Buildings with no input requirement (output-only resources
+    /// like Wood) ignore this since they never lack input.
+    pub max_no_input_ticks: u8,
 }
 
 /// An active building instance in the world.

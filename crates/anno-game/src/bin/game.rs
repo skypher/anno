@@ -609,6 +609,9 @@ enum PlaceOutcome {
     NotCoastal,
     NoIslandMap,
     NoBuildingSelected,
+    /// Bauinfra gate: player's highest-populated tier is below the
+    /// building's `min_tier` (manual sec. 6.7.1).
+    WrongTier { needed: u8, have: u8 },
 }
 
 /// Attempt to place the placer's currently-selected building at
@@ -686,6 +689,23 @@ fn try_place_building(
                 need: cost,
                 have: sim.players.get(owner_idx).map(|p| p.gold).unwrap_or(0),
             };
+        }
+        // Bauinfra gate: building requires the player to have at
+        // least `min_tier` population in the matching tier or
+        // higher. Manual sec. 6.7.1: civilization-level governs
+        // which buildings unlock.
+        if def.min_tier > 0 && owner_idx < sim.players.len() {
+            let p = &sim.players[owner_idx];
+            let highest = (0..p.population.len() as u8)
+                .filter(|&t| p.population[t as usize] > 0)
+                .max()
+                .unwrap_or(0);
+            if highest < def.min_tier {
+                return PlaceOutcome::WrongTier {
+                    needed: def.min_tier,
+                    have: highest,
+                };
+            }
         }
     }
 
@@ -2389,6 +2409,20 @@ fn main() {
                                 PlaceOutcome::BlockedByTerrain => {
                                     // Silent — common case while
                                     // dragging across mixed terrain.
+                                }
+                                PlaceOutcome::WrongTier { needed, have } => {
+                                    let tier_name = |t: u8| match t {
+                                        0 => "Pioneer", 1 => "Settler",
+                                        2 => "Citizen", 3 => "Merchant",
+                                        _ => "Aristocrat",
+                                    };
+                                    save_banner = Some((
+                                        format!(
+                                            "build FAILED: needs {} tier (you're at {})",
+                                            tier_name(needed), tier_name(have),
+                                        ),
+                                        std::time::Instant::now(),
+                                    ));
                                 }
                                 PlaceOutcome::NoIslandMap
                                 | PlaceOutcome::NoBuildingSelected => {}

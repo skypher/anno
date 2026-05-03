@@ -258,6 +258,42 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         cost_bricks,
         maintenance_cost: maintenance,
         native: prop("Nativflg") == "1",
+        min_tier: parse_bauinfra(prop("Bauinfra")),
+        max_no_input_ticks: {
+            let v = prop_int("Maxnorohst");
+            if v > 0 { (v as u8).min(255) } else { 6 }
+        },
+    }
+}
+
+/// Map a `Bauinfra` token from haeuser.cod to a population tier
+/// requirement (0..=4, matching PopTier). Tier 0 = no requirement.
+///
+/// `INFRA_STUFE_NX` uses N as the tier digit (1..5 → Pioneer..
+/// Aristocrat); the letter suffix groups variants within a tier.
+/// Special prefixes like `INFRA_BURG_*` / `INFRA_KONTOR_*` are
+/// upgrade-chain gates and conservatively map to the highest
+/// existing tier (Citizen / Merchant) so they unlock late.
+fn parse_bauinfra(token: &str) -> u8 {
+    if token.is_empty() { return 0; }
+    if let Some(rest) = token.strip_prefix("INFRA_STUFE_") {
+        // First char is the tier digit (1..5).
+        if let Some(c) = rest.chars().next() {
+            if let Some(d) = c.to_digit(10) {
+                return (d.saturating_sub(1).min(4)) as u8;
+            }
+        }
+    }
+    match token {
+        "INFRA_KONTOR_1" => 1,  // Settler — first warehouse upgrade
+        "INFRA_KONTOR_2" => 2,  // Citizen
+        "INFRA_KONTOR_3" => 3,  // Merchant
+        "INFRA_BURG_1" | "INFRA_WACHTURM" => 2,  // Citizen — first military
+        "INFRA_BURG_2" => 3,    // Merchant
+        "INFRA_BURG_3" => 4,    // Aristocrat
+        "INFRA_MUSKETE" => 3,   // Merchant — needs musket production
+        "INFRA_KANON" => 4,     // Aristocrat — endgame
+        _ => 0,
     }
 }
 
