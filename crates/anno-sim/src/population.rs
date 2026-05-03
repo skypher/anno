@@ -17,7 +17,7 @@ use crate::warehouse::Warehouse;
 
 /// Goods demanded by each population tier.
 /// Each tier demands all goods of its level plus all lower-tier goods.
-const TIER_DEMANDS: &[&[Good]] = &[
+pub const TIER_DEMANDS: &[&[Good]] = &[
     // Pioneer
     &[Good::Food],
     // Settler

@@ -799,6 +799,12 @@ fn main() {
         .build()
         .expect("canvas creation failed");
 
+    // Pin the logical drawing surface to WINDOW_W × WINDOW_H so panels
+    // and HUD positions remain stable even when the user resizes the OS
+    // window. SDL letterboxes / scales for us.
+    canvas.set_logical_size(WINDOW_W, WINDOW_H)
+        .expect("set_logical_size failed");
+
     let texture_creator = canvas.texture_creator();
     let mut event_pump = sdl.event_pump().expect("event pump failed");
 
@@ -894,8 +900,6 @@ fn main() {
     let mut show_paths = false;
     let mut route_list_panel = false;
     let mut route_list_sel: usize = 0;
-    let mut queue_panel = false;
-    let mut chain_panel = false;
     let mut help_panel = false;
     let mut wh_panel = false;
     let mut ship_panel = false;
@@ -907,22 +911,10 @@ fn main() {
     let mut perf_history: std::collections::VecDeque<(u32, u32, u32)>
         = std::collections::VecDeque::with_capacity(60);
     let mut frame_started = std::time::Instant::now();
-    /// Right-click context menu: position + tile + action list.
-    struct ContextMenu {
-        screen_x: i32,
-        screen_y: i32,
-        tile_x: i32,
-        tile_y: i32,
-        actions: Vec<&'static str>,
-        sel: usize,
-    }
-    let mut context_menu: Option<ContextMenu> = None;
     // Auto-pause-while-menu-open: when any modal panel is opened we
     // pause the sim so the player can read it; we only unpause on close
     // if we were the ones who paused (i.e. the player didn't manually
     // unpause via Space while reading).
-    let mut prev_modal_open = false;
-    let mut auto_paused = false;
     let mut scenario_picker = false;
     let mut scenario_sel: usize = 0;
     // Scan Szenes/ once at startup so the picker is populated.
@@ -952,23 +944,7 @@ fn main() {
     }
     let mut chat_active = false;
     let mut chat_input = String::new();
-    /// Floating combat numbers: (tile_x, tile_y, amount, target_kind, spawn_instant).
-    let mut floating_nums: Vec<(i32, i32, u16, u8, std::time::Instant)>
-        = Vec::new();
-    /// Cosmetic civilians: (island_id, fx*256, fy*256, target_x, target_y, spawn).
-    /// Move 1 sub-tile per frame toward target, despawn after 4s.
-    let mut civilians: Vec<(u8, i32, i32, i32, i32, std::time::Instant)>
-        = Vec::new();
-    let mut civilian_seed: u64 = 0xDEAD_BEEF_DEAD_BEEF;
     let mut last_alarm: Option<std::time::Instant> = None;
-    /// First-run hint: shown until the user touches anything substantive.
-    /// Suppressed permanently once the marker file exists.
-    let tutorial_marker = anno_sim::settings::Settings::config_path()
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("tutorial-seen");
-    let mut show_tutorial = !tutorial_marker.exists();
-    let mut tutorial_dismissed_via_action = false;
     // Recently received chat lines (oldest first) with timestamp for TTL.
     let mut chat_log: std::collections::VecDeque<(String, std::time::Instant)> =
         std::collections::VecDeque::new();
@@ -1026,8 +1002,6 @@ fn main() {
                     if chat_active {
                         chat_active = false;
                         chat_input.clear();
-                    } else if context_menu.is_some() {
-                        context_menu = None;
                     } else if route_list_panel {
                         route_list_panel = false;
                     } else if scenario_picker {
@@ -1042,10 +1016,6 @@ fn main() {
                         wh_panel = false;
                     } else if ship_panel {
                         ship_panel = false;
-                    } else if queue_panel {
-                        queue_panel = false;
-                    } else if chain_panel {
-                        chain_panel = false;
                     } else if help_panel {
                         help_panel = false;
                     } else if obj_panel {
@@ -1101,52 +1071,6 @@ fn main() {
                             }
                             Keycode::R if shift_held => { route_list_panel = false; }
                             Keycode::Escape => { route_list_panel = false; }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    if let Some(menu) = context_menu.as_mut() {
-                        match key {
-                            Keycode::Up => {
-                                if menu.sel > 0 { menu.sel -= 1; }
-                            }
-                            Keycode::Down => {
-                                if menu.sel + 1 < menu.actions.len() {
-                                    menu.sel += 1;
-                                }
-                            }
-                            Keycode::Return | Keycode::KpEnter => {
-                                let act = menu.actions[menu.sel];
-                                let (tx, ty) = (menu.tile_x, menu.tile_y);
-                                context_menu = None;
-                                match act {
-                                    "Inspect" => {
-                                        inspection = Some(Inspection {
-                                            tile_x: tx, tile_y: ty,
-                                            building_idx: None,
-                                            warehouse_idx: None,
-                                            info: format!("Tile ({tx},{ty})"),
-                                        });
-                                    }
-                                    "Move selected here" => {
-                                        for &ui in &selected_units {
-                                            if let Some(u) = sim.military_units.get_mut(ui) {
-                                                if u.is_alive() {
-                                                    u.target_x = tx;
-                                                    u.target_y = ty;
-                                                    u.combat_target = -1;
-                                                    u.move_timer_ms = 0;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    "Demolish" => {
-                                        demolish_mode = true;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Keycode::Escape => { context_menu = None; }
                             _ => {}
                         }
                         continue;
@@ -1698,12 +1622,6 @@ fn main() {
                             Keycode::J => {
                                 ship_panel = !ship_panel;
                             }
-                            Keycode::Q => {
-                                queue_panel = !queue_panel;
-                            }
-                            Keycode::X => {
-                                chain_panel = !chain_panel;
-                            }
                             Keycode::Question | Keycode::Slash => {
                                 obj_panel = !obj_panel;
                             }
@@ -1863,25 +1781,12 @@ fn main() {
                                 let msg = match anno_sim::save::save_to_file(
                                     &quicksave_path, &snap,
                                 ) {
-                                    Ok(()) => {
-                                        // Also dump a thumbnail of the
-                                        // current terrain frame next to
-                                        // the save for the slot picker.
-                                        if let Some(ref rs) = rendered {
-                                            let thumb_name = format!(
-                                                "{}.quickthumb",
-                                                scenario_name,
-                                            );
-                                            save_ppm(&rs.rgba, rs.width, rs.height,
-                                                &thumb_name);
-                                        }
-                                        format!(
-                                            "saved → {} ({} buildings, {} gold)",
-                                            quicksave_path.display(),
-                                            sim.buildings.len(),
-                                            sim.players.first().map(|p| p.gold).unwrap_or(0),
-                                        )
-                                    }
+                                    Ok(()) => format!(
+                                        "saved → {} ({} buildings, {} gold)",
+                                        quicksave_path.display(),
+                                        sim.buildings.len(),
+                                        sim.players.first().map(|p| p.gold).unwrap_or(0),
+                                    ),
                                     Err(e) => format!("save FAILED: {e}"),
                                 };
                                 println!("{msg}");
@@ -2336,44 +2241,6 @@ fn main() {
                     y,
                     ..
                 } => {
-                    // Shift + RMB: open context menu at the cursor.
-                    if shift_held && !world_mode {
-                        if let Some(ref rs) = rendered {
-                            let dst_w = rs.width as i32 * display_zoom;
-                            let dst_h = rs.height as i32 * display_zoom;
-                            let dst_x = (WINDOW_W as i32 - dst_w) / 2 + scroll_x;
-                            let dst_y = (WINDOW_H as i32 - dst_h) / 2 + scroll_y;
-                            let tex_x = (x - dst_x) / display_zoom;
-                            let tex_y = (y - dst_y) / display_zoom;
-                            let (tile_x, tile_y) = screen_to_tile(
-                                tex_x, tex_y, rs.origin_x, rs.origin_y,
-                                rs.tile_w, rs.tile_h,
-                            );
-                            // Compose action list based on what's at the tile.
-                            let mut actions: Vec<&'static str> = vec!["Inspect"];
-                            if !selected_units.is_empty() {
-                                actions.push("Move selected here");
-                            }
-                            let island_id = islands[current_island].number;
-                            let has_player_building = sim.buildings.iter().any(|b| {
-                                b.owner == 0 && b.island_id == island_id && {
-                                    let def = &defs[b.def_id as usize];
-                                    let bx = b.tile_x as i32;
-                                    let by = b.tile_y as i32;
-                                    tile_x >= bx && tile_x < bx + def.width as i32
-                                        && tile_y >= by && tile_y < by + def.height as i32
-                                }
-                            });
-                            if has_player_building { actions.push("Demolish"); }
-                            actions.push("Cancel");
-                            context_menu = Some(ContextMenu {
-                                screen_x: x, screen_y: y,
-                                tile_x, tile_y,
-                                actions, sel: 0,
-                            });
-                        }
-                        continue;
-                    }
                     // If units are selected: issue a move order to that tile.
                     if !world_mode && !selected_units.is_empty() {
                         if let Some(ref rs) = rendered {
@@ -2695,30 +2562,8 @@ fn main() {
             }
         }
 
-        // Auto-pause when any modal info panel transitions open; auto-unpause
-        // on close iff we were the ones who paused. The player can still hit
-        // Space mid-read to override (auto_paused flips to false then).
-        let any_modal = graph_panel || prod_panel || roster_panel
-            || market_panel || wh_panel || ship_panel || save_panel
-            || scenario_picker || tax_panel || diplomacy_panel
-            || trade_route_mode || obj_panel || settings_panel
-            || context_menu.is_some() || route_list_panel || queue_panel
-            || chain_panel || help_panel;
-        if any_modal != prev_modal_open {
-            if any_modal {
-                if !sim.paused {
-                    sim.paused = true;
-                    auto_paused = true;
-                }
-            } else if auto_paused {
-                sim.paused = false;
-                auto_paused = false;
-            }
-            prev_modal_open = any_modal;
-        } else if any_modal && !sim.paused {
-            // Player un-paused manually while reading — disarm the auto.
-            auto_paused = false;
-        }
+        // Anno 1602 keeps the simulation running while menus are open;
+        // the player has to hit Space to pause manually. No auto-pause.
 
         let perf_sim_start = std::time::Instant::now();
         if dt_ms > 0 && dt_ms < 1000 {
@@ -2739,43 +2584,8 @@ fn main() {
                     audio.waves.play_once(sfx, WINDOW_W as i32 / 2, WINDOW_H as i32 / 2, handle);
                 }
             }
-            // Wake-up alarm: if the player is broke or has zero food
-            // stock, ping the destroy SFX with a 30s cooldown.
-            {
-                let gold = sim.players.first().map(|p| p.gold).unwrap_or(0);
-                let zero_food: bool = sim.players.first()
-                    .map(|p| p.satisfaction[0] < 64)
-                    .unwrap_or(false)
-                    && sim.warehouses.iter()
-                        .filter(|w| w.active && w.owner == 0)
-                        .all(|w| w.stock(Good::Food) == 0);
-                let alarm = gold < 500 || zero_food;
-                let cooldown = std::time::Duration::from_secs(30);
-                let cooled = last_alarm.map_or(true,
-                    |t| t.elapsed() > cooldown);
-                if alarm && cooled {
-                    if let (Some(sfx), Some(handle)) =
-                        (event_destroy_slot, &audio.stream_handle)
-                    {
-                        audio.waves.play_once(
-                            sfx,
-                            WINDOW_W as i32 / 2,
-                            WINDOW_H as i32 / 2,
-                            handle,
-                        );
-                    }
-                    last_alarm = Some(std::time::Instant::now());
-                    chat_log.push_back((
-                        if gold < 500 {
-                            "[alarm] gold low — bankruptcy looming".to_string()
-                        } else {
-                            "[alarm] population starving — Food empty".to_string()
-                        },
-                        std::time::Instant::now(),
-                    ));
-                    if chat_log.len() > 8 { chat_log.pop_front(); }
-                }
-            }
+            // (Wake-up alarms via SFX removed — faithful Anno used voice
+            // announcements which we'll wire up properly later.)
 
             // Drain sim event log lines.
             if !sim.event_log.is_empty() {
@@ -2785,13 +2595,9 @@ fn main() {
                 }
             }
 
-            // Drain damage events into the floating-number animation.
-            if !sim.damage_events.is_empty() {
-                let now = std::time::Instant::now();
-                for ev in sim.damage_events.drain(..) {
-                    floating_nums.push((ev.x, ev.y, ev.amount, ev.target, now));
-                }
-            }
+            // Damage events are still produced by the sim but not
+            // surfaced as floating numbers (Anno didn't have those).
+            sim.damage_events.clear();
 
             // Drain combat-destroyed buildings: clear matching island tiles
             // so the static renderer no longer paints the dead footprint.
@@ -3480,37 +3286,6 @@ fn main() {
                     }
                 }
 
-                // Day/night tint: one full cycle per 3000 game ticks
-                // (~5 in-game minutes). Warm dusk/dawn tints, deep blue at
-                // midnight, no tint at midday.
-                {
-                    let cycle = 3000u32;
-                    let phase = (sim.game_clock % cycle) as f32 / cycle as f32;
-                    let two_pi = std::f32::consts::TAU;
-                    let dayness = (phase * two_pi).sin(); // -1..=1
-                    if dayness < 0.95 {
-                        // Map dayness to RGBA tint:
-                        //   dayness =  1 → no overlay
-                        //   dayness =  0 → warm orange dusk
-                        //   dayness = -1 → dark blue night
-                        let warm = (1.0 - dayness.abs()).max(0.0); // 0..1
-                        let dark = (-dayness).max(0.0);            // 0..1
-                        let r = (90.0 * warm + 5.0 * dark) as u16;
-                        let g = (40.0 * warm + 10.0 * dark) as u16;
-                        let b = (10.0 * warm + 60.0 * dark) as u16;
-                        let alpha = ((warm * 60.0) + (dark * 90.0)) as u16;
-                        let alpha = alpha.min(120) as u16;
-                        if alpha > 0 {
-                            let inv = 255 - alpha;
-                            for px in frame.chunks_exact_mut(4) {
-                                px[0] = ((px[0] as u16 * inv + r * alpha) / 255) as u8;
-                                px[1] = ((px[1] as u16 * inv + g * alpha) / 255) as u8;
-                                px[2] = ((px[2] as u16 * inv + b * alpha) / 255) as u8;
-                            }
-                        }
-                    }
-                }
-
                 texture
                     .update(None, &frame, (rs.width * 4) as usize)
                     .expect("texture update failed");
@@ -3769,6 +3544,40 @@ fn main() {
                         format!("Upkeep: {}/tick", def.maintenance_cost),
                         [0xCC, 0xCC, 0xCC, 0xFF],
                     ));
+                }
+                // Residence: surface per-good demand fulfillment for this
+                // tier so the player can spot which need is dragging
+                // satisfaction down.
+                let is_residence = def.kind == "WOHN" || def.prod_kind == "WOHN";
+                if is_residence {
+                    let tier = (b.house_tier as usize)
+                        .min(anno_sim::population::TIER_DEMANDS.len() - 1);
+                    if let Some(p) = sim.players.first() {
+                        for &g in anno_sim::population::TIER_DEMANDS[tier] {
+                            // Find the demand slot index by good — match
+                            // population::DEMAND_GOODS.
+                            let slot_idx = anno_sim::population::DEMAND_GOODS
+                                .iter().position(|&dg| dg == g);
+                            let pct = match slot_idx {
+                                Some(i) if p.demands[i].demand > 0 => {
+                                    (p.demands[i].supply as u64 * 100
+                                        / p.demands[i].demand as u64) as u32
+                                }
+                                _ => 100,
+                            };
+                            let color = if pct < 50 {
+                                [0xFF, 0x88, 0x66, 0xFF]
+                            } else if pct < 90 {
+                                [0xFF, 0xCC, 0x66, 0xFF]
+                            } else {
+                                [0xCC, 0xFF, 0xCC, 0xFF]
+                            };
+                            lines.push((
+                                format!("  {:?}: {}%", g, pct),
+                                color,
+                            ));
+                        }
+                    }
                 }
             } else {
                 lines.push((
@@ -4393,42 +4202,6 @@ fn main() {
             }
         }
 
-        // Context menu (Shift+RMB). Floats at the cursor; Up/Dn picks,
-        // Enter activates the action, Esc closes.
-        if let Some(ref menu) = context_menu {
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 160u32;
-            let panel_h = (menu.actions.len() as i32 * line_h + 8) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 230;
-            }
-            for (i, &act) in menu.actions.iter().enumerate() {
-                let arrow = if i == menu.sel { ">" } else { " " };
-                let line = format!("{arrow} {}", act);
-                let color = if i == menu.sel {
-                    [0xFF, 0xFF, 0x00, 0xFF]
-                } else {
-                    [0xCC, 0xCC, 0xCC, 0xFF]
-                };
-                tiny_font::draw_str(&mut buf, panel_w, panel_h,
-                    4, 4 + i as i32 * line_h, &line, color, scale);
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = menu.screen_x.min(WINDOW_W as i32 - panel_w as i32 - 4);
-                let ty = menu.screen_y.min(WINDOW_H as i32 - panel_h as i32 - 4);
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
         // Help / keybindings panel (F11). Read-only reference so the
         // player doesn't have to memorise every hotkey.
         if help_panel {
@@ -4476,143 +4249,6 @@ fn main() {
                 };
                 tiny_font::draw_str(&mut buf, panel_w, panel_h,
                     4, 4 + i as i32 * line_h, l, color, scale);
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Production chain panel (X): list every BuildingDef that has an
-        // output_good, showing inputs → output. Color rows by whether the
-        // player has at least one producer; missing producers stand out so
-        // chain gaps are obvious.
-        if chain_panel {
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 460u32;
-            let header_h = 30i32;
-            // Aggregate distinct (input1, input2 → output) chains.
-            let mut chains: Vec<(Good, Good, Good)> = Vec::new();
-            let mut producer_counts: std::collections::HashMap<Good, u32> =
-                std::collections::HashMap::new();
-            for d in &defs {
-                if d.output_good == Good::None { continue; }
-                let triple = (d.input_good_1, d.input_good_2, d.output_good);
-                if !chains.contains(&triple) { chains.push(triple); }
-            }
-            for b in &sim.buildings {
-                if b.owner != 0 || !b.is_built() { continue; }
-                let def = &defs[b.def_id as usize];
-                if def.output_good != Good::None {
-                    *producer_counts.entry(def.output_good).or_insert(0) += 1;
-                }
-            }
-            let visible = chains.len().min(28);
-            let panel_h = (header_h + visible as i32 * line_h + 12) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "PRODUCTION CHAINS (X/Esc close)  inputs -> output  [n owned]",
-                [0xFF, 0xD7, 0x00, 0xFF], 1,
-            );
-            for (i, (in1, in2, out)) in chains.iter().take(visible).enumerate() {
-                let n = producer_counts.get(out).copied().unwrap_or(0);
-                let in_str = match (in1, in2) {
-                    (Good::None, Good::None) => "(raw)".to_string(),
-                    (a, Good::None) | (Good::None, a) => format!("{:?}", a),
-                    (a, b) => format!("{:?} + {:?}", a, b),
-                };
-                let line = format!("{:<22} -> {:<10} [{}]",
-                    if in_str.len() > 22 { in_str[..22].to_string() } else { in_str },
-                    format!("{:?}", out),
-                    n,
-                );
-                let color = if n == 0 {
-                    [0xFF, 0x88, 0x66, 0xFF] // missing producer
-                } else {
-                    [0xCC, 0xFF, 0xCC, 0xFF]
-                };
-                tiny_font::draw_str(&mut buf, panel_w, panel_h,
-                    4, header_h + i as i32 * line_h, &line, color, scale);
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Construction queue panel (Q): list every player-owned building
-        // that's not yet built — progress + outstanding materials.
-        if queue_panel {
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 460u32;
-            let header_h = 30i32;
-            let pending: Vec<&anno_sim::building::BuildingInstance> = sim
-                .buildings.iter()
-                .filter(|b| b.owner == 0 && b.active && !b.is_built())
-                .collect();
-            let visible = pending.len().max(1);
-            let panel_h = (header_h + visible as i32 * line_h + 12) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "BUILD QUEUE (Q/Esc close) — name pos prog W/T/B",
-                [0xFF, 0xD7, 0x00, 0xFF], 1,
-            );
-            if pending.is_empty() {
-                tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, header_h, "(no buildings under construction)",
-                    [0x88, 0x88, 0x88, 0xFF], scale,
-                );
-            } else {
-                for (i, b) in pending.iter().enumerate() {
-                    let name = cod.buildings[b.def_id as usize]
-                        .properties
-                        .get("Name")
-                        .cloned()
-                        .unwrap_or_else(|| format!("Bldg#{}", b.def_id));
-                    let pct = b.construction_progress_128() as u32 * 100 / 128;
-                    let line = format!(
-                        "{:<14} ({:>2},{:>2}) {:>3}%  W{} T{} B{}",
-                        if name.len() > 14 { name[..14].to_string() } else { name },
-                        b.tile_x, b.tile_y, pct,
-                        b.wood_needed, b.tools_needed, b.bricks_needed,
-                    );
-                    let ready = b.wood_needed == 0 && b.tools_needed == 0
-                        && b.bricks_needed == 0;
-                    let color = if ready {
-                        [0xCC, 0xFF, 0xCC, 0xFF] // materials all in
-                    } else {
-                        [0xFF, 0xCC, 0x66, 0xFF] // waiting on supply
-                    };
-                    tiny_font::draw_str(&mut buf, panel_w, panel_h,
-                        4, header_h + i as i32 * line_h, &line, color, scale);
-                }
             }
             if let Ok(mut tex) = texture_creator
                 .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
@@ -5295,167 +4931,6 @@ fn main() {
             title
         };
         canvas.window_mut().set_title(&title).ok();
-
-        // First-run tutorial banner. Dismisses on first action that
-        // changes the sim or quits the panel.
-        if show_tutorial {
-            if !sim.buildings.is_empty() && !tutorial_dismissed_via_action {
-                tutorial_dismissed_via_action = true;
-            }
-            if tutorial_dismissed_via_action {
-                show_tutorial = false;
-                if let Some(parent) = tutorial_marker.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::write(&tutorial_marker, b"seen\n");
-            }
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 480u32;
-            let lines = [
-                "ANNO 1602 — quick start",
-                "  F2  pick a scenario",
-                "  F7  found a colony (drop a Kontor)",
-                "  B   build mode (1-9 select, click place)",
-                "  T   set tax rates",
-                "  ?   list scenario objectives",
-                "(this banner closes after your first build)",
-            ];
-            let panel_h = (line_h * lines.len() as i32 + 8) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 200;
-            }
-            for (i, l) in lines.iter().enumerate() {
-                let color = if i == 0 {
-                    [0xFF, 0xD7, 0x00, 0xFF]
-                } else { [0xCC, 0xCC, 0xCC, 0xFF] };
-                tiny_font::draw_str(&mut buf, panel_w, panel_h,
-                    4, 4 + i as i32 * line_h, l, color, scale);
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = WINDOW_H as i32 - panel_h as i32 - 80;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Cosmetic civilians: spawn occasionally near player residences,
-        // drift to a target, despawn after 4s. Pure visual fluff.
-        {
-            const TTL: std::time::Duration = std::time::Duration::from_secs(4);
-            let now = std::time::Instant::now();
-            civilians.retain(|c| now - c.5 < TTL);
-            // Roll for a new spawn ~1 frame in 30 if under cap.
-            civilian_seed = civilian_seed.wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            if civilians.len() < 16 && (civilian_seed >> 56) % 30 == 0 {
-                let residences: Vec<(u8, i32, i32)> = sim.buildings.iter()
-                    .filter(|b| {
-                        b.owner == 0 && b.is_built() && {
-                            let def = &defs[b.def_id as usize];
-                            def.kind == "WOHN" || def.prod_kind == "WOHN"
-                        }
-                    })
-                    .map(|b| (b.island_id, b.tile_x as i32, b.tile_y as i32))
-                    .collect();
-                if !residences.is_empty() {
-                    let pick = (civilian_seed >> 8) as usize % residences.len();
-                    let (iid, sx, sy) = residences[pick];
-                    let tdx = (((civilian_seed >> 16) as i32) % 7) - 3;
-                    let tdy = (((civilian_seed >> 24) as i32) % 7) - 3;
-                    civilians.push((iid, sx * 256, sy * 256, sx + tdx, sy + tdy, now));
-                }
-            }
-            // Drift each civilian by 8 sub-tiles toward target.
-            for c in civilians.iter_mut() {
-                let dx = c.3 * 256 - c.1;
-                let dy = c.4 * 256 - c.2;
-                if dx.abs() > 4 { c.1 += dx.signum() * 4; }
-                if dy.abs() > 4 { c.2 += dy.signum() * 4; }
-            }
-            // Render: a small white dot per civilian on the active island.
-            if !world_mode {
-                if let Some(ref rs) = rendered {
-                    let half_tw = rs.tile_w / 2;
-                    let half_th = rs.tile_h / 2;
-                    let island_id = islands[current_island].number;
-                    for c in civilians.iter() {
-                        if c.0 != island_id { continue; }
-                        let tx = c.1 / 256;
-                        let ty = c.2 / 256;
-                        let tex_sx = rs.origin_x + (tx - ty) * half_tw + half_tw;
-                        let tex_sy = rs.origin_y + (tx + ty) * half_th + half_th;
-                        let dst_w = rs.width as i32 * display_zoom;
-                        let dst_h = rs.height as i32 * display_zoom;
-                        let dst_x = (WINDOW_W as i32 - dst_w) / 2 + scroll_x;
-                        let dst_y = (WINDOW_H as i32 - dst_h) / 2 + scroll_y;
-                        let screen_x = dst_x + tex_sx * display_zoom;
-                        let screen_y = dst_y + tex_sy * display_zoom;
-                        canvas.set_draw_color(sdl2::pixels::Color::RGB(0xEE, 0xEE, 0xC0));
-                        canvas.fill_rect(Rect::new(screen_x, screen_y, 2, 2)).ok();
-                    }
-                }
-            }
-        }
-
-        // Floating combat numbers: drift up + fade across 1.5s. Drawn on
-        // the SDL canvas (post-texture) so they sit on top of the world.
-        {
-            const TTL: std::time::Duration = std::time::Duration::from_millis(1500);
-            let now = std::time::Instant::now();
-            floating_nums.retain(|&(_, _, _, _, spawn)| now - spawn < TTL);
-            if let Some(ref rs) = rendered {
-                let half_tw = rs.tile_w / 2;
-                let half_th = rs.tile_h / 2;
-                for &(tx, ty, amount, target, spawn) in floating_nums.iter() {
-                    let age = now - spawn;
-                    let frac = age.as_secs_f32() / TTL.as_secs_f32();
-                    if frac >= 1.0 { continue; }
-                    let drift_px = (frac * 24.0) as i32;
-                    // Convert tile to texture pixel, then to screen.
-                    let tex_sx = rs.origin_x + (tx - ty) * half_tw + half_tw;
-                    let tex_sy = rs.origin_y + (tx + ty) * half_th + half_th - drift_px;
-                    let dst_w = rs.width as i32 * display_zoom;
-                    let dst_h = rs.height as i32 * display_zoom;
-                    let dst_x = (WINDOW_W as i32 - dst_w) / 2 + scroll_x;
-                    let dst_y = (WINDOW_H as i32 - dst_h) / 2 + scroll_y;
-                    let screen_x = dst_x + tex_sx * display_zoom;
-                    let screen_y = dst_y + tex_sy * display_zoom;
-                    let label = if target == 2 {
-                        format!("+{}", amount)
-                    } else {
-                        format!("-{}", amount)
-                    };
-                    let alpha = ((1.0 - frac) * 255.0) as u8;
-                    let color = match target {
-                        1 => [0xFF, 0xCC, 0x40, alpha], // amber buildings
-                        2 => [0x66, 0xFF, 0x66, alpha], // green deposits
-                        _ => [0xFF, 0x60, 0x60, alpha], // red units
-                    };
-                    let scale = 1u32;
-                    let w = tiny_font::measure(&label, scale);
-                    let h = (5 * scale) + 2;
-                    let mut buf = vec![0u8; (w * h * 4) as usize];
-                    tiny_font::draw_str(&mut buf, w, h, 0, 0, &label, color, scale);
-                    if let Ok(mut tex) = texture_creator
-                        .create_texture_streaming(PixelFormatEnum::RGBA32, w, h)
-                    {
-                        tex.update(None, &buf, (w * 4) as usize).ok();
-                        tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                        canvas.copy(&tex, None,
-                            Some(Rect::new(screen_x - w as i32 / 2, screen_y, w, h))).ok();
-                    }
-                }
-            }
-        }
 
         // Perf overlay (F12). Drawn last so it lands on top of everything.
         if show_perf {

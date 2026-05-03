@@ -135,6 +135,36 @@
 109. **Keys help panel (F11)** — read-only reference listing every keybinding grouped by purpose (build/city, trade, diagnostics, world/view, save/system). Until full rebinding lands, this gives the player a lookup that doesn't require memorising the doc-comment header
 110. **Workspace test count** — the new ticks (events, stockpile alerts) and panels are all built on top of the existing tick infrastructure so `cargo test --workspace` stays at 115 sim + 9 net + 8 formats + 2 audio = 134 passing tests
 
+### Authenticity audit (2026-05-03)
+
+After a faithful-clone audit of the 110 features above, several
+were found to be modern-strategy-game drift rather than authentic
+Anno 1602 mechanics. The following have been **removed** from the
+codebase to keep the project honest:
+
+- **#67 Auto-pause for info panels** — Anno never paused on menus.
+- **#85 / #91 Dynamic market prices** — Anno used FIXED per-good prices.
+- **#86 Right-click context menu** — Anno's RMB had a fixed action.
+- **#88 Day/night cycle tint** — Anno 1602 has no day/night cycle.
+- **#95 Idle building maintenance halving** — Anno paid full upkeep.
+- **#97 Build queue panel** — no such panel in Anno.
+- **#98 Combat damage floating numbers** — never in Anno.
+- **#100 Cosmetic civilians (cream pixels)** — Anno had real sprites
+  walking real paths; the pixel-stub implementation was misleading.
+- **#101 Free trader teleport arrivals** — Anno's free trader was a
+  ROAMING SHIP that visited warehouses, not gold-for-goods teleports.
+- **#102 PPM thumbnail dump** — concept fine but PPM file isn't shown
+  in the slot picker; reverted until rendering catches up.
+- **#105 Stockpile chat alerts** — Anno used voice announcements.
+- **#106 First-launch tutorial banner** — Anno had a tutorial scenario.
+- **#108 Production chain panel** — modern strategy UI, not Anno.
+- **#48 Chat `/gold +500` commands** — Anno had no console.
+- **#44 Wake-up alarm SFX (using destroy sample)** — should be
+  speech samples; reverted until proper voice wiring lands.
+
+A faithful replacement pass for some of these (real free trader ship,
+proper voice announcements, real civilian sprites) is queued.
+
 ### What's missing / next
 
 1. ~~Marketplace radius extension~~ ✓
