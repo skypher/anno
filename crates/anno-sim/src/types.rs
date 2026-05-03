@@ -17,7 +17,15 @@ pub enum PopTier {
 pub const NUM_POP_TIERS: usize = 5;
 
 /// Goods/resource types.
-/// The original engine has 59 goods entries; these are the most important ones.
+///
+/// The Anno 1602 engine stores 59 internal good slots (`text.cod`
+/// `[WARE]` block + flag/wildcard entries like ALLWARE/NOWARE +
+/// terrain growth pseudo-goods like GRAS/BAUM/TABAKBAUM that don't
+/// surface to the player). The 25 player-facing economic goods from
+/// the manual's WARE list are all enumerated below; we add a handful
+/// of extras (Stone, GoldOre, Hides, Cotton, Silk, Fish, Grapes) that
+/// appear in haeuser.cod production chains but aren't shown as
+/// distinct entries in the manual.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum Good {
@@ -54,7 +62,6 @@ pub enum Good {
     Jewelry = 28,    // SCHMUCK — jewelry
     Clothing = 29,   // KLEIDUNG — clothing
     Fish = 30,       // FISCHE — fish
-    // ... more goods exist in the original
 }
 
 /// Military unit types.

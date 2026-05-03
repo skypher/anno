@@ -12,17 +12,26 @@ use crate::building::{BuildingDef, BuildingInstance};
 use crate::types::Good;
 
 /// Map COD good names to simulation Good enum.
+///
+/// Covers all 25 player-facing goods from `text.cod [WARE]` plus the
+/// raw-plantation crops the engine references in production chains
+/// (BAUM = forest tree, KAKAOBAUM = cocoa tree, TABAKBAUM = tobacco
+/// plant, GEWUERZBAUM = spice tree, ZUCKERROHR = sugarcane). These
+/// plant tokens aren't separate economic goods; they map to the
+/// finished-good enum the player sees in their warehouse so the
+/// production tick can consume them as an input. ALLWARE / NOWARE /
+/// GRAS are flag/terrain pseudo-goods → `Good::None`.
 fn parse_good(name: &str) -> Good {
     match name {
-        "HOLZ" => Good::Wood,
+        "HOLZ" | "BAUM" => Good::Wood,
         "EISEN" => Good::Iron,
         "EISENERZ" | "ERZE" => Good::Ore,
         "GOLD" => Good::Gold,
         "GOLDERZ" => Good::GoldOre,
         "WOLLE" => Good::Wool,
         "ZUCKER" | "ZUCKERROHR" => Good::Sugar,
-        "TABAK" => Good::Tobacco,
-        "RIND" | "FLEISCH" | "VIEH" => Good::Cattle,
+        "TABAK" | "TABAKBAUM" => Good::Tobacco,
+        "RIND" | "FLEISCH" | "VIEH" | "WILD" => Good::Cattle,
         "GETREIDE" | "KORN" => Good::Grain,
         "MEHL" => Good::Flour,
         "WERKZEUG" => Good::Tools,
@@ -35,8 +44,8 @@ fn parse_good(name: &str) -> Good {
         "STOFFE" | "STOFF" | "TUCH" => Good::Cloth,
         "ALKOHOL" | "RUM" => Good::Alcohol,
         "TABAKWAREN" | "TABAKWARE" => Good::TobaccoProducts,
-        "GEWUERZ" | "GEWUERZE" => Good::Spices,
-        "KAKAO" => Good::Cocoa,
+        "GEWUERZ" | "GEWUERZE" | "GEWUERZBAUM" => Good::Spices,
+        "KAKAO" | "KAKAOBAUM" => Good::Cocoa,
         "WEINTRAUBEN" | "WEIN" => Good::Grapes,
         "HAEUTE" => Good::Hides,
         "BAUMWOLLE" => Good::Cotton,
@@ -44,7 +53,35 @@ fn parse_good(name: &str) -> Good {
         "SCHMUCK" => Good::Jewelry,
         "KLEIDUNG" => Good::Clothing,
         "FISCHE" | "FISCH" => Good::Fish,
+        // Flags / terrain pseudo-goods that don't correspond to a
+        // player-facing good slot.
+        "NOWARE" | "ALLWARE" | "GRAS" | "" => Good::None,
         _ => Good::None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn parse_good_covers_all_haeuser_cod_tokens() {
+    // Tokens enumerated from `extracted/haeuser.cod` Ware: / Rohstoff:
+    // / Workstoff: lines (excluding the literal "ALLWARE" / "NOWARE"
+    // wildcards which always resolve to None).
+    let tokens = [
+        "ALKOHOL", "BAUM", "BAUMWOLLE", "EISEN", "EISENERZ", "ERZE",
+        "FISCHE", "FLEISCH", "GETREIDE", "GEWUERZBAUM", "GEWUERZE",
+        "GOLD", "GRAS", "HOLZ", "KAKAO", "KAKAOBAUM", "KANONEN",
+        "KLEIDUNG", "KORN", "MEHL", "MUSKETEN", "NAHRUNG",
+        "SCHMUCK", "SCHWERTER", "STEINE", "STOFFE", "TABAK",
+        "TABAKBAUM", "TABAKWAREN", "WEINTRAUBEN", "WERKZEUG", "WILD",
+        "WOLLE", "ZIEGEL", "ZUCKER", "ZUCKERROHR",
+    ];
+    for tok in tokens {
+        let g = parse_good(tok);
+        // GRAS is the only one that legitimately maps to None.
+        if tok != "GRAS" {
+            assert_ne!(g, Good::None,
+                "token {tok} should map to a real good");
+        }
     }
 }
 

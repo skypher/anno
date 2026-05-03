@@ -282,6 +282,11 @@ impl Simulation {
     }
 
     fn tick_events(&mut self) {
+        self.tick_pirate_event();
+        self.tick_disaster_event();
+    }
+
+    fn tick_pirate_event(&mut self) {
         // Pirates only spawn when there is an active player trade ship to
         // hunt — otherwise the world is too empty for it to matter.
         let target_ship = self.trade_ships.iter()
@@ -293,11 +298,28 @@ impl Simulation {
         let r = self.next_rand();
         if r % 3 != 0 { return; }
 
-        // Pirate appears on the closest map edge ~30 tiles from the ship.
-        let dx = ((r >> 8) as i32 % 60) - 30;
-        let dy = ((r >> 16) as i32 % 60) - 30;
-        let px = (sx + dx).max(0);
-        let py = (sy + dy).max(0);
+        // Pirate origin: prefer an active PIRATWOHN hideout building
+        // (manual sec. 7.5 "Pirates and Natives" — pirates have
+        // hideouts on uninhabited islands, not random map edges).
+        // RE: `haeuser.cod` `Kind: PIRATWOHN` defines the hideout
+        // building. If no hideout exists in this scenario, fall back
+        // to the legacy random-edge spawn.
+        let hideout = self.buildings.iter()
+            .filter(|b| b.active && b.is_built() && {
+                let id = b.def_id as usize;
+                id < self.building_defs.len()
+                    && self.building_defs[id].prod_kind == "PIRATWOHN"
+            })
+            .map(|b| (b.tile_x as i32, b.tile_y as i32))
+            .next();
+        let (px, py) = match hideout {
+            Some((hx, hy)) => (hx, hy),
+            None => {
+                let dx = ((r >> 8) as i32 % 60) - 30;
+                let dy = ((r >> 16) as i32 % 60) - 30;
+                ((sx + dx).max(0), (sy + dy).max(0))
+            }
+        };
 
         // Slot 6 is the pirate faction. Make them at war with everyone
         // else (idempotent — set on every spawn).
@@ -310,6 +332,54 @@ impl Simulation {
         pirate.target_x = sx;
         pirate.target_y = sy;
         self.military_units.push(pirate);
+    }
+
+    /// Random fire / volcano event for the human player. Called from
+    /// `tick_events`. RE: figuren.cod `Nummer: VULKAN` (figure 0x12)
+    /// and `Nummer: BRANDMARKT` (figure 0x08); see `disaster.rs`
+    /// module doc-comment.
+    fn tick_disaster_event(&mut self) {
+        // Pick a random building owned by the human player.
+        let candidates: Vec<usize> = self.buildings.iter()
+            .enumerate()
+            .filter(|(_, b)| b.active && b.owner == 0 && b.is_built())
+            .map(|(i, _)| i)
+            .collect();
+        if candidates.is_empty() { return; }
+        let r = self.next_rand();
+
+        // Fire: rare ignition this tick (1-in-N gate).
+        if r % crate::disaster::FIRE_IGNITION_GATE == 0 {
+            let pick = (r >> 16) as usize % candidates.len();
+            let bi = candidates[pick];
+            crate::disaster::ignite_building(
+                &mut self.buildings[bi], &mut self.damage_events,
+            );
+            self.event_log.push(format!(
+                "[fire] a building at ({},{}) is on fire",
+                self.buildings[bi].tile_x, self.buildings[bi].tile_y,
+            ));
+        }
+
+        // Volcano: rarer area-of-effect event. We anchor the eruption
+        // on a random player-owned building so the effect lands in a
+        // populated area; the original engine uses fixed VULKAN
+        // tiles on volcanic islands which we don't track yet.
+        let r2 = self.next_rand();
+        if r2 % crate::disaster::VOLCANO_ERUPTION_GATE == 0 {
+            let pick = (r2 >> 16) as usize % candidates.len();
+            let bi = candidates[pick];
+            let cx = self.buildings[bi].tile_x;
+            let cy = self.buildings[bi].tile_y;
+            let island_id = self.buildings[bi].island_id;
+            let hit = crate::disaster::erupt_at(
+                cx, cy, island_id,
+                &mut self.buildings, &mut self.damage_events,
+            );
+            self.event_log.push(format!(
+                "[volcano] eruption at ({cx},{cy}) damaged {hit} building(s)",
+            ));
+        }
     }
 
     /// Main simulation tick, called with real-time delta in milliseconds.
@@ -2299,6 +2369,43 @@ mod tests {
         assert!(owned > 0, "AI should have spawned at least one unit, got {owned}");
         // And paid for them.
         assert!(sim.players[1].gold < 5_000);
+    }
+
+    #[test]
+    fn pirate_spawns_from_hideout_when_present() {
+        use crate::building::BuildingInstance;
+        use crate::trade::TradeShip;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        // Define a single PIRATWOHN building def at index 0.
+        sim.building_defs.push(crate::building::BuildingDef {
+            id: 0, category: 0, width: 2, height: 2,
+            production_type: crate::types::ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "PIRATWOHN".into(),
+            radius: 4,
+            output_good: crate::types::Good::None,
+            input_good_1: crate::types::Good::None,
+            input_good_2: crate::types::Good::None,
+            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 0, cycle_time_ms: 0, carrier_interval_ms: 0,
+            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+        });
+        // Place a hideout at a known tile.
+        let mut h = BuildingInstance::new(0, 0, 7, 11, 6);
+        h.construction_ms_remaining = 0;
+        sim.buildings.push(h);
+        // Need a player trade ship for pirates to want to spawn.
+        sim.trade_ships.push(TradeShip::new(0, 0, 50, 50));
+
+        // Force the 1-in-3 random gate to pass.
+        sim.rng_state = 3;
+        sim.tick_pirate_event();
+        // Pirate spawn should originate from the hideout tile.
+        let pirate = sim.military_units.iter()
+            .find(|u| u.owner == 6)
+            .expect("pirate should have spawned");
+        assert_eq!((pirate.tile_x, pirate.tile_y), (7, 11));
     }
 
     #[test]
