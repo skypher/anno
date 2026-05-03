@@ -3025,6 +3025,70 @@ fn main() {
                     show_paths,
                 );
 
+                // Selected-building service-radius preview. Anno
+                // surfaced this by clicking a public building (church
+                // / tavern / school / marketplace) — the info window
+                // showed the served-tiles diamond. We draw it as a
+                // ring-outline on the iso grid.
+                if !world_mode {
+                    if let Some(bi) = selected_building_idx {
+                        if bi < sim.buildings.len() {
+                            let b = &sim.buildings[bi];
+                            let def = &defs[b.def_id as usize];
+                            if def.radius > 0
+                                && b.island_id == islands[current_island].number
+                            {
+                                let half_tw = rs.tile_w / 2;
+                                let half_th = rs.tile_h / 2;
+                                let cx = b.tile_x as i32 + def.width as i32 / 2;
+                                let cy = b.tile_y as i32 + def.height as i32 / 2;
+                                let r = def.radius as i32;
+                                let outline = match def.prod_kind.as_str() {
+                                    "MARKT" | "KONTOR" => [0xFF, 0xE0, 0x40, 0xFF],
+                                    "KIRCHE" | "KAPELLE" => [0xFF, 0xCC, 0xCC, 0xFF],
+                                    "WIRT" => [0xFF, 0x88, 0x40, 0xFF],
+                                    "SCHULE" | "HOCHSCHULE" => [0x80, 0xC0, 0xFF, 0xFF],
+                                    "KLINIK" => [0xFF, 0x60, 0x60, 0xFF],
+                                    "THEATER" | "BADEHAUS" => [0xC0, 0x80, 0xFF, 0xFF],
+                                    _ => [0x80, 0xFF, 0xC0, 0xFF],
+                                };
+                                // Manhattan-distance ring (matches the
+                                // coverage::apply_radius diamond).
+                                for dy in -r..=r {
+                                    let dx_at_dy = r - dy.abs();
+                                    for &dx in &[-dx_at_dy, dx_at_dy] {
+                                        let tx = cx + dx;
+                                        let ty = cy + dy;
+                                        let sx = rs.origin_x + (tx - ty) * half_tw;
+                                        let sy = rs.origin_y + (tx + ty) * half_th;
+                                        let cx_pix = sx + half_tw;
+                                        let cy_pix = sy + half_th;
+                                        for offset in 0..=2 {
+                                            for sign in [-1i32, 1] {
+                                                let px = cx_pix + offset * sign;
+                                                let py = cy_pix;
+                                                if px < 0 || py < 0
+                                                    || (px as u32) >= rs.width
+                                                    || (py as u32) >= rs.height
+                                                { continue; }
+                                                let off =
+                                                    ((py as u32 * rs.width
+                                                        + px as u32) * 4) as usize;
+                                                if off + 3 < frame.len() {
+                                                    frame[off] = outline[0];
+                                                    frame[off + 1] = outline[1];
+                                                    frame[off + 2] = outline[2];
+                                                    frame[off + 3] = 0xFF;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Draw service coverage overlay (C key, single-island mode)
                 if show_coverage && !world_mode {
                     let island = &islands[current_island];

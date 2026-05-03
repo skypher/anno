@@ -240,14 +240,42 @@ pub fn update_population_growth(player: &mut Player, housing_cap: u32) {
         new_pop[tier] = (pop as i64 + delta as i64).max(0) as u32;
     }
 
-    // 2. Promotion (lower → higher)
+    // 2. Promotion (lower → higher).
+    //
+    // Anno 1602 manual section 6.7.1 ("The relationships between
+    // population, the level of civilization, and demand"): citizens
+    // upgrade when their existing demands are fully met AND the
+    // additional goods that the next tier requires are also being
+    // supplied. We honour that: promote only when (a) current tier
+    // satisfaction is full, and (b) every good the next tier
+    // *additionally* demands has > 0 supply this tick.
     for tier in 0..NUM_POP_TIERS - 1 {
-        if player.satisfaction[tier] >= 96 && new_pop[tier] > 0 {
-            let promoted = (new_pop[tier] / 50).max(1); // 2% (min 1)
-            let promoted = promoted.min(new_pop[tier]);
-            new_pop[tier] -= promoted;
-            new_pop[tier + 1] = new_pop[tier + 1].saturating_add(promoted);
+        if player.satisfaction[tier] < 96 || new_pop[tier] == 0 {
+            continue;
         }
+        let cur_demands: &[Good] = TIER_DEMANDS[tier];
+        let next_demands: &[Good] = TIER_DEMANDS[tier + 1];
+        let extra_goods: Vec<Good> = next_demands.iter()
+            .copied()
+            .filter(|g| !cur_demands.contains(g))
+            .collect();
+        let next_tier_supplied = extra_goods.iter().all(|g| {
+            // The good must be in the demand-slot grid AND have a
+            // non-zero most-recent fulfilment sample. If we don't
+            // track this good as a demand category at all, we can't
+            // gate on it — fall through to the satisfaction rule.
+            match DEMAND_GOODS.iter().position(|d| d == g) {
+                Some(idx) => player.demands[idx].fulfillment_history[0] > 0,
+                None => true,
+            }
+        });
+        if !next_tier_supplied {
+            continue;
+        }
+        let promoted = (new_pop[tier] / 50).max(1); // 2% (min 1)
+        let promoted = promoted.min(new_pop[tier]);
+        new_pop[tier] -= promoted;
+        new_pop[tier + 1] = new_pop[tier + 1].saturating_add(promoted);
     }
 
     // 3. Emigration on severe shortage.
@@ -303,12 +331,18 @@ mod tests {
         p.satisfaction[0] = 128;
         let before_pioneer = p.population[0];
         update_population_growth(&mut p, 0);
-        // Some pioneers promoted to settlers.
-        assert!(p.population[1] > 0, "should have promoted some to settlers");
-        // And the pioneer count moved (either net up from growth or down from promotion).
+        // Pioneers' next-tier extra demand is Cloth. Without Cloth
+        // supply the gate stops promotion entirely.
+        assert_eq!(p.population[1], 0,
+            "promotion should be blocked without next-tier supply");
         let total_after = p.population.iter().sum::<u32>();
-        // Total can't have lost people on positive sat; promotion is internal.
         assert!(total_after >= before_pioneer);
+
+        // Now wire Cloth supply and re-run: promotion fires.
+        let cloth_idx = DEMAND_GOODS.iter().position(|g| *g == Good::Cloth).unwrap();
+        p.demands[cloth_idx].fulfillment_history[0] = 128;
+        update_population_growth(&mut p, 0);
+        assert!(p.population[1] > 0, "supplied Cloth → settlers exist");
     }
 
     #[test]
