@@ -2607,6 +2607,24 @@ fn main() {
             if net_client.is_none() {
                 sim.tick(dt_ms);
             }
+            // Auto-save: matches `1602_exe.c:98061` —
+            //   if (DAT_005bafc8 != 0 && (DAT_005b1b68 += DAT_005b315c, 599999 < DAT_005b1b68))
+            //     FUN_00488b50("lastgame", path); reset counter
+            // i.e. when not paused, accumulate frame time and on
+            // crossing 599 999 ms (~10 min) write to "lastgame.bin".
+            if !sim.paused
+                && sim.autosave_timer_ms >= anno_sim::simulation::AUTOSAVE_INTERVAL_MS
+            {
+                sim.autosave_timer_ms = 0;
+                let path = save_dir.join(format!("{}.lastgame.bin", scenario_name));
+                let snap = sim.snapshot();
+                let msg = match anno_sim::save::save_to_file(&path, &snap) {
+                    Ok(()) => format!("auto-saved → {}", path.display()),
+                    Err(e) => format!("auto-save FAILED: {e}"),
+                };
+                println!("{msg}");
+                save_banner = Some((msg, std::time::Instant::now()));
+            }
             // Drain objective completions for the chat log.
             if !sim.objective_completions.is_empty() {
                 let drained: Vec<usize> = sim.objective_completions.drain(..).collect();
@@ -3387,6 +3405,50 @@ fn main() {
                                     mini_rgba[dst_off + 1] = frame[src_off + 1];
                                     mini_rgba[dst_off + 2] = frame[src_off + 2];
                                     mini_rgba[dst_off + 3] = if frame[src_off + 3] > 0 { 220 } else { 80 };
+                                }
+                            }
+                        }
+                    }
+
+                    // Building dots: stamp a small per-owner-coloured
+                    // pixel cluster at each building's iso position.
+                    // Helps players locate their settlements at a
+                    // glance the way the original minimap showed them.
+                    if !world_mode {
+                        let half_tw = rs.tile_w / 2;
+                        let half_th = rs.tile_h / 2;
+                        for b in &sim.buildings {
+                            if !b.active { continue; }
+                            if b.island_id != islands[current_island].number {
+                                continue;
+                            }
+                            let tx = b.tile_x as i32;
+                            let ty = b.tile_y as i32;
+                            let sx = rs.origin_x + (tx - ty) * half_tw;
+                            let sy = rs.origin_y + (tx + ty) * half_th;
+                            // Project to minimap pixel.
+                            let mx = (sx as f64 * mini_scale) as i32;
+                            let my = (sy as f64 * mini_scale) as i32;
+                            let color = match b.owner {
+                                0 => [0x40, 0xFF, 0x80, 0xFF], // human green
+                                1 => [0xFF, 0x60, 0x60, 0xFF], // red
+                                2 => [0x60, 0x80, 0xFF, 0xFF], // blue
+                                3 => [0xFF, 0xE0, 0x40, 0xFF], // yellow
+                                _ => [0xCC, 0xCC, 0xCC, 0xFF],
+                            };
+                            // 2x2 dot for visibility.
+                            for dy in 0..2 {
+                                for dx in 0..2 {
+                                    let px = mx + dx;
+                                    let py = my + dy;
+                                    if px < 0 || py < 0
+                                        || px >= mini_w as i32
+                                        || py >= mini_h as i32
+                                    { continue; }
+                                    let off = ((py as u32 * mini_w + px as u32) * 4) as usize;
+                                    if off + 3 < mini_rgba.len() {
+                                        mini_rgba[off..off + 4].copy_from_slice(&color);
+                                    }
                                 }
                             }
                         }
@@ -4596,7 +4658,49 @@ fn main() {
         } else {
             title
         };
+        // Outcome takes precedence — sticks once decided.
+        let title = match sim.outcome {
+            anno_sim::simulation::GameOutcome::Victory => format!("[VICTORY] {title}"),
+            anno_sim::simulation::GameOutcome::Defeat => format!("[DEFEAT] {title}"),
+            _ => title,
+        };
         canvas.window_mut().set_title(&title).ok();
+
+        // Outcome banner overlay — drawn centred so the player can see
+        // it in-window, not just in the title bar.
+        if sim.outcome != anno_sim::simulation::GameOutcome::Pending {
+            let (label, color) = match sim.outcome {
+                anno_sim::simulation::GameOutcome::Victory =>
+                    ("VICTORY", [0x40, 0xFF, 0x80, 0xFF]),
+                anno_sim::simulation::GameOutcome::Defeat =>
+                    ("DEFEAT", [0xFF, 0x40, 0x40, 0xFF]),
+                _ => ("", [0xFF, 0xFF, 0xFF, 0xFF]),
+            };
+            let scale = 4u32;
+            let panel_w = 240u32;
+            let panel_h = (5 * scale + 16) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 220;
+            }
+            let text_x = (panel_w as i32 - (label.len() as i32) * 4 * scale as i32) / 2;
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                text_x, 8, label, color, scale,
+            );
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                let ty = 80i32;
+                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+            }
+        }
 
         // Perf overlay (F12). Drawn last so it lands on top of everything.
         if show_perf {

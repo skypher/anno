@@ -144,6 +144,34 @@ pub struct Simulation {
     /// Last sampled human-player gold; used to fire a treasury voice
     /// alert exactly once per dip below the warning threshold.
     pub last_treasury_warn_gold: i32,
+    /// End-of-game outcome for the human player. `Pending` until a
+    /// scenario condition triggers victory or defeat (then the
+    /// renderer surfaces a banner; the simulation keeps ticking so
+    /// the player can keep building, matching the original endless
+    /// behaviour).
+    pub outcome: GameOutcome,
+}
+
+/// Game-over state for the human player slot 0.
+///
+/// Defeat triggers (from Anno 1602 player.rs constants and manual):
+/// - Sustained bankruptcy: `Player::is_game_over` (40 economy ticks
+///   below `BANKRUPTCY_THRESHOLD = -1001` gold, set by `tick_economy`).
+/// - All Kontors destroyed: a player without an active warehouse has
+///   no economy left.
+///
+/// Victory triggers (manual section on assignment goals — "the
+/// assignment goal has been reached when the predetermined opponent,
+/// or opponents, have been defeated"):
+/// - Every non-human, non-empty player slot is `Defeated`.
+/// - Or all scenario `objectives` are complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         serde::Serialize, serde::Deserialize)]
+pub enum GameOutcome {
+    #[default]
+    Pending,
+    Victory,
+    Defeat,
 }
 
 impl Simulation {
@@ -197,6 +225,7 @@ impl Simulation {
             free_traders: Vec::new(),
             free_trader_cooldown: 0,
             last_treasury_warn_gold: i32::MAX,
+            outcome: GameOutcome::Pending,
         }
     }
 
@@ -507,8 +536,82 @@ impl Simulation {
             self.last_treasury_warn_gold = p0_gold;
         }
 
+        self.evaluate_outcomes();
+
         // AI decision-making
         self.tick_ai();
+    }
+
+    /// Flip player slots to `PlayerState::Defeated` when their
+    /// civilisation collapses, and resolve the human player's
+    /// `outcome` when victory or defeat conditions are met.
+    fn evaluate_outcomes(&mut self) {
+        use crate::player::PlayerState;
+
+        // 1. Per-slot defeat: sustained bankruptcy (40 ticks below
+        //    -1001 gold) or zero active Kontors. We snapshot the
+        //    Kontor count to avoid an iterator-borrow conflict.
+        let active_kontors_for: Vec<u32> = (0..self.players.len())
+            .map(|owner| {
+                self.warehouses.iter()
+                    .filter(|w| w.active && w.owner as usize == owner)
+                    .count() as u32
+            })
+            .collect();
+        for (i, p) in self.players.iter_mut().enumerate() {
+            if matches!(p.state, PlayerState::Empty | PlayerState::Defeated) {
+                continue;
+            }
+            let bankrupt_too_long = p.is_game_over();
+            let no_economy = active_kontors_for[i] == 0
+                && p.population.iter().all(|n| *n == 0);
+            if bankrupt_too_long || no_economy {
+                p.state = PlayerState::Defeated;
+                self.event_log.push(format!(
+                    "[defeat] player {i} has been defeated",
+                ));
+            }
+        }
+
+        // 2. Human outcome (slot 0). Once decided, never revert.
+        if self.outcome != GameOutcome::Pending {
+            return;
+        }
+        let human_defeated = self.players.first()
+            .map(|p| p.state == PlayerState::Defeated)
+            .unwrap_or(false);
+        if human_defeated {
+            self.outcome = GameOutcome::Defeat;
+            self.event_log.push("[outcome] DEFEAT".to_string());
+            return;
+        }
+
+        // Victory by elimination: at least one rival existed at game
+        // start, and all non-human / non-empty / non-pirate slots are
+        // now Defeated.
+        let any_rival = self.players.iter().enumerate().any(|(i, p)| {
+            i != 0 && !matches!(p.state, PlayerState::Empty)
+        });
+        let all_rivals_down = self.players.iter().enumerate().all(|(i, p)| {
+            i == 0 || matches!(p.state, PlayerState::Empty | PlayerState::Defeated)
+        });
+        if any_rival && all_rivals_down {
+            self.outcome = GameOutcome::Victory;
+            self.event_log.push(
+                "[outcome] VICTORY — all rivals defeated".to_string(),
+            );
+            return;
+        }
+
+        // Victory by objectives: every scenario objective complete.
+        if !self.objectives.items.is_empty()
+            && self.objectives.items.iter().all(|(_, done)| *done)
+        {
+            self.outcome = GameOutcome::Victory;
+            self.event_log.push(
+                "[outcome] VICTORY — scenario objectives complete".to_string(),
+            );
+        }
     }
 
     fn tick_ai(&mut self) {
@@ -2147,5 +2250,47 @@ mod tests {
         assert!(owned > 0, "AI should have spawned at least one unit, got {owned}");
         // And paid for them.
         assert!(sim.players[1].gold < 5_000);
+    }
+
+    #[test]
+    fn defeat_when_human_runs_out_of_kontors_and_population() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        // No warehouses, no population → instant collapse.
+        sim.evaluate_outcomes();
+        assert_eq!(sim.players[0].state, crate::player::PlayerState::Defeated);
+        assert_eq!(sim.outcome, GameOutcome::Defeat);
+    }
+
+    #[test]
+    fn victory_when_all_rivals_defeated() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        // Give the human a Kontor + population so they aren't defeated.
+        sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
+        sim.players[0].population[1] = 100;
+
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players.push(Player::new_ai(2, 0));
+        // Knock both rivals out.
+        sim.players[1].state = crate::player::PlayerState::Defeated;
+        sim.players[2].state = crate::player::PlayerState::Defeated;
+
+        sim.evaluate_outcomes();
+        assert_eq!(sim.outcome, GameOutcome::Victory);
+    }
+
+    #[test]
+    fn outcome_pending_while_rivals_alive() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
+        sim.players[0].population[1] = 100;
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[1].population[1] = 100;
+        sim.warehouses.push(Warehouse::new(0, 1, 32, 42));
+
+        sim.evaluate_outcomes();
+        assert_eq!(sim.outcome, GameOutcome::Pending);
     }
 }
