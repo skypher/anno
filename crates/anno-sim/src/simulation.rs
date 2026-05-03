@@ -134,6 +134,10 @@ pub struct Simulation {
     /// Combat damage events from the most recent military tick. Drained
     /// by the renderer each frame to animate floating "-N" numbers.
     pub damage_events: Vec<crate::combat::DamageEvent>,
+
+    /// Sim-emitted text events (free-trader arrivals, etc.). Drained by
+    /// the game binary into the chat-log overlay each frame.
+    pub event_log: Vec<String>,
 }
 
 impl Simulation {
@@ -183,6 +187,7 @@ impl Simulation {
 
             exploration: Vec::new(),
             damage_events: Vec::new(),
+            event_log: Vec::new(),
 
             current_prices: (0..31u8)
                 .map(|i| {
@@ -271,6 +276,37 @@ impl Simulation {
     }
 
     fn tick_events(&mut self) {
+        // 1-in-5 chance: a free trader arrives at the player's first
+        // warehouse and offers a small parcel of exotic goods at +25%
+        // current-market price. Auto-applied: drops the goods, deducts
+        // gold, fires a chat event line.
+        let r0 = self.next_rand();
+        if r0 % 5 == 0 {
+            use crate::types::Good;
+            let exotic = match (r0 >> 16) % 4 {
+                0 => Good::Spices,
+                1 => Good::Cocoa,
+                2 => Good::Silk,
+                _ => Good::Jewelry,
+            };
+            let qty: u16 = 10;
+            let unit_price = self.current_price(exotic).buy * 5 / 4;
+            let cost = unit_price * qty as i32;
+            if self.players.get(0).map(|p| p.gold).unwrap_or(0) >= cost {
+                if let Some(wh) = self.warehouses.iter_mut()
+                    .find(|w| w.active && w.owner == 0)
+                {
+                    let dep = wh.deposit(exotic, qty);
+                    if dep > 0 {
+                        let actual = dep as i32 * unit_price;
+                        self.players[0].gold -= actual;
+                        self.event_log.push(format!(
+                            "[merchant] free trader brought {dep} {exotic:?} for {actual}g",
+                        ));
+                    }
+                }
+            }
+        }
         // Pirates only spawn when there is an active player trade ship to
         // hunt — otherwise the world is too empty for it to matter.
         let target_ship = self.trade_ships.iter()
@@ -599,30 +635,37 @@ impl Simulation {
                         }
                     }
                     AiAction::RequestMilitary { unit_count } => {
-                        // Spawn `unit_count` Swordsmen near the AI's first
-                        // active warehouse, capped by gold (100 / unit).
+                        // Spawn a mix of unit types near the AI's first
+                        // active warehouse. Distribution: 40% Swordsmen,
+                        // 30% Musketeers, 20% Cavalry, 10% Cannons.
+                        // Each type costs differently; the AI stops mid-
+                        // batch if it can't afford the next pick.
+                        use crate::combat::UnitType;
                         let owner = self.ai_controllers[ai_idx].player_idx;
-                        const SWORDSMAN_COST: i32 = 100;
+                        let pick_type = |k: u32| -> (UnitType, i32) {
+                            match k % 10 {
+                                0..=3 => (UnitType::Swordsman, 100),
+                                4..=6 => (UnitType::Musketeer, 150),
+                                7..=8 => (UnitType::Cavalry, 200),
+                                _      => (UnitType::Cannon,    300),
+                            }
+                        };
                         let spawn = self.warehouses.iter().find(|w| {
                             w.active && w.owner == owner
                         });
                         if let Some(spawn) = spawn {
                             let (sx, sy) = (spawn.tile_x as i32, spawn.tile_y as i32);
-                            let mut spent = 0;
-                            for k in 0..(unit_count as i32) {
-                                if self.players[player_idx].gold < SWORDSMAN_COST {
-                                    break;
-                                }
-                                self.players[player_idx].gold -= SWORDSMAN_COST;
+                            let mut spent = 0u32;
+                            for k in 0..unit_count {
+                                let (utype, cost) = pick_type(k);
+                                if self.players[player_idx].gold < cost { break; }
+                                self.players[player_idx].gold -= cost;
                                 spent += 1;
-                                // Stagger spawn positions in a small ring.
-                                let dx = (k % 3) - 1;
-                                let dy = (k / 3) % 3 - 1;
+                                let kk = k as i32;
+                                let dx = (kk % 3) - 1;
+                                let dy = (kk / 3) % 3 - 1;
                                 self.military_units.push(MilitaryUnit::new(
-                                    crate::combat::UnitType::Swordsman,
-                                    owner,
-                                    sx + dx,
-                                    sy + dy,
+                                    utype, owner, sx + dx, sy + dy,
                                 ));
                             }
                             self.players[player_idx].military_maintenance =
@@ -747,6 +790,30 @@ impl Simulation {
         self.tick_market_prices();
         // Reveal tiles around player-owned entities.
         self.tick_exploration();
+        // Stockpile alerts: warn the player about overflowing or empty
+        // strategic warehouses on the same market cadence.
+        self.tick_stockpile_alerts();
+    }
+
+    fn tick_stockpile_alerts(&mut self) {
+        // Throttle alerts to once every 6 market ticks (~6s) so we don't
+        // flood the chat log every cycle.
+        const COOLDOWN_TICKS: u32 = 6;
+        // Use a hidden field on the sim — repurpose `autosave_timer_ms`?
+        // No, that has its own meaning. Let's use rng_state's low byte
+        // as a counter.
+        let cycle = (self.rng_state >> 32) as u32;
+        if cycle % COOLDOWN_TICKS != 0 { return; }
+        for w in self.warehouses.iter().filter(|w| w.active && w.owner == 0) {
+            for (g, qty, cap) in w.all_stock() {
+                if cap > 0 && qty as u32 * 10 >= cap as u32 * 9 {
+                    self.event_log.push(format!(
+                        "[stock] warehouse @ ({},{}) overflowing on {:?} ({}/{})",
+                        w.tile_x, w.tile_y, g, qty, cap,
+                    ));
+                }
+            }
+        }
     }
 
     fn tick_exploration(&mut self) {
@@ -1206,8 +1273,42 @@ impl Simulation {
                 true
             }
             Command::SetDiplomacy { a, b, state } => {
-                self.diplomacy.set(a, b, state);
-                true
+                use crate::combat::Diplomacy;
+                // Declaring war / breaking treaty is unilateral; nobody
+                // gets to refuse. Asking for alliance or peace, however,
+                // is a proposal — the target's AI evaluates relative
+                // strength and may decline.
+                let unilateral = state == Diplomacy::War;
+                if unilateral {
+                    self.diplomacy.set(a, b, state);
+                    return true;
+                }
+                // Score helper.
+                let score_for = |sim: &Simulation, slot: u8| -> i64 {
+                    let units: i64 = sim.military_units.iter()
+                        .filter(|u| u.is_alive() && u.owner == slot)
+                        .count() as i64 * 10;
+                    let gold: i64 = sim.players.get(slot as usize)
+                        .map(|p| (p.gold.max(0) as i64) / 200)
+                        .unwrap_or(0);
+                    units + gold
+                };
+                let proposer_score = score_for(self, a);
+                let target_score = score_for(self, b);
+                // Target accepts when the proposer is at least as strong:
+                // weaklings can't dictate alliance terms to powerhouses.
+                if proposer_score >= target_score {
+                    self.diplomacy.set(a, b, state);
+                    self.event_log.push(format!(
+                        "[diplo] p{b} accepted your {state:?} proposal",
+                    ));
+                    true
+                } else {
+                    self.event_log.push(format!(
+                        "[diplo] p{b} rejected your {state:?} proposal",
+                    ));
+                    false
+                }
             }
             Command::Buy { player, good, qty } => {
                 let pi = player as usize;

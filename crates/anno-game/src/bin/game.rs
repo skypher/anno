@@ -895,6 +895,8 @@ fn main() {
     let mut route_list_panel = false;
     let mut route_list_sel: usize = 0;
     let mut queue_panel = false;
+    let mut chain_panel = false;
+    let mut help_panel = false;
     let mut wh_panel = false;
     let mut ship_panel = false;
     let mut obj_panel = false;
@@ -953,6 +955,19 @@ fn main() {
     /// Floating combat numbers: (tile_x, tile_y, amount, target_kind, spawn_instant).
     let mut floating_nums: Vec<(i32, i32, u16, u8, std::time::Instant)>
         = Vec::new();
+    /// Cosmetic civilians: (island_id, fx*256, fy*256, target_x, target_y, spawn).
+    /// Move 1 sub-tile per frame toward target, despawn after 4s.
+    let mut civilians: Vec<(u8, i32, i32, i32, i32, std::time::Instant)>
+        = Vec::new();
+    let mut civilian_seed: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+    /// First-run hint: shown until the user touches anything substantive.
+    /// Suppressed permanently once the marker file exists.
+    let tutorial_marker = anno_sim::settings::Settings::config_path()
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("tutorial-seen");
+    let mut show_tutorial = !tutorial_marker.exists();
+    let mut tutorial_dismissed_via_action = false;
     // Recently received chat lines (oldest first) with timestamp for TTL.
     let mut chat_log: std::collections::VecDeque<(String, std::time::Instant)> =
         std::collections::VecDeque::new();
@@ -1028,6 +1043,10 @@ fn main() {
                         ship_panel = false;
                     } else if queue_panel {
                         queue_panel = false;
+                    } else if chain_panel {
+                        chain_panel = false;
+                    } else if help_panel {
+                        help_panel = false;
                     } else if obj_panel {
                         obj_panel = false;
                     } else if placer.active {
@@ -1415,7 +1434,16 @@ fn main() {
                                         Diplomacy::War => Diplomacy::Neutral,
                                     }
                                 };
-                                sim.diplomacy.set(0, diplomacy_target, next);
+                                // Route through apply_command so peace /
+                                // alliance proposals can be rejected; war
+                                // declarations remain unilateral.
+                                sim.apply_command(
+                                    &anno_sim::commands::Command::SetDiplomacy {
+                                        a: 0,
+                                        b: diplomacy_target,
+                                        state: next,
+                                    },
+                                );
                             }
                             Keycode::Y | Keycode::Escape => {
                                 diplomacy_panel = false;
@@ -1672,6 +1700,9 @@ fn main() {
                             Keycode::Q => {
                                 queue_panel = !queue_panel;
                             }
+                            Keycode::X => {
+                                chain_panel = !chain_panel;
+                            }
                             Keycode::Question | Keycode::Slash => {
                                 obj_panel = !obj_panel;
                             }
@@ -1683,6 +1714,9 @@ fn main() {
                             }
                             Keycode::F10 => {
                                 settings_panel = !settings_panel;
+                            }
+                            Keycode::F11 => {
+                                help_panel = !help_panel;
                             }
                             Keycode::F12 => {
                                 show_perf = !show_perf;
@@ -1828,12 +1862,25 @@ fn main() {
                                 let msg = match anno_sim::save::save_to_file(
                                     &quicksave_path, &snap,
                                 ) {
-                                    Ok(()) => format!(
-                                        "saved → {} ({} buildings, {} gold)",
-                                        quicksave_path.display(),
-                                        sim.buildings.len(),
-                                        sim.players.first().map(|p| p.gold).unwrap_or(0),
-                                    ),
+                                    Ok(()) => {
+                                        // Also dump a thumbnail of the
+                                        // current terrain frame next to
+                                        // the save for the slot picker.
+                                        if let Some(ref rs) = rendered {
+                                            let thumb_name = format!(
+                                                "{}.quickthumb",
+                                                scenario_name,
+                                            );
+                                            save_ppm(&rs.rgba, rs.width, rs.height,
+                                                &thumb_name);
+                                        }
+                                        format!(
+                                            "saved → {} ({} buildings, {} gold)",
+                                            quicksave_path.display(),
+                                            sim.buildings.len(),
+                                            sim.players.first().map(|p| p.gold).unwrap_or(0),
+                                        )
+                                    }
                                     Err(e) => format!("save FAILED: {e}"),
                                 };
                                 println!("{msg}");
@@ -2654,7 +2701,8 @@ fn main() {
             || market_panel || wh_panel || ship_panel || save_panel
             || scenario_picker || tax_panel || diplomacy_panel
             || trade_route_mode || obj_panel || settings_panel
-            || context_menu.is_some() || route_list_panel || queue_panel;
+            || context_menu.is_some() || route_list_panel || queue_panel
+            || chain_panel || help_panel;
         if any_modal != prev_modal_open {
             if any_modal {
                 if !sim.paused {
@@ -2690,6 +2738,14 @@ fn main() {
                     audio.waves.play_once(sfx, WINDOW_W as i32 / 2, WINDOW_H as i32 / 2, handle);
                 }
             }
+            // Drain sim event log lines.
+            if !sim.event_log.is_empty() {
+                for line in sim.event_log.drain(..) {
+                    chat_log.push_back((line, std::time::Instant::now()));
+                    if chat_log.len() > 8 { chat_log.pop_front(); }
+                }
+            }
+
             // Drain damage events into the floating-number animation.
             if !sim.damage_events.is_empty() {
                 let now = std::time::Instant::now();
@@ -3696,7 +3752,7 @@ fn main() {
                 let tier_names = ["Pioneer", "Settler", "Citizen", "Merchant", "Aristocrat"];
                 let tax_scale = 2u32;
                 let line_h = 14i32;
-                let panel_w = 280u32;
+                let panel_w = 380u32;
                 let panel_h = (7 * line_h as u32) + 12;
                 let mut panel_buf = vec![0u8; (panel_w * panel_h * 4) as usize];
                 // Dark background
@@ -3722,17 +3778,26 @@ fn main() {
                     &format!("Inc:{} Cost:{} Net:{}", income, costs, net),
                     [0xAA, 0xAA, 0xAA, 0xFF], tax_scale,
                 );
-                // Per-tier rows
+                // Per-tier rows. Each row also previews the per-tier
+                // contribution to income and the next-tick growth delta
+                // so the player can see the consequences of a tax change.
                 for i in 0..5 {
                     let y = 4 + (i + 2) as i32 * line_h;
                     let rate = player.tax_rates[i] as u32 * 100 / 128;
                     let sat = player.satisfaction[i] as u32 * 100 / 128;
                     let pop = player.population[i];
+                    let tier_inc = (pop as i32
+                        * player.tax_rates[i] as i32
+                        * player.satisfaction[i] as i32) / (128 * 128);
+                    // Cribbed from population::growth_delta math.
+                    let permille = (player.satisfaction[i] as i32 - 64) * 50 / 64;
+                    let delta = ((pop as i64 * permille as i64) / 1000) as i32;
+                    let delta = delta.clamp(-50, 50);
                     let selected = i == tax_tier;
                     let arrow = if selected { ">" } else { " " };
                     let line = format!(
-                        "{}{} Tax:{}% Sat:{}% Pop:{}",
-                        arrow, tier_names[i], rate, sat, pop
+                        "{}{} Tax:{}% Sat:{}% Pop:{} (+{} g, Δ{:+})",
+                        arrow, tier_names[i], rate, sat, pop, tier_inc, delta,
                     );
                     let color = if selected {
                         [0xFF, 0xFF, 0x00, 0xFF] // Yellow for selected
@@ -4225,6 +4290,135 @@ fn main() {
                 tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                 let tx = menu.screen_x.min(WINDOW_W as i32 - panel_w as i32 - 4);
                 let ty = menu.screen_y.min(WINDOW_H as i32 - panel_h as i32 - 4);
+                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+            }
+        }
+
+        // Help / keybindings panel (F11). Read-only reference so the
+        // player doesn't have to memorise every hotkey.
+        if help_panel {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 480u32;
+            let lines = [
+                "KEYBINDINGS (F11/Esc close)",
+                "",
+                "Build / city",
+                "  B   build mode    D   demolish    Z   rotate    [/]  category",
+                "  T   tax panel     Y   diplomacy   F7  found colony",
+                "  F8  export islands as .szs",
+                "Trade",
+                "  R   trade route   Shift+R routes  J   fleet     A   market",
+                "  F4  buy ship      U   warehouses",
+                "Diagnostics",
+                "  K   graphs        P   production  O   roster    Q   build queue",
+                "  X   chain         ?   objectives  H   HUD       C   coverage",
+                "  F6  paths         F12 perf",
+                "World / view",
+                "  W   world toggle  G   speed up    Space pause  Tab next island",
+                "  M/N/V audio       S   screenshot  +/- zoom",
+                "Save / system",
+                "  F2 scenarios  F3 save slots  F5 quicksave  F9 quickload",
+                "  F10 settings  F11 this help",
+            ];
+            let panel_h = (line_h * lines.len() as i32 + 8) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 220;
+            }
+            for (i, l) in lines.iter().enumerate() {
+                let color = if l.starts_with(' ') {
+                    [0xCC, 0xCC, 0xCC, 0xFF]
+                } else if i == 0 {
+                    [0xFF, 0xD7, 0x00, 0xFF]
+                } else if l.is_empty() {
+                    [0; 4]
+                } else {
+                    [0x99, 0xCC, 0xFF, 0xFF]
+                };
+                tiny_font::draw_str(&mut buf, panel_w, panel_h,
+                    4, 4 + i as i32 * line_h, l, color, scale);
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                let ty = 60i32;
+                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+            }
+        }
+
+        // Production chain panel (X): list every BuildingDef that has an
+        // output_good, showing inputs → output. Color rows by whether the
+        // player has at least one producer; missing producers stand out so
+        // chain gaps are obvious.
+        if chain_panel {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 460u32;
+            let header_h = 30i32;
+            // Aggregate distinct (input1, input2 → output) chains.
+            let mut chains: Vec<(Good, Good, Good)> = Vec::new();
+            let mut producer_counts: std::collections::HashMap<Good, u32> =
+                std::collections::HashMap::new();
+            for d in &defs {
+                if d.output_good == Good::None { continue; }
+                let triple = (d.input_good_1, d.input_good_2, d.output_good);
+                if !chains.contains(&triple) { chains.push(triple); }
+            }
+            for b in &sim.buildings {
+                if b.owner != 0 || !b.is_built() { continue; }
+                let def = &defs[b.def_id as usize];
+                if def.output_good != Good::None {
+                    *producer_counts.entry(def.output_good).or_insert(0) += 1;
+                }
+            }
+            let visible = chains.len().min(28);
+            let panel_h = (header_h + visible as i32 * line_h + 12) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 220;
+            }
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4, "PRODUCTION CHAINS (X/Esc close)  inputs -> output  [n owned]",
+                [0xFF, 0xD7, 0x00, 0xFF], 1,
+            );
+            for (i, (in1, in2, out)) in chains.iter().take(visible).enumerate() {
+                let n = producer_counts.get(out).copied().unwrap_or(0);
+                let in_str = match (in1, in2) {
+                    (Good::None, Good::None) => "(raw)".to_string(),
+                    (a, Good::None) | (Good::None, a) => format!("{:?}", a),
+                    (a, b) => format!("{:?} + {:?}", a, b),
+                };
+                let line = format!("{:<22} -> {:<10} [{}]",
+                    if in_str.len() > 22 { in_str[..22].to_string() } else { in_str },
+                    format!("{:?}", out),
+                    n,
+                );
+                let color = if n == 0 {
+                    [0xFF, 0x88, 0x66, 0xFF] // missing producer
+                } else {
+                    [0xCC, 0xFF, 0xCC, 0xFF]
+                };
+                tiny_font::draw_str(&mut buf, panel_w, panel_h,
+                    4, header_h + i as i32 * line_h, &line, color, scale);
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                let ty = 60i32;
                 canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
             }
         }
@@ -4966,6 +5160,116 @@ fn main() {
             title
         };
         canvas.window_mut().set_title(&title).ok();
+
+        // First-run tutorial banner. Dismisses on first action that
+        // changes the sim or quits the panel.
+        if show_tutorial {
+            if !sim.buildings.is_empty() && !tutorial_dismissed_via_action {
+                tutorial_dismissed_via_action = true;
+            }
+            if tutorial_dismissed_via_action {
+                show_tutorial = false;
+                if let Some(parent) = tutorial_marker.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&tutorial_marker, b"seen\n");
+            }
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 480u32;
+            let lines = [
+                "ANNO 1602 — quick start",
+                "  F2  pick a scenario",
+                "  F7  found a colony (drop a Kontor)",
+                "  B   build mode (1-9 select, click place)",
+                "  T   set tax rates",
+                "  ?   list scenario objectives",
+                "(this banner closes after your first build)",
+            ];
+            let panel_h = (line_h * lines.len() as i32 + 8) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 200;
+            }
+            for (i, l) in lines.iter().enumerate() {
+                let color = if i == 0 {
+                    [0xFF, 0xD7, 0x00, 0xFF]
+                } else { [0xCC, 0xCC, 0xCC, 0xFF] };
+                tiny_font::draw_str(&mut buf, panel_w, panel_h,
+                    4, 4 + i as i32 * line_h, l, color, scale);
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                let ty = WINDOW_H as i32 - panel_h as i32 - 80;
+                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+            }
+        }
+
+        // Cosmetic civilians: spawn occasionally near player residences,
+        // drift to a target, despawn after 4s. Pure visual fluff.
+        {
+            const TTL: std::time::Duration = std::time::Duration::from_secs(4);
+            let now = std::time::Instant::now();
+            civilians.retain(|c| now - c.5 < TTL);
+            // Roll for a new spawn ~1 frame in 30 if under cap.
+            civilian_seed = civilian_seed.wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            if civilians.len() < 16 && (civilian_seed >> 56) % 30 == 0 {
+                let residences: Vec<(u8, i32, i32)> = sim.buildings.iter()
+                    .filter(|b| {
+                        b.owner == 0 && b.is_built() && {
+                            let def = &defs[b.def_id as usize];
+                            def.kind == "WOHN" || def.prod_kind == "WOHN"
+                        }
+                    })
+                    .map(|b| (b.island_id, b.tile_x as i32, b.tile_y as i32))
+                    .collect();
+                if !residences.is_empty() {
+                    let pick = (civilian_seed >> 8) as usize % residences.len();
+                    let (iid, sx, sy) = residences[pick];
+                    let tdx = (((civilian_seed >> 16) as i32) % 7) - 3;
+                    let tdy = (((civilian_seed >> 24) as i32) % 7) - 3;
+                    civilians.push((iid, sx * 256, sy * 256, sx + tdx, sy + tdy, now));
+                }
+            }
+            // Drift each civilian by 8 sub-tiles toward target.
+            for c in civilians.iter_mut() {
+                let dx = c.3 * 256 - c.1;
+                let dy = c.4 * 256 - c.2;
+                if dx.abs() > 4 { c.1 += dx.signum() * 4; }
+                if dy.abs() > 4 { c.2 += dy.signum() * 4; }
+            }
+            // Render: a small white dot per civilian on the active island.
+            if !world_mode {
+                if let Some(ref rs) = rendered {
+                    let half_tw = rs.tile_w / 2;
+                    let half_th = rs.tile_h / 2;
+                    let island_id = islands[current_island].number;
+                    for c in civilians.iter() {
+                        if c.0 != island_id { continue; }
+                        let tx = c.1 / 256;
+                        let ty = c.2 / 256;
+                        let tex_sx = rs.origin_x + (tx - ty) * half_tw + half_tw;
+                        let tex_sy = rs.origin_y + (tx + ty) * half_th + half_th;
+                        let dst_w = rs.width as i32 * display_zoom;
+                        let dst_h = rs.height as i32 * display_zoom;
+                        let dst_x = (WINDOW_W as i32 - dst_w) / 2 + scroll_x;
+                        let dst_y = (WINDOW_H as i32 - dst_h) / 2 + scroll_y;
+                        let screen_x = dst_x + tex_sx * display_zoom;
+                        let screen_y = dst_y + tex_sy * display_zoom;
+                        canvas.set_draw_color(sdl2::pixels::Color::RGB(0xEE, 0xEE, 0xC0));
+                        canvas.fill_rect(Rect::new(screen_x, screen_y, 2, 2)).ok();
+                    }
+                }
+            }
+        }
 
         // Floating combat numbers: drift up + fade across 1.5s. Drawn on
         // the SDL canvas (post-texture) so they sit on top of the world.
