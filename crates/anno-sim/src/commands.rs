@@ -32,6 +32,32 @@ pub enum Command {
     /// active warehouses. Drains from the sender's first matching
     /// warehouse, deposits into the recipient's first matching one.
     GiftGoods { from: u8, to: u8, good: Good, qty: u16 },
+    /// Arm a naval unit with cannons (manual sec. 9.2.3 "Arming
+    /// your ships"). `target_cannons` is the desired count; the
+    /// command clamps to the ship class's `cannon_capacity`. Each
+    /// cannon costs `Cannons` from the player's nearest active
+    /// warehouse + 200 gold (manual: cannons are crafted-good
+    /// expenditure plus an installation fee).
+    ArmShip { player: u8, unit_index: u32, target_cannons: u8 },
+    /// Set or clear a unit's patrol waypoint list (manual sec.
+    /// 9.2.4). An empty list cancels patrol. Sets `target_x/y` to
+    /// the first waypoint immediately so movement starts on the
+    /// next tick.
+    SetPatrol {
+        player: u8,
+        unit_index: u32,
+        waypoints: Vec<(i32, i32)>,
+    },
+    /// Propose a trade agreement (manual sec. 7.2). Bilateral once
+    /// concluded. Auto-accepted in single-player; auto-rejected if
+    /// the players are at war or a recent trade agreement was
+    /// broken between them.
+    ProposeTradeAgreement { a: u8, b: u8 },
+    /// Cancel an existing trade agreement. Sets the per-pair broken
+    /// flag so the next proposal is auto-rejected until cleared
+    /// (manual: "seldom possible to conclude a new trade agreement
+    /// right after one has been broken").
+    BreakTradeAgreement { a: u8, b: u8 },
     /// Market-wagon trade: transfer `qty` of `good` between two of
     /// `player`'s active warehouses (by index). Manual section 8.2
     /// "Trading with other cities on your island": the KARREN

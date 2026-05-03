@@ -180,9 +180,39 @@ pub struct MilitaryUnit {
     /// none. Updated each tick so the unit's `target` shadows the ship.
     #[serde(default = "default_escort_ship")]
     pub escort_ship: i32,
+    /// Number of cannons mounted on this naval unit (manual sec.
+    /// 9.2.3 "Arming your ships"). For land units this stays 0.
+    /// `attack_damage` of the unit's stats is multiplied by
+    /// `(1 + cannons / 4)` so a fully-armed warship hits harder than
+    /// a stripped one. SmallWarship / LargeWarship each have a
+    /// platform cap (4 / 8 respectively) — the buy command clamps.
+    #[serde(default)]
+    pub cannons: u8,
+    /// Patrol waypoint list (manual sec. 9.2.4 "Patrol"). When
+    /// non-empty AND `combat_target == -1`, the unit cycles through
+    /// these waypoints — heading to one, then advancing the index.
+    /// Engaging an enemy clears the active patrol step but not the
+    /// waypoints, so the ship resumes patrol after the fight.
+    #[serde(default)]
+    pub patrol: Vec<(i32, i32)>,
+    /// Index of the current patrol target (round-robin).
+    #[serde(default)]
+    pub patrol_idx: u32,
 }
 
 fn default_escort_ship() -> i32 { -1 }
+
+/// Maximum cannons each ship class can mount. Manual sec. 9.2.3
+/// describes "small and large warships" as the two armed naval
+/// classes — small can carry fewer cannons, large carries more. The
+/// numbers are SPECULATIVE pending RE of the Werft (shipyard) UI.
+pub fn cannon_capacity(t: UnitType) -> u8 {
+    match t {
+        UnitType::SmallWarship => 4,
+        UnitType::LargeWarship => 8,
+        _ => 0,
+    }
+}
 
 impl MilitaryUnit {
     pub fn new(unit_type: UnitType, owner: u8, tile_x: i32, tile_y: i32) -> Self {
@@ -201,6 +231,9 @@ impl MilitaryUnit {
             combat_target: -1,
             active: true,
             escort_ship: -1,
+            cannons: 0,
+            patrol: Vec::new(),
+            patrol_idx: 0,
         }
     }
 
@@ -227,7 +260,21 @@ pub enum Diplomacy {
 pub struct DiplomacyMatrix {
     /// 7×7 matrix (max 7 players).
     relations: [[Diplomacy; 7]; 7],
+    /// Trade-agreement matrix (manual sec. 7.2). Symmetric: a trade
+    /// agreement between players a and b is bilateral. Once
+    /// concluded, each side can inspect the other's warehouses.
+    /// Cleared on war declaration.
+    #[serde(default = "default_trade_matrix")]
+    trade_agreement: [[bool; 7]; 7],
+    /// Per-pair "broke a trade agreement recently" penalty flag.
+    /// Manual: "breaking a trade agreement usually has a negative
+    /// influence on the other players' attitude towards you" — we
+    /// surface that as a temporary block on re-proposing.
+    #[serde(default = "default_trade_matrix")]
+    trade_agreement_broken: [[bool; 7]; 7],
 }
+
+fn default_trade_matrix() -> [[bool; 7]; 7] { [[false; 7]; 7] }
 
 impl DiplomacyMatrix {
     pub fn new() -> Self {
@@ -236,7 +283,11 @@ impl DiplomacyMatrix {
         for i in 0..7 {
             relations[i][i] = Diplomacy::Allied;
         }
-        Self { relations }
+        Self {
+            relations,
+            trade_agreement: [[false; 7]; 7],
+            trade_agreement_broken: [[false; 7]; 7],
+        }
     }
 
     pub fn new_all_war() -> Self {
@@ -264,6 +315,53 @@ impl DiplomacyMatrix {
         }
         self.relations[a as usize][b as usize] = state;
         self.relations[b as usize][a as usize] = state;
+        // Manual sec. 7.2: declaring war breaks any trade agreement.
+        if state == Diplomacy::War {
+            self.trade_agreement[a as usize][b as usize] = false;
+            self.trade_agreement[b as usize][a as usize] = false;
+        }
+    }
+
+    /// Returns true if `a` and `b` have a concluded trade agreement.
+    pub fn has_trade_agreement(&self, a: u8, b: u8) -> bool {
+        if a as usize >= 7 || b as usize >= 7 { return false; }
+        self.trade_agreement[a as usize][b as usize]
+    }
+
+    /// Open a trade agreement between `a` and `b`. Manual sec. 7.2:
+    /// rejected if either side recently broke an agreement (penalty
+    /// flag set) OR if the players are at war. Sets the flag
+    /// symmetrically. Returns true on success.
+    pub fn propose_trade_agreement(&mut self, a: u8, b: u8) -> bool {
+        if a as usize >= 7 || b as usize >= 7 || a == b { return false; }
+        if self.get(a, b) == Diplomacy::War { return false; }
+        if self.trade_agreement_broken[a as usize][b as usize] { return false; }
+        self.trade_agreement[a as usize][b as usize] = true;
+        self.trade_agreement[b as usize][a as usize] = true;
+        true
+    }
+
+    /// Cancel a trade agreement. Sets the per-pair broken-flag so the
+    /// next proposal is auto-rejected (manual: "seldom possible to
+    /// conclude a new trade agreement right after one has been
+    /// broken").
+    pub fn break_trade_agreement(&mut self, a: u8, b: u8) -> bool {
+        if a as usize >= 7 || b as usize >= 7 || a == b { return false; }
+        if !self.trade_agreement[a as usize][b as usize] { return false; }
+        self.trade_agreement[a as usize][b as usize] = false;
+        self.trade_agreement[b as usize][a as usize] = false;
+        self.trade_agreement_broken[a as usize][b as usize] = true;
+        self.trade_agreement_broken[b as usize][a as usize] = true;
+        true
+    }
+
+    /// Clear the broken-trade-agreement penalty between `a` and `b`
+    /// (e.g. after enough cooldown ticks). Restores the ability to
+    /// re-propose.
+    pub fn clear_broken_flag(&mut self, a: u8, b: u8) {
+        if a as usize >= 7 || b as usize >= 7 { return; }
+        self.trade_agreement_broken[a as usize][b as usize] = false;
+        self.trade_agreement_broken[b as usize][a as usize] = false;
     }
 }
 
@@ -340,13 +438,17 @@ pub fn tick_combat(
         if units[i].attack_timer_ms >= stats.attack_speed_ms {
             units[i].attack_timer_ms -= stats.attack_speed_ms;
 
-            // Apply damage to target (and report it for the floating-
-            // number overlay; amount in 1/100 hp ≈ percent for u16).
-            units[target_idx].health -= stats.attack_damage;
+            // Apply damage to target. Naval units scale with the
+            // number of cannons mounted (manual sec. 9.2.3): each
+            // cannon adds 25% on top of the base hull damage. Land
+            // units have cannons = 0 so they're unaffected.
+            let cannons = units[i].cannons;
+            let damage = stats.attack_damage * (1.0 + cannons as f32 * 0.25);
+            units[target_idx].health -= damage;
             events.push(DamageEvent {
                 x: units[target_idx].tile_x,
                 y: units[target_idx].tile_y,
-                amount: (stats.attack_damage * 100.0) as u16,
+                amount: (damage * 100.0) as u16,
                 target: 0,
             });
 
@@ -472,7 +574,17 @@ pub fn tick_unit_orders_with_ocean(
         }
         if u.tile_x == u.target_x && u.tile_y == u.target_y {
             u.move_timer_ms = 0;
-            continue;
+            // Patrol advance: when a waypoint is reached and the
+            // unit has a patrol list, retarget the next waypoint
+            // (round-robin). Manual sec. 9.2.4 "Patrol".
+            if !u.patrol.is_empty() {
+                u.patrol_idx = (u.patrol_idx + 1) % u.patrol.len() as u32;
+                let (nx, ny) = u.patrol[u.patrol_idx as usize];
+                u.target_x = nx;
+                u.target_y = ny;
+            } else {
+                continue;
+            }
         }
         let speed = u.unit_type.stats().move_speed.max(1) as u32;
         let step_ms = (1000 / speed).max(100);
@@ -516,7 +628,15 @@ pub fn tick_unit_orders(units: &mut [MilitaryUnit], dt_ms: u32) {
         }
         if u.tile_x == u.target_x && u.tile_y == u.target_y {
             u.move_timer_ms = 0;
-            continue;
+            // Patrol advance — same logic as the ocean-aware variant.
+            if !u.patrol.is_empty() {
+                u.patrol_idx = (u.patrol_idx + 1) % u.patrol.len() as u32;
+                let (nx, ny) = u.patrol[u.patrol_idx as usize];
+                u.target_x = nx;
+                u.target_y = ny;
+            } else {
+                continue;
+            }
         }
         let speed = u.unit_type.stats().move_speed.max(1) as u32;
         let step_ms = (1000 / speed).max(100);

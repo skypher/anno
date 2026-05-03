@@ -1685,6 +1685,89 @@ impl Simulation {
                     false
                 }
             }
+            Command::SetPatrol { ref player, ref unit_index, ref waypoints } => {
+                let ui = *unit_index as usize;
+                if ui >= self.military_units.len() { return false; }
+                let unit = &mut self.military_units[ui];
+                if unit.owner != *player || !unit.is_alive() { return false; }
+                if waypoints.is_empty() {
+                    unit.patrol.clear();
+                    unit.patrol_idx = 0;
+                } else {
+                    unit.patrol = waypoints.clone();
+                    unit.patrol_idx = 0;
+                    let first = waypoints[0];
+                    unit.target_x = first.0;
+                    unit.target_y = first.1;
+                    unit.combat_target = -1;
+                    unit.move_timer_ms = 0;
+                }
+                true
+            }
+            Command::ArmShip { player, unit_index, target_cannons } => {
+                let pi = player as usize;
+                if pi >= self.players.len() { return false; }
+                let ui = unit_index as usize;
+                if ui >= self.military_units.len() { return false; }
+                let unit = &self.military_units[ui];
+                if unit.owner != player || !unit.is_alive() { return false; }
+                let cap = crate::combat::cannon_capacity(unit.unit_type);
+                if cap == 0 { return false; }
+                let want = target_cannons.min(cap);
+                let have = unit.cannons;
+                if want <= have { return false; }
+                let to_install = (want - have) as u32;
+                let cost_gold = to_install as i32 * 200;
+                if self.players[pi].gold < cost_gold { return false; }
+                // Pull `Cannons` good from any of the player's
+                // warehouses to cover the install.
+                let mut needed = to_install as u16;
+                for w in self.warehouses.iter_mut()
+                    .filter(|w| w.active && w.owner == player)
+                {
+                    if needed == 0 { break; }
+                    let took = w.withdraw(crate::types::Good::Cannons, needed);
+                    needed -= took;
+                }
+                if needed > 0 {
+                    // Refund anything we already pulled — withdraw is
+                    // idempotent at the warehouse level so we just
+                    // walk back what we still owe.
+                    let recovered = to_install as u16 - needed;
+                    if recovered > 0 {
+                        if let Some(w) = self.warehouses.iter_mut()
+                            .find(|w| w.active && w.owner == player)
+                        {
+                            w.deposit(crate::types::Good::Cannons, recovered);
+                        }
+                    }
+                    return false;
+                }
+                self.players[pi].gold -= cost_gold;
+                self.military_units[ui].cannons = want;
+                self.event_log.push(format!(
+                    "[werft] ship #{ui} armed with {want}/{cap} cannons",
+                ));
+                true
+            }
+            Command::ProposeTradeAgreement { a, b } => {
+                let ok = self.diplomacy.propose_trade_agreement(a, b);
+                if ok {
+                    self.event_log.push(format!(
+                        "[diplo] trade agreement signed: p{a} ↔ p{b}",
+                    ));
+                }
+                ok
+            }
+            Command::BreakTradeAgreement { a, b } => {
+                let ok = self.diplomacy.break_trade_agreement(a, b);
+                if ok {
+                    self.event_log.push(format!(
+                        "[diplo] trade agreement BROKEN: p{a} ↔ p{b}",
+                    ));
+                }
+                ok
+            }
             Command::DispatchCart {
                 player, from_warehouse, to_warehouse, good, qty,
             } => {
@@ -2428,6 +2511,118 @@ mod tests {
         assert!(owned > 0, "AI should have spawned at least one unit, got {owned}");
         // And paid for them.
         assert!(sim.players[1].gold < 5_000);
+    }
+
+    #[test]
+    fn patrol_cycles_waypoints() {
+        use crate::combat::{MilitaryUnit, UnitType, tick_unit_orders};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.military_units.push(MilitaryUnit::new(
+            UnitType::SmallWarship, 0, 0, 0,
+        ));
+        let ok = sim.apply_command(&crate::commands::Command::SetPatrol {
+            player: 0, unit_index: 0,
+            waypoints: vec![(2, 0), (2, 2), (0, 2)],
+        });
+        assert!(ok);
+        // Tick the unit until it reaches the first waypoint.
+        for _ in 0..20 {
+            tick_unit_orders(&mut sim.military_units, 200);
+            if sim.military_units[0].tile_x == 2 && sim.military_units[0].tile_y == 0 {
+                break;
+            }
+        }
+        // After arrival the patrol index should advance to waypoint 1
+        // and the new target_x/y should reflect (2, 2).
+        tick_unit_orders(&mut sim.military_units, 200);
+        assert_eq!(
+            (sim.military_units[0].target_x, sim.military_units[0].target_y),
+            (2, 2),
+        );
+
+        // Empty waypoints cancels patrol.
+        sim.apply_command(&crate::commands::Command::SetPatrol {
+            player: 0, unit_index: 0, waypoints: vec![],
+        });
+        assert!(sim.military_units[0].patrol.is_empty());
+    }
+
+    #[test]
+    fn arm_ship_consumes_cannons_and_clamps_to_cap() {
+        use crate::combat::{MilitaryUnit, UnitType};
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players[0].gold = 5_000;
+        sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
+        sim.warehouses[0].set_capacity(Good::Cannons, 50);
+        sim.warehouses[0].deposit(Good::Cannons, 50);
+        sim.military_units.push(MilitaryUnit::new(
+            UnitType::SmallWarship, 0, 60, 60,
+        ));
+        let ok = sim.apply_command(&crate::commands::Command::ArmShip {
+            player: 0, unit_index: 0, target_cannons: 99, // request beyond cap
+        });
+        assert!(ok);
+        let cap = crate::combat::cannon_capacity(UnitType::SmallWarship);
+        assert_eq!(sim.military_units[0].cannons, cap);
+        assert_eq!(sim.warehouses[0].stock(Good::Cannons), 50 - cap as u16);
+        assert_eq!(sim.players[0].gold, 5_000 - 200 * cap as i32);
+    }
+
+    #[test]
+    fn arm_ship_rejects_land_unit() {
+        use crate::combat::{MilitaryUnit, UnitType};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.military_units.push(MilitaryUnit::new(
+            UnitType::Swordsman, 0, 0, 0,
+        ));
+        assert!(!sim.apply_command(&crate::commands::Command::ArmShip {
+            player: 0, unit_index: 0, target_cannons: 1,
+        }));
+    }
+
+    #[test]
+    fn trade_agreement_lifecycle() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+
+        // Propose & accept.
+        assert!(sim.apply_command(
+            &crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 }
+        ));
+        assert!(sim.diplomacy.has_trade_agreement(0, 1));
+        assert!(sim.diplomacy.has_trade_agreement(1, 0));
+
+        // Break it: penalty flag set, can't re-propose immediately.
+        assert!(sim.apply_command(
+            &crate::commands::Command::BreakTradeAgreement { a: 0, b: 1 }
+        ));
+        assert!(!sim.diplomacy.has_trade_agreement(0, 1));
+        assert!(!sim.apply_command(
+            &crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 }
+        ));
+
+        // Clear penalty (e.g. after cooldown), proposal allowed.
+        sim.diplomacy.clear_broken_flag(0, 1);
+        assert!(sim.apply_command(
+            &crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 }
+        ));
+    }
+
+    #[test]
+    fn declaring_war_clears_trade_agreement() {
+        use crate::combat::Diplomacy;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.diplomacy.propose_trade_agreement(0, 1);
+        assert!(sim.diplomacy.has_trade_agreement(0, 1));
+        sim.diplomacy.set(0, 1, Diplomacy::War);
+        assert!(!sim.diplomacy.has_trade_agreement(0, 1));
     }
 
     #[test]
