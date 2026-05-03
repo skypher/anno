@@ -198,7 +198,17 @@ pub struct BuildingInstance {
     /// natural placement order.
     #[serde(default)]
     pub build_priority: u8,
+    /// Remaining-ore counter for ore-mine buildings (RE: haeuser.cod
+    /// `Erzbergnr` deposit size). Initialised to the deposit's
+    /// `OreDeposit::capacity()` when the mine is placed; each
+    /// successful production cycle decrements by `output_rate`.
+    /// When 0, the mine refuses further production. `u16::MAX`
+    /// = uncapped (default for non-mine buildings).
+    #[serde(default = "default_remaining_ore")]
+    pub remaining_ore: u16,
 }
+
+fn default_remaining_ore() -> u16 { u16::MAX }
 
 /// Production ticks a building must idle before its maintenance halves.
 pub const IDLE_MAINTENANCE_THRESHOLD: u32 = 5;
@@ -230,6 +240,7 @@ impl BuildingInstance {
             bricks_needed: 0,
             idle_ticks: 0,
             build_priority: 0,
+            remaining_ore: u16::MAX,
         }
     }
 

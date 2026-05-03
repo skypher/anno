@@ -748,6 +748,12 @@ fn try_place_building(
     );
     if input1 != Good::None { instance.input_1_stock = storage; }
     if input2 != Good::None { instance.input_2_stock = storage; }
+    // Mines tap a finite ore deposit (RE: haeuser.cod Erzbergnr).
+    // Non-mine buildings keep the u16::MAX uncapped default.
+    let cap = def.ore_deposit.capacity();
+    if cap > 0 {
+        instance.remaining_ore = cap;
+    }
     let footprint = (def.width as u32) * (def.height as u32);
     let build_ms = (2_000u32 * footprint).max(2_000);
     if free_build {
