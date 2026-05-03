@@ -131,14 +131,55 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
     let cost_wood = prop_int("Holz").max(0) as u16;
     let cost_bricks = prop_int("Ziegel").max(0) as u16;
 
-    // Maintenance from Kosten property (comma-separated, first value is the cost constant)
-    // For now use a flat estimate based on production kind
+    // Per-building maintenance cost. RE: anno-capsu.netlify.app
+    // /1602/production_efficiency.html lists the per-building
+    // maintenance "cost" for every production building. The COD
+    // doesn't store it as a field — it's looked up by building
+    // type at runtime — so we map by output_good first, then fall
+    // back to a prod-kind default.
     let prod_kind_str = prop("ProdKind");
-    let maintenance = match prod_kind_str {
-        "HANDWERK" => 5,
-        "ROHSTOFF" | "PLANTAGE" | "STEINBRUCH" | "BERGWERK" | "JAGDHAUS" | "FISCHEREI" => 3,
-        "WEIDETIER" | "ROHSTWACHS" => 2,
-        _ => 0,
+    use crate::types::Good;
+    let maintenance: u16 = match output_good {
+        // Food chain.
+        Good::Food => match prod_kind_str {
+            "FISCHEREI" | "JAGDHAUS" => 5,
+            _ => 5, // Bakery / Butcher per appendix
+        },
+        Good::Flour => 5,                 // Windmill
+        Good::Grain | Good::Cattle => 5,  // Plantation farms
+        Good::Cotton | Good::Wool => 10,  // Wool/cotton farms
+        // Heavy industry.
+        Good::Cannons => 60,
+        Good::Muskets => 45,
+        Good::Swords => 30,
+        Good::Iron => 25,
+        Good::Tools => 25,
+        Good::Ore => 60,
+        Good::Gold => 60,
+        Good::GoldOre => 60,
+        Good::Jewelry => 45,
+        // Cloth chain.
+        Good::Cloth => 20,                // Weaving mill / weaver / tailor
+        Good::Clothing => 20,
+        // Plantations.
+        Good::Sugar | Good::Tobacco | Good::Spices | Good::Cocoa => 5,
+        Good::Wood => 5,                  // Forester
+        Good::Stone | Good::Bricks => 25,
+        // Drinks.
+        Good::Alcohol => 15,              // Distillery
+        Good::Grapes => 35,               // Winery
+        Good::TobaccoProducts => 25,
+        Good::Hides => 5,
+        Good::Silk => 20,
+        Good::Fish => 5,
+        // Non-production buildings (markets etc.) — fall through.
+        _ => match prod_kind_str {
+            "HANDWERK" => 5,
+            "ROHSTOFF" | "PLANTAGE" | "STEINBRUCH" | "BERGWERK"
+            | "JAGDHAUS" | "FISCHEREI" => 3,
+            "WEIDETIER" | "ROHSTWACHS" => 2,
+            _ => 0,
+        },
     };
 
     // Resolve Radius property (may be a number or a constant name)

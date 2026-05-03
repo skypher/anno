@@ -44,13 +44,31 @@ pub const TIER_DEMANDS: &[&[Good]] = &[
 ];
 
 /// Per-capita consumption rate per economy tick (per 100 population).
-/// Higher tiers consume more per capita.
+/// Higher tiers consume more per capita because they demand more
+/// distinct goods.
+///
+/// RE-cited from the Anno-1602 community population-per-industry
+/// appendix
+/// (anno-capsu.netlify.app/1602/population_per_industry.html), which
+/// transcribes the binary's per-80-inhabitants-per-minute table:
+///
+/// | Tier       | Sum over all demanded goods (per 80 per minute) |
+/// |------------|-------------------------------------------------|
+/// | Pioneer    | 0.95 (food only)                                |
+/// | Settler    | 1.75 (0.95 + 0.45 + 0.35)                       |
+/// | Citizen    | 2.60 (0.95 + 0.5 + 0.45 + 0.35 + 0.35)          |
+/// | Merchant   | 3.40 (+0.55 + 0.5 + 0.45 + 0.45 + 0.5)          |
+/// | Aristocrat | 3.30 (+0.55 + 0.45 + 0.45 + 0.45 + 0.35 + 0.1) |
+///
+/// Scaled to per-100-pop-per-economy-tick (9999 ms ≈ 1/6 minute) and
+/// rounded so the integer math at tick time is meaningful: Pioneer
+/// 2, Settler 4, Citizen 5, Merchant 7, Aristocrat 7.
 const CONSUMPTION_PER_100: [u16; NUM_POP_TIERS] = [
-    2, // Pioneer: 2 units per 100 pop per tick
-    2, // Settler
-    3, // Citizen
-    3, // Merchant
-    4, // Aristocrat
+    2, // Pioneer
+    4, // Settler
+    5, // Citizen
+    7, // Merchant
+    7, // Aristocrat
 ];
 
 /// Map demand slot indices to goods.
