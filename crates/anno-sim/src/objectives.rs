@@ -24,6 +24,11 @@ pub enum Objective {
     /// section 11.7.2.4: "You may also set the attainment of two
     /// monopolies simultaneously as the assignment goal."
     Monopolies { goods: Vec<Good> },
+    /// "Support a fellow player" — manual sec. 11.7.2.5: scenario
+    /// completes when the named other player slot reaches at least
+    /// `target_population` total inhabitants. Used for cooperative
+    /// missions where the human is asked to bootstrap an AI ally.
+    SupportFellowPlayer { who: u8, target_population: u32 },
 }
 
 impl Objective {
@@ -50,6 +55,9 @@ impl Objective {
                     .map(|g| format!("{g:?}")).collect();
                 format!("Monopoly: {}", names.join(" + "))
             }
+            Objective::SupportFellowPlayer { who, target_population } => {
+                format!("Help player {} reach {} pop", who, target_population)
+            }
         }
     }
 }
@@ -68,12 +76,16 @@ impl ObjectiveSet {
 
     /// Evaluate every unfulfilled objective against the given player view.
     /// Returns the indices that flipped from false → true this call.
+    /// `all_players` is needed for cross-player checks like
+    /// `SupportFellowPlayer`; pass `&[player.clone()]` if only the
+    /// owner's slot matters.
     pub fn evaluate(
         &mut self,
         player: &crate::player::Player,
         buildings: &[crate::building::BuildingInstance],
         defs: &[crate::building::BuildingDef],
         warehouses: &[crate::warehouse::Warehouse],
+        all_players: &[crate::player::Player],
         owner: u8,
     ) -> Vec<usize> {
         let mut newly_done = Vec::new();
@@ -101,6 +113,13 @@ impl ObjectiveSet {
                         .map(|w| w.stock(*good) as u32)
                         .sum();
                     total >= *qty
+                }
+                Objective::SupportFellowPlayer { who, target_population } => {
+                    let who_idx = *who as usize;
+                    if who_idx >= all_players.len() { false }
+                    else {
+                        all_players[who_idx].total_population >= *target_population
+                    }
                 }
                 Objective::Monopolies { goods } => {
                     // For every listed good: the owner produces it
@@ -157,12 +176,12 @@ mod tests {
         ]);
         let mut p = Player::new_human(0);
         p.population[1] = 50;
-        let done = set.evaluate(&p, &[], &[], &[], 0);
+        let done = set.evaluate(&p, &[], &[], &[], &[p.clone()], 0);
         assert!(done.is_empty());
         assert_eq!(set.progress(), (0, 1));
 
         p.population[1] = 150;
-        let done = set.evaluate(&p, &[], &[], &[], 0);
+        let done = set.evaluate(&p, &[], &[], &[], &[p.clone()], 0);
         assert_eq!(done, vec![0]);
         assert_eq!(set.progress(), (1, 1));
     }
@@ -199,7 +218,7 @@ mod tests {
                 goods: vec![Good::Tools, Good::Cloth],
             },
         ]);
-        let done = set.evaluate(&p, &buildings, &defs, &[], 0);
+        let done = set.evaluate(&p, &buildings, &defs, &[], &[p.clone()], 0);
         assert_eq!(done, vec![0]);
 
         // If a rival also builds Tools, the monopoly is broken — but
@@ -208,8 +227,26 @@ mod tests {
             Objective::Monopolies { goods: vec![Good::Tools] },
         ]);
         let buildings2 = vec![mk_b(0, 0), mk_b(0, 1)];
-        let done2 = set2.evaluate(&p, &buildings2, &defs, &[], 0);
+        let done2 = set2.evaluate(&p, &buildings2, &defs, &[], &[p.clone()], 0);
         assert!(done2.is_empty(), "rival production blocks monopoly");
+    }
+
+    #[test]
+    fn support_fellow_player_completes_when_target_pop_reached() {
+        let mut set = ObjectiveSet::new(vec![
+            Objective::SupportFellowPlayer { who: 1, target_population: 100 },
+        ]);
+        let mut p = Player::new_human(0);
+        let mut ally = Player::new_ai(1, 0);
+        ally.total_population = 50;
+        let players = vec![p.clone(), ally.clone()];
+        let done = set.evaluate(&p, &[], &[], &[], &players, 0);
+        assert!(done.is_empty());
+        ally.total_population = 150;
+        p.gold = 1; // make this a real edit
+        let players = vec![p.clone(), ally.clone()];
+        let done = set.evaluate(&p, &[], &[], &[], &players, 0);
+        assert_eq!(done, vec![0]);
     }
 
     #[test]
@@ -219,10 +256,10 @@ mod tests {
         ]);
         let mut p = Player::new_human(0);
         p.gold = 1500;
-        set.evaluate(&p, &[], &[], &[], 0);
+        set.evaluate(&p, &[], &[], &[], &[p.clone()], 0);
         // Spend down — the flag stays set.
         p.gold = 0;
-        set.evaluate(&p, &[], &[], &[], 0);
+        set.evaluate(&p, &[], &[], &[], &[p.clone()], 0);
         assert_eq!(set.progress(), (1, 1));
     }
 }

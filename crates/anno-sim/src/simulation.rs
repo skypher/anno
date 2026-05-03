@@ -150,6 +150,11 @@ pub struct Simulation {
     /// the player can keep building, matching the original endless
     /// behaviour).
     pub outcome: GameOutcome,
+    /// Global tile-animation frame counter, advanced once per
+    /// 40 000 ms `timer_animation` tick. Saves and replays preserve
+    /// it so animation phase stays deterministic across
+    /// load / multiplayer / state diffs.
+    pub animation_frame: u32,
 }
 
 /// Game-over state for the human player slot 0.
@@ -226,6 +231,7 @@ impl Simulation {
             free_trader_cooldown: 0,
             last_treasury_warn_gold: i32::MAX,
             outcome: GameOutcome::Pending,
+            animation_frame: 0,
         }
     }
 
@@ -460,7 +466,16 @@ impl Simulation {
     }
 
     fn tick_animations(&mut self) {
-        // TODO: advance tile animation frames
+        // Advance the global animation frame counter. The original
+        // engine drives all tile/building animations from a single
+        // 40s-period frame counter (`timer_animation` in our naming);
+        // each sprite cycle uses its own AnimAdd / AnimAnz from
+        // figuren.cod / haeuser.cod relative to this base. The
+        // renderer reads `animation_frame` if it wants deterministic
+        // sim-driven animation phase (otherwise it can keep using
+        // its own real-time clock). Keeping this in the sim layer
+        // means save/load and multiplayer stay frame-aligned.
+        self.animation_frame = self.animation_frame.wrapping_add(1);
     }
 
     fn tick_production(&mut self) {
@@ -581,13 +596,17 @@ impl Simulation {
 
         // Sample player 0 (the human) into the rolling history (gold,
         // pop, satisfaction, income/costs, AND per-good warehouse stocks).
-        if let Some(p0) = self.players.first() {
-            self.history.record_full(p0, &self.warehouses, 0);
+        if !self.players.is_empty() {
+            // Snapshot to break the borrow with self.objectives.
+            let p0 = self.players[0].clone();
+            self.history.record_full(&p0, &self.warehouses, 0);
             // Re-evaluate scenario objectives against the human player.
             let just_done = self.objectives.evaluate(
-                p0, &self.buildings, &self.building_defs, &self.warehouses, 0,
+                &p0, &self.buildings, &self.building_defs,
+                &self.warehouses, &self.players, 0,
             );
             self.objective_completions.extend(just_done);
+            let p0 = &p0;
 
             // Voice announcement: fire on entry into the bankruptcy
             // window. RE: `player::BANKRUPTCY_THRESHOLD = -1001` —

@@ -3016,6 +3016,7 @@ fn main() {
                     &sim,
                     world_mode,
                     if world_mode { None } else { Some(&islands[current_island]) },
+                    &islands,
                     &carrier_sprites[sprite_zoom],
                     &ship_sprites[sprite_zoom],
                     &soldier_sprites[sprite_zoom],
@@ -5125,6 +5126,7 @@ fn overlay_entities(
     sim: &Simulation,
     world_mode: bool,
     current_island: Option<&Island>,
+    islands: &[Island],
     carrier_sprites: &[(u32, u32, Vec<u8>)],
     ship_sprites: &[(u32, u32, Vec<u8>)],
     soldier_sprites: &[(u32, u32, Vec<u8>)],
@@ -5156,7 +5158,7 @@ fn overlay_entities(
             let (ix, iy) = if world_mode {
                 if (figure.building_idx as usize) < sim.buildings.len() {
                     let bld = &sim.buildings[figure.building_idx as usize];
-                    island_offset_for(bld.island_id, sim, current_island)
+                    island_offset_for(bld.island_id, sim, current_island, islands)
                 } else { (0, 0) }
             } else if let Some(island) = current_island {
                 if (figure.building_idx as usize) < sim.buildings.len() {
@@ -5198,7 +5200,7 @@ fn overlay_entities(
         let (ix, iy) = if world_mode {
             if (figure.building_idx as usize) < sim.buildings.len() {
                 let bld = &sim.buildings[figure.building_idx as usize];
-                island_offset_for(bld.island_id, sim, current_island)
+                island_offset_for(bld.island_id, sim, current_island, islands)
             } else {
                 (0, 0)
             }
@@ -5265,7 +5267,7 @@ fn overlay_entities(
     // Draw warehouses (blue squares)
     for wh in &sim.warehouses {
         let (ix, iy) = if world_mode {
-            island_offset_for(wh.island_id, sim, current_island)
+            island_offset_for(wh.island_id, sim, current_island, islands)
         } else if let Some(island) = current_island {
             if wh.island_id != island.number {
                 continue;
@@ -5393,18 +5395,21 @@ fn overlay_entities(
     }
 }
 
-/// Get island world offset by island_id.
+/// World-space tile offset for island `island_id`. The SZS file
+/// stores per-island `x_pos`/`y_pos` (the position of the island's
+/// top-left tile within the world grid); world-mode rendering needs
+/// these offsets so islands don't stack on top of each other.
 fn island_offset_for(
-    _island_id: u8,
+    island_id: u8,
     _sim: &Simulation,
     _current_island: Option<&Island>,
+    islands: &[Island],
 ) -> (i32, i32) {
-    // In world mode, islands have x_pos/y_pos offsets in the SZS.
-    // But we don't have direct access to the SZS islands here.
-    // For now, the figures store tile coords relative to the island,
-    // and we pass (0,0) since the sim doesn't store island offsets yet.
-    // TODO: Store island offsets in Simulation for proper world-map overlay.
-    (0, 0)
+    islands
+        .iter()
+        .find(|i| i.number == island_id)
+        .map(|i| (i.x_pos as i32, i.y_pos as i32))
+        .unwrap_or((0, 0))
 }
 
 /// Draw a filled square marker centered at (cx, cy).
