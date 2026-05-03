@@ -566,6 +566,40 @@ pub struct DamageEvent {
 ///
 /// Per tick: 5 hp drained per adjacent enemy land unit (within 2 tiles
 /// of the building's footprint). Naval units don't damage land buildings.
+/// Defensive tower / castle damage. Buildings with
+/// `defensive_cannons > 0` (RE: haeuser.cod `Kanon: 2`) fire on
+/// hostile units within range each combat tick. Range scales with
+/// cannon count: 4 + cannons. Damage per hostile in range is 0.05
+/// per cannon.
+pub fn tick_tower_defense(
+    units: &mut [MilitaryUnit],
+    buildings: &[crate::building::BuildingInstance],
+    diplomacy: &DiplomacyMatrix,
+    defs: &[crate::building::BuildingDef],
+) {
+    for b in buildings.iter() {
+        if !b.active { continue; }
+        if (b.def_id as usize) >= defs.len() { continue; }
+        let def = &defs[b.def_id as usize];
+        if def.defensive_cannons == 0 { continue; }
+        let bx = b.tile_x as i32 + def.width as i32 / 2;
+        let by = b.tile_y as i32 + def.height as i32 / 2;
+        let range = 4 + def.defensive_cannons as i32;
+        let dmg = 0.05 * def.defensive_cannons as f32;
+        for u in units.iter_mut() {
+            if !u.is_alive() || u.owner == b.owner { continue; }
+            if diplomacy.get(u.owner, b.owner) != Diplomacy::War { continue; }
+            let dx = (u.tile_x - bx).abs();
+            let dy = (u.tile_y - by).abs();
+            if dx.max(dy) > range { continue; }
+            u.health -= dmg;
+            if !u.is_alive() {
+                u.active = false;
+            }
+        }
+    }
+}
+
 pub fn tick_building_damage(
     units: &[MilitaryUnit],
     buildings: &mut [crate::building::BuildingInstance],
@@ -960,6 +994,46 @@ mod tests {
         let cannons_alive = units.iter().filter(|u| u.owner == 0 && u.is_alive()).count();
         assert!(cannons_alive > 0, "At least one cannon should survive");
         assert!(!units[2].is_alive(), "Pikeman should die to cannon fire");
+    }
+
+    #[test]
+    fn tower_defense_damages_hostile_in_range() {
+        use crate::building::{BuildingDef, BuildingInstance, OreDeposit};
+        use crate::types::ProductionType;
+        let mk_tower = |cannons: u8| BuildingDef {
+            id: 0, category: 5, width: 2, height: 2,
+            production_type: ProductionType::Craft,
+            kind: "TURM".into(), prod_kind: "TURM".into(),
+            radius: 0,
+            output_good: crate::types::Good::None,
+            input_good_1: crate::types::Good::None,
+            input_good_2: crate::types::Good::None,
+            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 0, cycle_time_ms: 0, carrier_interval_ms: 0,
+            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+            native: false, min_tier: 0, max_no_input_ticks: 6,
+            can_dry_up: false, wegspeed: [100; 4],
+            has_door: false, upgradeable: false,
+            max_energy: 0,
+            ore_deposit: OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: cannons,
+        };
+        let defs = vec![mk_tower(2)];
+        let mut tower = BuildingInstance::new(0, 0, 5, 5, 0);
+        tower.construction_ms_remaining = 0;
+        let buildings = vec![tower];
+        let mut units = vec![
+            MilitaryUnit::new(UnitType::Swordsman, 1, 6, 6),
+            MilitaryUnit::new(UnitType::Swordsman, 1, 50, 50), // far
+        ];
+        let mut diplo = DiplomacyMatrix::new();
+        diplo.set(0, 1, Diplomacy::War);
+        let h_before = (units[0].health, units[1].health);
+        tick_tower_defense(&mut units, &buildings, &diplo, &defs);
+        assert!(units[0].health < h_before.0, "near unit takes damage");
+        assert_eq!(units[1].health, h_before.1, "far unit unaffected");
     }
 
     #[test]

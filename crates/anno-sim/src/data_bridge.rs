@@ -283,6 +283,8 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
             "ERZBERG_GROSS" => crate::building::OreDeposit::Large,
             _ => crate::building::OreDeposit::None,
         },
+        pirate_owned: prop("Piratflg") == "1",
+        defensive_cannons: prop_int("Kanon").max(0) as u8,
     }
 }
 

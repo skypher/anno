@@ -236,6 +236,8 @@ mod tests {
             upgradeable: true,
             max_energy: 0,
             ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
         }
     }
 

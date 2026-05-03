@@ -317,8 +317,13 @@ impl Simulation {
         let hideout = self.buildings.iter()
             .filter(|b| b.active && b.is_built() && {
                 let id = b.def_id as usize;
-                id < self.building_defs.len()
-                    && self.building_defs[id].prod_kind == "PIRATWOHN"
+                id < self.building_defs.len() && {
+                    let def = &self.building_defs[id];
+                    // Either a PIRATWOHN building OR a building
+                    // marked with `Piratflg: 1` (pirate Kontor /
+                    // huts in haeuser.cod).
+                    def.prod_kind == "PIRATWOHN" || def.pirate_owned
+                }
             })
             .map(|b| (b.tile_x as i32, b.tile_y as i32))
             .next();
@@ -1387,6 +1392,15 @@ impl Simulation {
             &mut self.damage_events,
         );
 
+        // Tower / castle defensive cannons fire on hostile units
+        // in range. RE: haeuser.cod `Kanon: 2` on tower buildings.
+        combat::tick_tower_defense(
+            &mut self.military_units,
+            &self.buildings,
+            &self.diplomacy,
+            &self.building_defs,
+        );
+
         // Building damage from adjacent hostile land units.
         let destroyed = combat::tick_building_damage(
             &self.military_units,
@@ -2073,6 +2087,8 @@ mod tests {
             upgradeable: false,
             max_energy: 0,
             ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
         });
         // Drive the build path manually.
         let action = AiAction::RequestBuild { good: Good::Tools, priority: 0 };
@@ -2184,6 +2200,8 @@ mod tests {
             upgradeable: false,
             max_energy: 0,
             ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
         });
         let mut b = BuildingInstance::new(0, 0, 0, 0, 0);
         b.construction_ms_total = 1_000;
@@ -2325,6 +2343,8 @@ mod tests {
             upgradeable: false,
             max_energy: 0,
             ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
         });
         let b = BuildingInstance::new(0, 0, 10, 10, 0); // player 0 owns
         sim.buildings.push(b);
@@ -2372,6 +2392,8 @@ mod tests {
             upgradeable: false,
             max_energy: 0,
             ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
         });
         sim.buildings.push(BuildingInstance::new(0, 0, 10, 10, 0));
         sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 1, 11, 12));
@@ -2528,6 +2550,8 @@ mod tests {
             upgradeable: false,
             max_energy: 0,
             ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
         };
         // Two defs producing the same Good. Cheaper one would always win
         // under the old logic.
@@ -2621,6 +2645,8 @@ mod tests {
             upgradeable: true,     // and is upgradeable per Ausbauflg
             max_energy: 0,
             ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
         });
         sim.buildings.push(BuildingInstance::new(0, 0, 0, 0, 0));
         assert_eq!(sim.buildings[0].house_tier, 0);
@@ -2655,6 +2681,8 @@ mod tests {
             upgradeable: false,
             max_energy: 0,
             ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
         };
         sim.building_defs.push(mk_def(5)); // def 0 cost 5
         sim.building_defs.push(mk_def(8)); // def 1 cost 8
@@ -2697,6 +2725,8 @@ mod tests {
             upgradeable: false,
             max_energy: 0,
             ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
         });
         // One under construction, one finished.
         let mut bb = BuildingInstance::new(0, 0, 0, 0, 0);
@@ -3104,6 +3134,8 @@ mod tests {
             upgradeable: false,
             max_energy: 0,
             ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
         });
         // Place a hideout at a known tile.
         let mut h = BuildingInstance::new(0, 0, 7, 11, 6);

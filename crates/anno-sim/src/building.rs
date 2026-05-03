@@ -96,6 +96,14 @@ pub struct BuildingDef {
     /// initialise per-deposit `output_stock` caps so mines deplete
     /// finite resources rather than producing forever.
     pub ore_deposit: OreDeposit,
+    /// Pirate-faction flag (`Piratflg: 1` in haeuser.cod). 3
+    /// entries — pirate Kontor + huts. Mirrors `native` for the
+    /// pirate slot 6.
+    pub pirate_owned: bool,
+    /// Defensive cannon count (`Kanon: <n>` in haeuser.cod). 4
+    /// turret/castle buildings carry `Kanon: 2`. Drives passive
+    /// defensive damage radiating from owned towers/castles.
+    pub defensive_cannons: u8,
 }
 
 /// Ore-deposit size. Manual sec. 6.7 + Tim Howgego's resources
