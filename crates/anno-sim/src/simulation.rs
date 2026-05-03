@@ -191,6 +191,28 @@ impl Simulation {
         crate::prices::price_of(good)
     }
 
+    /// Civilization-power score for a player slot. Combines settled
+    /// population, military strength, and treasury into one number that
+    /// the diplomacy AI uses for war / peace / treaty decisions.
+    ///
+    /// Anno is fundamentally a city-builder, so population dominates.
+    /// A military unit costs ~100-200 gold and meaningful upkeep, so it
+    /// counts for ~25 inhabitants. Gold is the smallest factor: 100 gold
+    /// per power point keeps a 20k starting purse from outweighing an
+    /// actual settlement.
+    pub fn civilization_power(&self, slot: u8) -> i64 {
+        let pop = self.players.get(slot as usize)
+            .map(|p| p.total_population as i64)
+            .unwrap_or(0);
+        let units = self.military_units.iter()
+            .filter(|u| u.is_alive() && u.owner == slot)
+            .count() as i64 * 25;
+        let gold = self.players.get(slot as usize)
+            .map(|p| (p.gold.max(0) as i64) / 100)
+            .unwrap_or(0);
+        pop + units + gold
+    }
+
     fn next_rand(&mut self) -> u64 {
         if self.rng_state == 0 { self.rng_state = 0xCBF29CE484222325; }
         let mut x = self.rng_state;
@@ -730,18 +752,11 @@ impl Simulation {
     }
 
     fn tick_diplomacy(&mut self) {
-        // Score each player slot: military weight + a fraction of gold.
-        // Used by AI controllers to decide war / peace based on power.
-        let mut scores = vec![0i64; self.players.len()];
-        for u in &self.military_units {
-            if u.is_alive() {
-                let i = u.owner as usize;
-                if i < scores.len() { scores[i] += 10; }
-            }
-        }
-        for (i, p) in self.players.iter().enumerate() {
-            scores[i] += (p.gold.max(0) as i64) / 200;
-        }
+        // Civilization power per slot, used by AI controllers to decide
+        // war / peace based on relative strength.
+        let scores: Vec<i64> = (0..self.players.len())
+            .map(|i| self.civilization_power(i as u8))
+            .collect();
 
         for ctrl_idx in 0..self.ai_controllers.len() {
             let me = self.ai_controllers[ctrl_idx].player_idx as usize;
@@ -771,9 +786,11 @@ impl Simulation {
                 let cur = self.diplomacy.get(me as u8, other as u8);
 
                 // Declare war on a clearly weaker neutral neighbor.
+                // 100 power = a small but real foothold (e.g. 4 units,
+                // or ~100 inhabitants, or 10k gold).
                 if aggressor
                     && cur == Diplomacy::Neutral
-                    && my_score >= 20
+                    && my_score >= 100
                     && other_score * 2 <= my_score
                 {
                     self.diplomacy.set(me as u8, other as u8, Diplomacy::War);
@@ -1145,18 +1162,8 @@ impl Simulation {
                     self.diplomacy.set(a, b, state);
                     return true;
                 }
-                // Score helper.
-                let score_for = |sim: &Simulation, slot: u8| -> i64 {
-                    let units: i64 = sim.military_units.iter()
-                        .filter(|u| u.is_alive() && u.owner == slot)
-                        .count() as i64 * 10;
-                    let gold: i64 = sim.players.get(slot as usize)
-                        .map(|p| (p.gold.max(0) as i64) / 200)
-                        .unwrap_or(0);
-                    units + gold
-                };
-                let proposer_score = score_for(self, a);
-                let target_score = score_for(self, b);
+                let proposer_score = self.civilization_power(a);
+                let target_score = self.civilization_power(b);
                 // Target accepts when the proposer is at least as strong:
                 // weaklings can't dictate alliance terms to powerhouses.
                 if proposer_score >= target_score {
@@ -1823,7 +1830,7 @@ mod tests {
         sim.players.push(Player::new_human(0));
         sim.players.push(Player::new_ai(1, 0));
         // Drain the human player's default starting gold so AI(1) clearly
-        // outscores them on the (units * 10 + gold/200) heuristic.
+        // outscores them on the civilization-power heuristic.
         sim.players[0].gold = 0;
         sim.players[1].gold = 5_000;
         // AI(1) is Military and beefy; player 0 is weak.

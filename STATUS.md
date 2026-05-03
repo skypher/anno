@@ -165,6 +165,31 @@ codebase to keep the project honest:
 A faithful replacement pass for some of these (real free trader ship,
 proper voice announcements, real civilian sprites) is queued.
 
+### Authenticity audit pass 2 (2026-05-03)
+
+Second sweep targeting modern flat-list diagnostic panels and other
+remnants. Anno surfaced data through right-click info windows on the
+specific object you cared about, not through global tables. The
+following have been **removed**:
+
+- **Economy graph panel (G)** — three-band gold/pop/satisfaction
+  history overlay was a strategy-game add-on.
+- **Production overview panel (P)** — global per-good aggregate table
+  with sparklines was modern UI; Anno used per-building info windows.
+- **Player roster panel (Tab)** — global slot listing isn't Anno;
+  diplomacy in Anno is per-opponent.
+- **Per-island warehouse table (U)** — global stock-by-warehouse grid;
+  Anno surfaced this by right-clicking the Kontor.
+- **Carrier-cargo letter chip** — single-letter goods overlay on
+  carriers was a debug crutch. Real fix is correct TRAEGER.BSH sprite
+  indexing for the carried good (queued).
+- **Treaty proposal scoring formula** — replaced arbitrary
+  `units * 10 + gold/200` with a unified `civilization_power(slot)`
+  method that weights population (1×), military (25×), and gold
+  (1/100×) — population dominates, in keeping with Anno being a
+  city-builder. Same scoring is now used by both the diplomacy AI
+  loop and treaty-acceptance checks.
+
 ### What's missing / next
 
 1. ~~Marketplace radius extension~~ ✓

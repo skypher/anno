@@ -892,16 +892,12 @@ fn main() {
     let mut tax_tier: usize = 0; // selected tier for tax adjustment
     let mut diplomacy_panel = false;
     let mut diplomacy_target: u8 = 1; // selected counterpart (1..6) for player 0
-    let mut graph_panel = false;
-    let mut prod_panel = false;
-    let mut roster_panel = false;
     let mut market_panel = false;
     let mut market_sel: usize = 0;
     let mut show_paths = false;
     let mut route_list_panel = false;
     let mut route_list_sel: usize = 0;
     let mut help_panel = false;
-    let mut wh_panel = false;
     let mut ship_panel = false;
     let mut obj_panel = false;
     let mut settings = anno_sim::settings::Settings::load_default();
@@ -1012,8 +1008,6 @@ fn main() {
                         settings_panel = false;
                     } else if market_panel {
                         market_panel = false;
-                    } else if wh_panel {
-                        wh_panel = false;
                     } else if ship_panel {
                         ship_panel = false;
                     } else if help_panel {
@@ -1024,12 +1018,6 @@ fn main() {
                         placer.active = false;
                     } else if demolish_mode {
                         demolish_mode = false;
-                    } else if graph_panel {
-                        graph_panel = false;
-                    } else if prod_panel {
-                        prod_panel = false;
-                    } else if roster_panel {
-                        roster_panel = false;
                     } else if trade_route_mode {
                         trade_route_mode = false;
                         draft_route_stops.clear();
@@ -1604,20 +1592,8 @@ fn main() {
                             Keycode::C => {
                                 show_coverage = !show_coverage;
                             }
-                            Keycode::K => {
-                                graph_panel = !graph_panel;
-                            }
-                            Keycode::P => {
-                                prod_panel = !prod_panel;
-                            }
-                            Keycode::O => {
-                                roster_panel = !roster_panel;
-                            }
                             Keycode::A => {
                                 market_panel = !market_panel;
-                            }
-                            Keycode::U => {
-                                wh_panel = !wh_panel;
                             }
                             Keycode::J => {
                                 ship_panel = !ship_panel;
@@ -3832,313 +3808,6 @@ fn main() {
             }
         }
 
-        // Draw economy graph panel (G key)
-        if graph_panel {
-            let panel_w = 360u32;
-            let panel_h = 240u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            // Background
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "ECONOMY HISTORY (G to close)",
-                [0xFF, 0xD7, 0x00, 0xFF], 2,
-            );
-            let series_gold = sim.history.gold_series();
-            let series_pop = sim.history.population_series();
-            let series_sat = sim.history.satisfaction_series();
-            // Plot each series in a horizontal band.
-            let bands: [(&str, [u8; 4], i64, i64, Vec<i64>); 3] = [
-                (
-                    "GOLD",
-                    [0xFF, 0xD0, 0x00, 0xFF],
-                    series_gold.iter().copied().min().unwrap_or(0).min(0) as i64,
-                    series_gold.iter().copied().max().unwrap_or(1).max(1) as i64,
-                    series_gold.iter().map(|&g| g as i64).collect(),
-                ),
-                (
-                    "POPULATION",
-                    [0x40, 0xFF, 0x60, 0xFF],
-                    0,
-                    series_pop.iter().copied().max().unwrap_or(1).max(1) as i64,
-                    series_pop.iter().map(|&p| p as i64).collect(),
-                ),
-                (
-                    "AVG SATISFACTION (0-128)",
-                    [0x60, 0xC0, 0xFF, 0xFF],
-                    0,
-                    128,
-                    series_sat.iter().map(|&s| s as i64).collect(),
-                ),
-            ];
-            let band_h = 60i32;
-            let band_top0 = 28i32;
-            for (i, (label, color, ymin, ymax, samples)) in bands.iter().enumerate() {
-                let band_top = band_top0 + i as i32 * (band_h + 8);
-                let band_left = 8i32;
-                let band_w = panel_w as i32 - 16;
-                // Frame: bottom line
-                for x in 0..band_w {
-                    let fx = band_left + x;
-                    let fy = band_top + band_h - 1;
-                    let off = ((fy as u32 * panel_w + fx as u32) * 4) as usize;
-                    if off + 3 < buf.len() {
-                        buf[off] = 0x40; buf[off + 1] = 0x40;
-                        buf[off + 2] = 0x40; buf[off + 3] = 0xFF;
-                    }
-                }
-                // Label and current value
-                let cur = samples.last().copied().unwrap_or(0);
-                let line = format!("{label}: now={cur} max={ymax}");
-                tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    band_left, band_top, &line,
-                    [0xCC, 0xCC, 0xCC, 0xFF], 1,
-                );
-                if samples.is_empty() { continue; }
-                let span = (ymax - ymin).max(1);
-                let n = samples.len();
-                let plot_top = band_top + 10;
-                let plot_h = band_h - 12;
-                for k in 0..n {
-                    let v = samples[k];
-                    let frac = ((v - ymin) as f64 / span as f64).clamp(0.0, 1.0);
-                    let h_pix = (frac * plot_h as f64) as i32;
-                    let x = band_left + (k as i32 * band_w / n.max(1) as i32);
-                    let y = plot_top + plot_h - h_pix;
-                    // Plot as a small filled column.
-                    for py in y..(plot_top + plot_h) {
-                        if py < 0 || py >= panel_h as i32 { continue; }
-                        let off = ((py as u32 * panel_w + x as u32) * 4) as usize;
-                        if off + 3 < buf.len() {
-                            buf[off] = color[0];
-                            buf[off + 1] = color[1];
-                            buf[off + 2] = color[2];
-                            buf[off + 3] = color[3];
-                        }
-                    }
-                }
-            }
-
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Production overview panel (P key) — aggregates per-Good across the
-        // human player's buildings: producer count, average efficiency, and
-        // total stock pooled across warehouses.
-        if prod_panel {
-            use std::collections::HashMap;
-            let player_owner = 0u8;
-            let mut acc: HashMap<Good, (u32, u32, u32)> = HashMap::new();
-            // (n_producers, sum_efficiency_128, _placeholder)
-            for b in sim.buildings.iter().filter(|b| b.owner == player_owner) {
-                let def = &defs[b.def_id as usize];
-                if def.output_good == Good::None { continue; }
-                let entry = acc.entry(def.output_good).or_insert((0, 0, 0));
-                entry.0 += 1;
-                entry.1 += b.efficiency as u32;
-            }
-            let mut stock_by_good: HashMap<Good, u32> = HashMap::new();
-            for w in sim.warehouses.iter().filter(|w| w.owner == player_owner) {
-                for (g, qty, _cap) in w.all_stock() {
-                    *stock_by_good.entry(g).or_insert(0) += qty as u32;
-                }
-            }
-            let mut rows: Vec<(Good, u32, u32, u32)> = acc
-                .into_iter()
-                .map(|(g, (n, eff_sum, _))| {
-                    let stock = *stock_by_good.get(&g).unwrap_or(&0);
-                    (g, n, eff_sum / n.max(1), stock)
-                })
-                .collect();
-            // Also list goods we have stock of but don't produce.
-            for (g, stock) in &stock_by_good {
-                if !rows.iter().any(|(rg, _, _, _)| rg == g) {
-                    rows.push((*g, 0, 0, *stock));
-                }
-            }
-            rows.sort_by(|a, b| b.3.cmp(&a.3).then(format!("{:?}", a.0).cmp(&format!("{:?}", b.0))));
-
-            let panel_w = 460u32;
-            let line_h = 12i32;
-            let header_h = 32i32;
-            let visible_rows = rows.len().min(20) as i32;
-            let panel_h = (header_h + visible_rows * line_h + 12) as u32;
-            let spark_w = 90i32;
-            let spark_h = 8i32;
-            let spark_x0 = panel_w as i32 - spark_w - 8;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "PRODUCTION (P to close)",
-                [0xFF, 0xD7, 0x00, 0xFF], 2,
-            );
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4 + 14,
-                "Good      n  eff%  stock  buy/sell  history",
-                [0xCC, 0xCC, 0xCC, 0xFF], 1,
-            );
-            for (i, (g, n, eff, stock)) in rows.iter().take(20).enumerate() {
-                let y = header_h + i as i32 * line_h;
-                let eff_pct = (*eff * 100 / 128).min(999);
-                let label_full = format!("{:?}", g);
-                let label = if label_full.len() > 9 {
-                    label_full[..9].to_string()
-                } else {
-                    label_full
-                };
-                let p = sim.current_price(*g);
-                let row = format!(
-                    "{:<9} {:>2}  {:>3}%  {:>5}  {:>3}/{:<3}",
-                    label, n, eff_pct, stock, p.buy, p.sell,
-                );
-                let color = if *n > 0 {
-                    [0xCC, 0xFF, 0xCC, 0xFF]
-                } else {
-                    [0xCC, 0xCC, 0xCC, 0xFF]
-                };
-                tiny_font::draw_str(&mut buf, panel_w, panel_h, 4, y, &row, color, 1);
-
-                // Sparkline: stock history for this good across the last 120
-                // economy ticks. Single-pixel column per sample, height
-                // scaled to the per-row max (so each row is self-normalised).
-                let series = sim.history.stock_series(*g);
-                if !series.is_empty() {
-                    let max = series.iter().copied().max().unwrap_or(1).max(1);
-                    let n = series.len() as i32;
-                    for (k, &v) in series.iter().enumerate() {
-                        let sx = spark_x0 + k as i32 * spark_w / n.max(1);
-                        let frac = v as f64 / max as f64;
-                        let bar = (frac * spark_h as f64).round() as i32;
-                        let bar = bar.min(spark_h);
-                        for dy in 0..bar {
-                            let fy = y + spark_h - 1 - dy;
-                            let off = ((fy as u32 * panel_w + sx as u32) * 4) as usize;
-                            if off + 3 < buf.len() {
-                                buf[off] = color[0];
-                                buf[off + 1] = color[1];
-                                buf[off + 2] = color[2];
-                                buf[off + 3] = 0xFF;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Player roster panel (Tab) — quick at-a-glance view of every slot.
-        if roster_panel {
-            use anno_sim::combat::Diplomacy;
-            use anno_sim::player::PlayerState;
-            let panel_w = 480u32;
-            let header_h = 30i32;
-            let line_h = 14i32;
-            let n_rows = 7;
-            let panel_h = (header_h + line_h * n_rows + 12) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "PLAYERS (Tab to close)",
-                [0xFF, 0xD7, 0x00, 0xFF], 2,
-            );
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 18,
-                "#  state           gold     pop  units  vs you",
-                [0xCC, 0xCC, 0xCC, 0xFF], 1,
-            );
-            for slot in 0..n_rows as usize {
-                let y = header_h + slot as i32 * line_h;
-                let p = sim.players.get(slot);
-                let (state_str, color, gold, pop, is_human) = match p {
-                    Some(pl) => {
-                        let s = match pl.state {
-                            PlayerState::HumanActive => "Human",
-                            PlayerState::Empty => "(empty)",
-                            PlayerState::AiDefending => "AI(defend)",
-                            PlayerState::AiActive => "AI(active)",
-                            PlayerState::AiAllied => "AI(ally)",
-                            PlayerState::Defeated => "DEFEATED",
-                        };
-                        let c = match pl.state {
-                            PlayerState::HumanActive => [0xFF, 0xFF, 0xFF, 0xFF],
-                            PlayerState::Empty => [0x66, 0x66, 0x66, 0xFF],
-                            PlayerState::Defeated => [0xFF, 0x66, 0x66, 0xFF],
-                            _ => [0xCC, 0xCC, 0xCC, 0xFF],
-                        };
-                        (s, c, pl.gold, pl.population.iter().sum::<u32>(),
-                         pl.state == PlayerState::HumanActive)
-                    }
-                    None => ("(none)", [0x44, 0x44, 0x44, 0xFF], 0, 0u32, false),
-                };
-                let units = sim.military_units.iter()
-                    .filter(|u| u.is_alive() && u.owner as usize == slot)
-                    .count();
-                let dip_str = if is_human || slot == 0 {
-                    "—".to_string()
-                } else {
-                    match sim.diplomacy.get(0, slot as u8) {
-                        Diplomacy::Allied => "ALLIED".into(),
-                        Diplomacy::Neutral => "NEUTRAL".into(),
-                        Diplomacy::War => "WAR".into(),
-                    }
-                };
-                let row = format!(
-                    "{}  {:<14} {:>7}  {:>5}  {:>4}   {}",
-                    slot, state_str, gold, pop, units, dip_str,
-                );
-                tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, y, &row, color, 1,
-                );
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
         // Scenario picker (F2). Re-execs the binary with the chosen .szs.
         if scenario_picker {
             let panel_w = 480u32;
@@ -4405,108 +4074,6 @@ fn main() {
                 };
                 let y = header_h + slot as i32 * line_h;
                 tiny_font::draw_str(&mut buf, panel_w, panel_h, 4, y, &line, color, 1);
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Per-island warehouse panel (U): table of every player-owned
-        // warehouse on the active island, each as a column with its top
-        // goods. Useful when you've placed multiple Kontors and want to
-        // see at a glance where stock is piling up vs. running dry.
-        if wh_panel {
-            let island_id = if !world_mode {
-                Some(islands[current_island].number)
-            } else {
-                None
-            };
-            let warehouses: Vec<&anno_sim::warehouse::Warehouse> = sim
-                .warehouses
-                .iter()
-                .filter(|w| w.active && w.owner == 0
-                    && island_id.map_or(true, |id| w.island_id == id))
-                .collect();
-            // Union of goods that any warehouse on this island carries.
-            let mut all_goods: Vec<Good> = Vec::new();
-            for wh in &warehouses {
-                for (g, _, _) in wh.all_stock() {
-                    if !all_goods.contains(&g) {
-                        all_goods.push(g);
-                    }
-                }
-            }
-            all_goods.sort_by_key(|g| format!("{:?}", g));
-
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let col_w = 110i32;
-            let panel_w = (10 + warehouses.len().max(1) as i32 * col_w) as u32;
-            let panel_h = (24 + line_h * (all_goods.len() as i32 + 2)) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4,
-                "WAREHOUSES (U/Esc close)",
-                [0xFF, 0xD7, 0x00, 0xFF], 2,
-            );
-            // Column headers: tile coords.
-            for (col, wh) in warehouses.iter().enumerate() {
-                let x = 10 + col as i32 * col_w;
-                tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    x, 22,
-                    &format!("@({},{})", wh.tile_x, wh.tile_y),
-                    [0xCC, 0xCC, 0xCC, 0xFF], scale,
-                );
-            }
-            // Rows: per-good stock across each warehouse column.
-            for (row, &g) in all_goods.iter().enumerate() {
-                let y = 22 + line_h + row as i32 * line_h;
-                let label = format!("{:?}", g);
-                let label = if label.len() > 9 { label[..9].to_string() } else { label };
-                // Row label spans the full panel left side.
-                tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, y, &label, [0xAA, 0xAA, 0xAA, 0xFF], scale,
-                );
-                for (col, wh) in warehouses.iter().enumerate() {
-                    let x = 10 + col as i32 * col_w + 50;
-                    let qty = wh.stock(g);
-                    let cap = wh.capacity(g);
-                    let color = if qty == 0 {
-                        [0x55, 0x55, 0x55, 0xFF]
-                    } else if qty * 4 < cap {
-                        [0xFF, 0x88, 0x66, 0xFF]
-                    } else {
-                        [0xCC, 0xFF, 0xCC, 0xFF]
-                    };
-                    tiny_font::draw_str(
-                        &mut buf, panel_w, panel_h,
-                        x, y, &format!("{}/{}", qty, cap),
-                        color, scale,
-                    );
-                }
-            }
-            if all_goods.is_empty() {
-                tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, 22 + line_h,
-                    "(all warehouses empty)",
-                    [0x88, 0x88, 0x88, 0xFF], scale,
-                );
             }
             if let Ok(mut tex) = texture_creator
                 .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
@@ -5112,8 +4679,6 @@ fn overlay_entities(
             + dir * carrier_frames_per_dir
             + frame;
 
-        // Track sprite top so we can stamp a cargo indicator above it.
-        let mut sprite_top = sy + half_th - 12;
         let mut drew_sprite = false;
         if sprite_idx < carrier_sprites.len() {
             let (sw, sh, ref data) = carrier_sprites[sprite_idx];
@@ -5125,7 +4690,6 @@ fn overlay_entities(
                     dy,
                     data, sw, sh,
                 );
-                sprite_top = dy;
                 drew_sprite = true;
             }
         }
@@ -5139,39 +4703,9 @@ fn overlay_entities(
             draw_marker(rgba, img_w, img_h, sx, sy, 3, &color);
         }
 
-        // Cargo indicator: small colored chip above the figure with a
-        // single-letter abbreviation when carrying. Skip when idle/empty.
-        if matches!(figure.action, ActionType::CarryingGoods | ActionType::Returning)
-            && figure.carried_amount > 0
-        {
-            let good = good_from_u8(figure.carried_good);
-            if let Some((color, letter)) = cargo_chip(good) {
-                let cx = sx + half_tw;
-                let cy = (sprite_top - 6).max(0);
-                // Backing chip
-                for cy_off in 0..7i32 {
-                    for cx_off in -4i32..=4i32 {
-                        let fx = cx + cx_off;
-                        let fy = cy + cy_off;
-                        if fx < 0 || fy < 0 { continue; }
-                        if (fx as u32) >= img_w || (fy as u32) >= img_h { continue; }
-                        let off = ((fy as u32 * img_w + fx as u32) * 4) as usize;
-                        if off + 3 >= rgba.len() { continue; }
-                        rgba[off] = color[0];
-                        rgba[off + 1] = color[1];
-                        rgba[off + 2] = color[2];
-                        rgba[off + 3] = 0xFF;
-                    }
-                }
-                // Letter on top
-                let label = String::from(letter);
-                tiny_font::draw_str(
-                    rgba, img_w, img_h,
-                    cx - 1, cy + 1, &label,
-                    [0x00, 0x00, 0x00, 0xFF], 1,
-                );
-            }
-        }
+        // (Cargo indicator chip removed — Anno carriers showed cargo via
+        // the actual Träger-with-good sprite. Real fix is correct
+        // TRAEGER.BSH sprite indexing per carried good, queued separately.)
     }
 
     // Draw warehouses (blue squares)
@@ -5756,63 +5290,6 @@ fn player_color(owner: u8) -> [u8; 4] {
         6 => [0xFF, 0x40, 0x40, 0xFF], // pirate: red
         _ => [0xCC, 0xCC, 0xCC, 0xFF], // fallback gray
     }
-}
-
-/// Map a `figure.carried_good` u8 back to its `Good` enum.
-/// Mirrors `anno_sim::carrier::good_from_u8` (which is private to its module).
-fn good_from_u8(val: u8) -> Good {
-    match val {
-        1  => Good::Wood, 2  => Good::Iron, 3  => Good::Gold,
-        4  => Good::Wool, 5  => Good::Sugar, 6  => Good::Tobacco,
-        7  => Good::Cattle, 8  => Good::Grain, 9  => Good::Flour,
-        10 => Good::Tools, 11 => Good::Bricks, 12 => Good::Swords,
-        13 => Good::Muskets, 14 => Good::Cannons, 15 => Good::Food,
-        16 => Good::Cloth, 17 => Good::Alcohol, 18 => Good::TobaccoProducts,
-        19 => Good::Spices, 20 => Good::Cocoa, 21 => Good::Grapes,
-        22 => Good::Stone, 23 => Good::Ore, 24 => Good::GoldOre,
-        25 => Good::Hides, 26 => Good::Cotton, 27 => Good::Silk,
-        28 => Good::Jewelry, 29 => Good::Clothing, 30 => Good::Fish,
-        _ => Good::None,
-    }
-}
-
-/// Pick a chip color + single-letter abbreviation for the cargo indicator
-/// drawn above carriers when they're hauling goods.
-fn cargo_chip(good: Good) -> Option<([u8; 4], char)> {
-    let (color, ch) = match good {
-        Good::None => return None,
-        Good::Wood   => ([0x8B, 0x4F, 0x20, 0xFF], 'W'),
-        Good::Iron   => ([0x80, 0x80, 0x90, 0xFF], 'I'),
-        Good::Ore    => ([0x70, 0x60, 0x50, 0xFF], 'O'),
-        Good::Stone  => ([0xA0, 0xA0, 0xA0, 0xFF], 'S'),
-        Good::Gold   => ([0xFF, 0xD7, 0x00, 0xFF], 'G'),
-        Good::GoldOre => ([0xC0, 0x9A, 0x40, 0xFF], 'g'),
-        Good::Tools  => ([0xC0, 0xC0, 0xD0, 0xFF], 'T'),
-        Good::Bricks => ([0xB0, 0x60, 0x40, 0xFF], 'B'),
-        Good::Wool   => ([0xE0, 0xE0, 0xC0, 0xFF], 'w'),
-        Good::Cotton => ([0xF0, 0xF0, 0xE0, 0xFF], 'C'),
-        Good::Hides  => ([0x80, 0x40, 0x20, 0xFF], 'h'),
-        Good::Cattle => ([0xA0, 0x60, 0x30, 0xFF], 'c'),
-        Good::Grain  => ([0xE0, 0xC0, 0x40, 0xFF], 'r'),
-        Good::Flour  => ([0xF8, 0xE8, 0xC0, 0xFF], 'f'),
-        Good::Food   => ([0xE0, 0x40, 0x20, 0xFF], 'F'),
-        Good::Sugar  => ([0xF0, 0xF0, 0xF8, 0xFF], 's'),
-        Good::Tobacco => ([0x80, 0x60, 0x20, 0xFF], 'b'),
-        Good::TobaccoProducts => ([0x60, 0x40, 0x20, 0xFF], 'P'),
-        Good::Cocoa  => ([0x60, 0x40, 0x20, 0xFF], 'k'),
-        Good::Spices => ([0xC0, 0x60, 0x20, 0xFF], 'x'),
-        Good::Cloth  => ([0xA0, 0xA0, 0xE0, 0xFF], 'L'),
-        Good::Clothing => ([0x80, 0x80, 0xC0, 0xFF], 'l'),
-        Good::Alcohol => ([0xA0, 0x40, 0x80, 0xFF], 'A'),
-        Good::Grapes => ([0x80, 0x40, 0xA0, 0xFF], 'p'),
-        Good::Fish   => ([0x40, 0xA0, 0xC0, 0xFF], 'i'),
-        Good::Silk   => ([0xE0, 0x80, 0xC0, 0xFF], 'k'),
-        Good::Jewelry => ([0xFF, 0xC0, 0x40, 0xFF], 'J'),
-        Good::Swords  => ([0xC0, 0xC0, 0xC0, 0xFF], 'V'),
-        Good::Muskets => ([0x80, 0x80, 0x80, 0xFF], 'M'),
-        Good::Cannons => ([0x40, 0x40, 0x40, 0xFF], 'N'),
-    };
-    Some((color, ch))
 }
 
 fn blit_rgba(
