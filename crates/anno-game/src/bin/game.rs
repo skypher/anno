@@ -3298,15 +3298,26 @@ fn main() {
                         if bi < sim.buildings.len() {
                             let b = &sim.buildings[bi];
                             let def = &defs[b.def_id as usize];
-                            if def.radius > 0
+                            // Towers / castles use defensive_cannons
+                            // range; everything else uses def.radius.
+                            // RE: combat::tick_tower_defense uses
+                            // `range = 4 + defensive_cannons`.
+                            let effective_radius = if def.defensive_cannons > 0 {
+                                4 + def.defensive_cannons as u16
+                            } else {
+                                def.radius
+                            };
+                            if effective_radius > 0
                                 && b.island_id == islands[current_island].number
                             {
                                 let half_tw = rs.tile_w / 2;
                                 let half_th = rs.tile_h / 2;
                                 let cx = b.tile_x as i32 + def.width as i32 / 2;
                                 let cy = b.tile_y as i32 + def.height as i32 / 2;
-                                let r = def.radius as i32;
-                                let outline = match def.prod_kind.as_str() {
+                                let r = effective_radius as i32;
+                                let outline = if def.defensive_cannons > 0 {
+                                    [0xFF, 0x40, 0x20, 0xFF] // tower-red
+                                } else { match def.prod_kind.as_str() {
                                     "MARKT" | "KONTOR" => [0xFF, 0xE0, 0x40, 0xFF],
                                     "KIRCHE" | "KAPELLE" => [0xFF, 0xCC, 0xCC, 0xFF],
                                     "WIRT" => [0xFF, 0x88, 0x40, 0xFF],
@@ -3314,7 +3325,7 @@ fn main() {
                                     "KLINIK" => [0xFF, 0x60, 0x60, 0xFF],
                                     "THEATER" | "BADEHAUS" => [0xC0, 0x80, 0xFF, 0xFF],
                                     _ => [0x80, 0xFF, 0xC0, 0xFF],
-                                };
+                                }};
                                 // Manhattan-distance ring (matches the
                                 // coverage::apply_radius diamond).
                                 for dy in -r..=r {
@@ -3640,6 +3651,67 @@ fn main() {
                             cx - 2, cy - 4, &label,
                             [0x00, 0x00, 0x00, 0xFF], 1,
                         );
+                    }
+                }
+
+                // Draw status tints for dried-up plantations
+                // (yellow) and depleted mines (gray), so the player
+                // can spot non-functional buildings at a glance.
+                if !world_mode {
+                    let island_id = islands[current_island].number;
+                    let half_tw = rs.tile_w / 2;
+                    let half_th = rs.tile_h / 2;
+                    for b in sim.buildings.iter() {
+                        if b.island_id != island_id { continue; }
+                        let def = &defs[b.def_id as usize];
+                        let mut tint: Option<[u8; 4]> = None;
+                        if def.can_dry_up && !b.active {
+                            tint = Some([0xC0, 0xA0, 0x40, 0x80]); // yellow
+                        } else if def.ore_deposit
+                            != anno_sim::building::OreDeposit::None
+                            && b.remaining_ore == 0
+                        {
+                            tint = Some([0x80, 0x80, 0x80, 0x80]); // gray
+                        }
+                        let Some(tint) = tint else { continue; };
+                        let bw = def.width as i32;
+                        let bh = def.height as i32;
+                        let bx = b.tile_x as i32;
+                        let by = b.tile_y as i32;
+                        for dy in 0..bh {
+                            for dx in 0..bw {
+                                let tx = bx + dx;
+                                let ty = by + dy;
+                                let sx = rs.origin_x + (tx - ty) * half_tw;
+                                let sy = rs.origin_y + (tx + ty) * half_th;
+                                for py in 0..rs.tile_h {
+                                    let row_half = if py <= rs.tile_h / 2 {
+                                        py * half_tw / half_th.max(1)
+                                    } else {
+                                        (rs.tile_h - py) * half_tw / half_th.max(1)
+                                    };
+                                    for px in (half_tw - row_half)..(half_tw + row_half) {
+                                        let fx = sx + px;
+                                        let fy = sy + py;
+                                        if fx < 0 || fy < 0 { continue; }
+                                        if (fx as u32) >= rs.width
+                                            || (fy as u32) >= rs.height { continue; }
+                                        let off = ((fy as u32 * rs.width + fx as u32) * 4) as usize;
+                                        if off + 3 < frame.len() {
+                                            let a = tint[3] as u16;
+                                            let inv_a = 255 - a;
+                                            frame[off] = ((tint[0] as u16 * a
+                                                + frame[off] as u16 * inv_a) / 255) as u8;
+                                            frame[off + 1] = ((tint[1] as u16 * a
+                                                + frame[off + 1] as u16 * inv_a) / 255) as u8;
+                                            frame[off + 2] = ((tint[2] as u16 * a
+                                                + frame[off + 2] as u16 * inv_a) / 255) as u8;
+                                            frame[off + 3] = 255;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -4806,6 +4878,45 @@ fn main() {
                 }
                 if def.maintenance_cost > 0 {
                     lines.push(format!("upkeep: {}/tick", def.maintenance_cost));
+                }
+                // Mine deposit status (RE: haeuser.cod Erzbergnr).
+                if def.ore_deposit
+                    != anno_sim::building::OreDeposit::None
+                {
+                    let total = def.ore_deposit.capacity();
+                    lines.push(format!(
+                        "ore deposit: {}/{} t remaining",
+                        b.remaining_ore, total,
+                    ));
+                    if b.remaining_ore == 0 {
+                        lines.push("DEPLETED".to_string());
+                    }
+                }
+                // Maxenergy progress bar (RE: haeuser.cod Maxenergy).
+                if def.max_energy > 0 {
+                    lines.push(format!(
+                        "wear: {}/{} cycles",
+                        b.total_work, def.max_energy,
+                    ));
+                }
+                // Defensive cannons (RE: haeuser.cod Kanon).
+                if def.defensive_cannons > 0 {
+                    lines.push(format!(
+                        "defense: {} cannons (range {})",
+                        def.defensive_cannons,
+                        4 + def.defensive_cannons,
+                    ));
+                }
+                // Drought status for plantations.
+                if def.can_dry_up && !b.active {
+                    lines.push("DRIED UP — bulldoze and replant".to_string());
+                }
+                // Idle warning.
+                if b.is_built() && b.idle_ticks > 0 {
+                    lines.push(format!(
+                        "idle: {} cycles (limit {})",
+                        b.idle_ticks, def.max_no_input_ticks,
+                    ));
                 }
                 let scale = 1u32;
                 let line_h = (5 * scale + 3) as i32;
