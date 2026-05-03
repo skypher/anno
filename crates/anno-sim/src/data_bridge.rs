@@ -272,6 +272,17 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
             }
             quad
         },
+        has_door: prop("Tuerflg") == "1",
+        upgradeable: prop("Ausbauflg") == "1",
+        max_energy: {
+            let v = prop_int("Maxenergy");
+            if v > 0 { v as u16 } else { 0 }
+        },
+        ore_deposit: match prop("Erzbergnr") {
+            "ERZBERG_KLEIN" => crate::building::OreDeposit::Small,
+            "ERZBERG_GROSS" => crate::building::OreDeposit::Large,
+            _ => crate::building::OreDeposit::None,
+        },
     }
 }
 

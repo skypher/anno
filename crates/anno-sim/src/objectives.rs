@@ -205,6 +205,10 @@ mod tests {
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
+            has_door: false,
+            upgradeable: false,
+            max_energy: 0,
+            ore_deposit: crate::building::OreDeposit::None,
         };
         let defs = vec![mk_def(Good::Tools), mk_def(Good::Cloth)];
         let mk_b = |def_id: u16, owner: u8| {

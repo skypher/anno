@@ -23,6 +23,13 @@ pub fn tick_building(building: &mut BuildingInstance, def: &BuildingDef, dt_ms: 
     if !building.active || !building.is_built() {
         return 0;
     }
+    // Maxenergy cap: once cumulative work hits the per-building
+    // limit (RE: haeuser.cod `Maxenergy`), the building stops
+    // producing — analogous to needing repair / overhaul. 0 means
+    // uncapped.
+    if def.max_energy > 0 && building.total_work >= def.max_energy {
+        return 0;
+    }
 
     // Calculate efficiency from input stock levels
     building.efficiency = calculate_efficiency(building, def);
@@ -126,6 +133,10 @@ mod tests {
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
+            has_door: false,
+            upgradeable: false,
+            max_energy: 0,
+            ore_deposit: crate::building::OreDeposit::None,
         }
     }
 

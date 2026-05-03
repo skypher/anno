@@ -100,6 +100,13 @@ pub fn try_spawn_civilian(
     if def.prod_kind != "WOHN" {
         return None;
     }
+    // Civilians only emerge from buildings with a `Tuerflg: 1`
+    // door (RE: haeuser.cod). Residence shells without a door
+    // (construction-phase placeholders, upgraded variants) don't
+    // host civilians.
+    if !def.has_door {
+        return None;
+    }
     // Skip residences still under construction; civilians only walk
     // out of finished houses.
     if building.construction_ms_remaining > 0 {
@@ -225,6 +232,10 @@ mod tests {
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
+            has_door: true,         // residences in tests have doors
+            upgradeable: true,
+            max_energy: 0,
+            ore_deposit: crate::building::OreDeposit::None,
         }
     }
 

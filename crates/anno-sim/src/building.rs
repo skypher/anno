@@ -72,6 +72,51 @@ pub struct BuildingDef {
     /// 100 loaded on-road). Roads boost empty carriers but
     /// slightly slow loaded ones. `[100; 4]` = no preference.
     pub wegspeed: [u16; 4],
+    /// Door flag (`Tuerflg: 1` in haeuser.cod). Marks residences
+    /// from which civilians may emerge. 56 buildings carry this.
+    /// `false` for buildings without addressable doors (production
+    /// houses, public services, etc.) — civilian spawning skips
+    /// these.
+    pub has_door: bool,
+    /// Upgradeable flag (`Ausbauflg: 1` in haeuser.cod). 10
+    /// residence buildings carry it; promotion (Pioneer → Settler
+    /// → … → Aristocrat) is gated on this. False for fixed-tier
+    /// buildings that can't be promoted.
+    pub upgradeable: bool,
+    /// Maximum cumulative production work the building can do
+    /// before needing repair / overhaul. RE: haeuser.cod
+    /// `Maxenergy` field — varies 3..230 with most common values
+    /// 5/50/115. 0 means uncapped (default for buildings without
+    /// the field).
+    pub max_energy: u16,
+    /// Ore-deposit size for ore-source buildings. RE: haeuser.cod
+    /// `Erzbergnr` — `ERZBERG_KLEIN` (small, 80t per Tim Howgego
+    /// appendix) or `ERZBERG_GROSS` (large, 240t total). `None`
+    /// for non-ore buildings; the simulation can use this to
+    /// initialise per-deposit `output_stock` caps so mines deplete
+    /// finite resources rather than producing forever.
+    pub ore_deposit: OreDeposit,
+}
+
+/// Ore-deposit size. Manual sec. 6.7 + Tim Howgego's resources
+/// appendix: small deposits give 80 tons, large deposits 240 tons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OreDeposit {
+    #[default]
+    None,
+    Small,  // ERZBERG_KLEIN — 80 tons
+    Large,  // ERZBERG_GROSS — 240 tons
+}
+
+impl OreDeposit {
+    /// Total ore tonnage available from this deposit. 0 for `None`.
+    pub fn capacity(self) -> u16 {
+        match self {
+            OreDeposit::None => 0,
+            OreDeposit::Small => 80,
+            OreDeposit::Large => 240,
+        }
+    }
 }
 
 /// An active building instance in the world.
