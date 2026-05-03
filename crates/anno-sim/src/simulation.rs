@@ -130,6 +130,10 @@ pub struct Simulation {
 
     /// Per-island fog-of-war bitmap. Lazily allocated on first sighting.
     pub exploration: Vec<crate::exploration::ExplorationMap>,
+
+    /// Combat damage events from the most recent military tick. Drained
+    /// by the renderer each frame to animate floating "-N" numbers.
+    pub damage_events: Vec<crate::combat::DamageEvent>,
 }
 
 impl Simulation {
@@ -178,6 +182,7 @@ impl Simulation {
             rng_state: 0xCBF29CE484222325,
 
             exploration: Vec::new(),
+            damage_events: Vec::new(),
 
             current_prices: (0..31u8)
                 .map(|i| {
@@ -1023,6 +1028,7 @@ impl Simulation {
             &mut self.military_units,
             &self.diplomacy,
             self.timer_military.interval_ms,
+            &mut self.damage_events,
         );
 
         // Building damage from adjacent hostile land units.
@@ -1031,6 +1037,7 @@ impl Simulation {
             &mut self.buildings,
             &self.diplomacy,
             &self.building_defs,
+            &mut self.damage_events,
         );
         // Remove destroyed buildings (in reverse) and emit tile-clear events.
         for &bi in destroyed.iter().rev() {

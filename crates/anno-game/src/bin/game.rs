@@ -950,6 +950,9 @@ fn main() {
     }
     let mut chat_active = false;
     let mut chat_input = String::new();
+    /// Floating combat numbers: (tile_x, tile_y, amount, target_kind, spawn_instant).
+    let mut floating_nums: Vec<(i32, i32, u16, u8, std::time::Instant)>
+        = Vec::new();
     // Recently received chat lines (oldest first) with timestamp for TTL.
     let mut chat_log: std::collections::VecDeque<(String, std::time::Instant)> =
         std::collections::VecDeque::new();
@@ -2687,6 +2690,14 @@ fn main() {
                     audio.waves.play_once(sfx, WINDOW_W as i32 / 2, WINDOW_H as i32 / 2, handle);
                 }
             }
+            // Drain damage events into the floating-number animation.
+            if !sim.damage_events.is_empty() {
+                let now = std::time::Instant::now();
+                for ev in sim.damage_events.drain(..) {
+                    floating_nums.push((ev.x, ev.y, ev.amount, ev.target, now));
+                }
+            }
+
             // Drain combat-destroyed buildings: clear matching island tiles
             // so the static renderer no longer paints the dead footprint.
             if !sim.tile_clears.is_empty() {
@@ -4956,6 +4967,53 @@ fn main() {
         };
         canvas.window_mut().set_title(&title).ok();
 
+        // Floating combat numbers: drift up + fade across 1.5s. Drawn on
+        // the SDL canvas (post-texture) so they sit on top of the world.
+        {
+            const TTL: std::time::Duration = std::time::Duration::from_millis(1500);
+            let now = std::time::Instant::now();
+            floating_nums.retain(|&(_, _, _, _, spawn)| now - spawn < TTL);
+            if let Some(ref rs) = rendered {
+                let half_tw = rs.tile_w / 2;
+                let half_th = rs.tile_h / 2;
+                for &(tx, ty, amount, target, spawn) in floating_nums.iter() {
+                    let age = now - spawn;
+                    let frac = age.as_secs_f32() / TTL.as_secs_f32();
+                    if frac >= 1.0 { continue; }
+                    let drift_px = (frac * 24.0) as i32;
+                    // Convert tile to texture pixel, then to screen.
+                    let tex_sx = rs.origin_x + (tx - ty) * half_tw + half_tw;
+                    let tex_sy = rs.origin_y + (tx + ty) * half_th + half_th - drift_px;
+                    let dst_w = rs.width as i32 * display_zoom;
+                    let dst_h = rs.height as i32 * display_zoom;
+                    let dst_x = (WINDOW_W as i32 - dst_w) / 2 + scroll_x;
+                    let dst_y = (WINDOW_H as i32 - dst_h) / 2 + scroll_y;
+                    let screen_x = dst_x + tex_sx * display_zoom;
+                    let screen_y = dst_y + tex_sy * display_zoom;
+                    let label = format!("-{}", amount);
+                    let alpha = ((1.0 - frac) * 255.0) as u8;
+                    let color = if target == 1 {
+                        [0xFF, 0xCC, 0x40, alpha]   // amber for buildings
+                    } else {
+                        [0xFF, 0x60, 0x60, alpha]   // red for units
+                    };
+                    let scale = 1u32;
+                    let w = tiny_font::measure(&label, scale);
+                    let h = (5 * scale) + 2;
+                    let mut buf = vec![0u8; (w * h * 4) as usize];
+                    tiny_font::draw_str(&mut buf, w, h, 0, 0, &label, color, scale);
+                    if let Ok(mut tex) = texture_creator
+                        .create_texture_streaming(PixelFormatEnum::RGBA32, w, h)
+                    {
+                        tex.update(None, &buf, (w * 4) as usize).ok();
+                        tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                        canvas.copy(&tex, None,
+                            Some(Rect::new(screen_x - w as i32 / 2, screen_y, w, h))).ok();
+                    }
+                }
+            }
+        }
+
         // Perf overlay (F12). Drawn last so it lands on top of everything.
         if show_perf {
             let scale = 1u32;
@@ -5231,6 +5289,13 @@ fn overlay_entities(
             let cy = sy + half_th;
             let r = (half_tw + half_th) / 2 + 2;
             draw_ring(rgba, img_w, img_h, cx, cy, r, &[0xFF, 0xFF, 0x00, 0xFF]);
+        } else {
+            // Faction color ring so multi-player maps read at a glance.
+            let owner_color = player_color(unit.owner);
+            let cx = sx + half_tw;
+            let cy = sy + half_th;
+            let r = (half_tw + half_th) / 2 + 1;
+            draw_ring(rgba, img_w, img_h, cx, cy, r, &owner_color);
         }
 
         // Use direction to pick a sprite frame (8 dirs × frames)
@@ -5757,6 +5822,22 @@ fn render_island(
     }
 
     (rgba, img_w, img_h, origin_x, origin_y)
+}
+
+/// Distinctive RGBA color per player slot, used for ownership rings on
+/// units and (eventually) building outlines. Slot 0 = blue (human), 1-5
+/// = AI rivals, 6 = pirate red.
+fn player_color(owner: u8) -> [u8; 4] {
+    match owner {
+        0 => [0x40, 0x80, 0xFF, 0xFF], // human: blue
+        1 => [0xFF, 0x80, 0x40, 0xFF], // AI 1: orange
+        2 => [0x40, 0xFF, 0x80, 0xFF], // AI 2: green
+        3 => [0xC0, 0x40, 0xFF, 0xFF], // AI 3: purple
+        4 => [0xFF, 0x40, 0xC0, 0xFF], // AI 4: pink
+        5 => [0xFF, 0xFF, 0x40, 0xFF], // AI 5: yellow
+        6 => [0xFF, 0x40, 0x40, 0xFF], // pirate: red
+        _ => [0xCC, 0xCC, 0xCC, 0xFF], // fallback gray
+    }
 }
 
 /// Map a `figure.carried_good` u8 back to its `Good` enum.

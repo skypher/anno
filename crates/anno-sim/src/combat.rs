@@ -280,6 +280,7 @@ pub fn tick_combat(
     units: &mut [MilitaryUnit],
     diplomacy: &DiplomacyMatrix,
     dt_ms: u32,
+    events: &mut Vec<DamageEvent>,
 ) -> Vec<usize> {
     let mut dead = Vec::new();
     let len = units.len();
@@ -339,8 +340,15 @@ pub fn tick_combat(
         if units[i].attack_timer_ms >= stats.attack_speed_ms {
             units[i].attack_timer_ms -= stats.attack_speed_ms;
 
-            // Apply damage to target
+            // Apply damage to target (and report it for the floating-
+            // number overlay; amount in 1/100 hp ≈ percent for u16).
             units[target_idx].health -= stats.attack_damage;
+            events.push(DamageEvent {
+                x: units[target_idx].tile_x,
+                y: units[target_idx].tile_y,
+                amount: (stats.attack_damage * 100.0) as u16,
+                target: 0,
+            });
 
             // Check if target died
             if !units[target_idx].is_alive() {
@@ -359,6 +367,17 @@ pub fn tick_combat(
     dead
 }
 
+/// One-frame combat-damage event for the renderer to animate as a
+/// floating number. Coordinate space depends on `target`.
+#[derive(Debug, Clone, Copy)]
+pub struct DamageEvent {
+    pub x: i32,
+    pub y: i32,
+    pub amount: u16,
+    /// 0 = land unit (tile coords), 1 = building (tile coords).
+    pub target: u8,
+}
+
 /// Damage to enemy buildings from adjacent military units. Called each
 /// military tick. Returns the indices of buildings that hit 0 HP.
 ///
@@ -369,6 +388,7 @@ pub fn tick_building_damage(
     buildings: &mut [crate::building::BuildingInstance],
     diplomacy: &DiplomacyMatrix,
     defs: &[crate::building::BuildingDef],
+    events: &mut Vec<DamageEvent>,
 ) -> Vec<usize> {
     const DMG_PER_ENEMY: u16 = 5;
     let mut destroyed = Vec::new();
@@ -398,6 +418,12 @@ pub fn tick_building_damage(
         }
         if hostile == 0 { continue; }
         let total = DMG_PER_ENEMY.saturating_mul(hostile);
+        events.push(DamageEvent {
+            x: b.tile_x as i32,
+            y: b.tile_y as i32,
+            amount: total,
+            target: 1,
+        });
         if b.health <= total {
             b.health = 0;
             b.active = false;
@@ -605,7 +631,7 @@ mod tests {
 
         // Run enough ticks for combat to resolve
         for _ in 0..200 {
-            tick_combat(&mut units, &diplomacy, 100);
+            tick_combat(&mut units, &diplomacy, 100, &mut Vec::new());
         }
 
         // Swordsman should win (more damage)
@@ -656,7 +682,7 @@ mod tests {
         let diplomacy = DiplomacyMatrix::new();
 
         for _ in 0..100 {
-            tick_combat(&mut units, &diplomacy, 100);
+            tick_combat(&mut units, &diplomacy, 100, &mut Vec::new());
         }
 
         // Both should be alive (no combat between allies)
@@ -676,7 +702,7 @@ mod tests {
 
         // Run combat
         for _ in 0..200 {
-            tick_combat(&mut units, &diplomacy, 100);
+            tick_combat(&mut units, &diplomacy, 100, &mut Vec::new());
         }
 
         // At least one cannon should survive, pikeman should die
@@ -704,7 +730,7 @@ mod tests {
         let diplomacy = DiplomacyMatrix::new_all_war();
 
         for _ in 0..100 {
-            tick_combat(&mut units, &diplomacy, 100);
+            tick_combat(&mut units, &diplomacy, 100, &mut Vec::new());
         }
 
         // Both should be alive — naval and land can't fight each other
