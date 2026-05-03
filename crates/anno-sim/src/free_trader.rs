@@ -45,30 +45,33 @@ use crate::warehouse::Warehouse;
 /// for the trader by convention rather than direct mapping.
 pub const FREE_TRADER_SLOT: u8 = 5;
 
-// Visit count and dock duration. The Anno 1602 manual (section 8.1
-// "Free traders") describes traders as roaming around buying surplus
-// and selling needed goods at every player-set buy/sell slider.
-// Traders don't have a fixed "visits before leaving" — in the
-// original they keep circulating between active Kontors as long as
-// there are at least two warehouses on the island chain (manual
-// section 11.4.3). To match that behaviour we treat
-// `VISITS_BEFORE_LEAVING` as a soft per-spawn cap so the same ship
-// doesn't loop forever (the binary recreates trader ships
-// dynamically — see `1602_exe.c:50289` returning `&DAT_004cf358 +
-// iVar3 * 0x218` after `FUN_004488d0` picks a new target).
+// Visit count and dock duration. Anno 1602 manual section 8.1
+// "Free traders" + section 11.4.3 "Placing ships" tell us:
 //
-// `DOCK_TICKS` and `TRADE_BATCH` control how long a trader stays at
-// each Kontor and how much it exchanges per dock-tick. The original
-// uses player-set slider amounts (manual 8.1: "Use one slider to
-// set the selling price and the other to set the maximum amount you
-// want to sell."), which we simplify into a fixed batch since our
-// warehouse model doesn't yet track per-good buy/sell sliders.
+//   - Traders keep circulating between Kontors as long as there are
+//     two or more warehouses in the island chain. They don't pick a
+//     "visits before leaving" — the binary recreates trader ships
+//     dynamically when their target changes (see `1602_exe.c:50289`
+//     returning `&DAT_004cf358 + iVar3 * 0x218` after
+//     `FUN_004488d0` picks a new target).
+//   - Per-good exchange amounts come from the player's buy/sell
+//     sliders set at the warehouse: section 8.1 explains that the
+//     player sets a sell-floor ("everything left of the mark stays
+//     in the warehouse, while everything to the right of it will be
+//     sold") and a buy-ceiling ("the free traders will keep selling
+//     you the chosen product, up to the desired amount").
 //
-// Tick rate is 10 Hz / 600 per minute (decoded from `:98053`); 5
-// dock-ticks = 0.5 s in our model.
+// We honour the per-warehouse sliders directly (`Warehouse::sell_offer`
+// / `Warehouse::buy_demand`). `VISITS_BEFORE_LEAVING` is a soft cap
+// so the same ship doesn't loop forever in our simplified world; the
+// pool size is enforced by `Simulation::tick_free_traders` matching
+// `target_traders = active_kontors / 2`.
+//
+// `DOCK_TICKS` is how many ticks the ship stays at each Kontor
+// before sailing on. Tick rate is 10 Hz / 600 per minute (decoded
+// from `1602_exe.c:98053`); 5 dock-ticks = 0.5 s.
 const VISITS_BEFORE_LEAVING: u8 = 3;
 const DOCK_TICKS: u8 = 5;
-const TRADE_BATCH: u16 = 5;
 
 /// Initial inventory of a freshly-spawned free trader.
 ///
@@ -181,9 +184,16 @@ pub struct TradeResult {
 }
 
 /// Run a single docked trade interaction with the warehouse pointed at
-/// by `trader.target_warehouse`. Sells what the warehouse can afford
-/// and has room for; buys high-stock goods the trader still has space
-/// for. Standard prices; gold settled with the warehouse owner.
+/// by `trader.target_warehouse`. Honours the warehouse's per-good
+/// buy/sell sliders (manual 8.1):
+///   - For each good with a buy-slider set, sell from trader stock
+///     up to the slider ceiling, charging the player the standard buy
+///     price. Player only pays for what they can afford.
+///   - For each good with a sell-slider set, buy down to the slider
+///     floor, paying the player the standard sell price.
+/// Goods without sliders configured are skipped — matching the
+/// original, where the trader only trades what the player has
+/// explicitly opted into.
 pub fn dock_trade(
     trader: &mut FreeTrader,
     warehouses: &mut [Warehouse],
@@ -199,17 +209,18 @@ pub fn dock_trade(
         return result;
     }
 
-    // 1. Sell from trader stock → warehouse.
+    // 1. Sell from trader stock → warehouse, capped by the player's
+    //    buy-slider ceiling (manual 8.1 "the free traders will keep
+    //    selling you the chosen product, up to the desired amount").
     let stock_snapshot: Vec<(Good, u16)> = trader.stock.clone();
     for (good, available) in stock_snapshot {
         if available == 0 { continue; }
-        let want = TRADE_BATCH.min(available);
+        let demand = wh.buy_demand(good);
+        if demand == 0 { continue; }
         let price = crate::prices::price_of(good).buy as i32;
-        if *player_gold < price {
-            continue;
-        }
+        if *player_gold < price { continue; }
         let max_aff = (*player_gold / price.max(1)) as u16;
-        let qty = want.min(max_aff);
+        let qty = available.min(demand).min(max_aff);
         let deposited = wh.deposit(good, qty);
         if deposited > 0 {
             trader.withdraw_stock(good, deposited);
@@ -218,15 +229,19 @@ pub fn dock_trade(
         }
     }
 
-    // 2. Buy surplus from warehouse → trader. Pick goods the warehouse
-    //    has more than 30 of so we don't drain its working stock.
-    let surplus: Vec<(Good, u16)> = wh
+    // 2. Buy surplus from warehouse → trader, down to the player's
+    //    sell-slider floor (manual 8.1 "everything left of the mark
+    //    you set with the slider will remain in the warehouse, while
+    //    everything to the right of it will be sold").
+    let offers: Vec<(Good, u16)> = wh
         .all_stock()
         .into_iter()
-        .filter(|(_, qty, _)| *qty > 30)
-        .map(|(g, qty, _)| (g, qty.saturating_sub(30).min(TRADE_BATCH)))
+        .filter_map(|(g, _, _)| {
+            let offer = wh.sell_offer(g);
+            (offer > 0).then_some((g, offer))
+        })
         .collect();
-    for (good, qty) in surplus {
+    for (good, qty) in offers {
         let price = crate::prices::price_of(good).sell as i32;
         let withdrawn = wh.withdraw(good, qty);
         if withdrawn > 0 {
@@ -335,35 +350,52 @@ mod tests {
     }
 
     #[test]
-    fn dock_trade_sells_to_warehouse() {
-        let mut wh = mk_wh(0, 0, 5, 5);
-        let mut whs = vec![wh.clone()];
+    fn dock_trade_sells_to_warehouse_when_buy_slider_set() {
+        let mut whs = vec![mk_wh(0, 0, 5, 5)];
+        // Player wants up to 20 Tools.
+        whs[0].set_buy_max_stock(Good::Tools, Some(20));
         let mut trader = FreeTrader::spawn_at(5, 5);
         trader.target_warehouse = Some(0);
         let mut gold = 5000;
         let _ = dock_trade(&mut trader, &mut whs, &mut gold);
         assert!(whs[0].stock(Good::Tools) > 0);
+        assert!(whs[0].stock(Good::Tools) <= 20);
         assert!(gold < 5000);
-        let _ = wh; // suppress unused
     }
 
     #[test]
-    fn dock_trade_buys_warehouse_surplus() {
+    fn dock_trade_skipped_when_no_buy_slider() {
+        let mut whs = vec![mk_wh(0, 0, 5, 5)];
+        // No buy slider → trader does not push goods on the player.
+        let mut trader = FreeTrader::spawn_at(5, 5);
+        trader.target_warehouse = Some(0);
+        let mut gold = 5000;
+        let _ = dock_trade(&mut trader, &mut whs, &mut gold);
+        assert_eq!(whs[0].stock(Good::Tools), 0);
+        assert_eq!(gold, 5000);
+    }
+
+    #[test]
+    fn dock_trade_buys_warehouse_surplus_when_sell_slider_set() {
         let mut whs = vec![mk_wh(0, 0, 5, 5)];
         whs[0].set_capacity(Good::Wool, 200);
         whs[0].deposit(Good::Wool, 200);
+        // Player wants to keep 30 Wool, sell anything above.
+        whs[0].set_sell_min_keep(Good::Wool, Some(30));
         let mut trader = FreeTrader::spawn_at(5, 5);
         trader.target_warehouse = Some(0);
         trader.stock.clear();
         let mut gold = 0;
         let _ = dock_trade(&mut trader, &mut whs, &mut gold);
         assert!(trader.stock_amount(Good::Wool) > 0);
+        assert_eq!(whs[0].stock(Good::Wool), 30);
         assert!(gold > 0);
     }
 
     #[test]
     fn dock_trade_skipped_when_player_broke() {
         let mut whs = vec![mk_wh(0, 0, 5, 5)];
+        whs[0].set_buy_max_stock(Good::Tools, Some(20));
         let mut trader = FreeTrader::spawn_at(5, 5);
         trader.target_warehouse = Some(0);
         let mut gold = 0;

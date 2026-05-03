@@ -23,6 +23,29 @@ pub struct Warehouse {
 
     /// Inventory: good → (current_stock, max_capacity)
     inventory: HashMap<Good, (u16, u16)>,
+
+    /// Per-good buy/sell sliders (Anno 1602 manual section 8.1).
+    /// `Sell` = "everything left of the mark stays, everything right
+    /// of it gets sold to the free trader" → `min_keep` (we sell down
+    /// to this floor).
+    /// `Buy` = "the trader keeps selling you the chosen product up to
+    /// the desired amount" → `max_buy` (we buy up to this ceiling).
+    /// Defaults: no slider configured = no trade with the free trader
+    /// for that good (matching the original — players have to set
+    /// each slider explicitly).
+    #[serde(default)]
+    sliders: HashMap<Good, TradeSlider>,
+}
+
+/// Per-good free-trader sliders. See `Warehouse::sliders` doc-comment.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct TradeSlider {
+    /// Sell-to-trader floor: keep at least this many in stock.
+    /// `None` = don't sell this good.
+    pub sell_min_keep: Option<u16>,
+    /// Buy-from-trader ceiling: top up to at most this many in stock.
+    /// `None` = don't buy this good.
+    pub buy_max_stock: Option<u16>,
 }
 
 impl Warehouse {
@@ -34,7 +57,45 @@ impl Warehouse {
             tile_y,
             active: true,
             inventory: HashMap::new(),
+            sliders: HashMap::new(),
         }
+    }
+
+    /// Slider configuration for a good (default = no trade).
+    pub fn slider(&self, good: Good) -> TradeSlider {
+        self.sliders.get(&good).copied().unwrap_or_default()
+    }
+
+    /// Set the sell-to-trader floor. Pass `None` to disable selling.
+    pub fn set_sell_min_keep(&mut self, good: Good, min_keep: Option<u16>) {
+        let s = self.sliders.entry(good).or_default();
+        s.sell_min_keep = min_keep;
+    }
+
+    /// Set the buy-from-trader ceiling. Pass `None` to disable buying.
+    pub fn set_buy_max_stock(&mut self, good: Good, max_stock: Option<u16>) {
+        let s = self.sliders.entry(good).or_default();
+        s.buy_max_stock = max_stock;
+    }
+
+    /// How much of `good` we are willing to sell to the trader right
+    /// now (current stock minus the slider floor; 0 if no slider set).
+    pub fn sell_offer(&self, good: Good) -> u16 {
+        let floor = match self.slider(good).sell_min_keep {
+            Some(f) => f,
+            None => return 0,
+        };
+        self.stock(good).saturating_sub(floor)
+    }
+
+    /// How much of `good` we want to buy from the trader right now
+    /// (slider ceiling minus current stock; 0 if no slider set).
+    pub fn buy_demand(&self, good: Good) -> u16 {
+        let ceiling = match self.slider(good).buy_max_stock {
+            Some(c) => c,
+            None => return 0,
+        };
+        ceiling.saturating_sub(self.stock(good))
     }
 
     /// Get current stock of a good.

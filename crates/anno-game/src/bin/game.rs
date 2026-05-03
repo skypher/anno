@@ -1205,6 +1205,49 @@ fn main() {
                             Keycode::A | Keycode::Escape => {
                                 market_panel = false;
                             }
+                            Keycode::B => {
+                                // Cycle the free-trader BUY-MAX slider
+                                // for the selected good on the player's
+                                // first warehouse: None → 25 → 50 → 100
+                                // → None. Manual 8.1: "the free traders
+                                // will keep selling you the chosen
+                                // product, up to the desired amount."
+                                if let Some(g) = GOODS.get(market_sel).copied() {
+                                    if let Some(wh) = sim.warehouses.iter_mut()
+                                        .find(|w| w.active && w.owner == 0)
+                                    {
+                                        let next = match wh.slider(g).buy_max_stock {
+                                            None => Some(25),
+                                            Some(25) => Some(50),
+                                            Some(50) => Some(100),
+                                            _ => None,
+                                        };
+                                        wh.set_buy_max_stock(g, next);
+                                    }
+                                }
+                            }
+                            Keycode::N => {
+                                // Cycle the free-trader SELL-MIN-KEEP
+                                // slider: None → 0 → 30 → 60 → None.
+                                // Manual 8.1: "everything left of the
+                                // mark you set with the slider will
+                                // remain in the warehouse, while
+                                // everything to the right of it will
+                                // be sold."
+                                if let Some(g) = GOODS.get(market_sel).copied() {
+                                    if let Some(wh) = sim.warehouses.iter_mut()
+                                        .find(|w| w.active && w.owner == 0)
+                                    {
+                                        let next = match wh.slider(g).sell_min_keep {
+                                            None => Some(0),
+                                            Some(0) => Some(30),
+                                            Some(30) => Some(60),
+                                            _ => None,
+                                        };
+                                        wh.set_sell_min_keep(g, next);
+                                    }
+                                }
+                            }
                             Keycode::Space => {
                                 sim.paused = !sim.paused;
                             }
@@ -4297,13 +4340,13 @@ fn main() {
             }
             tiny_font::draw_str(
                 &mut buf, panel_w, panel_h,
-                4, 4, "MARKET (A close  Up/Dn pick  Lt/Rt ±10  Shift=±100)",
+                4, 4, "MARKET (A close  Lt/Rt ±10 trade  B buy-max  N sell-min)",
                 [0xFF, 0xD7, 0x00, 0xFF], 1,
             );
             let gold_now = sim.players.first().map(|p| p.gold).unwrap_or(0);
             tiny_font::draw_str(
                 &mut buf, panel_w, panel_h,
-                4, 16, &format!("gold:{gold_now}  Good      stock  buy/sell"),
+                4, 16, &format!("gold:{gold_now}  Good      stock  b/s   buy/sell"),
                 [0xCC, 0xCC, 0xCC, 0xFF], 1,
             );
             // Sliding window centered on selection.
@@ -4315,17 +4358,20 @@ fn main() {
                 market_sel.saturating_sub(max_visible / 2)
                     .min(total - max_visible)
             };
-            // Pull stock for player 0's first active warehouse.
+            // Pull stock + slider state for player 0's first warehouse.
+            let player_wh = sim.warehouses.iter()
+                .find(|w| w.active && w.owner == 0);
             let stock_for = |g: Good| -> u16 {
-                sim.warehouses.iter()
-                    .find(|w| w.active && w.owner == 0)
-                    .map(|w| w.stock(g))
-                    .unwrap_or(0)
+                player_wh.map(|w| w.stock(g)).unwrap_or(0)
+            };
+            let slider_for = |g: Good| -> anno_sim::warehouse::TradeSlider {
+                player_wh.map(|w| w.slider(g)).unwrap_or_default()
             };
             for (row, idx) in (start..(start + max_visible).min(total)).enumerate() {
                 let g = GOODS[idx];
                 let price = sim.current_price(g);
                 let stock = stock_for(g);
+                let slider = slider_for(g);
                 let label_full = format!("{:?}", g);
                 let label = if label_full.len() > 9 {
                     label_full[..9].to_string()
@@ -4333,9 +4379,18 @@ fn main() {
                     label_full
                 };
                 let arrow = if idx == market_sel { ">" } else { " " };
+                // Compact slider chip: "b25/s30" (None entries shown as ".").
+                let buy_chip = match slider.buy_max_stock {
+                    Some(n) => format!("b{n}"),
+                    None => "b.".into(),
+                };
+                let sell_chip = match slider.sell_min_keep {
+                    Some(n) => format!("s{n}"),
+                    None => "s.".into(),
+                };
                 let line = format!(
-                    "{arrow} {:<9}  {:>4}   {:>3}/{:<3}",
-                    label, stock, price.buy, price.sell,
+                    "{arrow} {:<9}  {:>4} {:>4}/{:<4} {:>3}/{:<3}",
+                    label, stock, buy_chip, sell_chip, price.buy, price.sell,
                 );
                 let color = if idx == market_sel {
                     [0xFF, 0xFF, 0x00, 0xFF]
