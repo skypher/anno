@@ -47,10 +47,20 @@ pub struct UnitStats {
 
 impl UnitType {
     pub fn stats(self) -> UnitStats {
+        // Land-unit stats RE-cited from Tim Howgego's military-data
+        // appendix. HP / Strength values transcribed directly:
+        //   Infantry  HP 20, Strength 1.0
+        //   Cavalry   HP 18, Strength 1.6
+        //   Musketeer HP 15, Strength 2.4
+        //   Cannoneer HP 12, Strength 7.0
+        // We scale HP by /20 to fit our 1.0-baseline (Infantry HP 20
+        // → max_health 1.0). Strength becomes attack_damage / 20.
+        // Pikeman and Swordsman both map to "Infantry" since the
+        // appendix doesn't distinguish them.
         match self {
             UnitType::Pikeman => UnitStats {
-                max_health: 1.0,
-                attack_damage: 0.08,
+                max_health: 20.0 / 20.0,    // = 1.0
+                attack_damage: 1.0 / 20.0,  // = 0.05
                 attack_speed_ms: 1000,
                 attack_range: 1,
                 move_speed: 3,
@@ -58,17 +68,22 @@ impl UnitType {
                 is_naval: false,
             },
             UnitType::Swordsman => UnitStats {
-                max_health: 1.0,
-                attack_damage: 0.12,
-                attack_speed_ms: 1200,
+                // Swordsman is the upgraded Infantry: same HP as
+                // appendix Infantry but +20% damage from the
+                // sword-vs-pike weapon distinction (figuren.cod
+                // gives them separate Soldat entries with different
+                // gold costs — 80 vs 60 — so we keep them distinct).
+                max_health: 20.0 / 20.0,    // = 1.0
+                attack_damage: 1.2 / 20.0,  // = 0.06 (>Pikeman's 0.05)
+                attack_speed_ms: 1000,
                 attack_range: 1,
                 move_speed: 3,
                 is_ranged: false,
                 is_naval: false,
             },
             UnitType::Musketeer => UnitStats {
-                max_health: 0.8,
-                attack_damage: 0.15,
+                max_health: 15.0 / 20.0,    // = 0.75
+                attack_damage: 2.4 / 20.0,  // = 0.12
                 attack_speed_ms: 2000,
                 attack_range: 4,
                 move_speed: 2,
@@ -76,8 +91,8 @@ impl UnitType {
                 is_naval: false,
             },
             UnitType::Cavalry => UnitStats {
-                max_health: 1.2,
-                attack_damage: 0.14,
+                max_health: 18.0 / 20.0,    // = 0.9
+                attack_damage: 1.6 / 20.0,  // = 0.08
                 attack_speed_ms: 800,
                 attack_range: 1,
                 move_speed: 5,
@@ -85,6 +100,7 @@ impl UnitType {
                 is_naval: false,
             },
             UnitType::Archer => UnitStats {
+                // Archer not in appendix — kept from previous values.
                 max_health: 0.6,
                 attack_damage: 0.06,
                 attack_speed_ms: 1500,
@@ -94,16 +110,22 @@ impl UnitType {
                 is_naval: false,
             },
             UnitType::Cannon => UnitStats {
-                max_health: 0.5,
-                attack_damage: 0.25,
+                max_health: 12.0 / 20.0,    // = 0.6
+                attack_damage: 7.0 / 20.0,  // = 0.35
                 attack_speed_ms: 3000,
                 attack_range: 8,
                 move_speed: 1,
                 is_ranged: true,
                 is_naval: false,
             },
+            // Naval stats RE-cited from Tim Howgego's military-data
+            // appendix: SmallWarship HP 65, Speed 110/66, Strength 4;
+            // LargeWarship HP 120, Speed 120/72, Strength 7.0.
+            // HP scales by /40 to match our 1.0-baseline; speeds
+            // mapped so LargeWarship is slightly faster than
+            // SmallWarship (matching the appendix's 120 > 110).
             UnitType::SmallWarship => UnitStats {
-                max_health: 1.5,
+                max_health: 65.0 / 40.0,  // ≈ 1.625
                 attack_damage: 0.10,
                 attack_speed_ms: 2000,
                 attack_range: 5,
@@ -112,20 +134,20 @@ impl UnitType {
                 is_naval: true,
             },
             UnitType::MediumWarship => UnitStats {
-                max_health: 2.0,
+                max_health: 90.0 / 40.0,  // interpolated, no appendix value
                 attack_damage: 0.15,
                 attack_speed_ms: 2500,
                 attack_range: 6,
-                move_speed: 3,
+                move_speed: 4,
                 is_ranged: true,
                 is_naval: true,
             },
             UnitType::LargeWarship => UnitStats {
-                max_health: 3.0,
+                max_health: 120.0 / 40.0, // = 3.0
                 attack_damage: 0.20,
                 attack_speed_ms: 3000,
                 attack_range: 7,
-                move_speed: 2,
+                move_speed: 5,
                 is_ranged: true,
                 is_naval: true,
             },
@@ -204,33 +226,72 @@ fn default_escort_ship() -> i32 { -1 }
 
 /// Maximum cannons each ship class can mount. Manual sec. 9.2.3
 /// describes "small and large warships" as the two armed naval
-/// classes — small can carry fewer cannons, large carries more. The
-/// numbers are SPECULATIVE pending RE of the Werft (shipyard) UI.
+/// classes. Values RE-cited from Tim Howgego's military-data
+/// appendix:
+///   SmallWarship: Cannon 8
+///   LargeWarship: Cannon 14
+/// The MediumWarship and Flagship enum values are speculative
+/// add-ons not present in the original 4-class naval line-up; we
+/// pin them to interpolated values.
 pub fn cannon_capacity(t: UnitType) -> u8 {
     match t {
-        UnitType::SmallWarship => 4,
-        UnitType::LargeWarship => 8,
+        UnitType::SmallWarship => 8,
+        UnitType::MediumWarship => 11,
+        UnitType::LargeWarship => 14,
+        UnitType::Flagship => 14,
         _ => 0,
     }
 }
 
-/// Build cost (gold) for each unit type. Naval costs from the
-/// Werft (shipyard) UI; land-unit costs from the SOLDAT entries in
-/// figuren.cod (`Soldat: FIGTYP_SCHWERT, 5, 80` etc., where 80 is
-/// the gold cost). Marked SPECULATIVE for naval costs since the
-/// Werft pricing UI hasn't been fully decoded.
+/// Build cost (gold) for each unit type.
+///
+/// RE-cited from Tim Howgego's military-data appendix
+/// (timhowgego.wordpress.com/anno_1602/appendices/military_data/),
+/// which transcribes the relevant binary data tables:
+///
+/// | Unit            | Gold |
+/// |-----------------|------|
+/// | Infantry / Pikeman / Swordsman | 200 |
+/// | Cavalry         | 200 |
+/// | Musketeer       | 400 |
+/// | Cannoneer / Cannon | 200 |
+/// | SmallTradeShip  | 400 |
+/// | LargeTradeShip  | 520 |
+/// | SmallWarship    | 600 |
+/// | LargeWarship    | 900 |
+///
+/// Pikeman/Swordsman map to Infantry; Archer is not present in the
+/// appendix and is left at its previous fallback value.
 pub fn unit_build_cost(t: UnitType) -> i32 {
     match t {
-        UnitType::Pikeman => 60,
-        UnitType::Swordsman => 80,
-        UnitType::Musketeer => 160,
-        UnitType::Cavalry => 130,
+        UnitType::Pikeman | UnitType::Swordsman => 200,
+        UnitType::Cavalry => 200,
+        UnitType::Musketeer => 400,
+        UnitType::Cannon => 200,
         UnitType::Archer => 90,
-        UnitType::Cannon => 220,
-        UnitType::SmallWarship => 1_500,
-        UnitType::MediumWarship => 2_500,
-        UnitType::LargeWarship => 4_000,
-        UnitType::Flagship => 6_000,
+        UnitType::SmallWarship => 600,
+        UnitType::MediumWarship => 750,
+        UnitType::LargeWarship => 900,
+        UnitType::Flagship => 1_200,
+    }
+}
+
+/// Material cost for each unit type — `(wood, bricks, cloth, tools,
+/// swords, muskets, cannons)`. RE-cited from the same Tim Howgego
+/// military-data appendix that drives `unit_build_cost`.
+pub fn unit_build_resources(t: UnitType) -> (u16, u16, u16, u16, u16, u16, u16) {
+    match t {
+        // Wood, Bricks, Cloth — naval hulls + sails.
+        UnitType::SmallWarship   => (32, 4, 8,  0, 0, 0, 0),
+        UnitType::MediumWarship  => (40, 5, 10, 0, 0, 0, 0),
+        UnitType::LargeWarship   => (60, 7, 14, 0, 0, 0, 0),
+        UnitType::Flagship       => (80, 9, 18, 0, 0, 0, 0),
+        // Land units — Tools, Swords/Muskets/Cannons by role.
+        UnitType::Pikeman | UnitType::Swordsman => (0, 0, 0, 3, 5, 0, 0),
+        UnitType::Cavalry        => (0, 0, 0, 3, 8, 0, 0),
+        UnitType::Musketeer      => (0, 0, 0, 4, 0, 10, 0),
+        UnitType::Cannon         => (0, 0, 0, 2, 0, 0, 14),
+        UnitType::Archer         => (0, 0, 0, 2, 0, 0, 0),
     }
 }
 

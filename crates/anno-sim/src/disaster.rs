@@ -34,11 +34,15 @@ use crate::combat::DamageEvent;
 /// human player's settlement during a single event tick. SPECULATIVE.
 pub const FIRE_IGNITION_GATE: u64 = 8;
 
-/// Damage applied to a building when fire ticks. Tuned so that
-/// `MAX_BRAND_DAMAGE_TICKS * FIRE_TICK_DAMAGE = 20` hp out of 100,
-/// i.e. an unattended fire eats 20% of building HP before
-/// burnout. SPECULATIVE.
-pub const FIRE_TICK_DAMAGE: u16 = 5;
+/// Damage applied to a building when fire ticks (per 10s event
+/// tick). Calibrated against a player observation reported on
+/// Tim Howgego's Anno-1602 finally page:
+///   "a house [observed] burning for approximately 10 minutes
+///    before it eventually collapsed and was immediately rebuilt"
+/// 10 min × 60s = 600 s; at 10s event ticks that's 60 ticks. With
+/// `BUILDING_MAX_HEALTH = 100` we want ~100/60 ≈ 1.67 hp per tick;
+/// round to 2.
+pub const FIRE_TICK_DAMAGE: u16 = 2;
 
 /// Maximum fire damage ticks a single building can absorb before
 /// burnout. RE: `haeuser.cod` default `Maxbrand: 4` (parsed at
