@@ -205,13 +205,20 @@ with RE references where available:
   starting gold), `figuren.cod` `Nummer: HANDEL1` (ship sprite set
   reused at render time). Visit count, dock duration, stock list
   marked SPECULATIVE in source — original dispatcher RE pending.
-- **#100 Cosmetic civilians** — DEFERRED. `figuren.cod` confirms five
-  civilian figures `ADELWEIBL`/`ADEL`/`ALTER`/`FRAU`/`PASSANT` at
-  `GFXZIVIL+0/64/128/192/256` (= TRAEGER.BSH sprite indices
-  1272/1336/1400/1464/1528, computed from the GFX… constant chain).
-  Implementation deferred until the spawn dispatcher is located in
-  the binary so cadence and target selection are RE-grounded rather
-  than invented.
+- **#100 Civilian wanderers** — `crates/anno-sim/src/civilian.rs`.
+  Per-residence tick (piggy-backs on the production tick, matching
+  the original's per-building 4999 ms cycle) spawns one of eight
+  civilian figures from a finished `WOHN` building, who walks three
+  tiles in a random compass direction and despawns. RE: `1602_exe.c`
+  lines 84620 (`if (4999 < DAT_005491c8)` per-building tick), 84666
+  (`FUN_00443a90(0x5a, ...)` ALTER spawn), 94389
+  (`FUN_00443a90(0x5c, 1, sVar11, 1)` PASSANT spawn), 11856 (ADEL
+  spawn on player init), 46943 (`FUN_00443a90` figure-allocator).
+  `figuren.cod` definition order indices `0x58..=0x5f` resolve to
+  ADELWEIBL/ADEL/ALTER/FRAU/PASSANT/VETERAN/KINDREIF/PILGER at
+  `GFXZIVIL` + `N×64` (= TRAEGER.BSH sprite bases
+  1272/1336/1400/1464/1528/1592/1656/1720, computed from the
+  `GFXTRAEGER..GFXZIVIL` chain).
 - **Carrier sprite by cargo (audit #66 follow-up)** — `figuren.cod`
   `Nummer: TRAEGER` defines exactly two walk animations: anim 0 at
   `AnimOffs:0` (empty) and anim 1 at `AnimOffs:64` (loaded). The

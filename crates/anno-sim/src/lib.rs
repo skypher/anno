@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod building;
 pub mod carrier;
+pub mod civilian;
 pub mod climate;
 pub mod commands;
 pub mod combat;

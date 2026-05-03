@@ -7,6 +7,7 @@
 use crate::ai::{AiAction, AiController};
 use crate::building::{BuildingDef, BuildingInstance};
 use crate::carrier;
+use crate::civilian;
 use crate::combat::{self, DiplomacyMatrix, MilitaryUnit};
 use crate::coverage::CoverageMap;
 use crate::ocean_map::OceanMap;
@@ -209,12 +210,19 @@ impl Simulation {
     /// population, military strength, and treasury into one number that
     /// the diplomacy AI uses for war / peace / treaty decisions.
     ///
-    /// SPECULATIVE weighting — the original AI's actual scoring
-    /// formula is in `FUN_0042b4b0` (RE pending) and the three
-    /// per-personality dispatchers `FUN_0042adf0/b000/b160`. Until
-    /// those are decoded, this is a best-effort city-builder-leaning
-    /// heuristic: population (1×), military units (25×), gold
-    /// (1/100×). Replace with the original formula once located.
+    /// SIMPLIFICATION (NOT in the original) — the actual Anno 1602 AI
+    /// (`decompiled/1602_exe.c:31910 FUN_0042adf0` "defending",
+    /// `:32011 FUN_0042b000` "active", `:32078 FUN_0042b160` "allied",
+    /// dispatched by `:32182 FUN_0042b430` and gated by
+    /// `:32223 FUN_0042b4b0`) drives diplomacy off a player-slot state
+    /// machine: it iterates `&DAT_005b7680` (stride 0xA0) testing
+    /// `state == 0xC` / `0xE` and the per-slot 0x4a flag, with cooldown
+    /// fields recharged by `+ 0x50` (80 ticks), `+ 6000`, `+ 10000` per
+    /// tick of `param_1`. There is no scalar strength score in the
+    /// binary; the original used reputation counters and per-action
+    /// cooldowns, not a Lanchester-style number. This power score is a
+    /// stand-in we use until the state-machine port is complete; it
+    /// keeps the diplomacy AI functional but is not RE-faithful.
     pub fn civilization_power(&self, slot: u8) -> i64 {
         let pop = self.players.get(slot as usize)
             .map(|p| p.total_population as i64)
@@ -365,6 +373,23 @@ impl Simulation {
                 self.timer_production.interval_ms,
             );
 
+            // Civilian wanderer spawn for residences.
+            // RE: `1602_exe.c:84620-84666` per-building 4999 ms tick
+            // calling FUN_00443a90(0x5a, …) when DAT_005bafc8 != 0.
+            // We piggy-back on the production tick (similar cadence
+            // when the production timer is ~1 s) since the original
+            // dispatcher fires every building tick regardless of
+            // whether the building actually produces a good.
+            if def.prod_kind == "WOHN" {
+                let r = self.next_rand();
+                if let Some(mut fig) = civilian::try_spawn_civilian(
+                    &self.buildings[i], &def, i as u16, r,
+                ) {
+                    fig.building_idx = i as u16;
+                    new_carriers.push(fig);
+                }
+            }
+
             if produced > 0 && production::needs_carrier(&self.buildings[i], &def) {
                 // Check if this building already has an active carrier
                 let has_carrier = self.figures.iter().any(|f| {
@@ -459,14 +484,16 @@ impl Simulation {
             );
             self.objective_completions.extend(just_done);
 
-            // Voice announcement: rate-limited by requiring the
-            // previous edge to clear before re-firing.
-            // SPECULATIVE threshold (500) — the original game's
-            // treasury-warning trigger is unknown pending RE; this is
-            // a conservative number well above the bankruptcy floor of
-            // -1001 (`player.rs` BANKRUPTCY_GAME_OVER_TICKS context).
+            // Voice announcement: fire on entry into the bankruptcy
+            // window. RE: `player::BANKRUPTCY_THRESHOLD = -1001` —
+            // the same floor the original uses to start counting
+            // `bankruptcy_ticks` toward game-over (40 ticks). Edge-
+            // triggered against the previous sample so the line
+            // doesn't flood every tick the player is in the red.
             let p0_gold = p0.gold;
-            if p0_gold < 500 && self.last_treasury_warn_gold >= 500 {
+            if p0_gold < crate::player::BANKRUPTCY_THRESHOLD
+                && self.last_treasury_warn_gold >= crate::player::BANKRUPTCY_THRESHOLD
+            {
                 self.event_log.push(
                     "[treasury] our treasury is running dangerously low".to_string(),
                 );
@@ -815,10 +842,15 @@ impl Simulation {
                 let cur = self.diplomacy.get(me as u8, other as u8);
 
                 // Declare war on a clearly weaker neutral neighbor.
-                // SPECULATIVE thresholds (`>= 100`, `2:1`) — original
-                // war-trigger conditions live in the AI dispatcher
-                // (RE pending). Conservative defaults: 100 power = a
-                // small foothold, 2:1 = clear superiority.
+                // SIMPLIFICATION (NOT in original) — the binary's
+                // dispatchers (`1602_exe.c:31910 FUN_0042adf0` and
+                // `:32011 FUN_0042b000`) trigger war from a
+                // state-machine plus per-action cooldown counters
+                // recharged at +0x50/6000/10000 ticks (see
+                // `civilization_power` doc-comment), not from a
+                // numeric strength comparison. We approximate with
+                // a `my_score >= 100` foothold gate and a 2:1 ratio
+                // until the state-machine port is complete.
                 if aggressor
                     && cur == Diplomacy::Neutral
                     && my_score >= 100
@@ -1222,6 +1254,30 @@ impl Simulation {
                                 &mut self.damage_events,
                             );
                             if should_despawn {
+                                despawn_indices.push(idx);
+                            }
+                        }
+                    }
+                    ActionType::Walking if civilian::is_civilian(figure) => {
+                        // Step toward target tile, one tile per move
+                        // step. When the figure reaches its target or
+                        // its TTL (stored in the unused-for-civilians
+                        // `health` field) expires, mark it for
+                        // despawn.
+                        let dx = figure.target_x - figure.tile_x;
+                        let dy = figure.target_y - figure.tile_y;
+                        if dx == 0 && dy == 0 {
+                            despawn_indices.push(idx);
+                        } else {
+                            if dx.abs() >= dy.abs() {
+                                figure.tile_x += dx.signum();
+                            } else {
+                                figure.tile_y += dy.signum();
+                            }
+                            figure.anim_frame =
+                                figure.anim_frame.wrapping_add(1);
+                            figure.health = figure.health.saturating_sub(1);
+                            if figure.health == 0 {
                                 despawn_indices.push(idx);
                             }
                         }
