@@ -62,12 +62,22 @@ pub struct SzsFile {
 /// from `1602_exe.c` `&DAT_005b7680`). We only extract fields
 /// we know how to interpret; the raw blob is preserved on the
 /// `Chunk` for callers that need more.
+///
+/// Cross-scenario sample (A Plague of Pirates / Atoll /
+/// Competition / Continuous Play 00-02) confirms a consistent
+/// per-slot layout. Slots 4..=6 are reserved for special
+/// factions: slot 4 = free trader (1 000 000 gold, matching
+/// `1602_exe.c:83179` `s_Trader_d`), slot 5 = native faction
+/// (50 000), slot 6 = pirates (5 000).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlayerSlotInit {
-    /// Starting gold (first u32 of the slot record). Confirmed
-    /// against tutorial scenarios: 50 000 for Tutorial0, matching
-    /// the manual's "starting funds" field in the editor.
+    /// Starting gold (first u32 of the slot record).
     pub starting_gold: i32,
+    /// True when this slot is a human player. RE-derived from
+    /// byte offset 12 of the slot record: `0x00` = human / fixed
+    /// faction, `0xff` = not present (AI fills the slot when the
+    /// scenario configures one).
+    pub is_human: bool,
 }
 
 const PLAYER4_SLOT_BYTES: usize = 1072;
@@ -167,11 +177,14 @@ impl SzsFile {
         let mut out = Vec::new();
         for slot in 0..PLAYER4_MAX_SLOTS {
             let off = slot * PLAYER4_SLOT_BYTES;
-            if off + 4 > data.len() { break; }
+            if off + 16 > data.len() { break; }
             let starting_gold = i32::from_le_bytes([
                 data[off], data[off + 1], data[off + 2], data[off + 3],
             ]);
-            out.push(PlayerSlotInit { starting_gold });
+            // Byte 12 = 0x00 (active player / fixed faction) vs
+            // 0xff (slot inactive — AI fills it on game start).
+            let is_human = data[off + 12] == 0x00 && slot < 4;
+            out.push(PlayerSlotInit { starting_gold, is_human });
         }
         out
     }
@@ -351,7 +364,8 @@ mod tests {
             }
         };
         let szs = SzsFile::parse(&data).expect("parse Tutorial0");
-        assert!(!szs.players.is_empty(), "PLAYER4 chunk should yield ≥1 slot");
+        assert!(szs.players.len() == 7,
+            "PLAYER4 chunk yields exactly 7 slots, got {}", szs.players.len());
         // Tutorial scenarios start with non-zero gold so a player
         // can actually do anything; the binary's editor shows this
         // is configurable per-slot.
@@ -359,5 +373,12 @@ mod tests {
         assert!(slot0 > 0,
             "tutorial slot 0 starting_gold should be positive (got {})",
             slot0);
+        // Slot 4 is the free trader (1602_exe.c:83179) — every
+        // surveyed scenario gives it 1 000 000 gold.
+        assert_eq!(szs.players[4].starting_gold, 1_000_000,
+            "slot 4 (free trader) should have 1M gold");
+        // Slot 6 is the pirate faction.
+        assert_eq!(szs.players[6].starting_gold, 5_000,
+            "slot 6 (pirates) should have 5 000 gold");
     }
 }
