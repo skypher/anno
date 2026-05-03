@@ -1121,6 +1121,10 @@ fn main() {
     let mut route_list_panel = false;
     let mut route_list_sel: usize = 0;
     let mut help_panel = false;
+    let mut eval_panel = false;
+    let mut cities_panel = false;
+    let mut music_panel = false;
+    let mut music_sel: usize = 0;
     let mut ship_panel = false;
     let mut obj_panel = false;
     let mut settings = anno_sim::settings::Settings::load_default();
@@ -1252,6 +1256,12 @@ fn main() {
                     } else if trade_route_mode {
                         trade_route_mode = false;
                         draft_route_stops.clear();
+                    } else if eval_panel {
+                        eval_panel = false;
+                    } else if cities_panel {
+                        cities_panel = false;
+                    } else if music_panel {
+                        music_panel = false;
                     } else if !selected_units.is_empty() {
                         selected_units.clear();
                     } else if selected_building_idx.is_some() {
@@ -1465,6 +1475,41 @@ fn main() {
                             }
                             Keycode::Space => {
                                 sim.paused = !sim.paused;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    if music_panel {
+                        match key {
+                            Keycode::Up => {
+                                if music_sel > 0 { music_sel -= 1; }
+                            }
+                            Keycode::Down => {
+                                if music_sel + 1 < music_files.len() {
+                                    music_sel += 1;
+                                }
+                            }
+                            Keycode::Return | Keycode::KpEnter => {
+                                if let Some(track) = music_files.get(music_sel) {
+                                    if let Some(slot) = music_slot {
+                                        audio.streams.stop(slot);
+                                        audio.streams.destroy(slot);
+                                    }
+                                    music_slot = audio.streams.create(track, 0);
+                                    if let (Some(slot), Some(handle)) =
+                                        (music_slot, audio.stream_handle.as_ref())
+                                    {
+                                        audio.streams.play(slot, music_volume, handle);
+                                        save_banner = Some((
+                                            format!("playing: {}", track),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            }
+                            Keycode::Escape | Keycode::J => {
+                                music_panel = false;
                             }
                             _ => {}
                         }
@@ -1920,6 +1965,81 @@ fn main() {
                             }
                             Keycode::F12 => {
                                 show_perf = !show_perf;
+                            }
+                            Keycode::V if shift_held => {
+                                eval_panel = !eval_panel;
+                            }
+                            Keycode::C if shift_held => {
+                                cities_panel = !cities_panel;
+                            }
+                            Keycode::J if shift_held => {
+                                music_panel = !music_panel;
+                            }
+                            Keycode::G if editor_mode => {
+                                // In editor mode: append a sample
+                                // gold-target objective. Cycles
+                                // the threshold 5k/10k/20k/50k.
+                                use anno_sim::objectives::Objective;
+                                let amounts = [5_000, 10_000, 20_000, 50_000];
+                                let cur = sim.objectives.items.iter()
+                                    .filter_map(|(o, _)| match o {
+                                        Objective::AccumulateGold { amount } => Some(*amount),
+                                        _ => None,
+                                    })
+                                    .last()
+                                    .unwrap_or(0);
+                                let next = amounts.iter()
+                                    .find(|&&a| a > cur)
+                                    .copied()
+                                    .unwrap_or(amounts[0]);
+                                sim.objectives.items.push((
+                                    Objective::AccumulateGold { amount: next }, false,
+                                ));
+                                save_banner = Some((
+                                    format!("editor: added gold target {next}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                            Keycode::P if editor_mode => {
+                                // Append a population objective:
+                                // Settlers 50 / Citizens 100 /
+                                // Merchants 200 / Aristocrats 400.
+                                use anno_sim::objectives::Objective;
+                                let goal = match sim.objectives.items.iter()
+                                    .filter_map(|(o, _)| match o {
+                                        Objective::ReachPopulation { tier, count } =>
+                                            Some((*tier, *count)),
+                                        _ => None,
+                                    })
+                                    .last()
+                                {
+                                    None => (1u8, 50u32),         // Settlers 50
+                                    Some((1, _)) => (2, 100),     // Citizens 100
+                                    Some((2, _)) => (3, 200),     // Merchants 200
+                                    Some((3, _)) => (4, 400),     // Aristocrats 400
+                                    _ => (1, 50),
+                                };
+                                sim.objectives.items.push((
+                                    Objective::ReachPopulation {
+                                        tier: goal.0, count: goal.1,
+                                    }, false,
+                                ));
+                                save_banner = Some((
+                                    format!(
+                                        "editor: added population target tier{} = {}",
+                                        goal.0, goal.1,
+                                    ),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                            Keycode::Backspace if editor_mode => {
+                                // Pop the most-recent objective.
+                                if let Some((o, _)) = sim.objectives.items.pop() {
+                                    save_banner = Some((
+                                        format!("editor: removed {}", o.label()),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
                             }
                             Keycode::E if shift_held => {
                                 // Toggle scenario editor (Shift+E).
@@ -4680,6 +4800,193 @@ fn main() {
         }
 
         // Objectives panel (?). Read-only — pulls live from sim.objectives.
+        // Player evaluation screen (Shift+V) — manual sec. 5.2.
+        // Total per-player account view: gold, population, income,
+        // costs, net balance. Color-codes net (green positive, red
+        // negative).
+        if eval_panel {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 360u32;
+            let n_rows = sim.players.len() as i32;
+            let panel_h = (32 + (n_rows + 1) * line_h + 8) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 220;
+            }
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4, "EVALUATION (Shift+V/Esc close)",
+                [0xFF, 0xD7, 0x00, 0xFF], scale,
+            );
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4 + line_h,
+                "p#  gold     pop   income  cost  net",
+                [0xCC, 0xCC, 0xCC, 0xFF], scale,
+            );
+            for (i, p) in sim.players.iter().enumerate() {
+                let income = p.calculate_income();
+                let costs = p.calculate_costs();
+                let net = p.net_balance();
+                let pop: u32 = p.population.iter().sum();
+                let net_color = if net >= 0 {
+                    [0x40, 0xFF, 0x80, 0xFF]
+                } else {
+                    [0xFF, 0x60, 0x60, 0xFF]
+                };
+                let line = format!(
+                    "{}  {:>6}  {:>5}  {:>5}   {:>4}  {:>4}",
+                    i, p.gold, pop, income, costs, net,
+                );
+                tiny_font::draw_str(
+                    &mut buf, panel_w, panel_h,
+                    4, 4 + line_h * (2 + i as i32),
+                    &line, net_color, scale,
+                );
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                canvas.copy(&tex, None, Some(Rect::new(tx, 60, panel_w, panel_h))).ok();
+            }
+        }
+
+        // Cities list (Shift+C) — manual sec. 5.2. Lists every
+        // active warehouse (= "city"). Other-player cities are only
+        // shown if a trade agreement exists.
+        if cities_panel {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 360u32;
+            let visible: Vec<(usize, &anno_sim::warehouse::Warehouse)> = sim
+                .warehouses
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| {
+                    w.active && (w.owner == 0
+                        || sim.diplomacy.has_trade_agreement(0, w.owner))
+                })
+                .collect();
+            let n = visible.len() as i32;
+            let panel_h = (28 + (n + 1).max(2) * line_h + 8) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 220;
+            }
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4, "CITIES (Shift+C/Esc close)",
+                [0xFF, 0xD7, 0x00, 0xFF], scale,
+            );
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4 + line_h,
+                "owner  island  tile",
+                [0xCC, 0xCC, 0xCC, 0xFF], scale,
+            );
+            for (row, (_, w)) in visible.iter().enumerate() {
+                let line = format!(
+                    "p{}     {}      ({},{})",
+                    w.owner, w.island_id, w.tile_x, w.tile_y,
+                );
+                let color = if w.owner == 0 {
+                    [0x80, 0xFF, 0xC0, 0xFF]
+                } else {
+                    [0xCC, 0xCC, 0xCC, 0xFF]
+                };
+                tiny_font::draw_str(
+                    &mut buf, panel_w, panel_h,
+                    4, 4 + line_h * (2 + row as i32),
+                    &line, color, scale,
+                );
+            }
+            if visible.is_empty() {
+                tiny_font::draw_str(
+                    &mut buf, panel_w, panel_h,
+                    4, 4 + line_h * 2,
+                    "(no cities — found a Kontor with F7)",
+                    [0x88, 0x88, 0x88, 0xFF], scale,
+                );
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                canvas.copy(&tex, None, Some(Rect::new(tx, 60, panel_w, panel_h))).ok();
+            }
+        }
+
+        // Music jukebox (Shift+J) — list MUSIC8 tracks; Up/Down
+        // moves selection, Enter switches the currently-playing
+        // track.
+        if music_panel {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 360u32;
+            let max_visible = 16i32;
+            let total = music_files.len() as i32;
+            let visible = total.min(max_visible);
+            let panel_h = (28 + (visible + 1) * line_h + 8) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0;
+                buf[i * 4 + 2] = 0x18;
+                buf[i * 4 + 3] = 220;
+            }
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4,
+                "JUKEBOX (Shift+J/Esc  Up/Dn pick  Enter play)",
+                [0xFF, 0xD7, 0x00, 0xFF], scale,
+            );
+            let start = if total <= max_visible {
+                0
+            } else {
+                music_sel.saturating_sub(max_visible as usize / 2)
+                    .min(total as usize - max_visible as usize)
+            };
+            for (row, idx) in (start..(start + max_visible as usize)
+                .min(total as usize)).enumerate()
+            {
+                let name = std::path::Path::new(&music_files[idx])
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?");
+                let arrow = if idx == music_sel { "> " } else { "  " };
+                let color = if idx == music_sel {
+                    [0xFF, 0xFF, 0x00, 0xFF]
+                } else {
+                    [0xCC, 0xCC, 0xCC, 0xFF]
+                };
+                tiny_font::draw_str(
+                    &mut buf, panel_w, panel_h,
+                    4, 28 + row as i32 * line_h,
+                    &format!("{arrow}{name}"), color, scale,
+                );
+            }
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                canvas.copy(&tex, None, Some(Rect::new(tx, 60, panel_w, panel_h))).ok();
+            }
+        }
+
         if obj_panel {
             let scale = 1u32;
             let line_h = (5 * scale + 3) as i32;
@@ -5140,13 +5447,13 @@ fn main() {
             tiny_font::draw_str(
                 &mut buf, panel_w, panel_h,
                 4, 4 + line_h * 2,
-                "Free build (no gold/materials)",
+                "G add gold goal  P add pop goal",
                 [0xCC, 0xCC, 0xCC, 0xFF], scale,
             );
             tiny_font::draw_str(
                 &mut buf, panel_w, panel_h,
                 4, 4 + line_h * 3,
-                "F8 export island as .szs",
+                "Backspace pop goal  F8 export .szs",
                 [0xCC, 0xCC, 0xCC, 0xFF], scale,
             );
             if let Ok(mut tex) = texture_creator

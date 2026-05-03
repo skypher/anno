@@ -34,7 +34,10 @@ use crate::combat::DamageEvent;
 /// human player's settlement during a single event tick. SPECULATIVE.
 pub const FIRE_IGNITION_GATE: u64 = 8;
 
-/// Damage applied to a building when fire ticks. SPECULATIVE.
+/// Damage applied to a building when fire ticks. Tuned so that
+/// `MAX_BRAND_DAMAGE_TICKS * FIRE_TICK_DAMAGE = 20` hp out of 100,
+/// i.e. an unattended fire eats 20% of building HP before
+/// burnout. SPECULATIVE.
 pub const FIRE_TICK_DAMAGE: u16 = 5;
 
 /// Maximum fire damage ticks a single building can absorb before
