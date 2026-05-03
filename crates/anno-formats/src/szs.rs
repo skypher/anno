@@ -55,7 +55,49 @@ pub struct SzsFile {
     /// entries (slots 0-6 matching our diplomacy layout). Empty
     /// when no PLAYER4 chunk is present.
     pub players: Vec<PlayerSlotInit>,
+    /// Mission briefing & goal data parsed from `AUFTRAG4`.
+    /// `None` for files without that chunk (rare; even tutorial
+    /// scenarios carry an AUFTRAG4 with all-zero goal flags).
+    pub mission: Option<Mission>,
 }
+
+/// Mission metadata extracted from the `AUFTRAG4` chunk.
+///
+/// The chunk is always 2244 bytes and is dispatched by the
+/// engine's chunk loader (`s_AUFTRAG4` reachable via the dispatch
+/// in `1602_exe.c` around offset 0x40dxxx; see siblings
+/// `s_AUFTRAG`/`s_AUFTRAG2` at 0x498270/0x49827c). The decompiled
+/// loader is opaque (label-based dispatch), so this struct only
+/// surfaces fields verified across multiple shipping scenarios:
+///
+/// | Field | Offset | Cross-scenario evidence |
+/// |---|---|---|
+/// | `flags` | 0x04 (u32) | 0x0001 / 0x0011 / 0x0401 / 0x0403 in scripted scenarios; 0x0000 in tutorials |
+/// | `briefing` | 0x68 onward | Always begins at 0x68, null-terminated, CP1252 |
+/// | `goals_raw` | 0x870..end | Raw 996 bytes of typed goal records — structure not fully RE'd |
+///
+/// Confirmed against: A Plague of Pirates, Atoll, Cooperation,
+/// Exile, Fireland, Good Neighbors, Continous Play00, Tutorial0/1/2.
+#[derive(Debug, Clone)]
+pub struct Mission {
+    /// Mission goal-flags bitfield. Bit 0 (0x01) is set whenever
+    /// a population threshold is required; bits 0x10/0x400 toggle
+    /// in scenarios involving cooperative goals or pirate
+    /// combat. Higher-bit semantics not fully reverse-engineered.
+    pub flags: u32,
+    /// Briefing text shown before the scenario starts. Decoded
+    /// from CP1252 with the trailing nulls stripped.
+    pub briefing: String,
+    /// Goal-record region (offsets 0x870..0x8c4). First u32 is
+    /// reliably the primary population threshold; remaining bytes
+    /// encode tier indices and secondary goals whose layout is
+    /// scenario-flag dependent.
+    pub goals_raw: Vec<u8>,
+}
+
+const AUFTRAG4_BRIEFING_OFFSET: usize = 0x68;
+const AUFTRAG4_GOALS_OFFSET: usize = 0x870;
+const AUFTRAG4_TOTAL_BYTES: usize = 2244;
 
 /// One player-slot record parsed from the SZS PLAYER4 chunk.
 /// 1072 bytes per slot in the original (= 0xa0 stride confirmed
@@ -170,7 +212,31 @@ impl SzsFile {
             .map(|c| Self::parse_player4(&c.data))
             .unwrap_or_default();
 
-        Ok(SzsFile { chunks, islands, players })
+        let mission = chunks.iter()
+            .find(|c| c.name == "AUFTRAG4")
+            .and_then(|c| Self::parse_auftrag4(&c.data));
+
+        Ok(SzsFile { chunks, islands, players, mission })
+    }
+
+    fn parse_auftrag4(data: &[u8]) -> Option<Mission> {
+        if data.len() < AUFTRAG4_TOTAL_BYTES { return None; }
+        let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+
+        // Briefing text: CP1252, null-terminated, starts at 0x68.
+        let text_start = AUFTRAG4_BRIEFING_OFFSET;
+        let text_end = data[text_start..AUFTRAG4_GOALS_OFFSET]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|n| text_start + n)
+            .unwrap_or(AUFTRAG4_GOALS_OFFSET);
+        let briefing: String = data[text_start..text_end]
+            .iter()
+            .map(|&b| char::from(b))
+            .collect();
+
+        let goals_raw = data[AUFTRAG4_GOALS_OFFSET..AUFTRAG4_TOTAL_BYTES].to_vec();
+        Some(Mission { flags, briefing, goals_raw })
     }
 
     fn parse_player4(data: &[u8]) -> Vec<PlayerSlotInit> {
@@ -380,5 +446,39 @@ mod tests {
         // Slot 6 is the pirate faction.
         assert_eq!(szs.players[6].starting_gold, 5_000,
             "slot 6 (pirates) should have 5 000 gold");
+    }
+
+    #[test]
+    fn auftrag4_extracts_briefing_and_flags() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/A Plague of Pirates.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Plague");
+        let mission = szs.mission.as_ref().expect("AUFTRAG4 present");
+        // Plague of Pirates carries the pop-goal bit (0x01) plus a
+        // pirate-mission high byte (0x04xx); the precise meaning of
+        // the upper bits is not yet RE-confirmed, only their value.
+        assert_eq!(mission.flags, 0x0401);
+        // Spot-check that the briefing was decoded — full text begins
+        // with "You have managed to lead..." and mentions the 5 000
+        // population goal verbatim.
+        assert!(mission.briefing.starts_with("You have managed to lead"),
+            "briefing text wrong: {:?}", &mission.briefing);
+        assert!(mission.briefing.contains("5,000 inhabitants"),
+            "briefing should mention the 5 000 inhabitants goal");
+        // Primary pop threshold is the first u32 of the goals
+        // region; for Plague this is 0x1388 = 5000.
+        let pop = u32::from_le_bytes([
+            mission.goals_raw[0], mission.goals_raw[1],
+            mission.goals_raw[2], mission.goals_raw[3],
+        ]);
+        assert_eq!(pop, 5000, "goals_raw[0..4] should encode 5 000 pop");
     }
 }

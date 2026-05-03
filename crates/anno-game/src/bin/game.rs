@@ -912,6 +912,14 @@ fn main() {
         scenario_name,
         szs.islands.len()
     );
+    if let Some(mission) = szs.mission.as_ref() {
+        if !mission.briefing.is_empty() {
+            println!("Mission flags 0x{:04x}", mission.flags);
+            println!("---");
+            println!("{}", mission.briefing.trim_end());
+            println!("---");
+        }
+    }
 
     // Initialize simulation
     let mut sim = init_simulation(&szs, &cod, &defs);
