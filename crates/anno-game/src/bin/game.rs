@@ -625,6 +625,8 @@ fn try_place_building(
     placer: &BuildingPlacer,
     tile_x: i32,
     tile_y: i32,
+    owner: u8,
+    free_build: bool,
 ) -> PlaceOutcome {
     let bb = match placer.selected_building() {
         Some(b) => b,
@@ -675,14 +677,22 @@ fn try_place_building(
     ) {
         return PlaceOutcome::BlockedByTerrain;
     }
-    if sim.players[0].gold < cost as i32 {
-        return PlaceOutcome::NotEnoughGold {
-            need: cost, have: sim.players[0].gold,
-        };
+    let owner_idx = owner as usize;
+    if !free_build {
+        if owner_idx >= sim.players.len()
+            || sim.players[owner_idx].gold < cost as i32
+        {
+            return PlaceOutcome::NotEnoughGold {
+                need: cost,
+                have: sim.players.get(owner_idx).map(|p| p.gold).unwrap_or(0),
+            };
+        }
     }
 
     // All gates passed — apply the placement.
-    sim.players[0].gold -= cost as i32;
+    if !free_build && owner_idx < sim.players.len() {
+        sim.players[owner_idx].gold -= cost as i32;
+    }
     let cod_b = &cod.buildings[def_idx];
     let rot_count = cod_b.rotate.max(1) as u8;
     let orient = placer.orientation % rot_count;
@@ -714,17 +724,28 @@ fn try_place_building(
         island_number,
         tile_x as u16,
         tile_y as u16,
-        0,
+        owner,
     );
     if input1 != Good::None { instance.input_1_stock = storage; }
     if input2 != Good::None { instance.input_2_stock = storage; }
     let footprint = (def.width as u32) * (def.height as u32);
     let build_ms = (2_000u32 * footprint).max(2_000);
-    instance.construction_ms_total = build_ms;
-    instance.construction_ms_remaining = build_ms;
-    instance.wood_needed = def.cost_wood;
-    instance.tools_needed = def.cost_tools;
-    instance.bricks_needed = def.cost_bricks;
+    if free_build {
+        // Editor mode: building is finished immediately and needs no
+        // materials. Lets the editor lay out a scenario at full
+        // detail without spending the player's resources.
+        instance.construction_ms_total = 0;
+        instance.construction_ms_remaining = 0;
+        instance.wood_needed = 0;
+        instance.tools_needed = 0;
+        instance.bricks_needed = 0;
+    } else {
+        instance.construction_ms_total = build_ms;
+        instance.construction_ms_remaining = build_ms;
+        instance.wood_needed = def.cost_wood;
+        instance.tools_needed = def.cost_tools;
+        instance.bricks_needed = def.cost_bricks;
+    }
     sim.buildings.push(instance);
     PlaceOutcome::Placed
 }
@@ -1179,6 +1200,14 @@ fn main() {
     let mut show_coverage = false;
     let mut selected_units: Vec<usize> = Vec::new();
     let mut shift_held = false;
+    // Scenario editor mode: pauses the sim and lets the player
+    // place buildings as any of the 4 player slots (0..3) instead
+    // of always slot 0. Manual chapter 11 covers a full editor
+    // (place/edit goals/define computer attitudes); this is a
+    // minimal in-game version — design islands by placing per-slot
+    // buildings, then F8 to export the .szs.
+    let mut editor_mode = false;
+    let mut editor_owner: u8 = 0;
     let mut save_banner: Option<(String, std::time::Instant)> = None;
     let save_dir = std::path::PathBuf::from("saves");
     let quicksave_path = save_dir.join(format!("{}.quicksave.bin", scenario_name));
@@ -1892,6 +1921,48 @@ fn main() {
                             Keycode::F12 => {
                                 show_perf = !show_perf;
                             }
+                            Keycode::E if shift_held => {
+                                // Toggle scenario editor (Shift+E).
+                                // Pauses the sim so buildings placed
+                                // here are scenario-state, not live.
+                                editor_mode = !editor_mode;
+                                sim.paused = editor_mode;
+                                if editor_mode {
+                                    // Ensure slots 1..3 exist so the
+                                    // player can place AI-owned
+                                    // buildings without bounds checks
+                                    // failing.
+                                    while sim.players.len() < 4 {
+                                        let idx = sim.players.len() as u8;
+                                        sim.players.push(
+                                            anno_sim::player::Player::new_ai(idx, 0),
+                                        );
+                                    }
+                                }
+                                let msg = if editor_mode {
+                                    format!(
+                                        "EDITOR mode ON — placing as player {} ([/] cycle)",
+                                        editor_owner,
+                                    )
+                                } else {
+                                    "EDITOR mode OFF".to_string()
+                                };
+                                save_banner = Some((msg, std::time::Instant::now()));
+                            }
+                            Keycode::LeftBracket if editor_mode => {
+                                editor_owner = (editor_owner + 3) % 4;
+                                save_banner = Some((
+                                    format!("editor owner = player {editor_owner}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                            Keycode::RightBracket if editor_mode => {
+                                editor_owner = (editor_owner + 1) % 4;
+                                save_banner = Some((
+                                    format!("editor owner = player {editor_owner}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
                             Keycode::F8 => {
                                 // Export the current island layout to an
                                 // .szs file. Useful for scenario authoring
@@ -2150,6 +2221,8 @@ fn main() {
                             let outcome = try_place_building(
                                 &mut sim, &mut islands, current_island,
                                 &defs, &cod, &placer, tile_x, tile_y,
+                                if editor_mode { editor_owner } else { 0 },
+                                editor_mode,
                             );
                             match outcome {
                                 PlaceOutcome::Placed => {
@@ -2636,6 +2709,8 @@ fn main() {
                                 let outcome = try_place_building(
                                     &mut sim, &mut islands, current_island,
                                     &defs, &cod, &placer, tile_x, tile_y,
+                                    if editor_mode { editor_owner } else { 0 },
+                                    editor_mode,
                                 );
                                 if matches!(outcome, PlaceOutcome::Placed) {
                                     needs_redraw = true;
@@ -5034,6 +5109,54 @@ fn main() {
             _ => title,
         };
         canvas.window_mut().set_title(&title).ok();
+
+        // Scenario-editor HUD: a small panel pinned to the top-left
+        // showing edit-mode status, current placement owner, and the
+        // shortcut keys.
+        if editor_mode {
+            let scale = 1u32;
+            let line_h = (5 * scale + 3) as i32;
+            let panel_w = 240u32;
+            let panel_h = (line_h * 4 + 12) as u32;
+            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
+            for i in 0..(panel_w * panel_h) as usize {
+                buf[i * 4] = 0;
+                buf[i * 4 + 1] = 0x10;
+                buf[i * 4 + 2] = 0;
+                buf[i * 4 + 3] = 220;
+            }
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4,
+                &format!("EDITOR  player {}", editor_owner),
+                [0x80, 0xFF, 0x80, 0xFF], scale,
+            );
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4 + line_h,
+                "Shift+E exit  [/] cycle owner",
+                [0xCC, 0xCC, 0xCC, 0xFF], scale,
+            );
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4 + line_h * 2,
+                "Free build (no gold/materials)",
+                [0xCC, 0xCC, 0xCC, 0xFF], scale,
+            );
+            tiny_font::draw_str(
+                &mut buf, panel_w, panel_h,
+                4, 4 + line_h * 3,
+                "F8 export island as .szs",
+                [0xCC, 0xCC, 0xCC, 0xFF], scale,
+            );
+            if let Ok(mut tex) = texture_creator
+                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                canvas.copy(&tex, None, Some(Rect::new(8, 8, panel_w, panel_h))).ok();
+            }
+        }
 
         // Outcome banner overlay — drawn centred so the player can see
         // it in-window, not just in the title bar.
