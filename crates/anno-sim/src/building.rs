@@ -109,6 +109,13 @@ pub struct BuildingInstance {
     /// once production resumes).
     #[serde(default)]
     pub idle_ticks: u32,
+    /// Construction priority: higher = drained materials first.
+    /// 0 = normal (default), 1 = high, 2 = critical. The entity
+    /// tick sorts pending-construction buildings by `-priority`
+    /// before trickling materials so the player can override the
+    /// natural placement order.
+    #[serde(default)]
+    pub build_priority: u8,
 }
 
 /// Production ticks a building must idle before its maintenance halves.
@@ -140,6 +147,7 @@ impl BuildingInstance {
             tools_needed: 0,
             bricks_needed: 0,
             idle_ticks: 0,
+            build_priority: 0,
         }
     }
 

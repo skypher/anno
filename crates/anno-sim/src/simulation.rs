@@ -1446,8 +1446,16 @@ impl Simulation {
             }
             false
         };
-        for b in self.buildings.iter_mut() {
-            if b.is_built() { continue; }
+        // Process pending-construction buildings ordered by
+        // `build_priority` descending so high-priority buildings get
+        // first crack at limited warehouse stock. Within a priority
+        // level the natural index order is preserved (stable sort).
+        let mut pending_idx: Vec<usize> = (0..self.buildings.len())
+            .filter(|&i| !self.buildings[i].is_built())
+            .collect();
+        pending_idx.sort_by_key(|&i| std::cmp::Reverse(self.buildings[i].build_priority));
+        for i in pending_idx {
+            let b = &mut self.buildings[i];
             // Try to consume one unit of each pending material from a
             // warehouse on the same island. If a line is short, that
             // material simply isn't drawn this tick — construction stalls.
@@ -1793,6 +1801,104 @@ impl Simulation {
                     }
                     false
                 }
+            }
+            Command::SetBuildPriority { player, building_idx, priority } => {
+                let bi = building_idx as usize;
+                if bi >= self.buildings.len() { return false; }
+                if self.buildings[bi].owner != player { return false; }
+                self.buildings[bi].build_priority = priority.min(2);
+                true
+            }
+            Command::LoadShip {
+                player, ship_idx, warehouse_idx, good, qty,
+            } => {
+                let si = ship_idx as usize;
+                let wi = warehouse_idx as usize;
+                if si >= self.trade_ships.len()
+                    || wi >= self.warehouses.len()
+                    || qty == 0
+                {
+                    return false;
+                }
+                if self.trade_ships[si].owner != player
+                    || self.warehouses[wi].owner != player
+                    || !self.trade_ships[si].active
+                    || !self.warehouses[wi].active
+                {
+                    return false;
+                }
+                // Ship must be at the warehouse tile (within 2 tiles).
+                let ship = &self.trade_ships[si];
+                let wh = &self.warehouses[wi];
+                let dx = (ship.world_x - wh.tile_x as i32).abs();
+                let dy = (ship.world_y - wh.tile_y as i32).abs();
+                if dx > 2 || dy > 2 { return false; }
+                let took = self.warehouses[wi].withdraw(good, qty);
+                if took == 0 { return false; }
+                let loaded = self.trade_ships[si].load(good, took);
+                if loaded < took {
+                    // Cargo hold full — refund the surplus.
+                    self.warehouses[wi].deposit(good, took - loaded);
+                }
+                self.event_log.push(format!(
+                    "[ship] loaded {loaded} {good:?} onto ship #{si}",
+                ));
+                loaded > 0
+            }
+            Command::UnloadShip {
+                player, ship_idx, warehouse_idx, good, qty,
+            } => {
+                let si = ship_idx as usize;
+                let wi = warehouse_idx as usize;
+                if si >= self.trade_ships.len()
+                    || wi >= self.warehouses.len()
+                    || qty == 0
+                {
+                    return false;
+                }
+                if self.trade_ships[si].owner != player
+                    || self.warehouses[wi].owner != player
+                    || !self.trade_ships[si].active
+                    || !self.warehouses[wi].active
+                {
+                    return false;
+                }
+                let ship = &self.trade_ships[si];
+                let wh = &self.warehouses[wi];
+                let dx = (ship.world_x - wh.tile_x as i32).abs();
+                let dy = (ship.world_y - wh.tile_y as i32).abs();
+                if dx > 2 || dy > 2 { return false; }
+                let unloaded = self.trade_ships[si].unload(good, qty);
+                if unloaded == 0 { return false; }
+                let placed = self.warehouses[wi].deposit(good, unloaded);
+                if placed < unloaded {
+                    // Warehouse full — refund the surplus to the ship.
+                    self.trade_ships[si].load(good, unloaded - placed);
+                }
+                self.event_log.push(format!(
+                    "[ship] unloaded {placed} {good:?} from ship #{si}",
+                ));
+                placed > 0
+            }
+            Command::SellShip { player, unit_index } => {
+                let pi = player as usize;
+                if pi >= self.players.len() { return false; }
+                let ui = unit_index as usize;
+                if ui >= self.military_units.len() { return false; }
+                let u = &self.military_units[ui];
+                if u.owner != player || !u.is_alive() { return false; }
+                if !u.unit_type.stats().is_naval { return false; }
+                let cost = crate::combat::unit_build_cost(u.unit_type);
+                let refund = cost / 2;
+                self.players[pi].gold += refund;
+                // Remove the ship by deactivating it; tick_combat
+                // already filters dead/inactive units out.
+                self.military_units[ui].active = false;
+                self.military_units[ui].health = 0.0;
+                self.event_log.push(format!(
+                    "[werft] sold ship #{ui} for {refund} gold",
+                ));
+                true
             }
             Command::SetPatrol { ref player, ref unit_index, ref waypoints } => {
                 let ui = *unit_index as usize;
@@ -2700,6 +2806,90 @@ mod tests {
             player: 0, unit_index: 0, waypoints: vec![],
         });
         assert!(sim.military_units[0].patrol.is_empty());
+    }
+
+    #[test]
+    fn ship_cargo_load_unload_round_trip() {
+        use crate::trade::TradeShip;
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
+        sim.warehouses[0].set_capacity(Good::Tools, 100);
+        sim.warehouses[0].deposit(Good::Tools, 50);
+        // Ship docked next to warehouse.
+        let mut ship = TradeShip::new(0, 0, 30, 40);
+        ship.active = true;
+        sim.trade_ships.push(ship);
+
+        // Load 20 Tools.
+        let ok = sim.apply_command(&crate::commands::Command::LoadShip {
+            player: 0, ship_idx: 0, warehouse_idx: 0,
+            good: Good::Tools, qty: 20,
+        });
+        assert!(ok);
+        assert_eq!(sim.warehouses[0].stock(Good::Tools), 30);
+        assert_eq!(sim.trade_ships[0].cargo_amount(Good::Tools), 20);
+
+        // Unload 5 back.
+        let ok = sim.apply_command(&crate::commands::Command::UnloadShip {
+            player: 0, ship_idx: 0, warehouse_idx: 0,
+            good: Good::Tools, qty: 5,
+        });
+        assert!(ok);
+        assert_eq!(sim.warehouses[0].stock(Good::Tools), 35);
+        assert_eq!(sim.trade_ships[0].cargo_amount(Good::Tools), 15);
+    }
+
+    #[test]
+    fn ship_load_rejects_distant_ship() {
+        use crate::trade::TradeShip;
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
+        sim.warehouses[0].set_capacity(Good::Tools, 50);
+        sim.warehouses[0].deposit(Good::Tools, 50);
+        let mut ship = TradeShip::new(0, 0, 100, 100);
+        ship.active = true;
+        sim.trade_ships.push(ship);
+        let ok = sim.apply_command(&crate::commands::Command::LoadShip {
+            player: 0, ship_idx: 0, warehouse_idx: 0,
+            good: Good::Tools, qty: 5,
+        });
+        assert!(!ok);
+    }
+
+    #[test]
+    fn sell_ship_refunds_half_cost_and_deactivates() {
+        use crate::combat::{MilitaryUnit, UnitType, unit_build_cost};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players[0].gold = 100;
+        sim.military_units.push(MilitaryUnit::new(
+            UnitType::SmallWarship, 0, 5, 5,
+        ));
+        let cost = unit_build_cost(UnitType::SmallWarship);
+        let ok = sim.apply_command(&crate::commands::Command::SellShip {
+            player: 0, unit_index: 0,
+        });
+        assert!(ok);
+        assert_eq!(sim.players[0].gold, 100 + cost / 2);
+        assert!(!sim.military_units[0].active);
+    }
+
+    #[test]
+    fn sell_ship_rejects_land_unit() {
+        use crate::combat::{MilitaryUnit, UnitType};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.military_units.push(MilitaryUnit::new(
+            UnitType::Swordsman, 0, 0, 0,
+        ));
+        let ok = sim.apply_command(&crate::commands::Command::SellShip {
+            player: 0, unit_index: 0,
+        });
+        assert!(!ok);
     }
 
     #[test]

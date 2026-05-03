@@ -214,6 +214,26 @@ pub fn cannon_capacity(t: UnitType) -> u8 {
     }
 }
 
+/// Build cost (gold) for each unit type. Naval costs from the
+/// Werft (shipyard) UI; land-unit costs from the SOLDAT entries in
+/// figuren.cod (`Soldat: FIGTYP_SCHWERT, 5, 80` etc., where 80 is
+/// the gold cost). Marked SPECULATIVE for naval costs since the
+/// Werft pricing UI hasn't been fully decoded.
+pub fn unit_build_cost(t: UnitType) -> i32 {
+    match t {
+        UnitType::Pikeman => 60,
+        UnitType::Swordsman => 80,
+        UnitType::Musketeer => 160,
+        UnitType::Cavalry => 130,
+        UnitType::Archer => 90,
+        UnitType::Cannon => 220,
+        UnitType::SmallWarship => 1_500,
+        UnitType::MediumWarship => 2_500,
+        UnitType::LargeWarship => 4_000,
+        UnitType::Flagship => 6_000,
+    }
+}
+
 impl MilitaryUnit {
     pub fn new(unit_type: UnitType, owner: u8, tile_x: i32, tile_y: i32) -> Self {
         let stats = unit_type.stats();

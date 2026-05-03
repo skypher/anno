@@ -61,6 +61,40 @@ pub enum Command {
         good: Good,
         qty: u16,
     },
+    /// Set construction priority for a player-owned pending
+    /// building. 0 = normal, 1 = high, 2 = critical. The entity
+    /// tick drains materials in priority-descending order so a
+    /// short-supply scenario favours the prioritised buildings.
+    SetBuildPriority {
+        player: u8,
+        building_idx: u32,
+        priority: u8,
+    },
+    /// Manually load goods onto a trade ship at a warehouse
+    /// (manual sec. 5.3 + 8.3). Withdraws `qty` of `good` from
+    /// `warehouse_idx` and adds it to `ship_idx`'s cargo. Refused
+    /// if the ship isn't adjacent to the warehouse, or if cargo
+    /// is full, or if warehouse stock is short.
+    LoadShip {
+        player: u8,
+        ship_idx: u32,
+        warehouse_idx: u32,
+        good: Good,
+        qty: u16,
+    },
+    /// Manually unload goods from a trade ship to a warehouse.
+    UnloadShip {
+        player: u8,
+        ship_idx: u32,
+        warehouse_idx: u32,
+        good: Good,
+        qty: u16,
+    },
+    /// Sell or scuttle a naval unit at the Werft (manual: ships
+    /// can be sold or sunk if no longer needed). Refunds half the
+    /// unit's gold cost back to the player and removes the unit.
+    /// Refused for land units.
+    SellShip { player: u8, unit_index: u32 },
     /// Set or clear a unit's patrol waypoint list (manual sec.
     /// 9.2.4). An empty list cancels patrol. Sets `target_x/y` to
     /// the first waypoint immediately so movement starts on the

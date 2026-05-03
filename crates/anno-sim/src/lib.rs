@@ -14,6 +14,7 @@ pub mod entity;
 pub mod exploration;
 pub mod formation;
 pub mod free_trader;
+pub mod hiscore;
 pub mod history;
 pub mod island_map;
 pub mod native;
