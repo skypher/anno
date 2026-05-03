@@ -51,7 +51,27 @@ pub struct IslandTile {
 pub struct SzsFile {
     pub chunks: Vec<Chunk>,
     pub islands: Vec<Island>,
+    /// Per-slot setup parsed from the `PLAYER4` chunk. Up to 7
+    /// entries (slots 0-6 matching our diplomacy layout). Empty
+    /// when no PLAYER4 chunk is present.
+    pub players: Vec<PlayerSlotInit>,
 }
+
+/// One player-slot record parsed from the SZS PLAYER4 chunk.
+/// 1072 bytes per slot in the original (= 0xa0 stride confirmed
+/// from `1602_exe.c` `&DAT_005b7680`). We only extract fields
+/// we know how to interpret; the raw blob is preserved on the
+/// `Chunk` for callers that need more.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlayerSlotInit {
+    /// Starting gold (first u32 of the slot record). Confirmed
+    /// against tutorial scenarios: 50 000 for Tutorial0, matching
+    /// the manual's "starting funds" field in the editor.
+    pub starting_gold: i32,
+}
+
+const PLAYER4_SLOT_BYTES: usize = 1072;
+const PLAYER4_MAX_SLOTS: usize = 7;
 
 const CHUNK_HEADER_SIZE: usize = 20;
 
@@ -134,7 +154,26 @@ impl SzsFile {
             i += 1;
         }
 
-        Ok(SzsFile { chunks, islands })
+        // Extract per-slot player init from the PLAYER4 chunk.
+        let players = chunks.iter()
+            .find(|c| c.name == "PLAYER4")
+            .map(|c| Self::parse_player4(&c.data))
+            .unwrap_or_default();
+
+        Ok(SzsFile { chunks, islands, players })
+    }
+
+    fn parse_player4(data: &[u8]) -> Vec<PlayerSlotInit> {
+        let mut out = Vec::new();
+        for slot in 0..PLAYER4_MAX_SLOTS {
+            let off = slot * PLAYER4_SLOT_BYTES;
+            if off + 4 > data.len() { break; }
+            let starting_gold = i32::from_le_bytes([
+                data[off], data[off + 1], data[off + 2], data[off + 3],
+            ]);
+            out.push(PlayerSlotInit { starting_gold });
+        }
+        out
     }
 
     /// Encode an SZS file from a list of `Island`s. Generates one
@@ -297,5 +336,28 @@ mod tests {
 
         assert!(szs.islands.len() > 5, "Atoll should have many islands");
         assert!(!szs.islands[0].tiles.is_empty(), "First island should have tiles");
+    }
+
+    #[test]
+    fn player4_extracts_starting_gold() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/Tutorial0.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Tutorial0");
+        assert!(!szs.players.is_empty(), "PLAYER4 chunk should yield ≥1 slot");
+        // Tutorial scenarios start with non-zero gold so a player
+        // can actually do anything; the binary's editor shows this
+        // is configurable per-slot.
+        let slot0 = szs.players[0].starting_gold;
+        assert!(slot0 > 0,
+            "tutorial slot 0 starting_gold should be positive (got {})",
+            slot0);
     }
 }

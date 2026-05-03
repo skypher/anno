@@ -6187,19 +6187,27 @@ fn init_simulation(
     sim.coverage_maps = coverage_maps;
     sim.ocean_map = Some(ocean_map);
 
-    // Human player
+    // Human player. If the SZS file shipped a PLAYER4 chunk with
+    // a starting-gold value for slot 0, honour it; otherwise fall
+    // back to the dev default of 10 000.
     let mut player = Player::new_human(0);
     player.population[0] = 200;
     player.population[1] = 100;
     player.population[2] = 50;
-    player.gold = 10000;
+    player.gold = szs.players.first()
+        .map(|p| p.starting_gold)
+        .filter(|&g| g > 0)
+        .unwrap_or(10_000);
     sim.players.push(player);
 
-    // AI player
+    // AI player — same fallback.
     let mut ai_player = Player::new_ai(1, 0);
     ai_player.population[0] = 150;
     ai_player.population[1] = 50;
-    ai_player.gold = 8000;
+    ai_player.gold = szs.players.get(1)
+        .map(|p| p.starting_gold)
+        .filter(|&g| g > 0)
+        .unwrap_or(8_000);
     sim.players.push(ai_player);
     sim.ai_controllers
         .push(AiController::new(1, AiPersonality::Economic, Difficulty::Medium));
