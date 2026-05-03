@@ -22,6 +22,11 @@ pub struct IslandMap {
     pub height: u16,
     /// Flat grid: true = walkable. Index = y * width + x.
     walkable: Vec<bool>,
+    /// Per-tile road flag. Carriers crossing a road tile pay a
+    /// reduced path cost so the A* pathfinder prefers roads when
+    /// they're available — RE: haeuser.cod `Wegspeed: 145, 120,
+    /// 170, 100` (plain ground vs road quad).
+    road: Vec<bool>,
 }
 
 /// Building kinds that represent walkable terrain or roads.
@@ -65,6 +70,7 @@ impl IslandMap {
 
         // Start with all tiles as non-walkable (water/empty)
         let mut walkable = vec![false; size];
+        let mut road = vec![false; size];
 
         // Warehouse positions — always walkable
         let mut warehouse_tiles: HashSet<(u8, u8)> = HashSet::new();
@@ -87,6 +93,9 @@ impl IslandMap {
 
                 if is_walkable_kind(kind) {
                     walkable[idx] = true;
+                    if kind == "STRASSE" {
+                        road[idx] = true;
+                    }
                 } else if kind == "KONTOR" {
                     // Warehouses: mark walkable so carriers can reach them
                     walkable[idx] = true;
@@ -105,6 +114,7 @@ impl IslandMap {
             width,
             height,
             walkable,
+            road,
         }
     }
 
@@ -115,6 +125,17 @@ impl IslandMap {
             return false;
         }
         self.walkable[y as usize * self.width as usize + x as usize]
+    }
+
+    /// True if `(x, y)` is a road tile. Used by the pathfinder to
+    /// favour road-following routes (RE: haeuser.cod `Wegspeed`
+    /// quads — plain-ground 145/120 off-road vs 170/100 on-road).
+    #[inline]
+    pub fn is_road(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return false;
+        }
+        self.road[y as usize * self.width as usize + x as usize]
     }
 
     /// Mark a tile as walkable (e.g., for warehouse placement after map creation).
@@ -248,6 +269,14 @@ impl IslandMap {
             width,
             height,
             walkable: vec![true; size],
+            road: vec![false; size],
+        }
+    }
+
+    /// Mark a tile as a road (test helper / explicit road overlay).
+    pub fn set_road(&mut self, x: u16, y: u16, val: bool) {
+        if x < self.width && y < self.height {
+            self.road[y as usize * self.width as usize + x as usize] = val;
         }
     }
 }

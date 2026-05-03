@@ -263,6 +263,15 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
             let v = prop_int("Maxnorohst");
             if v > 0 { (v as u8).min(255) } else { 6 }
         },
+        can_dry_up: prop("Doerrflg") == "1",
+        wegspeed: {
+            let raw = prop("Wegspeed");
+            let mut quad = [100u16; 4];
+            for (i, tok) in raw.split(',').map(str::trim).enumerate().take(4) {
+                if let Ok(v) = tok.parse::<u16>() { quad[i] = v; }
+            }
+            quad
+        },
     }
 }
 

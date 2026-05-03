@@ -58,6 +58,20 @@ pub struct BuildingDef {
     /// Buildings with no input requirement (output-only resources
     /// like Wood) ignore this since they never lack input.
     pub max_no_input_ticks: u8,
+    /// Plantation drought flag (`Doerrflg: 1` in haeuser.cod). When
+    /// set, this building is a plantation crop tile that can dry up
+    /// from prolonged inactivity — once idle for an extended period
+    /// it stops producing entirely until rebuilt. RE: 7 building
+    /// entries carry this flag, all plantation crop tiles
+    /// (Getreide / etc.).
+    pub can_dry_up: bool,
+    /// Per-terrain walking speed quad. RE: haeuser.cod `Wegspeed`
+    /// field — each terrain tile lists 4 speeds in 1/100 units.
+    /// The most common quad is `145, 120, 170, 100` (plain ground:
+    /// 145 empty off-road, 120 loaded off-road, 170 empty on-road,
+    /// 100 loaded on-road). Roads boost empty carriers but
+    /// slightly slow loaded ones. `[100; 4]` = no preference.
+    pub wegspeed: [u16; 4],
 }
 
 /// An active building instance in the world.

@@ -2062,6 +2062,8 @@ mod tests {
             native: false,
             min_tier: 0,
             max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
         });
         // Drive the build path manually.
         let action = AiAction::RequestBuild { good: Good::Tools, priority: 0 };
@@ -2167,6 +2169,8 @@ mod tests {
             native: false,
             min_tier: 0,
             max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
         });
         let mut b = BuildingInstance::new(0, 0, 0, 0, 0);
         b.construction_ms_total = 1_000;
@@ -2302,6 +2306,8 @@ mod tests {
             native: false,
             min_tier: 0,
             max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
         });
         let b = BuildingInstance::new(0, 0, 10, 10, 0); // player 0 owns
         sim.buildings.push(b);
@@ -2343,6 +2349,8 @@ mod tests {
             native: false,
             min_tier: 0,
             max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
         });
         sim.buildings.push(BuildingInstance::new(0, 0, 10, 10, 0));
         sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 1, 11, 12));
@@ -2493,6 +2501,8 @@ mod tests {
             native: false,
             min_tier: 0,
             max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
         };
         // Two defs producing the same Good. Cheaper one would always win
         // under the old logic.
@@ -2580,6 +2590,8 @@ mod tests {
             native: false,
             min_tier: 0,
             max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
         });
         sim.buildings.push(BuildingInstance::new(0, 0, 0, 0, 0));
         assert_eq!(sim.buildings[0].house_tier, 0);
@@ -2608,6 +2620,8 @@ mod tests {
             native: false,
             min_tier: 0,
             max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
         };
         sim.building_defs.push(mk_def(5)); // def 0 cost 5
         sim.building_defs.push(mk_def(8)); // def 1 cost 8
@@ -2644,6 +2658,8 @@ mod tests {
             native: false,
             min_tier: 0,
             max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
         });
         // One under construction, one finished.
         let mut bb = BuildingInstance::new(0, 0, 0, 0, 0);
@@ -3045,6 +3061,8 @@ mod tests {
             native: false,
             min_tier: 0,
             max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
         });
         // Place a hideout at a known tile.
         let mut h = BuildingInstance::new(0, 0, 7, 11, 6);

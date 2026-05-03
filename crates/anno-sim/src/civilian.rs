@@ -223,6 +223,8 @@ mod tests {
             native: false,
             min_tier: 0,
             max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
         }
     }
 
