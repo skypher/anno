@@ -39,6 +39,28 @@ pub enum Command {
     /// warehouse + 200 gold (manual: cannons are crafted-good
     /// expenditure plus an installation fee).
     ArmShip { player: u8, unit_index: u32, target_cannons: u8 },
+    /// Native trade — deliver goods (manual sec. 8.6).
+    /// Withdraws `qty` of `good` from any of `player`'s active
+    /// warehouses and credits the corresponding native village's
+    /// trade balance for that player. Refused if the village
+    /// doesn't accept this good.
+    NativeDeliver {
+        player: u8,
+        village_idx: u32,
+        good: Good,
+        qty: u16,
+    },
+    /// Native trade — withdraw goods (manual sec. 8.6).
+    /// Spends the player's accumulated trade credit at the village
+    /// to deposit `qty` of `good` into one of `player`'s active
+    /// warehouses. Refused if the village doesn't offer this good
+    /// or the credit balance is too low.
+    NativeWithdraw {
+        player: u8,
+        village_idx: u32,
+        good: Good,
+        qty: u16,
+    },
     /// Set or clear a unit's patrol waypoint list (manual sec.
     /// 9.2.4). An empty list cancels patrol. Sets `target_x/y` to
     /// the first waypoint immediately so movement starts on the

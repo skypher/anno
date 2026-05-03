@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod building;
+pub mod campaign;
 pub mod carrier;
 pub mod civilian;
 pub mod climate;
@@ -15,6 +16,7 @@ pub mod formation;
 pub mod free_trader;
 pub mod history;
 pub mod island_map;
+pub mod native;
 pub mod objectives;
 pub mod ocean_map;
 pub mod pathfinding;

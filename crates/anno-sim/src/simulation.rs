@@ -155,6 +155,9 @@ pub struct Simulation {
     /// it so animation phase stays deterministic across
     /// load / multiplayer / state diffs.
     pub animation_frame: u32,
+    /// Indigenous-village trade posts placed by the scenario.
+    /// See `crate::native` for the barter mechanics.
+    pub native_villages: Vec<crate::native::NativeVillage>,
 }
 
 /// Game-over state for the human player slot 0.
@@ -232,6 +235,7 @@ impl Simulation {
             last_treasury_warn_gold: i32::MAX,
             outcome: GameOutcome::Pending,
             animation_frame: 0,
+            native_villages: Vec::new(),
         }
     }
 
@@ -1516,8 +1520,42 @@ impl Simulation {
                             }
                         }
                     }
+                    ActionType::Walking
+                    | ActionType::Sailing
+                    | ActionType::Patrolling
+                    | ActionType::Exploring => {
+                        // Generic move-toward-target step for any
+                        // remaining figure that isn't a carrier or
+                        // civilian. Walking, Sailing, Patrolling and
+                        // Exploring all share the same naive iso
+                        // step semantics; other ActionTypes (Combat,
+                        // TradeShipAi, FreeTrader, etc.) are handled
+                        // by their own dedicated subsystems.
+                        let dx = figure.target_x - figure.tile_x;
+                        let dy = figure.target_y - figure.tile_y;
+                        if dx == 0 && dy == 0 {
+                            // Reached the waypoint — leave the action
+                            // and the caller decides whether to
+                            // despawn or retarget.
+                        } else {
+                            if dx.abs() >= dy.abs() {
+                                figure.tile_x += dx.signum();
+                            } else {
+                                figure.tile_y += dy.signum();
+                            }
+                            figure.anim_frame =
+                                figure.anim_frame.wrapping_add(1);
+                        }
+                    }
                     _ => {
-                        // Other action types not yet implemented
+                        // Combat / TradeShipAi / FreeTrader /
+                        // Building / Mining / Fishing / Loading /
+                        // Delivering / SpecialEvent /
+                        // Artillery / Idle / TradeRoute /
+                        // ShipCombat / Farming / Walking-other are
+                        // driven elsewhere in the tick (combat,
+                        // tick_ships, free-trader, production).
+                        // No-op here.
                     }
                 }
             }
@@ -1682,6 +1720,77 @@ impl Simulation {
                 } else {
                     // No recipient warehouse — refund and fail.
                     self.warehouses[fi].deposit(good, took);
+                    false
+                }
+            }
+            Command::NativeDeliver { player, village_idx, good, qty } => {
+                let vi = village_idx as usize;
+                if vi >= self.native_villages.len() || qty == 0 {
+                    return false;
+                }
+                // Withdraw qty of `good` from any of the player's
+                // warehouses. Refund (no-op) if not enough stock.
+                let mut needed = qty;
+                let mut taken = 0u16;
+                for w in self.warehouses.iter_mut()
+                    .filter(|w| w.active && w.owner == player)
+                {
+                    if needed == 0 { break; }
+                    let took = w.withdraw(good, needed);
+                    needed -= took;
+                    taken += took;
+                }
+                if taken == 0 { return false; }
+                let outcome = self.native_villages[vi].deliver(player, good, taken);
+                if outcome == crate::native::BarterOutcome::NotWanted {
+                    // Refund — natives didn't accept after all.
+                    if let Some(w) = self.warehouses.iter_mut()
+                        .find(|w| w.active && w.owner == player)
+                    {
+                        w.deposit(good, taken);
+                    }
+                    return false;
+                }
+                self.event_log.push(format!(
+                    "[natives] delivered {taken} {good:?} to village #{vi}",
+                ));
+                true
+            }
+            Command::NativeWithdraw { player, village_idx, good, qty } => {
+                let vi = village_idx as usize;
+                if vi >= self.native_villages.len() || qty == 0 {
+                    return false;
+                }
+                let outcome = self.native_villages[vi].withdraw(player, good, qty);
+                if outcome != crate::native::BarterOutcome::Withdrawn {
+                    return false;
+                }
+                if let Some(w) = self.warehouses.iter_mut()
+                    .find(|w| w.active && w.owner == player)
+                {
+                    let placed = w.deposit(good, qty);
+                    if placed < qty {
+                        // Warehouse full — refund the credit so the
+                        // player can try again with more space.
+                        let refund = (qty - placed) as i32
+                            * crate::prices::price_of(good).sell as i32;
+                        let p = player as usize;
+                        if p < 7 {
+                            self.native_villages[vi].credit[p] += refund;
+                        }
+                    }
+                    self.event_log.push(format!(
+                        "[natives] received {placed} {good:?} from village #{vi}",
+                    ));
+                    placed > 0
+                } else {
+                    // No player warehouse — refund all credit and fail.
+                    let refund = qty as i32
+                        * crate::prices::price_of(good).sell as i32;
+                    let p = player as usize;
+                    if p < 7 {
+                        self.native_villages[vi].credit[p] += refund;
+                    }
                     false
                 }
             }
@@ -2511,6 +2620,51 @@ mod tests {
         assert!(owned > 0, "AI should have spawned at least one unit, got {owned}");
         // And paid for them.
         assert!(sim.players[1].gold < 5_000);
+    }
+
+    #[test]
+    fn native_barter_round_trip() {
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
+        sim.warehouses[0].set_capacity(Good::Cloth, 100);
+        sim.warehouses[0].deposit(Good::Cloth, 50);
+        sim.warehouses[0].set_capacity(Good::Spices, 100);
+        sim.native_villages.push(crate::native::NativeVillage::new(0, 60, 60));
+
+        // Deliver Cloth → village credit accumulates.
+        let ok = sim.apply_command(&crate::commands::Command::NativeDeliver {
+            player: 0, village_idx: 0, good: Good::Cloth, qty: 30,
+        });
+        assert!(ok);
+        assert_eq!(sim.warehouses[0].stock(Good::Cloth), 20);
+        assert!(sim.native_villages[0].credit[0] > 0);
+
+        // Withdraw a small amount of Spices — credit should cover it.
+        let ok = sim.apply_command(&crate::commands::Command::NativeWithdraw {
+            player: 0, village_idx: 0, good: Good::Spices, qty: 1,
+        });
+        assert!(ok);
+        assert_eq!(sim.warehouses[0].stock(Good::Spices), 1);
+    }
+
+    #[test]
+    fn native_deliver_rejects_unwanted_good() {
+        use crate::types::Good;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
+        sim.warehouses[0].set_capacity(Good::Wood, 50);
+        sim.warehouses[0].deposit(Good::Wood, 50);
+        sim.native_villages.push(crate::native::NativeVillage::new(0, 60, 60));
+        // Wood is not in the default wants list (Cloth/Tools/Jewelry).
+        let ok = sim.apply_command(&crate::commands::Command::NativeDeliver {
+            player: 0, village_idx: 0, good: Good::Wood, qty: 10,
+        });
+        assert!(!ok);
+        // Refund: warehouse stock unchanged.
+        assert_eq!(sim.warehouses[0].stock(Good::Wood), 50);
     }
 
     #[test]
