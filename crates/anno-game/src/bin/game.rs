@@ -780,6 +780,26 @@ fn main() {
     let event_war_slot = audio.waves.load("SPEECH8/1030.WAV")
         .or_else(|| audio.waves.load("1030.WAV"))
         .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
+    // Voice announcements: stockpile-low, treasury, trader, attack.
+    // SPECULATIVE — `text.cod` exposes a `[SPEECHKIND]` section listing
+    // the announcement categories (Events, Island status, Fellow
+    // players, Trade, Battles, Orders, Diplomacy) but the WAV-file
+    // numbering used by the original engine is not yet decoded. Each
+    // slot falls back to 1000.WAV so something is always audible;
+    // replace the exact filenames once the speech mapping is
+    // reverse-engineered.
+    let voice_stockpile_slot = audio.waves.load("SPEECH8/1040.WAV")
+        .or_else(|| audio.waves.load("SPEECH8/107.WAV"))
+        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
+    let voice_treasury_slot = audio.waves.load("SPEECH8/1050.WAV")
+        .or_else(|| audio.waves.load("SPEECH8/109.WAV"))
+        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
+    let voice_trader_slot = audio.waves.load("SPEECH8/1060.WAV")
+        .or_else(|| audio.waves.load("SPEECH8/111.WAV"))
+        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
+    let voice_attack_slot = audio.waves.load("SPEECH8/1070.WAV")
+        .or_else(|| audio.waves.load("SPEECH8/113.WAV"))
+        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
 
     // SDL2 setup
     let sdl = sdl2::init().expect("SDL2 init failed");
@@ -2563,9 +2583,27 @@ fn main() {
             // (Wake-up alarms via SFX removed — faithful Anno used voice
             // announcements which we'll wire up properly later.)
 
-            // Drain sim event log lines.
+            // Drain sim event log lines. Voice announcements key off
+            // the line prefix so we play one slot per announcement
+            // category — Anno used spoken cues, not SFX.
             if !sim.event_log.is_empty() {
                 for line in sim.event_log.drain(..) {
+                    let voice_slot = if line.starts_with("[trader]") {
+                        voice_trader_slot
+                    } else if line.starts_with("[combat]") || line.contains("attack") {
+                        voice_attack_slot
+                    } else if line.contains("treasury") || line.contains("bankrupt") {
+                        voice_treasury_slot
+                    } else if line.starts_with("[supply]") || line.contains("low on") {
+                        voice_stockpile_slot
+                    } else {
+                        None
+                    };
+                    if let (Some(sfx), Some(handle)) =
+                        (voice_slot, &audio.stream_handle)
+                    {
+                        audio.waves.play_once(sfx, WINDOW_W as i32 / 2, WINDOW_H as i32 / 2, handle);
+                    }
                     chat_log.push_back((line, std::time::Instant::now()));
                     if chat_log.len() > 8 { chat_log.pop_front(); }
                 }
@@ -2597,7 +2635,9 @@ fn main() {
                     ));
                     if chat_log.len() > 8 { chat_log.pop_front(); }
                 }
-                if let (Some(sfx), Some(handle)) = (event_destroy_slot, &audio.stream_handle) {
+                if let (Some(sfx), Some(handle)) =
+                    (voice_attack_slot.or(event_destroy_slot), &audio.stream_handle)
+                {
                     audio.waves.play_once(sfx, WINDOW_W as i32 / 2, WINDOW_H as i32 / 2, handle);
                 }
                 needs_redraw = true;
@@ -3848,9 +3888,16 @@ fn main() {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
                 let arrow = if idx == scenario_sel { "> " } else { "  " };
-                let line = format!("{arrow}{label}");
+                // Tutorial scenarios (Tutorial0.szs … Tutorial4.szs)
+                // ship with the original game and are the faithful
+                // replacement for an in-engine tutorial banner.
+                let is_tutorial = label.to_ascii_lowercase().starts_with("tutorial");
+                let suffix = if is_tutorial { "  [tutorial]" } else { "" };
+                let line = format!("{arrow}{label}{suffix}");
                 let color = if idx == scenario_sel {
                     [0xFF, 0xFF, 0x00, 0xFF]
+                } else if is_tutorial {
+                    [0x80, 0xFF, 0xC0, 0xFF]
                 } else {
                     [0xCC, 0xCC, 0xCC, 0xFF]
                 };
@@ -3888,8 +3935,7 @@ fn main() {
                 "  R   trade route   Shift+R routes  J   fleet     A   market",
                 "  F4  buy ship      U   warehouses",
                 "Diagnostics",
-                "  K   graphs        P   production  O   roster    Q   build queue",
-                "  X   chain         ?   objectives  H   HUD       C   coverage",
+                "  ?   objectives    H   HUD         C   coverage",
                 "  F6  paths         F12 perf",
                 "World / view",
                 "  W   world toggle  G   speed up    Space pause  Tab next island",
@@ -4672,10 +4718,21 @@ fn overlay_entities(
 
         let (sx, sy) = tile_to_screen(figure.tile_x as i32, figure.tile_y as i32, ix, iy);
 
-        // Try sprite rendering
+        // Try sprite rendering. TRAEGER has two walk animations
+        // (`figuren.cod` Nummer:TRAEGER):
+        //   anim 0 = empty walking, AnimOffs 0   (8 rotations × 8 frames = 64 sprites)
+        //   anim 1 = loaded walking, AnimOffs 64 (same shape)
+        // We pick the animation by figure action: empty when Returning,
+        // loaded when CarryingGoods. The original game does NOT carry
+        // per-good sprites — the loaded silhouette is generic.
         let dir = (figure.direction as usize) % 8;
         let frame = (figure.anim_frame as usize) % carrier_frames_per_dir;
+        let anim_offs = match figure.action {
+            ActionType::CarryingGoods => carrier_frames_per_dir * 8, // anim 1 base = 64
+            _ => 0,
+        };
         let sprite_idx = figure.base_sprite as usize
+            + anim_offs
             + dir * carrier_frames_per_dir
             + frame;
 
@@ -4703,9 +4760,8 @@ fn overlay_entities(
             draw_marker(rgba, img_w, img_h, sx, sy, 3, &color);
         }
 
-        // (Cargo indicator chip removed — Anno carriers showed cargo via
-        // the actual Träger-with-good sprite. Real fix is correct
-        // TRAEGER.BSH sprite indexing per carried good, queued separately.)
+        // No per-good chip: TRAEGER in the original has only empty/loaded
+        // animations, not per-good sprites (verified in figuren.cod).
     }
 
     // Draw warehouses (blue squares)
@@ -4813,6 +4869,29 @@ fn overlay_entities(
             }
         }
         draw_diamond(rgba, img_w, img_h, sx, sy, 5, &[0x00, 0xFF, 0xFF, 0xFF]);
+    }
+
+    // Free traders use the same SHIP.BSH cycle as regular trade ships;
+    // tinted diamond fallback colour to distinguish them on the minimap
+    // and when sprites are missing.
+    for trader in &sim.free_traders {
+        if !trader.active { continue; }
+        let (sx, sy) = tile_to_screen(trader.world_x, trader.world_y, 0, 0);
+        let dir = (trader.heading as usize) % 8;
+        let sprite_idx = dir * ship_anz / 8;
+        if sprite_idx < ship_sprites.len() {
+            let (sw, sh, ref data) = ship_sprites[sprite_idx];
+            if sw > 0 && sh > 0 {
+                blit_rgba(
+                    rgba, img_w, img_h,
+                    sx + half_tw - sw as i32 / 2,
+                    sy - sh as i32 + half_th,
+                    data, sw, sh,
+                );
+                continue;
+            }
+        }
+        draw_diamond(rgba, img_w, img_h, sx, sy, 5, &[0xFF, 0xC0, 0x40, 0xFF]);
     }
 }
 

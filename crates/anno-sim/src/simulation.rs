@@ -132,6 +132,17 @@ pub struct Simulation {
     /// Sim-emitted text events (free-trader arrivals, etc.). Drained by
     /// the game binary into the chat-log overlay each frame.
     pub event_log: Vec<String>,
+
+    /// Roving NPC trade ships. Spawned periodically from the world edge
+    /// in `tick_ships`; visit player Kontors and trade at standard
+    /// prices. See `crate::free_trader`. Ephemeral — not serialised.
+    pub free_traders: Vec<crate::free_trader::FreeTrader>,
+    /// Cooldown counter (ship-ticks) before another free trader may
+    /// spawn. Decremented every ship tick.
+    pub free_trader_cooldown: u32,
+    /// Last sampled human-player gold; used to fire a treasury voice
+    /// alert exactly once per dip below the warning threshold.
+    pub last_treasury_warn_gold: i32,
 }
 
 impl Simulation {
@@ -182,6 +193,9 @@ impl Simulation {
             exploration: Vec::new(),
             damage_events: Vec::new(),
             event_log: Vec::new(),
+            free_traders: Vec::new(),
+            free_trader_cooldown: 0,
+            last_treasury_warn_gold: i32::MAX,
         }
     }
 
@@ -195,11 +209,12 @@ impl Simulation {
     /// population, military strength, and treasury into one number that
     /// the diplomacy AI uses for war / peace / treaty decisions.
     ///
-    /// Anno is fundamentally a city-builder, so population dominates.
-    /// A military unit costs ~100-200 gold and meaningful upkeep, so it
-    /// counts for ~25 inhabitants. Gold is the smallest factor: 100 gold
-    /// per power point keeps a 20k starting purse from outweighing an
-    /// actual settlement.
+    /// SPECULATIVE weighting — the original AI's actual scoring
+    /// formula is in `FUN_0042b4b0` (RE pending) and the three
+    /// per-personality dispatchers `FUN_0042adf0/b000/b160`. Until
+    /// those are decoded, this is a best-effort city-builder-leaning
+    /// heuristic: population (1×), military units (25×), gold
+    /// (1/100×). Replace with the original formula once located.
     pub fn civilization_power(&self, slot: u8) -> i64 {
         let pop = self.players.get(slot as usize)
             .map(|p| p.total_population as i64)
@@ -443,6 +458,20 @@ impl Simulation {
                 p0, &self.buildings, &self.building_defs, &self.warehouses, 0,
             );
             self.objective_completions.extend(just_done);
+
+            // Voice announcement: rate-limited by requiring the
+            // previous edge to clear before re-firing.
+            // SPECULATIVE threshold (500) — the original game's
+            // treasury-warning trigger is unknown pending RE; this is
+            // a conservative number well above the bankruptcy floor of
+            // -1001 (`player.rs` BANKRUPTCY_GAME_OVER_TICKS context).
+            let p0_gold = p0.gold;
+            if p0_gold < 500 && self.last_treasury_warn_gold >= 500 {
+                self.event_log.push(
+                    "[treasury] our treasury is running dangerously low".to_string(),
+                );
+            }
+            self.last_treasury_warn_gold = p0_gold;
         }
 
         // AI decision-making
@@ -786,8 +815,10 @@ impl Simulation {
                 let cur = self.diplomacy.get(me as u8, other as u8);
 
                 // Declare war on a clearly weaker neutral neighbor.
-                // 100 power = a small but real foothold (e.g. 4 units,
-                // or ~100 inhabitants, or 10k gold).
+                // SPECULATIVE thresholds (`>= 100`, `2:1`) — original
+                // war-trigger conditions live in the AI dispatcher
+                // (RE pending). Conservative defaults: 100 power = a
+                // small foothold, 2:1 = clear superiority.
                 if aggressor
                     && cur == Diplomacy::Neutral
                     && my_score >= 100
@@ -957,6 +988,113 @@ impl Simulation {
                 }
             }
         }
+        self.tick_free_traders();
+    }
+
+    fn tick_free_traders(&mut self) {
+        if self.free_trader_cooldown > 0 {
+            self.free_trader_cooldown -= 1;
+        }
+
+        // Spawn at most one free trader at a time. Need a player Kontor
+        // to visit.
+        // SPECULATIVE spawn condition: at most one trader at a time,
+        // any player has a Kontor. Original spawn cadence is unknown
+        // pending RE; conservative single-trader placeholder.
+        if self.free_traders.iter().all(|t| !t.active)
+            && self.free_trader_cooldown == 0
+            && self.warehouses.iter().any(|w| w.active && w.owner < 4)
+        {
+            let r = self.next_rand();
+            // Spawn at a random map edge.
+            let side = r % 4;
+            let off = ((r >> 8) as i32) & 0x7F;
+            let (sx, sy) = match side {
+                0 => (off, 0),
+                1 => (off, 200),
+                2 => (0, off),
+                _ => (200, off),
+            };
+            let mut trader = crate::free_trader::FreeTrader::spawn_at(sx, sy);
+            self.assign_next_port(&mut trader);
+            self.free_traders.push(trader);
+            self.event_log.push(
+                "[trader] free trader sighted at the horizon".to_string(),
+            );
+            self.free_trader_cooldown = 0;
+        }
+
+        // Step each active trader.
+        let mut player_gold: Vec<i32> = self.players.iter().map(|p| p.gold).collect();
+        for i in 0..self.free_traders.len() {
+            if !self.free_traders[i].active { continue; }
+            let removed = crate::free_trader::tick_one(
+                &mut self.free_traders[i],
+                &mut self.warehouses,
+                &mut player_gold,
+            );
+            if removed { continue; }
+            // Pick next port if just finished docking.
+            if self.free_traders[i].state == crate::free_trader::FreeTraderState::Sailing
+                && self.free_traders[i].target_warehouse.is_none()
+                && !self.free_traders[i].leaving
+            {
+                if self.free_traders[i].visits_remaining == 0 {
+                    self.set_leaving_target(i);
+                } else {
+                    let mut t = std::mem::take(&mut self.free_traders[i]);
+                    self.assign_next_port(&mut t);
+                    self.free_traders[i] = t;
+                }
+            }
+        }
+        for (i, g) in player_gold.into_iter().enumerate() {
+            if i < self.players.len() { self.players[i].gold = g; }
+        }
+        // Drop departed ships and start the cooldown.
+        let before = self.free_traders.len();
+        self.free_traders.retain(|t| t.active);
+        if self.free_traders.len() < before && self.free_trader_cooldown == 0 {
+            // SPECULATIVE — original respawn delay unknown; ~10 min of
+            // ship-ticks (1 s each) chosen as a conservative gap.
+            self.free_trader_cooldown = 600;
+        }
+    }
+
+    fn assign_next_port(&self, trader: &mut crate::free_trader::FreeTrader) {
+        let candidates: Vec<(usize, &Warehouse)> = self.warehouses.iter()
+            .enumerate()
+            .filter(|(_, w)| w.active && w.owner < 4)
+            .collect();
+        if candidates.is_empty() { return; }
+        let pick = (trader.world_x.unsigned_abs() as usize
+            ^ trader.world_y.unsigned_abs() as usize)
+            % candidates.len();
+        let (wh_idx, wh) = candidates[pick];
+        trader.target_warehouse = Some(wh_idx);
+        trader.target_x = wh.tile_x as i32;
+        trader.target_y = wh.tile_y as i32;
+    }
+
+    fn set_leaving_target(&mut self, i: usize) {
+        // Pick the closest map edge.
+        let t = &mut self.free_traders[i];
+        let dx_left = t.world_x;
+        let dx_right = 200 - t.world_x;
+        let dy_top = t.world_y;
+        let dy_bot = 200 - t.world_y;
+        let min = dx_left.min(dx_right).min(dy_top).min(dy_bot);
+        if min == dx_left {
+            t.target_x = 0;
+        } else if min == dx_right {
+            t.target_x = 200;
+        } else if min == dy_top {
+            t.target_y = 0;
+        } else {
+            t.target_y = 200;
+        }
+        t.leaving = true;
+        t.target_warehouse = None;
     }
 
     fn tick_military(&mut self) {

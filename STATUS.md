@@ -188,7 +188,49 @@ following have been **removed**:
   method that weights population (1×), military (25×), and gold
   (1/100×) — population dominates, in keeping with Anno being a
   city-builder. Same scoring is now used by both the diplomacy AI
-  loop and treaty-acceptance checks.
+  loop and treaty-acceptance checks. SPECULATIVE — original
+  weighting in `FUN_0042b4b0` and the per-personality dispatchers
+  `FUN_0042adf0/b000/b160` not yet decoded.
+
+### Authenticity audit replacements (2026-05-03)
+
+Faithful replacements for items removed in the two audit passes,
+with RE references where available:
+
+- **#101 Free trader as roaming ship** — `crates/anno-sim/src/free_trader.rs`.
+  Spawns at the world edge, sails to player Kontors via the existing
+  ocean A*, docks for several ticks exchanging goods at standard
+  `prices::price_of` rates, then leaves. RE: `decompiled/1602_exe.c:83179`
+  (`s_Trader_d_0049ae30`, free-trader player slot 4 with 1 000 000
+  starting gold), `figuren.cod` `Nummer: HANDEL1` (ship sprite set
+  reused at render time). Visit count, dock duration, stock list
+  marked SPECULATIVE in source — original dispatcher RE pending.
+- **#100 Cosmetic civilians** — DEFERRED. `figuren.cod` confirms five
+  civilian figures `ADELWEIBL`/`ADEL`/`ALTER`/`FRAU`/`PASSANT` at
+  `GFXZIVIL+0/64/128/192/256` (= TRAEGER.BSH sprite indices
+  1272/1336/1400/1464/1528, computed from the GFX… constant chain).
+  Implementation deferred until the spawn dispatcher is located in
+  the binary so cadence and target selection are RE-grounded rather
+  than invented.
+- **Carrier sprite by cargo (audit #66 follow-up)** — `figuren.cod`
+  `Nummer: TRAEGER` defines exactly two walk animations: anim 0 at
+  `AnimOffs:0` (empty) and anim 1 at `AnimOffs:64` (loaded). The
+  original game does NOT have per-good carrier sprites — the loaded
+  silhouette is generic. Renderer in `game.rs` now picks anim 1 when
+  the figure's action is `CarryingGoods`, anim 0 when `Returning`.
+  No "letter chip"; the sprite swap IS the indicator.
+- **#105 / #44 Voice announcements** — `crates/anno-game/src/bin/game.rs`
+  loads four SPEECH8 voice slots (stockpile, treasury, trader,
+  attack) and plays one per drained `event_log` line keyed by line
+  prefix. RE: `text.cod` `[SPEECHKIND]` block lists the announcement
+  categories the original engine used. Specific WAV file numbers
+  marked SPECULATIVE — speech-to-WAV mapping not yet decoded; each
+  slot falls back to `1000.WAV`.
+- **#106 Tutorial scenario instead of first-launch banner** — the
+  five `Tutorial0..4.szs` scenarios shipped with the original under
+  `extracted/Szenes/` are already enumerated by the F2 picker; they
+  now render with a `[tutorial]` tag and a distinct colour so a
+  first-time player can find them.
 
 ### What's missing / next
 

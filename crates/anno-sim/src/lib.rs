@@ -9,6 +9,7 @@ pub mod data_bridge;
 pub mod economy;
 pub mod entity;
 pub mod exploration;
+pub mod free_trader;
 pub mod history;
 pub mod island_map;
 pub mod objectives;
