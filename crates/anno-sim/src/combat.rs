@@ -224,15 +224,17 @@ pub struct MilitaryUnit {
 
 fn default_escort_ship() -> i32 { -1 }
 
-/// Maximum cannons each ship class can mount. Manual sec. 9.2.3
-/// describes "small and large warships" as the two armed naval
-/// classes. Values RE-cited from Tim Howgego's military-data
-/// appendix:
-///   SmallWarship: Cannon 8
-///   LargeWarship: Cannon 14
-/// The MediumWarship and Flagship enum values are speculative
-/// add-ons not present in the original 4-class naval line-up; we
-/// pin them to interpolated values.
+/// Maximum cannons each ship class can mount. Values RE-cited
+/// from `figuren.cod` `Maxkanon:` field on the ship-figure
+/// entries:
+///   HANDEL1 = 6  (SmallTradeShip)
+///   HANDEL2 = 10 (LargeTradeShip — UnitType has no variant)
+///   KRIEG1  = 8  (SmallWarship)
+///   KRIEG2  = 14 (LargeWarship)
+///   HANDLER = 12 (free trader, UnitType has no variant)
+///   PIRAT   = 10 (pirate ship)
+/// MediumWarship / Flagship aren't in the original 4-class naval
+/// line-up; speculative interpolated values.
 pub fn cannon_capacity(t: UnitType) -> u8 {
     match t {
         UnitType::SmallWarship => 8,

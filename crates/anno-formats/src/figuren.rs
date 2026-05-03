@@ -66,6 +66,42 @@ impl FigureDef {
         let walk = self.walk_anim().map(|a| a.anim_anz).unwrap_or(0);
         self.rotate.max(1) * walk.max(1)
     }
+
+    /// Lookup a numeric property (Speed/Hitpoint/Maxtrag/etc.) from
+    /// the property bag, returning 0 when absent.
+    fn prop_int(&self, key: &str) -> i32 {
+        self.properties.get(key)
+            .and_then(|s| s.split(',').next().and_then(|t| t.trim().parse().ok()))
+            .unwrap_or(0)
+    }
+
+    /// Walking speed (`Speed:` in figuren.cod) in 1/100 tile-per-tick
+    /// units. Common values: 200 (citizens), 220 (carrier), 230 (adel),
+    /// 250 (child), 260 (soldier), 300 (cart), 400 (cavalry).
+    pub fn speed(&self) -> i32 { self.prop_int("Speed") }
+
+    /// Maximum cargo this figure carries in one trip (`Maxtrag:`).
+    /// 4 for civilian/Träger figures, 6 for KARREN (cart).
+    pub fn max_load(&self) -> i32 { self.prop_int("Maxtrag") }
+
+    /// Hit-points for combat figures (`Hitpoint:`). Land units are
+    /// tagged in the appendix; ships use HP from haeuser.cod /
+    /// ship-class tables.
+    pub fn hit_points(&self) -> i32 { self.prop_int("Hitpoint") }
+
+    /// Build cost in gold (`Preis:`). Used for non-Soldat figures
+    /// (ships, carts) that aren't gated through the SOLDAT lookup.
+    pub fn price(&self) -> i32 { self.prop_int("Preis") }
+
+    /// Workload duration / cycle time (`Worktime:`). Plantation
+    /// workers (MAEHER, HOLZFAELLER, etc.) have 8; civilians 3.
+    pub fn worktime(&self) -> i32 { self.prop_int("Worktime") }
+
+    /// Maximum cannons mountable on a naval figure (`Maxkanon:`).
+    /// Used by ship-arming UI in lieu of the hard-coded
+    /// `combat::cannon_capacity` table when figuren.cod is
+    /// available.
+    pub fn max_cannons(&self) -> i32 { self.prop_int("Maxkanon") }
 }
 
 impl FiguresFile {
@@ -334,6 +370,39 @@ Nummer: HANDEL1
         assert_eq!(fig.rotate, 1);
         assert_eq!(fig.anims.len(), 1);
         assert_eq!(fig.anims[0].anim_anz, 40);
+    }
+
+    #[test]
+    fn typed_accessors_pull_numeric_props() {
+        let text = b"\
+GFXSHIP = 0
+Nummer: HANDEL1
+  Gfx: GFXSHIP
+  Blocknr: 2
+  Rotate: 1
+  Speed: 220
+  Maxtrag: 6
+  Hitpoint: 65
+  Preis: 600
+  Worktime: 8
+  Maxkanon: 8
+  Objekt: ANIM
+    Nummer: 0
+    Kind: ENDLESS
+    AnimOffs: 0
+    AnimAdd: 1
+    AnimAnz: 40
+    AnimSpeed: 90
+  EndObj;
+";
+        let f = FiguresFile::parse_text(std::str::from_utf8(text).unwrap());
+        let h = f.find("HANDEL1").expect("HANDEL1 parsed");
+        assert_eq!(h.speed(), 220);
+        assert_eq!(h.max_load(), 6);
+        assert_eq!(h.hit_points(), 65);
+        assert_eq!(h.price(), 600);
+        assert_eq!(h.worktime(), 8);
+        assert_eq!(h.max_cannons(), 8);
     }
 
     #[test]
