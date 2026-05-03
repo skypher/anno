@@ -1146,7 +1146,12 @@ impl Simulation {
             .collect();
         combat::tick_escort_targets(&mut self.military_units, &positions);
         // Move military units toward player-issued targets (every step).
-        combat::tick_unit_orders(&mut self.military_units, dt_ms);
+        // Naval units are clamped to navigable tiles via the ocean map.
+        combat::tick_unit_orders_with_ocean(
+            &mut self.military_units,
+            dt_ms,
+            self.ocean_map.as_ref(),
+        );
 
         // Trickle construction materials from the player's warehouses,
         // then decrement the construction timer only once the materials
@@ -1203,6 +1208,7 @@ impl Simulation {
                                 &mut self.warehouses,
                                 &self.buildings,
                                 &self.island_maps,
+                                &mut self.damage_events,
                             );
                             if should_despawn {
                                 despawn_indices.push(idx);

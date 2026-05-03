@@ -960,6 +960,7 @@ fn main() {
     let mut civilians: Vec<(u8, i32, i32, i32, i32, std::time::Instant)>
         = Vec::new();
     let mut civilian_seed: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+    let mut last_alarm: Option<std::time::Instant> = None;
     /// First-run hint: shown until the user touches anything substantive.
     /// Suppressed permanently once the marker file exists.
     let tutorial_marker = anno_sim::settings::Settings::config_path()
@@ -2738,6 +2739,44 @@ fn main() {
                     audio.waves.play_once(sfx, WINDOW_W as i32 / 2, WINDOW_H as i32 / 2, handle);
                 }
             }
+            // Wake-up alarm: if the player is broke or has zero food
+            // stock, ping the destroy SFX with a 30s cooldown.
+            {
+                let gold = sim.players.first().map(|p| p.gold).unwrap_or(0);
+                let zero_food: bool = sim.players.first()
+                    .map(|p| p.satisfaction[0] < 64)
+                    .unwrap_or(false)
+                    && sim.warehouses.iter()
+                        .filter(|w| w.active && w.owner == 0)
+                        .all(|w| w.stock(Good::Food) == 0);
+                let alarm = gold < 500 || zero_food;
+                let cooldown = std::time::Duration::from_secs(30);
+                let cooled = last_alarm.map_or(true,
+                    |t| t.elapsed() > cooldown);
+                if alarm && cooled {
+                    if let (Some(sfx), Some(handle)) =
+                        (event_destroy_slot, &audio.stream_handle)
+                    {
+                        audio.waves.play_once(
+                            sfx,
+                            WINDOW_W as i32 / 2,
+                            WINDOW_H as i32 / 2,
+                            handle,
+                        );
+                    }
+                    last_alarm = Some(std::time::Instant::now());
+                    chat_log.push_back((
+                        if gold < 500 {
+                            "[alarm] gold low — bankruptcy looming".to_string()
+                        } else {
+                            "[alarm] population starving — Food empty".to_string()
+                        },
+                        std::time::Instant::now(),
+                    ));
+                    if chat_log.len() > 8 { chat_log.pop_front(); }
+                }
+            }
+
             // Drain sim event log lines.
             if !sim.event_log.is_empty() {
                 for line in sim.event_log.drain(..) {
@@ -3358,6 +3397,89 @@ fn main() {
                     }
                 }
 
+                // Faction outlines: thin colored rim on each player-owned
+                // building's footprint, so multi-player maps read at a
+                // glance who owns what.
+                if !world_mode {
+                    let island_id = islands[current_island].number;
+                    let half_tw = rs.tile_w / 2;
+                    let half_th = rs.tile_h / 2;
+                    for b in &sim.buildings {
+                        if !b.active || b.island_id != island_id { continue; }
+                        let def = &defs[b.def_id as usize];
+                        let bw = def.width as i32;
+                        let bh = def.height as i32;
+                        let color = player_color(b.owner);
+                        // Top corner of the diamond.
+                        let tx = b.tile_x as i32;
+                        let ty = b.tile_y as i32;
+                        let cx = rs.origin_x + (tx - ty) * half_tw + half_tw;
+                        let cy = rs.origin_y + (tx + ty) * half_th;
+                        // Draw a small 3x3 chip at the building's anchor.
+                        for cy_off in 0..3 {
+                            for cx_off in -1..=1 {
+                                let fx = cx + cx_off;
+                                let fy = cy + cy_off;
+                                if fx < 0 || fy < 0 { continue; }
+                                if (fx as u32) >= rs.width
+                                    || (fy as u32) >= rs.height { continue; }
+                                let off = ((fy as u32 * rs.width + fx as u32) * 4) as usize;
+                                if off + 3 >= frame.len() { continue; }
+                                frame[off]     = color[0];
+                                frame[off + 1] = color[1];
+                                frame[off + 2] = color[2];
+                                frame[off + 3] = 0xFF;
+                            }
+                        }
+                        let _ = (bw, bh); // footprint unused for chip variant
+                    }
+                }
+
+                // Fog-of-war: dim every island tile that hasn't been
+                // explored yet. Pulled from `sim.exploration` (per-island
+                // bitmap). Only relevant in single-island mode.
+                if !world_mode {
+                    let island = &islands[current_island];
+                    let island_id = island.number;
+                    if let Some(em) = sim.exploration.iter()
+                        .find(|e| e.island_id == island_id)
+                    {
+                        let half_tw = rs.tile_w / 2;
+                        let half_th = rs.tile_h / 2;
+                        for tile in &island.tiles {
+                            if em.is_explored(tile.x as u16, tile.y as u16) {
+                                continue;
+                            }
+                            let tx = tile.x as i32;
+                            let ty = tile.y as i32;
+                            let sx = rs.origin_x + (tx - ty) * half_tw;
+                            let sy = rs.origin_y + (tx + ty) * half_th;
+                            for py in 0..rs.tile_h {
+                                let row_half = if py <= rs.tile_h / 2 {
+                                    py * half_tw / half_th.max(1)
+                                } else {
+                                    (rs.tile_h - py) * half_tw / half_th.max(1)
+                                };
+                                let row_start = half_tw - row_half;
+                                let row_end = half_tw + row_half;
+                                for px in row_start..row_end {
+                                    let fx = sx + px;
+                                    let fy = sy + py;
+                                    if fx < 0 || fy < 0 { continue; }
+                                    if (fx as u32) >= rs.width
+                                        || (fy as u32) >= rs.height { continue; }
+                                    let off = ((fy as u32 * rs.width + fx as u32) * 4) as usize;
+                                    if off + 3 >= frame.len() { continue; }
+                                    // 60% darken toward dark gray.
+                                    frame[off] = (frame[off] as u16 * 80 / 255) as u8;
+                                    frame[off + 1] = (frame[off + 1] as u16 * 80 / 255) as u8;
+                                    frame[off + 2] = (frame[off + 2] as u16 * 90 / 255) as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Day/night tint: one full cycle per 3000 game ticks
                 // (~5 in-game minutes). Warm dusk/dawn tints, deep blue at
                 // midnight, no tint at midday.
@@ -3653,6 +3775,19 @@ fn main() {
                     format!("Tile ({},{})", insp.tile_x, insp.tile_y),
                     [0xFF, 0xD7, 0x00, 0xFF],
                 ));
+                // Show stored orientation when this is a non-default tile
+                // (loaded from SZS, etc.) so authors can debug rotation.
+                let tile = islands[current_island].tiles.iter().find(|t| {
+                    t.x as i32 == insp.tile_x && t.y as i32 == insp.tile_y
+                });
+                if let Some(t) = tile {
+                    if t.orientation != 0 {
+                        lines.push((
+                            format!("Orientation: {}", t.orientation),
+                            [0xCC, 0xCC, 0xCC, 0xFF],
+                        ));
+                    }
+                }
             }
             if let Some(wi) = insp.warehouse_idx {
                 let wh = &sim.warehouses[wi];
@@ -5294,12 +5429,16 @@ fn main() {
                     let dst_y = (WINDOW_H as i32 - dst_h) / 2 + scroll_y;
                     let screen_x = dst_x + tex_sx * display_zoom;
                     let screen_y = dst_y + tex_sy * display_zoom;
-                    let label = format!("-{}", amount);
-                    let alpha = ((1.0 - frac) * 255.0) as u8;
-                    let color = if target == 1 {
-                        [0xFF, 0xCC, 0x40, alpha]   // amber for buildings
+                    let label = if target == 2 {
+                        format!("+{}", amount)
                     } else {
-                        [0xFF, 0x60, 0x60, alpha]   // red for units
+                        format!("-{}", amount)
+                    };
+                    let alpha = ((1.0 - frac) * 255.0) as u8;
+                    let color = match target {
+                        1 => [0xFF, 0xCC, 0x40, alpha], // amber buildings
+                        2 => [0x66, 0xFF, 0x66, alpha], // green deposits
+                        _ => [0xFF, 0x60, 0x60, alpha], // red units
                     };
                     let scale = 1u32;
                     let w = tiny_font::measure(&label, scale);

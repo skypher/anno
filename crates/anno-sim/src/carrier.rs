@@ -172,6 +172,7 @@ pub fn handle_arrival(
     warehouses: &mut [Warehouse],
     buildings: &[BuildingInstance],
     island_maps: &[IslandMap],
+    deposit_events: &mut Vec<crate::combat::DamageEvent>,
 ) -> bool {
     match figure.action {
         ActionType::CarryingGoods => {
@@ -183,6 +184,16 @@ pub fn handle_arrival(
                 let good = good_from_u8(figure.carried_good);
                 let deposited = wh.deposit(good, figure.carried_amount);
                 figure.carried_amount -= deposited;
+                if deposited > 0 {
+                    // Reuse the floating-number system to surface a "+N"
+                    // over the warehouse. target=2 means deposit (positive).
+                    deposit_events.push(crate::combat::DamageEvent {
+                        x: wh.tile_x as i32,
+                        y: wh.tile_y as i32,
+                        amount: deposited,
+                        target: 2,
+                    });
+                }
             }
 
             // Return to source building

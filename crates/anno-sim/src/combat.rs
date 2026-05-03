@@ -459,6 +459,56 @@ pub fn tick_escort_targets(
 
 /// Move units toward their player-issued (target_x, target_y) when not in combat.
 /// One tile per `step_interval_ms` where step_interval = 1000 / move_speed (min 100ms).
+/// Naval units that would step into a non-navigable tile (per `ocean_map`)
+/// hold their position for that step instead.
+pub fn tick_unit_orders_with_ocean(
+    units: &mut [MilitaryUnit],
+    dt_ms: u32,
+    ocean_map: Option<&crate::ocean_map::OceanMap>,
+) {
+    for u in units.iter_mut() {
+        if !u.is_alive() || u.combat_target >= 0 {
+            continue;
+        }
+        if u.tile_x == u.target_x && u.tile_y == u.target_y {
+            u.move_timer_ms = 0;
+            continue;
+        }
+        let speed = u.unit_type.stats().move_speed.max(1) as u32;
+        let step_ms = (1000 / speed).max(100);
+        u.move_timer_ms = u.move_timer_ms.saturating_add(dt_ms);
+        let is_naval = u.unit_type.stats().is_naval;
+        while u.move_timer_ms >= step_ms {
+            u.move_timer_ms -= step_ms;
+            let dx = u.target_x - u.tile_x;
+            let dy = u.target_y - u.tile_y;
+            if dx == 0 && dy == 0 { break; }
+            let sx = dx.signum();
+            let sy = dy.signum();
+            let (nx, ny) = if dx.abs() > 0 && dy.abs() > 0 {
+                (u.tile_x + sx, u.tile_y + sy)
+            } else if dx.abs() > 0 {
+                (u.tile_x + sx, u.tile_y)
+            } else {
+                (u.tile_x, u.tile_y + sy)
+            };
+            // Naval clamp: refuse moves onto land.
+            if is_naval {
+                if let Some(om) = ocean_map {
+                    if !om.is_navigable(nx, ny) { break; }
+                }
+            }
+            u.tile_x = nx;
+            u.tile_y = ny;
+            u.direction = match (sx, sy) {
+                (0, -1) => 0, (1, -1) => 1, (1, 0) => 2, (1, 1) => 3,
+                (0, 1) => 4, (-1, 1) => 5, (-1, 0) => 6, (-1, -1) => 7,
+                _ => u.direction,
+            };
+        }
+    }
+}
+
 pub fn tick_unit_orders(units: &mut [MilitaryUnit], dt_ms: u32) {
     for u in units.iter_mut() {
         if !u.is_alive() || u.combat_target >= 0 {
