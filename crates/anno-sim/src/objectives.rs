@@ -181,6 +181,7 @@ impl ObjectiveSet {
         primary_population: Option<u32>,
         primary_tier: Option<u8>,
         cooperative_population: Option<u32>,
+        _cooperative_tier: Option<u8>,
     ) -> Self {
         const POP: u32 = 1 << 0;
         const COOP: u32 = 1 << 4;
@@ -214,7 +215,7 @@ mod tests {
     fn from_mission_flags_translates_population_and_cooperative() {
         // Plague-of-Pirates style: just population, no neighbour.
         let s = ObjectiveSet::from_mission_flags(
-            0x0401, Some(5_000), None, None,
+            0x0401, Some(5_000), None, None, None,
         );
         assert_eq!(s.items.len(), 1);
         assert!(matches!(s.items[0].0,
@@ -222,7 +223,7 @@ mod tests {
 
         // Good-Neighbors style: pop + cooperative neighbour.
         let s = ObjectiveSet::from_mission_flags(
-            0x0011, Some(1_000), Some(3), Some(1_000),
+            0x0011, Some(1_000), Some(3), Some(1_000), None,
         );
         assert_eq!(s.items.len(), 2);
         assert!(matches!(s.items[0].0,
@@ -232,7 +233,7 @@ mod tests {
 
         // Tutorial / no-flag: empty objective set so caller can fall
         // back to default_starter.
-        let s = ObjectiveSet::from_mission_flags(0, None, None, None);
+        let s = ObjectiveSet::from_mission_flags(0, None, None, None, None);
         assert!(s.items.is_empty());
     }
 

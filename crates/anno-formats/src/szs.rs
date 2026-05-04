@@ -206,10 +206,22 @@ impl Mission {
         MissionGoals {
             primary_population: pop_active.then(|| read_u32(0).unwrap_or(0))
                 .filter(|&v| v > 0),
-            primary_tier: pop_active.then(|| read_u32(1).unwrap_or(0) as u8)
-                .filter(|&t| t <= 4),
+            // u32 1 = primary tier; 0 means "unspecified" (Plague
+            // and a couple of pirate-defence missions leave it
+            // blank because the goal text doesn't pin a tier).
+            primary_tier: pop_active.then(|| read_u32(1).unwrap_or(0))
+                .filter(|&v| v >= 1 && v <= 4)
+                .map(|v| v as u8),
             cooperative_population: coop_active.then(|| read_u32(18).unwrap_or(0))
                 .filter(|&v| v > 0),
+            // u32 19 holds the cooperative tier; 0 means
+            // "unspecified" (Good Neighbors leaves it blank
+            // even though the player-side goal at u32 1 is
+            // tier 3). Surface as None in that case.
+            cooperative_tier: coop_active
+                .then(|| read_u32(19).unwrap_or(0))
+                .filter(|&v| v >= 1 && v <= 4)
+                .map(|v| v as u8),
         }
     }
 }
@@ -253,9 +265,14 @@ pub struct MissionGoals {
     pub primary_tier: Option<u8>,
     /// Cooperative neighbour-population requirement
     /// (`MISSION_FLAG_COOPERATIVE`). Stored at goals_raw u32 18
-    /// (chunk offset 0x8B8). Both Good Neighbors and
-    /// New Horizons2 use this slot.
+    /// (chunk offset 0x8B8). Good Neighbors / New Horizons2 /
+    /// Alliance all use this slot.
     pub cooperative_population: Option<u32>,
+    /// Tier index the cooperative neighbour must reach. Stored at
+    /// goals_raw u32 19. Every cooperative scenario in the
+    /// shipping corpus pins this to 3 (Merchant tier). `None`
+    /// when no cooperative goal is configured.
+    pub cooperative_tier: Option<u8>,
 }
 const AUFTRAG4_TOTAL_BYTES: usize = 2244;
 
@@ -836,10 +853,18 @@ mod tests {
         assert_eq!(g.primary_population, Some(5_000));
         assert_eq!(g.cooperative_population, None);
         // Good Neighbors: 1 000 in own city + 1 000 in neighbour.
+        // Neighbour-tier slot is 0 here (no specific tier
+        // requirement) so cooperative_tier is None.
         let g = load("Good Neighbors.szs").unwrap().goals();
         assert_eq!(g.primary_population, Some(1_000));
         assert_eq!(g.primary_tier, Some(3)); // Merchant
         assert_eq!(g.cooperative_population, Some(1_000));
+        assert_eq!(g.cooperative_tier, None);
+        // The Alliance pins the cooperative neighbour at tier 3
+        // (Merchant) — the u32 19 slot is filled in for that one.
+        let g = load("The Alliance.szs").unwrap().goals();
+        assert_eq!(g.cooperative_population, Some(1_000));
+        assert_eq!(g.cooperative_tier, Some(3));
         // Tutorial0: no flags → no decoded goals.
         let g = load("Tutorial0.szs").unwrap().goals();
         assert_eq!(g.primary_population, None);

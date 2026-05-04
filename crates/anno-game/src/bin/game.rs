@@ -964,7 +964,15 @@ fn main() {
                 println!("Goal: reach {} inhabitants{}", pop, tier);
             }
             if let Some(coop) = goals.cooperative_population {
-                println!("Goal: assist neighbour to {} inhabitants", coop);
+                let tier = match goals.cooperative_tier {
+                    Some(0) => " of Pioneer tier",
+                    Some(1) => " of Settler tier",
+                    Some(2) => " of Citizen tier",
+                    Some(3) => " of Merchant tier",
+                    Some(4) => " at Aristocrat tier",
+                    _ => "",
+                };
+                println!("Goal: assist neighbour to {} inhabitants{}", coop, tier);
             }
             println!("---");
             println!("{}", mission.briefing.trim_end());
@@ -992,6 +1000,7 @@ fn main() {
             g.primary_population,
             g.primary_tier,
             g.cooperative_population,
+            g.cooperative_tier,
         );
         if !scenario_set.items.is_empty() {
             sim.objectives = scenario_set;
