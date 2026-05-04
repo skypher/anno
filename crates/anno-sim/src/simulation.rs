@@ -897,7 +897,6 @@ impl Simulation {
                             crate::types::Good::Spices, crate::types::Good::WildGame,
                             crate::types::Good::Cotton, crate::types::Good::Silk,
                             crate::types::Good::Fish, crate::types::Good::Grapes,
-                            crate::types::Good::GoldOre,
                             crate::types::Good::TobaccoProducts,
                         ];
                         let next_id = self.trade_routes.iter()

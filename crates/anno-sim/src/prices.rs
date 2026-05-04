@@ -28,7 +28,6 @@ pub fn price_of(good: Good) -> GoodPrice {
         Wood    => GoodPrice { buy: 4,  sell: 2  },
         Stone   => GoodPrice { buy: 5,  sell: 3  },
         Ore     => GoodPrice { buy: 6,  sell: 3  },
-        GoldOre => GoodPrice { buy: 25, sell: 14 },
         Iron    => GoodPrice { buy: 8,  sell: 5  },
         Gold    => GoodPrice { buy: 50, sell: 28 },
         // Animals / plantation raw goods

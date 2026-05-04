@@ -1455,7 +1455,7 @@ fn main() {
                             Good::Bricks, Good::Swords, Good::Cannons, Good::Muskets,
                             Good::Stone, Good::Cocoa, Good::Spices, Good::WildGame,
                             Good::Cotton, Good::Silk, Good::Fish, Good::Grapes,
-                            Good::GoldOre, Good::TobaccoProducts,
+                            Good::TobaccoProducts,
                         ];
                         match key {
                             Keycode::Up => {
@@ -1899,7 +1899,7 @@ fn main() {
                                         Good::Muskets, Good::Stone, Good::Cocoa,
                                         Good::Spices, Good::WildGame, Good::Cotton,
                                         Good::Silk, Good::Fish, Good::Grapes,
-                                        Good::GoldOre, Good::TobaccoProducts,
+                                        Good::TobaccoProducts,
                                     ];
                                     let mut route = TradeRoute::new(next_route_id, 0);
                                     for &(island_id, wx, wy, mode) in &draft_route_stops {
@@ -2816,7 +2816,7 @@ fn main() {
                                     Good::Tools, Good::Bricks, Good::Swords, Good::Cannons,
                                     Good::Muskets, Good::Stone, Good::Cocoa, Good::Spices,
                                     Good::WildGame, Good::Cotton, Good::Silk, Good::Fish,
-                                    Good::Grapes, Good::GoldOre, Good::TobaccoProducts,
+                                    Good::Grapes, Good::TobaccoProducts,
                                 ];
                                 for &g in &all_goods {
                                     let qty = w.stock(g);
@@ -5325,7 +5325,7 @@ fn main() {
                 Good::Bricks, Good::Swords, Good::Cannons, Good::Muskets,
                 Good::Stone, Good::Cocoa, Good::Spices, Good::WildGame,
                 Good::Cotton, Good::Silk, Good::Fish, Good::Grapes,
-                Good::GoldOre, Good::TobaccoProducts,
+                Good::TobaccoProducts,
             ];
             let panel_w = 380u32;
             let header_h = 30i32;

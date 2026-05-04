@@ -22,39 +22,44 @@ use crate::types::Good;
 /// production tick can consume them as an input. ALLWARE / NOWARE /
 /// GRAS are flag/terrain pseudo-goods → `Good::None`.
 fn parse_good(name: &str) -> Good {
+    // Mapping keys verified against the four shipping COD files
+    // (haeuser.cod, figuren.cod, text.cod, editor.cod). Singular
+    // forms (`SCHWERT`, `STEIN`, etc.), `RUM`, `WEIN`, `GOLDERZ`
+    // and other speculative spellings were removed because the
+    // strings never appear in the data — defensive mappings to
+    // strings the game cannot emit are dead code.
     match name {
         "HOLZ" | "BAUM" => Good::Wood,
         "EISEN" => Good::Iron,
         "EISENERZ" | "ERZE" => Good::Ore,
         "GOLD" => Good::Gold,
-        "GOLDERZ" => Good::GoldOre,
         "WOLLE" => Good::Wool,
         "ZUCKER" => Good::Sugar,
         "ZUCKERROHR" => Good::SugarCane,
         "TABAK" | "TABAKBAUM" => Good::Tobacco,
-        "RIND" | "VIEH" => Good::Cattle,
+        "RIND" => Good::Cattle,
         "FLEISCH" => Good::Meat,
         "GETREIDE" | "KORN" => Good::Grain,
         "MEHL" => Good::Flour,
         "WERKZEUG" => Good::Tools,
         "ZIEGEL" => Good::Bricks,
-        "STEINE" | "STEIN" => Good::Stone,
-        "SCHWERT" | "SCHWERTER" => Good::Swords,
-        "MUSKETE" | "MUSKETEN" => Good::Muskets,
-        "KANONE" | "KANONEN" => Good::Cannons,
+        "STEINE" => Good::Stone,
+        "SCHWERTER" => Good::Swords,
+        "MUSKETEN" => Good::Muskets,
+        "KANONEN" => Good::Cannons,
         "NAHRUNG" => Good::Food,
-        "STOFFE" | "STOFF" | "TUCH" => Good::Cloth,
-        "ALKOHOL" | "RUM" => Good::Alcohol,
-        "TABAKWAREN" | "TABAKWARE" => Good::TobaccoProducts,
-        "GEWUERZ" | "GEWUERZE" | "GEWUERZBAUM" => Good::Spices,
+        "STOFFE" => Good::Cloth,
+        "ALKOHOL" => Good::Alcohol,
+        "TABAKWAREN" => Good::TobaccoProducts,
+        "GEWUERZE" | "GEWUERZBAUM" => Good::Spices,
         "KAKAO" | "KAKAOBAUM" => Good::Cocoa,
-        "WEINTRAUBEN" | "WEIN" => Good::Grapes,
+        "WEINTRAUBEN" => Good::Grapes,
         "WILD" => Good::WildGame,
         "BAUMWOLLE" => Good::Cotton,
         "SEIDE" => Good::Silk,
         "SCHMUCK" => Good::Jewelry,
         "KLEIDUNG" => Good::Clothing,
-        "FISCHE" | "FISCH" => Good::Fish,
+        "FISCHE" => Good::Fish,
         // Flags / terrain pseudo-goods that don't correspond to a
         // player-facing good slot.
         "NOWARE" | "ALLWARE" | "GRAS" | "" => Good::None,
@@ -158,7 +163,6 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         Good::Tools => 25,
         Good::Ore => 60,
         Good::Gold => 60,
-        Good::GoldOre => 60,
         Good::Jewelry => 45,
         // Cloth chain.
         Good::Cloth => 20,                // Weaving mill / weaver / tailor

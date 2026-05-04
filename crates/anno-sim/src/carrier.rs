@@ -282,7 +282,6 @@ fn good_from_u8(val: u8) -> Good {
         21 => Good::Grapes,
         22 => Good::Stone,
         23 => Good::Ore,
-        24 => Good::GoldOre,
         25 => Good::WildGame,
         26 => Good::Cotton,
         27 => Good::Silk,
