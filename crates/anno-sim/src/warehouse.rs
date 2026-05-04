@@ -9,9 +9,6 @@
 use crate::types::Good;
 use std::collections::HashMap;
 
-/// Maximum goods slots per warehouse.
-pub const MAX_GOOD_TYPES: usize = 32;
-
 /// Per-tier warehouse storage capacity (tons per good). Verified
 /// against `haeuser.cod`: the four `Kind: KONTOR` building
 /// definitions carry `Maxlager: 30 / 50 / 75 / 100` paired with
