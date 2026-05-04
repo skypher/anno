@@ -179,15 +179,15 @@ fn main() {
     // Set up military units for a combat demonstration
     sim.diplomacy.set(0, 1, Diplomacy::War);
     // Human player: 3 swordsmen + 1 cannon at island center
-    sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 0, 20, 20));
-    sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 0, 21, 20));
-    sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 0, 20, 21));
+    sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 0, 20, 20));
+    sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 0, 21, 20));
+    sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 0, 20, 21));
     sim.military_units.push(MilitaryUnit::new(UnitType::Cannon, 0, 18, 20));
     // AI player: 4 pikemen + 1 musketeer approaching
-    sim.military_units.push(MilitaryUnit::new(UnitType::Pikeman, 1, 25, 20));
-    sim.military_units.push(MilitaryUnit::new(UnitType::Pikeman, 1, 25, 21));
-    sim.military_units.push(MilitaryUnit::new(UnitType::Pikeman, 1, 26, 20));
-    sim.military_units.push(MilitaryUnit::new(UnitType::Pikeman, 1, 26, 21));
+    sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 25, 20));
+    sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 25, 21));
+    sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 26, 20));
+    sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 26, 21));
     sim.military_units.push(MilitaryUnit::new(UnitType::Musketeer, 1, 27, 20));
     println!(
         "Combat: {} human units vs {} AI units (at war)",

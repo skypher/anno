@@ -64,11 +64,14 @@ pub enum Good {
     Fish = 30,       // FISCHE — fish
 }
 
-/// Military unit types.
+/// Military unit types — mirrors the four `FIGTYP_*` land entries
+/// in `figuren.cod` (`SCHWERT`, `KAVALERIE`, `MUSKETIER`,
+/// `KANONIER`). The discriminants follow the order of `[FIGKIND]`
+/// in `text.cod`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MilitaryUnit {
-    Swordsman = 1,
+    Infantry = 1,
     Cavalry = 2,
     Musketeer = 3,
     Cannoneer = 4,

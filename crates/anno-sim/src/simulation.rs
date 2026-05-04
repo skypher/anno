@@ -819,7 +819,7 @@ impl Simulation {
                         let owner = self.ai_controllers[ai_idx].player_idx;
                         let pick_type = |k: u32| -> (UnitType, i32) {
                             match k % 10 {
-                                0..=3 => (UnitType::Swordsman, 100),
+                                0..=3 => (UnitType::Infantry, 100),
                                 4..=6 => (UnitType::Musketeer, 150),
                                 7..=8 => (UnitType::Cavalry, 200),
                                 _      => (UnitType::Cannon,    300),
@@ -1122,7 +1122,7 @@ impl Simulation {
                     let dx = (k % 3) - 1;
                     let dy = (k / 3) - 1;
                     self.military_units.push(MilitaryUnit::new(
-                        crate::combat::UnitType::Swordsman,
+                        crate::combat::UnitType::Infantry,
                         owner,
                         wx as i32 + dx,
                         wy as i32 + dy,
@@ -2147,7 +2147,7 @@ mod tests {
         sim.warehouses.push(Warehouse::new(0, 1, 30, 30));
         sim.diplomacy.set(0, 1, Diplomacy::War);
         // Hostile unit within 8 tiles of the AI's warehouse.
-        sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 0, 32, 32));
+        sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 0, 32, 32));
         sim.ai_controllers.push(AiController::new(
             1, AiPersonality::Military, Difficulty::Hard,
         ));
@@ -2349,7 +2349,7 @@ mod tests {
         let b = BuildingInstance::new(0, 0, 10, 10, 0); // player 0 owns
         sim.buildings.push(b);
         // Enemy unit standing right next to the footprint.
-        sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 1, 11, 12));
+        sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 11, 12));
         // Run several military ticks until building dies.
         for _ in 0..30 {
             sim.tick_military();
@@ -2396,7 +2396,7 @@ mod tests {
             defensive_cannons: 0,
         });
         sim.buildings.push(BuildingInstance::new(0, 0, 10, 10, 0));
-        sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 1, 11, 12));
+        sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 11, 12));
         // No diplomacy edit → relation stays Neutral, no damage.
         for _ in 0..30 {
             sim.tick_military();
@@ -2477,7 +2477,7 @@ mod tests {
         sim.diplomacy.set(0, 1, Diplomacy::War);
         // 4 idle AI units sitting near their warehouse.
         for k in 0..4 {
-            let mut u = MilitaryUnit::new(UnitType::Swordsman, 1, 10 + k, 10);
+            let mut u = MilitaryUnit::new(UnitType::Infantry, 1, 10 + k, 10);
             u.target_x = u.tile_x;
             u.target_y = u.tile_y;
             sim.military_units.push(u);
@@ -2504,7 +2504,7 @@ mod tests {
         sim.players[1].gold = 1_000;
         sim.warehouses.push(Warehouse::new(0, 1, 30, 30));
         // Neutral player walking near the warehouse — not a threat.
-        sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 0, 32, 32));
+        sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 0, 32, 32));
         sim.ai_controllers.push(AiController::new(
             1, AiPersonality::Military, Difficulty::Hard,
         ));
@@ -2752,7 +2752,7 @@ mod tests {
         sim.players[1].gold = 5_000;
         // AI(1) is Military and beefy; player 0 is weak.
         for _ in 0..10 {
-            sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 1, 0, 0));
+            sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 0, 0));
         }
         sim.ai_controllers.push(AiController::new(
             1, AiPersonality::Military, Difficulty::Hard,
@@ -2774,7 +2774,7 @@ mod tests {
         sim.diplomacy.set(1, 0, Diplomacy::War);
         // Player 0 vastly outmuscles AI(1).
         for _ in 0..30 {
-            sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 0, 0, 0));
+            sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 0, 0, 0));
         }
         sim.ai_controllers.push(AiController::new(
             1, AiPersonality::Military, Difficulty::Hard,
@@ -2793,7 +2793,7 @@ mod tests {
         sim.players[0].gold = 0;
         sim.players[1].gold = 5_000;
         for _ in 0..10 {
-            sim.military_units.push(MilitaryUnit::new(UnitType::Swordsman, 1, 0, 0));
+            sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 0, 0));
         }
         sim.ai_controllers.push(AiController::new(
             1, AiPersonality::Economic, Difficulty::Hard,
@@ -2986,7 +2986,7 @@ mod tests {
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.military_units.push(MilitaryUnit::new(
-            UnitType::Swordsman, 0, 0, 0,
+            UnitType::Infantry, 0, 0, 0,
         ));
         let ok = sim.apply_command(&crate::commands::Command::SellShip {
             player: 0, unit_index: 0,
@@ -3023,7 +3023,7 @@ mod tests {
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.military_units.push(MilitaryUnit::new(
-            UnitType::Swordsman, 0, 0, 0,
+            UnitType::Infantry, 0, 0, 0,
         ));
         assert!(!sim.apply_command(&crate::commands::Command::ArmShip {
             player: 0, unit_index: 0, target_cannons: 1,

@@ -6252,15 +6252,15 @@ fn init_simulation(
     // Military setup
     sim.diplomacy.set(0, 1, Diplomacy::War);
     sim.military_units
-        .push(MilitaryUnit::new(UnitType::Swordsman, 0, 20, 20));
+        .push(MilitaryUnit::new(UnitType::Infantry, 0, 20, 20));
     sim.military_units
-        .push(MilitaryUnit::new(UnitType::Swordsman, 0, 21, 20));
+        .push(MilitaryUnit::new(UnitType::Infantry, 0, 21, 20));
     sim.military_units
         .push(MilitaryUnit::new(UnitType::Cannon, 0, 18, 20));
     sim.military_units
-        .push(MilitaryUnit::new(UnitType::Pikeman, 1, 25, 20));
+        .push(MilitaryUnit::new(UnitType::Infantry, 1, 25, 20));
     sim.military_units
-        .push(MilitaryUnit::new(UnitType::Pikeman, 1, 25, 21));
+        .push(MilitaryUnit::new(UnitType::Infantry, 1, 25, 21));
     sim.military_units
         .push(MilitaryUnit::new(UnitType::Musketeer, 1, 27, 20));
 

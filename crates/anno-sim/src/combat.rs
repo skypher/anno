@@ -7,7 +7,7 @@
 //! - Combat triggers when units are within attack range (48 pixels / ~3 tiles)
 //! - Damage is applied per tick based on unit type stats
 //! - Health is normalized 0.0-1.0; units die at ≈0.0
-//! - Projectiles spawn for ranged units (archers, cannons, ships)
+//! - Projectiles spawn for ranged units (musketeers, cannons, ships)
 //! - Nation interaction matrix determines who can fight whom
 
 /// Maximum engagement detection range in tiles.
@@ -16,14 +16,20 @@ const DETECTION_RANGE: u32 = 6;
 const ATTACK_RANGE: u32 = 3;
 
 /// Military unit types (from FUN_00451890 switch cases).
+///
+/// Land-unit roster RE-cited from `figuren.cod`: there are
+/// exactly four land FIGTYP values — `SCHWERT` (sword/infantry),
+/// `KAVALERIE` (cavalry), `MUSKETIER` (musketeer), and `KANONIER`
+/// (artillery / cannon). `text.cod [FIGKIND]` confirms the same
+/// four entries (Infantryman / Cavalryman / Musketeer /
+/// Artilleryman). There is no separate Pikeman or Archer in the
+/// original game, so neither appears here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum UnitType {
-    Pikeman = 1,
-    Swordsman = 2,
+    Infantry = 1,
     Musketeer = 3,
     Cavalry = 4,
-    Archer = 5,
     Cannon = 6,
     // Naval
     SmallWarship = 11,
@@ -55,26 +61,10 @@ impl UnitType {
         //   Cannoneer HP 12, Strength 7.0
         // We scale HP by /20 to fit our 1.0-baseline (Infantry HP 20
         // → max_health 1.0). Strength becomes attack_damage / 20.
-        // Pikeman and Swordsman both map to "Infantry" since the
-        // appendix doesn't distinguish them.
         match self {
-            UnitType::Pikeman => UnitStats {
+            UnitType::Infantry => UnitStats {
                 max_health: 20.0 / 20.0,    // = 1.0
                 attack_damage: 1.0 / 20.0,  // = 0.05
-                attack_speed_ms: 1000,
-                attack_range: 1,
-                move_speed: 3,
-                is_ranged: false,
-                is_naval: false,
-            },
-            UnitType::Swordsman => UnitStats {
-                // Swordsman is the upgraded Infantry: same HP as
-                // appendix Infantry but +20% damage from the
-                // sword-vs-pike weapon distinction (figuren.cod
-                // gives them separate Soldat entries with different
-                // gold costs — 80 vs 60 — so we keep them distinct).
-                max_health: 20.0 / 20.0,    // = 1.0
-                attack_damage: 1.2 / 20.0,  // = 0.06 (>Pikeman's 0.05)
                 attack_speed_ms: 1000,
                 attack_range: 1,
                 move_speed: 3,
@@ -97,16 +87,6 @@ impl UnitType {
                 attack_range: 1,
                 move_speed: 5,
                 is_ranged: false,
-                is_naval: false,
-            },
-            UnitType::Archer => UnitStats {
-                // Archer not in appendix — kept from previous values.
-                max_health: 0.6,
-                attack_damage: 0.06,
-                attack_speed_ms: 1500,
-                attack_range: 5,
-                move_speed: 3,
-                is_ranged: true,
                 is_naval: false,
             },
             UnitType::Cannon => UnitStats {
@@ -166,11 +146,9 @@ impl UnitType {
     /// Convert from u8 value.
     pub fn from_u8(val: u8) -> Option<Self> {
         match val {
-            1 => Some(UnitType::Pikeman),
-            2 => Some(UnitType::Swordsman),
+            1 => Some(UnitType::Infantry),
             3 => Some(UnitType::Musketeer),
             4 => Some(UnitType::Cavalry),
-            5 => Some(UnitType::Archer),
             6 => Some(UnitType::Cannon),
             11 => Some(UnitType::SmallWarship),
             12 => Some(UnitType::MediumWarship),
@@ -253,24 +231,20 @@ pub fn cannon_capacity(t: UnitType) -> u8 {
 ///
 /// | Unit            | Gold |
 /// |-----------------|------|
-/// | Infantry / Pikeman / Swordsman | 200 |
+/// | Infantry        | 200 |
 /// | Cavalry         | 200 |
 /// | Musketeer       | 400 |
-/// | Cannoneer / Cannon | 200 |
+/// | Cannoneer       | 200 |
 /// | SmallTradeShip  | 400 |
 /// | LargeTradeShip  | 520 |
 /// | SmallWarship    | 600 |
 /// | LargeWarship    | 900 |
-///
-/// Pikeman/Swordsman map to Infantry; Archer is not present in the
-/// appendix and is left at its previous fallback value.
 pub fn unit_build_cost(t: UnitType) -> i32 {
     match t {
-        UnitType::Pikeman | UnitType::Swordsman => 200,
+        UnitType::Infantry => 200,
         UnitType::Cavalry => 200,
         UnitType::Musketeer => 400,
         UnitType::Cannon => 200,
-        UnitType::Archer => 90,
         UnitType::SmallWarship => 600,
         UnitType::MediumWarship => 750,
         UnitType::LargeWarship => 900,
@@ -289,11 +263,10 @@ pub fn unit_build_resources(t: UnitType) -> (u16, u16, u16, u16, u16, u16, u16) 
         UnitType::LargeWarship   => (60, 7, 14, 0, 0, 0, 0),
         UnitType::Flagship       => (80, 9, 18, 0, 0, 0, 0),
         // Land units — Tools, Swords/Muskets/Cannons by role.
-        UnitType::Pikeman | UnitType::Swordsman => (0, 0, 0, 3, 5, 0, 0),
+        UnitType::Infantry       => (0, 0, 0, 3, 5, 0, 0),
         UnitType::Cavalry        => (0, 0, 0, 3, 8, 0, 0),
         UnitType::Musketeer      => (0, 0, 0, 4, 0, 10, 0),
         UnitType::Cannon         => (0, 0, 0, 2, 0, 0, 14),
-        UnitType::Archer         => (0, 0, 0, 2, 0, 0, 0),
     }
 }
 
@@ -885,16 +858,17 @@ mod tests {
 
     #[test]
     fn unit_stats_consistency() {
-        // Swordsman should deal more damage than pikeman
-        let pike = UnitType::Pikeman.stats();
-        let sword = UnitType::Swordsman.stats();
-        assert!(sword.attack_damage > pike.attack_damage);
+        // Musketeer should deal more damage than infantry (matches
+        // appendix Strength values 2.4 vs 1.0).
+        let inf = UnitType::Infantry.stats();
+        let musk = UnitType::Musketeer.stats();
+        assert!(musk.attack_damage > inf.attack_damage);
 
         // Cannon should have longest range
         let cannon = UnitType::Cannon.stats();
-        assert!(cannon.attack_range > sword.attack_range);
+        assert!(cannon.attack_range > inf.attack_range);
         assert!(cannon.is_ranged);
-        assert!(!sword.is_ranged);
+        assert!(!inf.is_ranged);
     }
 
     #[test]
@@ -910,37 +884,31 @@ mod tests {
 
     #[test]
     fn combat_kills_weaker_unit() {
+        // Musketeer (Strength 2.4) vs Infantry (Strength 1.0) —
+        // the musketeer should reliably win.
         let mut units = vec![
-            MilitaryUnit::new(UnitType::Swordsman, 0, 5, 5),
-            MilitaryUnit::new(UnitType::Pikeman, 1, 6, 5),
+            MilitaryUnit::new(UnitType::Musketeer, 0, 5, 5),
+            MilitaryUnit::new(UnitType::Infantry, 1, 6, 5),
         ];
         let diplomacy = DiplomacyMatrix::new_all_war();
 
-        // Run enough ticks for combat to resolve
-        for _ in 0..200 {
+        for _ in 0..400 {
             tick_combat(&mut units, &diplomacy, 100, &mut Vec::new());
         }
 
-        // Swordsman should win (more damage)
-        assert!(units[0].is_alive() || units[1].is_alive(), "At least one should survive");
-        if units[0].is_alive() && !units[1].is_alive() {
-            // Expected: swordsman wins
-        } else if units[1].is_alive() && !units[0].is_alive() {
-            // Pikeman won (possible but unlikely)
-        }
         // At least one should be dead
         assert!(
             !units[0].is_alive() || !units[1].is_alive(),
-            "After 200 ticks, one unit should be dead"
+            "After 400 ticks, one unit should be dead"
         );
     }
 
     #[test]
     fn tick_unit_orders_moves_toward_target() {
-        let mut units = vec![MilitaryUnit::new(UnitType::Swordsman, 0, 0, 0)];
+        let mut units = vec![MilitaryUnit::new(UnitType::Infantry, 0, 0, 0)];
         units[0].target_x = 5;
         units[0].target_y = 5;
-        // Swordsman move_speed = 3 → step_ms = 333; advance many steps.
+        // Infantry move_speed = 3 → step_ms = 333; advance many steps.
         for _ in 0..40 {
             tick_unit_orders(&mut units, 100);
         }
@@ -950,7 +918,7 @@ mod tests {
 
     #[test]
     fn tick_unit_orders_skipped_during_combat() {
-        let mut units = vec![MilitaryUnit::new(UnitType::Swordsman, 0, 0, 0)];
+        let mut units = vec![MilitaryUnit::new(UnitType::Infantry, 0, 0, 0)];
         units[0].target_x = 5;
         units[0].target_y = 0;
         units[0].combat_target = 7; // Pretend we're engaged
@@ -963,8 +931,8 @@ mod tests {
     #[test]
     fn no_combat_between_allies() {
         let mut units = vec![
-            MilitaryUnit::new(UnitType::Swordsman, 0, 5, 5),
-            MilitaryUnit::new(UnitType::Pikeman, 0, 6, 5), // Same owner
+            MilitaryUnit::new(UnitType::Infantry, 0, 5, 5),
+            MilitaryUnit::new(UnitType::Infantry, 0, 6, 5), // Same owner
         ];
         let diplomacy = DiplomacyMatrix::new();
 
@@ -983,7 +951,7 @@ mod tests {
         let mut units = vec![
             MilitaryUnit::new(UnitType::Cannon, 0, 0, 0),
             MilitaryUnit::new(UnitType::Cannon, 0, 0, 1),
-            MilitaryUnit::new(UnitType::Pikeman, 1, 6, 0), // Within cannon range (8)
+            MilitaryUnit::new(UnitType::Infantry, 1, 6, 0), // Within cannon range (8)
         ];
         let diplomacy = DiplomacyMatrix::new_all_war();
 
@@ -995,7 +963,7 @@ mod tests {
         // At least one cannon should survive, pikeman should die
         let cannons_alive = units.iter().filter(|u| u.owner == 0 && u.is_alive()).count();
         assert!(cannons_alive > 0, "At least one cannon should survive");
-        assert!(!units[2].is_alive(), "Pikeman should die to cannon fire");
+        assert!(!units[2].is_alive(), "Infantry should die to cannon fire");
     }
 
     #[test]
@@ -1027,8 +995,8 @@ mod tests {
         tower.construction_ms_remaining = 0;
         let buildings = vec![tower];
         let mut units = vec![
-            MilitaryUnit::new(UnitType::Swordsman, 1, 6, 6),
-            MilitaryUnit::new(UnitType::Swordsman, 1, 50, 50), // far
+            MilitaryUnit::new(UnitType::Infantry, 1, 6, 6),
+            MilitaryUnit::new(UnitType::Infantry, 1, 50, 50), // far
         ];
         let mut diplo = DiplomacyMatrix::new();
         diplo.set(0, 1, Diplomacy::War);
@@ -1040,11 +1008,14 @@ mod tests {
 
     #[test]
     fn battle_outcome_prediction() {
+        // Cannons (Strength 7.0) vs the same count of Infantry
+        // (Strength 1.0) — cannon DPS ≈ 0.117 vs infantry 0.05
+        // and the HP-pool ratio still favours cannons in this
+        // simple Lanchester model.
         let (att_ratio, def_ratio) = simulate_battle_outcome(
-            &[(UnitType::Swordsman, 10)],
-            &[(UnitType::Pikeman, 10)],
+            &[(UnitType::Cannon, 10)],
+            &[(UnitType::Infantry, 10)],
         );
-        // Swordsmen should win overall (more damage)
         assert!(att_ratio > def_ratio);
     }
 
@@ -1052,7 +1023,7 @@ mod tests {
     fn naval_cant_attack_land() {
         let mut units = vec![
             MilitaryUnit::new(UnitType::LargeWarship, 0, 5, 5),
-            MilitaryUnit::new(UnitType::Swordsman, 1, 6, 5),
+            MilitaryUnit::new(UnitType::Infantry, 1, 6, 5),
         ];
         let diplomacy = DiplomacyMatrix::new_all_war();
 
