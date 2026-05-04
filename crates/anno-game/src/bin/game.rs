@@ -940,7 +940,17 @@ fn main() {
     }
     if let Some(mission) = szs.mission.as_ref() {
         if !mission.briefing.is_empty() {
-            println!("Mission flags 0x{:04x}", mission.flags);
+            use anno_formats::szs::{
+                MISSION_FLAG_POPULATION, MISSION_FLAG_COOPERATIVE,
+                MISSION_FLAG_RANKING, MISSION_FLAG_PIRATE,
+            };
+            let mut tags = Vec::new();
+            if mission.flags & MISSION_FLAG_POPULATION  != 0 { tags.push("population"); }
+            if mission.flags & MISSION_FLAG_COOPERATIVE != 0 { tags.push("cooperative"); }
+            if mission.flags & MISSION_FLAG_RANKING     != 0 { tags.push("ranking"); }
+            if mission.flags & MISSION_FLAG_PIRATE      != 0 { tags.push("pirate-combat"); }
+            let tag_str = if tags.is_empty() { String::new() } else { format!("  [{}]", tags.join(", ")) };
+            println!("Mission flags 0x{:04x}{}", mission.flags, tag_str);
             println!("---");
             println!("{}", mission.briefing.trim_end());
             println!("---");
