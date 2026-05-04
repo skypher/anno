@@ -16,7 +16,12 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// On-disk save format version. Bump on incompatible changes.
-pub const SAVE_VERSION: u32 = 12;
+///
+/// v13: FREE_TRADER_SLOT / NATIVE_SLOT corrected from 5 / 4 to
+///      4 / 5 (binary-confirmed). Pre-v13 saves have building /
+///      unit owner values for those factions swapped — refuse
+///      to load them rather than produce a corrupt world.
+pub const SAVE_VERSION: u32 = 13;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
