@@ -33,6 +33,23 @@ pub struct Island {
     pub x_pos: u16,
     pub y_pos: u16,
     pub tiles: Vec<IslandTile>,
+    /// Optional city info from the matching `STADT4` chunk that
+    /// follows this island's INSELHAUS in chunk order. Populated
+    /// only when the island carries a settled town.
+    pub city: Option<City>,
+}
+
+/// Per-island city info parsed from a STADT4 chunk (168 bytes).
+///
+/// Layout (verified across A Plague of Pirates / Atoll /
+/// Cooperation): byte 0 = owning player ID, bytes 0x87..0xa7 hold
+/// a null-terminated CP1252 city name. The intermediate region
+/// (0x78..0x86, fifteen 0x80-sentinel bytes) flags some per-tier
+/// or per-good state and is preserved on `Chunk` for later RE.
+#[derive(Debug, Clone)]
+pub struct City {
+    pub owner: u8,
+    pub name: String,
 }
 
 /// A single tile/building record from INSELHAUS (8 bytes).
@@ -189,15 +206,17 @@ impl SzsFile {
             if chunks[i].name == "INSEL5" && chunks[i].data.len() >= 8 {
                 let mut island = Self::parse_insel5(&chunks[i].data);
 
-                // Look for the matching INSELHAUS chunk (follows INSEL5, possibly with
-                // other chunks in between for the same island)
+                // Look for the matching INSELHAUS / STADT4 chunks
+                // (follow INSEL5, possibly with other chunks in
+                // between for the same island).
                 for j in (i + 1)..chunks.len() {
-                    if chunks[j].name == "INSELHAUS" {
-                        island.tiles = Self::parse_inselhaus(&chunks[j].data);
-                        break;
-                    }
-                    if chunks[j].name == "INSEL5" {
-                        break; // Next island, no INSELHAUS for this one
+                    match chunks[j].name.as_str() {
+                        "INSELHAUS" => island.tiles =
+                            Self::parse_inselhaus(&chunks[j].data),
+                        "STADT4" => island.city =
+                            Self::parse_stadt4(&chunks[j].data),
+                        "INSEL5" => break, // next island
+                        _ => {}
                     }
                 }
 
@@ -296,7 +315,24 @@ impl SzsFile {
             x_pos: u16::from_le_bytes([data[4], data[5]]),
             y_pos: u16::from_le_bytes([data[6], data[7]]),
             tiles: Vec::new(),
+            city: None,
         }
+    }
+
+    fn parse_stadt4(data: &[u8]) -> Option<City> {
+        if data.len() < 0xa8 { return None; }
+        let owner = data[0];
+        let name_start = 0x87;
+        let name_end = data[name_start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|n| name_start + n)
+            .unwrap_or(data.len());
+        let name: String = data[name_start..name_end]
+            .iter()
+            .map(|&b| char::from(b))
+            .collect();
+        Some(City { owner, name })
     }
 
     fn parse_inselhaus(data: &[u8]) -> Vec<IslandTile> {
@@ -350,11 +386,13 @@ mod tests {
                         orientation: 0, anim_count: 2, flags: 1,
                     },
                 ],
+                city: None,
             },
             Island {
                 number: 4, width: 60, height: 40,
                 x_pos: 500, y_pos: 600,
                 tiles: vec![],
+                city: None,
             },
         ];
         let bytes = SzsFile::encode_islands(&islands);
@@ -446,6 +484,29 @@ mod tests {
         // Slot 6 is the pirate faction.
         assert_eq!(szs.players[6].starting_gold, 5_000,
             "slot 6 (pirates) should have 5 000 gold");
+    }
+
+    #[test]
+    fn stadt4_extracts_city_name() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/A Plague of Pirates.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Plague");
+        // The first island chunk in Plague is a sentinel with no
+        // STADT4 attached; the player's city ("Larrach") sits on
+        // a later island. Find any city record and verify the name.
+        let city = szs.islands.iter()
+            .find_map(|i| i.city.as_ref())
+            .expect("at least one island has a STADT4 city");
+        assert_eq!(city.name, "Larrach");
+        assert_eq!(city.owner, 1);
     }
 
     #[test]

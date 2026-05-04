@@ -912,6 +912,14 @@ fn main() {
         scenario_name,
         szs.islands.len()
     );
+    for island in &szs.islands {
+        if let Some(city) = island.city.as_ref() {
+            if !city.name.is_empty() {
+                println!("  Island {}: city '{}' (owner {})",
+                    island.number, city.name, city.owner);
+            }
+        }
+    }
     if let Some(mission) = szs.mission.as_ref() {
         if !mission.briefing.is_empty() {
             println!("Mission flags 0x{:04x}", mission.flags);
