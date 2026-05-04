@@ -18,7 +18,21 @@ use crate::warehouse::Warehouse;
 /// Maximum stops per trade route.
 pub const MAX_ROUTE_STOPS: usize = 8;
 
-/// Maximum cargo capacity per ship.
+/// Default cargo capacity per trade ship (tons).
+///
+/// The original game has per-class capacity from figuren.cod
+/// `Maxware` × 10 t/slot:
+///
+///   HANDEL1 (small trader)  Maxware 4 → 40 t
+///   HANDEL2 (large trader)  Maxware 6 → 60 t
+///   HANDLER (free trader)   Maxware 6 → 60 t
+///   KRIEG1  (small warship) Maxware 3 → 30 t
+///   KRIEG2  (large warship) Maxware 8 → 80 t
+///   PIRAT   (pirate ship)   Maxware 5 → 50 t
+///
+/// `TradeShip` doesn't currently carry a per-instance ship class,
+/// so this is a placeholder mid-point. When ships gain a class
+/// field, switch this to a per-class lookup.
 pub const SHIP_CARGO_CAPACITY: u16 = 50;
 
 // Per-good buy/sell prices live in `crate::prices`. The flat constants that
