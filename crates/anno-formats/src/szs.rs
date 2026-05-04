@@ -137,18 +137,36 @@ pub struct ScenarioMeta {
 ///
 /// | Field | Offset | Cross-scenario evidence |
 /// |---|---|---|
-/// | `flags` | 0x04 (u32) | 0x0001 / 0x0011 / 0x0401 / 0x0403 in scripted scenarios; 0x0000 in tutorials |
+/// | `flags` | 0x04 (u32) | bit-flag corpus surveyed across all 60 shipping `.szs` files |
 /// | `briefing` | 0x68 onward | Always begins at 0x68, null-terminated, CP1252 |
 /// | `goals_raw` | 0x870..end | Raw 996 bytes of typed goal records — structure not fully RE'd |
 ///
-/// Confirmed against: A Plague of Pirates, Atoll, Cooperation,
-/// Exile, Fireland, Good Neighbors, Continous Play00, Tutorial0/1/2.
+/// Mission-flag bit assignments (deduced by cross-referencing
+/// the 60-scenario corpus against each scenario's briefing text):
+///
+///   bit 0 (`MISSION_FLAG_POPULATION`)  — primary population goal
+///                                         active; goals_raw[0..4]
+///                                         is the threshold
+///   bit 4 (`MISSION_FLAG_COOPERATIVE`) — cooperative neighbour-
+///                                         assist goal (Good Neighbors,
+///                                         Alliance)
+///   bit 8 (`MISSION_FLAG_RANKING`)     — secondary "ranking" /
+///                                         tier-headcount sub-goal
+///   bit 9                              — competitive (1v1) ranking
+///                                         (Competition.szs only)
+///   bit 10 (`MISSION_FLAG_PIRATE`)     — must defeat pirates /
+///                                         survive raid waves
+///                                         (Plague, Pirata, Fortress)
+///
+/// Tutorials and Continous-Play templates carry `flags = 0`.
+/// Higher-bit semantics (0x1000 / 0x4000 / 0x10000 / 0x1c000)
+/// remain not yet RE'd.
+///
+/// Confirmed against the full Szenes/ directory: 60 `.szs` files.
 #[derive(Debug, Clone)]
 pub struct Mission {
-    /// Mission goal-flags bitfield. Bit 0 (0x01) is set whenever
-    /// a population threshold is required; bits 0x10/0x400 toggle
-    /// in scenarios involving cooperative goals or pirate
-    /// combat. Higher-bit semantics not fully reverse-engineered.
+    /// Mission goal-flags bitfield. See [`MISSION_FLAG_*`] constants
+    /// in this module.
     pub flags: u32,
     /// Briefing text shown before the scenario starts. Decoded
     /// from CP1252 with the trailing nulls stripped.
@@ -162,6 +180,26 @@ pub struct Mission {
 
 const AUFTRAG4_BRIEFING_OFFSET: usize = 0x68;
 const AUFTRAG4_GOALS_OFFSET: usize = 0x870;
+
+/// Set when a population threshold is the primary mission goal.
+/// `Mission::goals_raw[0..4]` holds the threshold as a little-
+/// endian u32.
+pub const MISSION_FLAG_POPULATION: u32 = 1 << 0;
+
+/// Set when the scenario carries a cooperative-neighbour goal
+/// (Good Neighbors, The Alliance). The neighbour's required
+/// population sits later in `goals_raw`; layout not yet RE'd.
+pub const MISSION_FLAG_COOPERATIVE: u32 = 1 << 4;
+
+/// Set when there is a "ranking" sub-goal — typically a
+/// per-tier headcount requirement on top of the primary
+/// population threshold.
+pub const MISSION_FLAG_RANKING: u32 = 1 << 8;
+
+/// Set when the scenario involves a pirate / hostile-faction
+/// combat goal (Plague of Pirates, Pirata, Fortress, Exile,
+/// Dark Clouds on the Horizon, To Each his Own).
+pub const MISSION_FLAG_PIRATE: u32 = 1 << 10;
 const AUFTRAG4_TOTAL_BYTES: usize = 2244;
 
 /// One player-slot record parsed from the SZS PLAYER4 chunk.
@@ -692,6 +730,36 @@ mod tests {
         assert_eq!(szs.ships[0].name, "Seehind");
         assert_eq!(szs.ships[0].x, 0xd2);
         assert_eq!(szs.ships[0].y, 0x80);
+    }
+
+    #[test]
+    fn auftrag4_flag_bits_decode() {
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() {
+            println!("Skipping: {scenes:?} not found");
+            return;
+        }
+        let load = |name: &str| -> Option<Mission> {
+            let bytes = std::fs::read(scenes.join(name)).ok()?;
+            SzsFile::parse(&bytes).ok()?.mission
+        };
+        // Plague of Pirates: pop goal AND pirate combat goal.
+        let m = load("A Plague of Pirates.szs").expect("Plague present");
+        assert!(m.flags & MISSION_FLAG_POPULATION != 0,
+            "Plague must have population bit");
+        assert!(m.flags & MISSION_FLAG_PIRATE != 0,
+            "Plague must have pirate bit");
+        // Good Neighbors: pop + cooperative neighbour goal.
+        let m = load("Good Neighbors.szs").expect("Good Neighbors");
+        assert!(m.flags & MISSION_FLAG_POPULATION != 0);
+        assert!(m.flags & MISSION_FLAG_COOPERATIVE != 0);
+        assert!(m.flags & MISSION_FLAG_PIRATE == 0,
+            "Good Neighbors has no pirate combat");
+        // Tutorials carry no flags.
+        let m = load("Tutorial0.szs").expect("Tutorial0");
+        assert_eq!(m.flags, 0);
     }
 
     #[test]
