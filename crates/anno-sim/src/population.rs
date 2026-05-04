@@ -60,9 +60,9 @@ pub const TIER_DEMANDS: &[&[Good]] = &[
 /// | Merchant   | 3.40 (+0.55 + 0.5 + 0.45 + 0.45 + 0.5)          |
 /// | Aristocrat | 3.30 (+0.55 + 0.45 + 0.45 + 0.45 + 0.35 + 0.1) |
 ///
-/// Scaled to per-100-pop-per-economy-tick (9999 ms ≈ 1/6 minute) and
-/// rounded so the integer math at tick time is meaningful: Pioneer
-/// 2, Settler 4, Citizen 5, Merchant 7, Aristocrat 7.
+/// Scaled to per-100-pop-per-economy-tick (10 000 ms = 1/6 minute)
+/// and rounded so the integer math at tick time is meaningful:
+/// Pioneer 2, Settler 4, Citizen 5, Merchant 7, Aristocrat 7.
 const CONSUMPTION_PER_100: [u16; NUM_POP_TIERS] = [
     2, // Pioneer
     4, // Settler
@@ -85,7 +85,7 @@ pub const DEMAND_GOODS: [Good; NUM_DEMAND_CATEGORIES] = [
 
 /// Update population demands and satisfaction for a player based on warehouse supply.
 ///
-/// This is called each economy tick (9999ms) to:
+/// This is called each economy tick (10 000 ms) to:
 /// 1. Calculate total demand from population
 /// 2. Consume goods from warehouses
 /// 3. Update demand/supply ratios

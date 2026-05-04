@@ -94,7 +94,7 @@ impl AiController {
         }
     }
 
-    /// Main AI tick — called each economy tick (9999ms).
+    /// Main AI tick — called each economy tick (10 000 ms).
     /// Returns a list of actions the AI wants to take.
     pub fn tick(
         &mut self,

@@ -1,7 +1,7 @@
 //! Population happiness and economy model.
 //!
 //! Ported from FUN_0047f8a0 (population/player settlement tick).
-//! Timer: 9999ms intervals.
+//! Timer: 10 000 ms intervals (game-tick aligned).
 //!
 //! Happiness model:
 //! - For each demand category: fulfillment = (supply << 7) / demand (0-128 scale)
