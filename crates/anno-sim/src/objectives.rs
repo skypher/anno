@@ -176,31 +176,23 @@ impl ObjectiveSet {
     ///
     /// Returns an empty set when the mission carries no flagged
     /// goals — caller can fall back to `default_starter`.
-    pub fn from_mission_flags(
-        flags: u32,
-        primary_population: Option<u32>,
-        primary_tier: Option<u8>,
-        cooperative_population: Option<u32>,
-        _cooperative_tier: Option<u8>,
+    pub fn from_mission_goals(
+        goals: &anno_formats::szs::MissionGoals,
     ) -> Self {
-        const POP: u32 = 1 << 0;
-        const COOP: u32 = 1 << 4;
         let mut items = Vec::new();
-        if flags & POP != 0 {
-            if let Some(count) = primary_population {
+        for slot in [goals.primary, goals.secondary, goals.tertiary] {
+            if let Some(p) = slot {
                 items.push(Objective::ReachPopulation {
-                    tier: primary_tier.unwrap_or(PopTier::Aristocrat as u8),
-                    count,
+                    tier: p.tier.unwrap_or(PopTier::Aristocrat as u8),
+                    count: p.total,
                 });
             }
         }
-        if flags & COOP != 0 {
-            if let Some(target) = cooperative_population {
-                items.push(Objective::SupportFellowPlayer {
-                    who: 1,
-                    target_population: target,
-                });
-            }
+        if let Some(target) = goals.cooperative_population {
+            items.push(Objective::SupportFellowPlayer {
+                who: 1,
+                target_population: target,
+            });
         }
         Self::new(items)
     }
@@ -212,28 +204,44 @@ mod tests {
     use crate::player::Player;
 
     #[test]
-    fn from_mission_flags_translates_population_and_cooperative() {
-        // Plague-of-Pirates style: just population, no neighbour.
-        let s = ObjectiveSet::from_mission_flags(
-            0x0401, Some(5_000), None, None, None,
-        );
+    fn from_mission_goals_translates_triples_and_cooperative() {
+        use anno_formats::szs::{MissionGoals, PopulationGoal};
+
+        // Plague-of-Pirates style: just primary, no neighbour.
+        let s = ObjectiveSet::from_mission_goals(&MissionGoals {
+            primary: Some(PopulationGoal { total: 5_000, tier: None, at_tier: 0 }),
+            ..Default::default()
+        });
         assert_eq!(s.items.len(), 1);
         assert!(matches!(s.items[0].0,
             Objective::ReachPopulation { count: 5_000, .. }));
 
-        // Good-Neighbors style: pop + cooperative neighbour.
-        let s = ObjectiveSet::from_mission_flags(
-            0x0011, Some(1_000), Some(3), Some(1_000), None,
-        );
+        // Good-Neighbors: primary + cooperative neighbour.
+        let s = ObjectiveSet::from_mission_goals(&MissionGoals {
+            primary: Some(PopulationGoal { total: 1_000, tier: Some(3), at_tier: 500 }),
+            cooperative_population: Some(1_000),
+            ..Default::default()
+        });
         assert_eq!(s.items.len(), 2);
         assert!(matches!(s.items[0].0,
             Objective::ReachPopulation { tier: 3, count: 1_000 }));
         assert!(matches!(s.items[1].0,
             Objective::SupportFellowPlayer { who: 1, target_population: 1_000 }));
 
-        // Tutorial / no-flag: empty objective set so caller can fall
-        // back to default_starter.
-        let s = ObjectiveSet::from_mission_flags(0, None, None, None, None);
+        // The Continent: three city goals. All three triples
+        // produce ReachPopulation objectives.
+        let triple = PopulationGoal { total: 5_000, tier: Some(4), at_tier: 5_000 };
+        let s = ObjectiveSet::from_mission_goals(&MissionGoals {
+            primary: Some(triple),
+            secondary: Some(triple),
+            tertiary: Some(triple),
+            ..Default::default()
+        });
+        assert_eq!(s.items.len(), 3);
+
+        // Empty MissionGoals → empty set, caller falls back to
+        // default_starter.
+        let s = ObjectiveSet::from_mission_goals(&MissionGoals::default());
         assert!(s.items.is_empty());
     }
 

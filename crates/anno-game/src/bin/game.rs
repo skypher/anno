@@ -952,8 +952,8 @@ fn main() {
             let tag_str = if tags.is_empty() { String::new() } else { format!("  [{}]", tags.join(", ")) };
             println!("Mission flags 0x{:04x}{}", mission.flags, tag_str);
             let goals = mission.goals();
-            if let Some(pop) = goals.primary_population {
-                let tier = match goals.primary_tier {
+            if let Some(pop) = goals.primary_population() {
+                let tier = match goals.primary_tier() {
                     Some(0) => " of Pioneer tier",
                     Some(1) => " of Settler tier",
                     Some(2) => " of Citizen tier",
@@ -995,13 +995,7 @@ fn main() {
     // flagged goals (Tutorials, Continous-Play templates).
     if let Some(mission) = szs.mission.as_ref() {
         let g = mission.goals();
-        let scenario_set = anno_sim::objectives::ObjectiveSet::from_mission_flags(
-            mission.flags,
-            g.primary_population,
-            g.primary_tier,
-            g.cooperative_population,
-            g.cooperative_tier,
-        );
+        let scenario_set = anno_sim::objectives::ObjectiveSet::from_mission_goals(&g);
         if !scenario_set.items.is_empty() {
             sim.objectives = scenario_set;
         }

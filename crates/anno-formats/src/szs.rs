@@ -193,34 +193,40 @@ impl Mission {
     /// layout there isn't fully stable across scenarios, so
     /// they're left to callers via `goals_raw`.
     pub fn goals(&self) -> MissionGoals {
-        let read_u32 = |i: usize| -> Option<u32> {
+        let read_u32 = |i: usize| -> u32 {
             let off = i * 4;
-            if off + 4 > self.goals_raw.len() { return None; }
-            Some(u32::from_le_bytes([
+            if off + 4 > self.goals_raw.len() { return 0; }
+            u32::from_le_bytes([
                 self.goals_raw[off], self.goals_raw[off + 1],
                 self.goals_raw[off + 2], self.goals_raw[off + 3],
-            ]))
+            ])
         };
-        let pop_active = self.flags & MISSION_FLAG_POPULATION != 0;
+        let triple = |start: usize| -> Option<PopulationGoal> {
+            let total = read_u32(start);
+            if total == 0 { return None; }
+            let tier_raw = read_u32(start + 1);
+            let tier = if (1..=4).contains(&tier_raw) {
+                Some(tier_raw as u8)
+            } else {
+                None
+            };
+            Some(PopulationGoal {
+                total,
+                tier,
+                at_tier: read_u32(start + 2),
+            })
+        };
         let coop_active = self.flags & MISSION_FLAG_COOPERATIVE != 0;
         MissionGoals {
-            primary_population: pop_active.then(|| read_u32(0).unwrap_or(0))
+            primary:   (self.flags & MISSION_FLAG_POPULATION  != 0).then(|| triple(0)).flatten(),
+            secondary: (self.flags & MISSION_FLAG_POPULATION2 != 0).then(|| triple(3)).flatten(),
+            tertiary:  (self.flags & MISSION_FLAG_POPULATION3 != 0).then(|| triple(6)).flatten(),
+            cooperative_population: coop_active
+                .then(|| read_u32(18))
                 .filter(|&v| v > 0),
-            // u32 1 = primary tier; 0 means "unspecified" (Plague
-            // and a couple of pirate-defence missions leave it
-            // blank because the goal text doesn't pin a tier).
-            primary_tier: pop_active.then(|| read_u32(1).unwrap_or(0))
-                .filter(|&v| v >= 1 && v <= 4)
-                .map(|v| v as u8),
-            cooperative_population: coop_active.then(|| read_u32(18).unwrap_or(0))
-                .filter(|&v| v > 0),
-            // u32 19 holds the cooperative tier; 0 means
-            // "unspecified" (Good Neighbors leaves it blank
-            // even though the player-side goal at u32 1 is
-            // tier 3). Surface as None in that case.
             cooperative_tier: coop_active
-                .then(|| read_u32(19).unwrap_or(0))
-                .filter(|&v| v >= 1 && v <= 4)
+                .then(|| read_u32(19))
+                .filter(|&v| (1..=4).contains(&v))
                 .map(|v| v as u8),
         }
     }
@@ -230,13 +236,22 @@ const AUFTRAG4_BRIEFING_OFFSET: usize = 0x68;
 const AUFTRAG4_GOALS_OFFSET: usize = 0x870;
 
 /// Set when a population threshold is the primary mission goal.
-/// `Mission::goals_raw[0..4]` holds the threshold as a little-
-/// endian u32.
+/// Triple at `goals_raw` u32 0..=2 = (total, tier, at-tier count).
 pub const MISSION_FLAG_POPULATION: u32 = 1 << 0;
 
+/// Set when the scenario carries a SECOND population threshold
+/// (often a second city you must build). Triple at goals_raw
+/// u32 3..=5 = (total, tier, at-tier count). Used by On His
+/// Majesty's Service3, The Search for Gold, Exile, etc.
+pub const MISSION_FLAG_POPULATION2: u32 = 1 << 1;
+
+/// Set when the scenario carries a THIRD population threshold.
+/// Triple at goals_raw u32 6..=8. Used by The Continent and
+/// New Horizons1 (three cities of 5000 / 500 respectively).
+pub const MISSION_FLAG_POPULATION3: u32 = 1 << 2;
+
 /// Set when the scenario carries a cooperative-neighbour goal
-/// (Good Neighbors, The Alliance). The neighbour's required
-/// population sits later in `goals_raw`; layout not yet RE'd.
+/// (Good Neighbors, The Alliance). Triple at goals_raw u32 18,19.
 pub const MISSION_FLAG_COOPERATIVE: u32 = 1 << 4;
 
 /// Set when there is a "ranking" sub-goal — typically a
@@ -249,30 +264,59 @@ pub const MISSION_FLAG_RANKING: u32 = 1 << 8;
 /// Dark Clouds on the Horizon, To Each his Own).
 pub const MISSION_FLAG_PIRATE: u32 = 1 << 10;
 
+/// One population requirement: total inhabitants, optional tier,
+/// and how many of those total must be at that tier. Cross-
+/// scenario evidence: Cooperation `[2000, 4, 1300]` = "2000
+/// total inhabitants, of which 1300 must be Aristocrat tier".
+/// Plague `[5000, 0, 0]` = "5000 total, no tier requirement".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PopulationGoal {
+    /// Total population threshold for this goal slot.
+    pub total: u32,
+    /// Tier index (1..=4 ⇒ Settler..Aristocrat). `None` for
+    /// "any tier" — the original encodes that as raw 0 in u32 1.
+    pub tier: Option<u8>,
+    /// How many of `total` must be at `tier`. When `tier` is
+    /// `None` this is just the population subtotal echo.
+    pub at_tier: u32,
+}
+
 /// Decoded mission-goal numbers. Each field is `Option<…>`
 /// because not every flag bit is set in every scenario; callers
 /// should read these together with `Mission::flags`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MissionGoals {
-    /// Primary population threshold (`MISSION_FLAG_POPULATION`).
-    /// Stored at goals_raw u32 0. The accompanying tier index
-    /// at u32 1 says which tier the population must reach
-    /// (0 = Pioneer, 4 = Aristocrat).
-    pub primary_population: Option<u32>,
-    /// Tier index that `primary_population` must be at
-    /// (0..=4). `None` when the scenario carries no population
-    /// goal.
-    pub primary_tier: Option<u8>,
+    /// Primary population goal (`MISSION_FLAG_POPULATION`)
+    /// — triple at goals_raw u32 0..=2.
+    pub primary: Option<PopulationGoal>,
+    /// Secondary population goal (`MISSION_FLAG_POPULATION2`)
+    /// — triple at goals_raw u32 3..=5. Typically a second
+    /// settlement the player must establish.
+    pub secondary: Option<PopulationGoal>,
+    /// Tertiary population goal (`MISSION_FLAG_POPULATION3`)
+    /// — triple at goals_raw u32 6..=8. Used by The Continent
+    /// and New Horizons1 (three cities of 5000 / 500).
+    pub tertiary: Option<PopulationGoal>,
     /// Cooperative neighbour-population requirement
     /// (`MISSION_FLAG_COOPERATIVE`). Stored at goals_raw u32 18
     /// (chunk offset 0x8B8). Good Neighbors / New Horizons2 /
     /// Alliance all use this slot.
     pub cooperative_population: Option<u32>,
     /// Tier index the cooperative neighbour must reach. Stored at
-    /// goals_raw u32 19. Every cooperative scenario in the
-    /// shipping corpus pins this to 3 (Merchant tier). `None`
-    /// when no cooperative goal is configured.
+    /// goals_raw u32 19. The Alliance / New Horizons2 pin this
+    /// to 3 (Merchant); Good Neighbors leaves it at 0.
     pub cooperative_tier: Option<u8>,
+}
+
+/// Convenience accessor on `MissionGoals` for the legacy callers
+/// that just want the primary total.
+impl MissionGoals {
+    pub fn primary_population(&self) -> Option<u32> {
+        self.primary.map(|p| p.total)
+    }
+    pub fn primary_tier(&self) -> Option<u8> {
+        self.primary.and_then(|p| p.tier)
+    }
 }
 const AUFTRAG4_TOTAL_BYTES: usize = 2244;
 
@@ -845,30 +889,65 @@ mod tests {
         let load = |name: &str| -> Option<Mission> {
             SzsFile::parse(&std::fs::read(scenes.join(name)).ok()?).ok()?.mission
         };
-        // Plague of Pirates: 5 000 inhabitants (tier 4, Aristocrat
-        // — the briefing says "Your capital should have a
-        // population of at least 5 000 inhabitants" without
-        // specifying tier; goals_raw u32 1 stays at 0 here).
+        // Plague of Pirates: 5 000 inhabitants (tier left
+        // unspecified — the briefing only names a number).
         let g = load("A Plague of Pirates.szs").unwrap().goals();
-        assert_eq!(g.primary_population, Some(5_000));
+        let p = g.primary.expect("Plague has primary");
+        assert_eq!(p.total, 5_000);
+        assert_eq!(p.tier, None);
+        assert!(g.secondary.is_none());
         assert_eq!(g.cooperative_population, None);
-        // Good Neighbors: 1 000 in own city + 1 000 in neighbour.
-        // Neighbour-tier slot is 0 here (no specific tier
-        // requirement) so cooperative_tier is None.
+        // Good Neighbors: 1000 / Merchant + 1000 in neighbour
+        // (neighbour-tier unspecified).
         let g = load("Good Neighbors.szs").unwrap().goals();
-        assert_eq!(g.primary_population, Some(1_000));
-        assert_eq!(g.primary_tier, Some(3)); // Merchant
+        let p = g.primary.expect("Good Neighbors primary");
+        assert_eq!(p.total, 1_000);
+        assert_eq!(p.tier, Some(3));
         assert_eq!(g.cooperative_population, Some(1_000));
         assert_eq!(g.cooperative_tier, None);
-        // The Alliance pins the cooperative neighbour at tier 3
-        // (Merchant) — the u32 19 slot is filled in for that one.
+        // The Alliance pins the cooperative neighbour at tier 3.
         let g = load("The Alliance.szs").unwrap().goals();
         assert_eq!(g.cooperative_population, Some(1_000));
         assert_eq!(g.cooperative_tier, Some(3));
         // Tutorial0: no flags → no decoded goals.
         let g = load("Tutorial0.szs").unwrap().goals();
-        assert_eq!(g.primary_population, None);
+        assert!(g.primary.is_none());
+        assert!(g.secondary.is_none());
         assert_eq!(g.cooperative_population, None);
+    }
+
+    #[test]
+    fn mission_goals_decode_secondary_and_tertiary() {
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let load = |name: &str| -> Option<Mission> {
+            SzsFile::parse(&std::fs::read(scenes.join(name)).ok()?).ok()?.mission
+        };
+        // The Continent: flags 0x107 = POP + POP2 + POP3 + RANKING.
+        // Three triples each [5000, 4, 5000] (5k Aristocrats per
+        // city × three cities).
+        let g = load("The Continent.szs").unwrap().goals();
+        let p = g.primary.unwrap();
+        let s = g.secondary.unwrap();
+        let t = g.tertiary.unwrap();
+        assert_eq!(p.total, 5_000);
+        assert_eq!(p.tier, Some(4));
+        assert_eq!(p.at_tier, 5_000);
+        assert_eq!(s.total, 5_000);
+        assert_eq!(t.total, 5_000);
+        // Cooperation: Triple 0 = [2000, 4, 1300] meaning 2 000
+        // total, of which 1 300 must be Aristocrats.
+        let g = load("Cooperation.szs").unwrap().goals();
+        let p = g.primary.unwrap();
+        assert_eq!(p.total, 2_000);
+        assert_eq!(p.tier, Some(4));
+        assert_eq!(p.at_tier, 1_300);
+        // Cooperation has POP only (no POP2/POP3 bits) — secondary
+        // and tertiary stay None.
+        assert!(g.secondary.is_none());
+        assert!(g.tertiary.is_none());
     }
 
     #[test]
