@@ -197,7 +197,7 @@ mod tests {
             radius: 0,
             output_good: out, input_good_1: Good::None, input_good_2: Good::None,
             output_rate: 1, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 0, cycle_time_ms: 0, carrier_interval_ms: 0,
+            storage_capacity: 0, cycle_time_ms: 0,
             cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
             native: false,

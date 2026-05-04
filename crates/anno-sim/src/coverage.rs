@@ -243,7 +243,7 @@ mod tests {
             input_2_rate: 0,
             storage_capacity: 0,
             cycle_time_ms: 0,
-            carrier_interval_ms: 0,
+
             cost_gold: 200,
             cost_tools: 4,
             cost_wood: 10,
@@ -281,7 +281,7 @@ mod tests {
             input_2_rate: 0,
             storage_capacity: 0,
             cycle_time_ms: 0,
-            carrier_interval_ms: 0,
+
             cost_gold: 0,
             cost_tools: 0,
             cost_wood: 0,

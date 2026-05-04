@@ -151,7 +151,7 @@ mod tests {
             output_good: Good::Tools, input_good_1: Good::Iron,
             input_good_2: Good::None,
             output_rate: 1, input_1_rate: 1, input_2_rate: 0,
-            storage_capacity: 50, cycle_time_ms: 1000, carrier_interval_ms: 0,
+            storage_capacity: 50, cycle_time_ms: 1000,
             cost_gold: 100, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
             maintenance_cost: 0,
             native: false,

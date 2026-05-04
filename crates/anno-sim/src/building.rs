@@ -31,7 +31,6 @@ pub struct BuildingDef {
     pub input_2_rate: u16,
     pub storage_capacity: u16,
     pub cycle_time_ms: u32,
-    pub carrier_interval_ms: u32,
     pub cost_gold: u32,
     pub cost_tools: u16,
     pub cost_wood: u16,
