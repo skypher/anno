@@ -256,7 +256,11 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         input_1_rate: rohmenge,
         input_2_rate: workmenge,
         storage_capacity: maxlager,
-        cycle_time_ms: interval as u32 * 999, // Interval is in production ticks (each ~999ms)
+        // `Interval` from haeuser.cod counts production ticks. The
+        // game-loop tick is exactly 1000 ms (decompiled binary uses
+        // `-1000` decrement on the production-cycle accumulator at
+        // `1602_exe.c:16110`), not 999.
+        cycle_time_ms: interval as u32 * 1000,
         carrier_interval_ms: 5000,
         cost_gold,
         cost_tools,
