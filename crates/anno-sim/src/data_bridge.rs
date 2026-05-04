@@ -92,6 +92,36 @@ fn parse_good_covers_all_haeuser_cod_tokens() {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn parse_bauinfra_matches_haeuser_cod_ladder() {
+    // Aliases from haeuser.cod's `BESONDERE INFRASTRUKTUR
+    // MARKPUNKTE` block, paired with the PopTier index they
+    // resolve to (digit - 1 of the STUFE rung).
+    let cases: &[(&str, u8)] = &[
+        ("INFRA_KONTOR_1", 1), // Settler  (= INFRA_STUFE_2B)
+        ("INFRA_BURG_1",   1), // Settler  (= INFRA_STUFE_2G)
+        ("INFRA_WACHTURM", 1), // Settler  (= INFRA_STUFE_2G)
+        ("INFRA_KONTOR_2", 2), // Citizen  (= INFRA_STUFE_3A)
+        ("INFRA_KANON",    2), // Citizen  (= INFRA_STUFE_3E)
+        ("INFRA_KONTOR_3", 3), // Merchant (= INFRA_STUFE_4A)
+        ("INFRA_BURG_2",   3), // Merchant (= INFRA_STUFE_4B)
+        ("INFRA_MUSKETE",  3), // Merchant (= INFRA_STUFE_4B)
+        ("INFRA_BURG_3",   4), // Aristo   (= INFRA_STUFE_5B)
+        // Direct STUFE tokens.
+        ("INFRA_STUFE_1A", 0),
+        ("INFRA_STUFE_5A", 4),
+        ("",               0),
+        // Cultural-building tags (no marker-table alias defined).
+        ("INFRA_KIRCHE",   0),
+        ("INFRA_SCHULE",   0),
+    ];
+    for (tok, want) in cases {
+        let got = parse_bauinfra(tok);
+        assert_eq!(got, *want, "parse_bauinfra({tok:?}) = {got}, want {want}");
+    }
+}
+
 /// Convert a COD building definition into a simulation BuildingDef.
 fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
     let prop = |key: &str| -> &str {
@@ -303,30 +333,63 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
 ///
 /// `INFRA_STUFE_NX` uses N as the tier digit (1..5 → Pioneer..
 /// Aristocrat); the letter suffix groups variants within a tier.
-/// Special prefixes like `INFRA_BURG_*` / `INFRA_KONTOR_*` are
-/// upgrade-chain gates and conservatively map to the highest
-/// existing tier (Citizen / Merchant) so they unlock late.
+///
+/// Aliases like `INFRA_BURG_1`, `INFRA_KONTOR_1`, `INFRA_KANON`,
+/// etc. are direct-substitution constants defined at the top of
+/// haeuser.cod (`BESONDERE INFRASTRUKTUR MARKPUNKTE` block).
+/// Their tier values come straight from that ladder, NOT from
+/// general-knowledge guesses:
+///
+///   INFRA_BURG_1   = INFRA_STUFE_2G  (Settler)
+///   INFRA_WACHTURM = INFRA_STUFE_2G  (Settler)
+///   INFRA_KONTOR_1 = INFRA_STUFE_2B  (Settler)
+///   INFRA_KONTOR_2 = INFRA_STUFE_3A  (Citizen)
+///   INFRA_KANON    = INFRA_STUFE_3E  (Citizen)
+///   INFRA_KONTOR_3 = INFRA_STUFE_4A  (Merchant)
+///   INFRA_BURG_2   = INFRA_STUFE_4B  (Merchant)
+///   INFRA_MUSKETE  = INFRA_STUFE_4B  (Merchant)
+///   INFRA_BURG_3   = INFRA_STUFE_5B  (Aristocrat)
+///
+/// Cultural-building tags (INFRA_KIRCHE, INFRA_SCHULE, INFRA_ARZT,
+/// INFRA_BADE, INFRA_THEATER, INFRA_TRIUMPH, INFRA_DENKMAL,
+/// INFRA_HOCHSCHULE, INFRA_KATHETRALE, INFRA_SCHLOSS,
+/// INFRA_GALGEN, INFRA_WIRT) are not aliased to STUFE rungs in
+/// haeuser.cod's marker block — they appear directly as Bauinfra
+/// values on residences, and the binary's ladder resolver maps
+/// them at runtime from a separate table we haven't located.
+/// Until that table is RE'd, these return 0 (no tier gate).
 fn parse_bauinfra(token: &str) -> u8 {
     if token.is_empty() { return 0; }
-    if let Some(rest) = token.strip_prefix("INFRA_STUFE_") {
-        // First char is the tier digit (1..5).
+    let resolved = resolve_infra_alias(token).unwrap_or(token);
+    if let Some(rest) = resolved.strip_prefix("INFRA_STUFE_") {
+        // First char is the tier digit (1..5 → Pioneer..Aristocrat).
         if let Some(c) = rest.chars().next() {
             if let Some(d) = c.to_digit(10) {
                 return (d.saturating_sub(1).min(4)) as u8;
             }
         }
     }
-    match token {
-        "INFRA_KONTOR_1" => 1,  // Settler — first warehouse upgrade
-        "INFRA_KONTOR_2" => 2,  // Citizen
-        "INFRA_KONTOR_3" => 3,  // Merchant
-        "INFRA_BURG_1" | "INFRA_WACHTURM" => 2,  // Citizen — first military
-        "INFRA_BURG_2" => 3,    // Merchant
-        "INFRA_BURG_3" => 4,    // Aristocrat
-        "INFRA_MUSKETE" => 3,   // Merchant — needs musket production
-        "INFRA_KANON" => 4,     // Aristocrat — endgame
-        _ => 0,
-    }
+    0
+}
+
+/// Substitute the INFRASTRUKTUR-MARKPUNKTE aliases (BURG / KONTOR /
+/// WACHTURM / MUSKETE / KANON) for their STUFE rungs. Returns
+/// `None` for tokens that aren't in the alias table (the caller
+/// then keeps the original token, which is itself an INFRA_STUFE_*
+/// rung if the parser is supposed to succeed).
+fn resolve_infra_alias(token: &str) -> Option<&'static str> {
+    Some(match token {
+        "INFRA_BURG_1"   => "INFRA_STUFE_2G",
+        "INFRA_BURG_2"   => "INFRA_STUFE_4B",
+        "INFRA_BURG_3"   => "INFRA_STUFE_5B",
+        "INFRA_WACHTURM" => "INFRA_STUFE_2G",
+        "INFRA_MUSKETE"  => "INFRA_STUFE_4B",
+        "INFRA_KONTOR_1" => "INFRA_STUFE_2B",
+        "INFRA_KONTOR_2" => "INFRA_STUFE_3A",
+        "INFRA_KONTOR_3" => "INFRA_STUFE_4A",
+        "INFRA_KANON"    => "INFRA_STUFE_3E",
+        _ => return None,
+    })
 }
 
 /// Load all building definitions from a parsed COD file.
