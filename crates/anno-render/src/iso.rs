@@ -164,8 +164,8 @@ pub fn render_map(
         let x_offset = if row % 2 == 1 { half_tw } else { 0 };
         let base_screen_y = row as i32 * th;
 
-        let mut tile_x = row_tile_x;
-        let mut tile_y = row_tile_y;
+        let tile_x = row_tile_x;
+        let tile_y = row_tile_y;
 
         // Pass 1: ground layer (pass=0), Pass 2: buildings (pass=1)
         for pass in 0..2 {
