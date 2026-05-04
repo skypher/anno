@@ -180,6 +180,27 @@ const AUFTRAG4_TOTAL_BYTES: usize = 2244;
 pub struct PlayerSlotInit {
     /// Starting gold (first u32 of the slot record).
     pub starting_gold: i32,
+    /// Faction-state code at byte offset 4 of the slot record.
+    /// Cross-scenario sample (six shipping `.szs` files) gives a
+    /// stable per-slot mapping:
+    ///
+    ///   0x00 → human (slot 0 in every scenario)
+    ///   0x0c → AI rival (slots 1..=3)
+    ///   0x0d → free trader (slot 4)
+    ///   0x0e → natives (slot 5)
+    ///   0x0b → pirates (slot 6)
+    ///
+    /// These are FACTION-KIND codes, not the post-load runtime
+    /// `PlayerState` (whose `Empty` / `Defeated` values may share
+    /// numeric encoding with `0x0e` etc. but appear in a different
+    /// context). Stored raw; downstream code can interpret.
+    pub state_byte: u8,
+    /// Colour / portrait index at byte offset 7 of the slot record.
+    /// Slots 0..=3 carry the player-chosen colour (typically 0
+    /// for slot 0 in single-player templates); slots 4..=6 carry
+    /// the reserved-faction portraits — trader 6, native 4,
+    /// pirate 5.
+    pub color_idx: u8,
     /// Raw value of byte 12 of the slot record. Cross-scenario
     /// sample shows this isn't a clean `is_human` flag — Atoll
     /// (single-player free-for-all) sets it to `0x00` for slots
@@ -367,6 +388,8 @@ impl SzsFile {
             ]);
             // Byte 12 = 0x00 (active player / fixed faction) vs
             // 0xff (slot inactive — AI fills it on game start).
+            let state_byte = data[off + 4];
+            let color_idx  = data[off + 7];
             let slot_byte12 = data[off + 12];
             let name_off = off + PLAYER4_NAME_OFFSET;
             let name = if name_off + PLAYER4_NAME_BYTES <= data.len() {
@@ -377,7 +400,9 @@ impl SzsFile {
             } else {
                 String::new()
             };
-            out.push(PlayerSlotInit { starting_gold, slot_byte12, name });
+            out.push(PlayerSlotInit {
+                starting_gold, state_byte, color_idx, slot_byte12, name,
+            });
         }
         out
     }
@@ -595,6 +620,13 @@ mod tests {
         // Tutorial0 ships the default German male player name.
         assert_eq!(szs.players[0].name, "Wilfried",
             "slot 0 player name should be the default 'Wilfried'");
+        // Faction-state byte: 0 = human, 0x0c = AI, 0x0d = trader,
+        // 0x0e = native, 0x0b = pirate (cross-scenario verified).
+        assert_eq!(szs.players[0].state_byte, 0x00, "slot 0 = human");
+        assert_eq!(szs.players[1].state_byte, 0x0c, "slot 1 = AI rival");
+        assert_eq!(szs.players[4].state_byte, 0x0d, "slot 4 = trader");
+        assert_eq!(szs.players[5].state_byte, 0x0e, "slot 5 = native");
+        assert_eq!(szs.players[6].state_byte, 0x0b, "slot 6 = pirate");
     }
 
     #[test]
