@@ -1,19 +1,19 @@
 //! Campaign mode: a fixed sequence of scenarios played back-to-back.
 //!
-//! Manual sec. 4.2.4 lists 21 campaign missions grouped into seven
-//! arcs of three (originally the Kampagne-mode dropdown in the start
-//! menu). The mission names are stored in `text.cod` `[KAMPAGNE]`.
+//! Mission names and arc boundaries are taken directly from
+//! `extracted/text.cod` `[KAMPAGNE]` (English edition), where blank
+//! lines separate the arcs. Decoding the block gives 20 missions
+//! grouped into 6 arcs of sizes [4, 3, 3, 3, 3, 4] — note the
+//! first and last arcs are length 4, not 3 (the manual's "seven
+//! arcs of three" is mis-summarised; the data is authoritative).
 //!
 //! Campaign progression: the player completes the current mission
-//! (victory state), the campaign advances `next_mission` by one, and
-//! the launcher loads the next scenario file. Defeat resets to the
-//! start of the current arc (mission floor((idx) / 3) * 3).
-//!
-//! Mission names below transcribed from `extracted/text.cod`
-//! `[KAMPAGNE]` block (English edition).
+//! (victory state), the campaign advances `next_mission` by one,
+//! and the launcher loads the next scenario file. Defeat resets to
+//! the start of the current arc, computed from `ARC_STARTS`.
 
-/// 21 campaign missions in order. Indices 0-2 = arc 1 (tutorial),
-/// 3-5 = arc 2, etc. Lookup the matching `.szs` file by name in
+/// 20 campaign missions in order, transcribed from text.cod
+/// `[KAMPAGNE]`. Lookup the matching `.szs` file by name in
 /// `Szenes/` at load time.
 pub const CAMPAIGN_MISSIONS: &[&str] = &[
     "Halfway there",
@@ -37,6 +37,25 @@ pub const CAMPAIGN_MISSIONS: &[&str] = &[
     "The Deluge",
     "Close Quarters",
 ];
+
+/// Starting mission index of each arc, derived from the blank-line
+/// separators in `text.cod` `[KAMPAGNE]`. Missions in arc `i`
+/// inclusive-span `ARC_STARTS[i]..ARC_STARTS[i+1]`, with the final
+/// arc running to the end of `CAMPAIGN_MISSIONS`.
+pub const ARC_STARTS: &[u8] = &[0, 4, 7, 10, 13, 16];
+
+/// Index of the arc that contains `mission`. Linear scan over
+/// `ARC_STARTS` (six entries — small constant).
+fn arc_of(mission: u8) -> usize {
+    let mut i = ARC_STARTS.len();
+    while i > 0 {
+        i -= 1;
+        if mission >= ARC_STARTS[i] {
+            return i;
+        }
+    }
+    0
+}
 
 /// Campaign progression state. Saved with the scenario so resuming
 /// a campaign-mode game restores the right next-mission pointer.
@@ -73,11 +92,12 @@ impl CampaignState {
         Some(self.current_mission)
     }
 
-    /// On defeat, restart the current arc (each arc is 3 missions).
-    /// Manual: defeated players replay the arc, not the entire
-    /// campaign.
+    /// On defeat, restart the current arc. Arc starts come from
+    /// the blank-line layout of `text.cod [KAMPAGNE]` (sizes
+    /// [4, 3, 3, 3, 3, 4]); the first and sixth arcs are length 4
+    /// rather than 3.
     pub fn restart_arc_on_defeat(&mut self) -> u8 {
-        let arc_start = (self.current_mission / 3) * 3;
+        let arc_start = ARC_STARTS[arc_of(self.current_mission)];
         self.current_mission = arc_start;
         arc_start
     }
@@ -95,12 +115,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn campaign_has_21_missions() {
+    fn campaign_has_20_missions_and_six_arcs() {
         assert_eq!(CAMPAIGN_MISSIONS.len(), 20);
-        // 20 entries — manual lists 21 but the [KAMPAGNE] text.cod
-        // block extracted earlier has 20; the discrepancy is
-        // probably a manual typo or one mission absorbed into
-        // another. Either way, sticking to what's in the data.
+        assert_eq!(ARC_STARTS, &[0, 4, 7, 10, 13, 16]);
     }
 
     #[test]
@@ -116,9 +133,21 @@ mod tests {
     }
 
     #[test]
-    fn defeat_restarts_arc() {
+    fn defeat_restarts_to_correct_arc_start() {
+        // Mission 3 (Hard Times) belongs to arc 0 (length-4 arc),
+        // so a defeat there must restart at mission 0, not 3.
+        let mut s = CampaignState::start(3);
+        assert_eq!(s.restart_arc_on_defeat(), 0);
+        assert_eq!(s.current_mission, 0);
+
+        // Mission 7 (Gold Rush) is the start of arc 2.
         let mut s = CampaignState::start(7);
-        assert_eq!(s.restart_arc_on_defeat(), 6);
-        assert_eq!(s.current_mission, 6);
+        assert_eq!(s.restart_arc_on_defeat(), 7);
+
+        // Mission 19 (Close Quarters) is in arc 5 (16..=19); a
+        // defeat in the final mission must restart at 16 even
+        // though `(19 / 3) * 3 = 18` (the old buggy formula).
+        let mut s = CampaignState::start(19);
+        assert_eq!(s.restart_arc_on_defeat(), 16);
     }
 }
