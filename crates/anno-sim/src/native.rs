@@ -19,7 +19,9 @@
 //! - `figuren.cod` `Nummer: TRAEGER2` + `Gfx: GFXEINGEB`: the
 //!   native carrier figure (used to render villagers walking out
 //!   of the hut).
-//! - Player slot 4 is the native faction (`free_trader::NATIVE_SLOT`).
+//! - Player slot 5 is the native faction (`free_trader::NATIVE_SLOT`).
+//!   Slot 4 holds the free trader, not the natives — see the
+//!   PLAYER4 starting-gold table in `crates/anno-formats/src/szs.rs`.
 
 use crate::types::Good;
 

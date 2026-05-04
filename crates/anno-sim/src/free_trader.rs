@@ -40,15 +40,17 @@ use crate::types::Good;
 use crate::warehouse::Warehouse;
 
 /// Diplomacy / player slot reserved for the free-trader faction.
-/// SPECULATIVE — `1602_exe.c:83179` shows player slot 4 is the trader,
-/// but our slot layout uses 0-3 = humans/AI, 4 = native faction
-/// (haeuser.cod `Nativflg: 1` buildings), 5 = free trader, 6 = pirate.
-pub const FREE_TRADER_SLOT: u8 = 5;
+/// Verified against the binary at `1602_exe.c:83179` (sprintf
+/// "Trader %d", 4) and against the PLAYER4 SZS chunk: every
+/// shipping scenario gives slot 4 a starting balance of
+/// 1 000 000 gold (the trader's signature wallet).
+pub const FREE_TRADER_SLOT: u8 = 4;
 
 /// Diplomacy / player slot reserved for the indigenous-village
 /// (`Nativflg: 1`) faction. Owns chief-hut Kontors and native
-/// plantations / guard huts on tropical islands.
-pub const NATIVE_SLOT: u8 = 4;
+/// plantations / guard huts on tropical islands. PLAYER4 puts
+/// slot 5 at 50 000 gold across all surveyed scenarios.
+pub const NATIVE_SLOT: u8 = 5;
 
 // Visit count and dock duration. Anno 1602 manual section 8.1
 // "Free traders" + section 11.4.3 "Placing ships" + binary RE:

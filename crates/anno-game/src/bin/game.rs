@@ -4513,9 +4513,11 @@ fn main() {
                 "Up/Dn pick  Lt/Rt cycle  G gold  T tools",
                 [0xAA, 0xAA, 0xAA, 0xFF], dscale,
             );
-            // Per-counterpart rows. Slot 4 is the natives faction
-            // (`Nativflg: 1` buildings; manual sec. 7.5/8.6),
-            // slot 5 the free trader, slot 6 the pirates.
+            // Per-counterpart rows (binary-verified slot layout):
+            //   slot 4 = free trader (1 602 exe :83179, PLAYER4 1M gold)
+            //   slot 5 = native faction (`Nativflg: 1` buildings;
+            //                            manual sec. 7.5/8.6)
+            //   slot 6 = pirates
             for tgt in 1u8..=6 {
                 let y = 4 + (tgt as i32 + 1) * line_h;
                 let rel = sim.diplomacy.get(0, tgt);
