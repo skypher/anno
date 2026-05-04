@@ -6223,61 +6223,78 @@ fn init_simulation(
     sim.coverage_maps = coverage_maps;
     sim.ocean_map = Some(ocean_map);
 
-    // Human player. If the SZS file shipped a PLAYER4 chunk with
-    // a starting-gold value for slot 0, honour it; otherwise fall
-    // back to the dev default of 10 000.
-    let mut player = Player::new_human(0);
-    player.population[0] = 200;
-    player.population[1] = 100;
-    player.population[2] = 50;
-    player.gold = szs.players.first()
-        .map(|p| p.starting_gold)
-        .filter(|&g| g > 0)
-        .unwrap_or(10_000);
-    sim.players.push(player);
-
-    // AI player — same fallback.
-    let mut ai_player = Player::new_ai(1, 0);
-    ai_player.population[0] = 150;
-    ai_player.population[1] = 50;
-    ai_player.gold = szs.players.get(1)
-        .map(|p| p.starting_gold)
-        .filter(|&g| g > 0)
-        .unwrap_or(8_000);
-    sim.players.push(ai_player);
-    sim.ai_controllers
-        .push(AiController::new(1, AiPersonality::Economic, Difficulty::Medium));
-
-    // Reserved-faction slots (2..=6). The PLAYER4 chunk holds
-    // their starting balances — slot 4 = free trader (1M),
-    // slot 5 = native (50k), slot 6 = pirate (5k). They run
-    // outside the defeat check (no settlement / pop / tax model)
-    // so we tag them PlayerState::Empty; the trader / native /
-    // pirate subsystems read the gold field directly without
-    // needing an AiActive marker.
-    for slot in 2u8..=6 {
-        let mut p = Player::new_ai(slot, 0);
-        p.state = anno_sim::player::PlayerState::Empty;
-        if let Some(init) = szs.players.get(slot as usize) {
-            p.gold = init.starting_gold;
+    // Initialise the seven player slots from PLAYER4's state_byte
+    // (0x00 = human, 0x0c = AI rival, 0x0d/0x0e/0x0b = reserved
+    // trader / native / pirate factions). Reserved factions stay
+    // PlayerState::Empty so the defeat checker skips them — the
+    // trader / native / pirate subsystems address those slots
+    // directly by index. Slots without a PLAYER4 record fall back
+    // to PlayerState::Empty as a placeholder.
+    use anno_sim::player::PlayerState;
+    for slot in 0u8..7 {
+        let init = szs.players.get(slot as usize);
+        let state_byte = init.map(|p| p.state_byte).unwrap_or(0xff);
+        let mut p = match state_byte {
+            0x00 => Player::new_human(slot),
+            0x0c => Player::new_ai(slot, 0),
+            _    => {
+                let mut p = Player::new_ai(slot, 0);
+                p.state = PlayerState::Empty;
+                p
+            }
+        };
+        if let Some(init) = init {
+            if init.starting_gold > 0 {
+                p.gold = init.starting_gold;
+            }
         }
         sim.players.push(p);
+
+        // Spawn an AI controller alongside every AI rival slot.
+        if state_byte == 0x0c {
+            sim.ai_controllers.push(AiController::new(
+                slot, AiPersonality::Economic, Difficulty::Medium,
+            ));
+        }
     }
 
-    // Military setup
-    sim.diplomacy.set(0, 1, Diplomacy::War);
+    // Seed the human player and slot 1 with starting populations
+    // (the original game's scripted starting settlement). Other
+    // AI rivals get a smaller seed; reserved factions stay at 0.
+    if let Some(p) = sim.players.get_mut(0) {
+        p.population[0] = 200;
+        p.population[1] = 100;
+        p.population[2] = 50;
+    }
+    if let Some(p) = sim.players.get_mut(1) {
+        if p.state != PlayerState::Empty {
+            p.population[0] = 150;
+            p.population[1] = 50;
+        }
+    }
+
+    // Starting militia for the human player. Rival AI militia is
+    // only seeded when slot 1 actually holds an AI rival (i.e. its
+    // PLAYER4 state_byte was 0x0c, not the Empty placeholder used
+    // for Continous-Play templates without configured rivals).
     sim.military_units
         .push(MilitaryUnit::new(UnitType::Infantry, 0, 20, 20));
     sim.military_units
         .push(MilitaryUnit::new(UnitType::Infantry, 0, 21, 20));
     sim.military_units
         .push(MilitaryUnit::new(UnitType::Cannon, 0, 18, 20));
-    sim.military_units
-        .push(MilitaryUnit::new(UnitType::Infantry, 1, 25, 20));
-    sim.military_units
-        .push(MilitaryUnit::new(UnitType::Infantry, 1, 25, 21));
-    sim.military_units
-        .push(MilitaryUnit::new(UnitType::Musketeer, 1, 27, 20));
+    let slot1_is_ai = sim.players.get(1)
+        .map(|p| p.state != PlayerState::Empty)
+        .unwrap_or(false);
+    if slot1_is_ai {
+        sim.diplomacy.set(0, 1, Diplomacy::War);
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::Infantry, 1, 25, 20));
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::Infantry, 1, 25, 21));
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::Musketeer, 1, 27, 20));
+    }
 
     // Trade route between first two islands with warehouses
     let wh_islands: Vec<(u8, u16, u16)> = sim
