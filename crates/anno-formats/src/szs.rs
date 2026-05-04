@@ -39,6 +39,29 @@ pub struct Island {
     pub city: Option<City>,
 }
 
+/// One ship record from the SHIP4 chunk (436 bytes per slot).
+///
+/// Cross-scenario sample (Tutorial0 = 1 record, Continous Play00
+/// = 4, Cooperation = 7, Atoll = 8, A Plague of Pirates = 19)
+/// confirms the chunk is always exactly `N * 436` bytes. The
+/// fields decoded here are the ones needed to reconstruct
+/// initial ship layouts; remaining bytes (cargo manifest, AI
+/// state, route table) are preserved on the raw chunk.
+#[derive(Debug, Clone)]
+pub struct Ship {
+    /// Ship name as displayed in the original game UI (e.g.
+    /// "Carnera", "Seehind", "Palstek"). 28-byte slot, CP1252,
+    /// null-terminated.
+    pub name: String,
+    /// Spawn position in island-grid coordinates. u16 x at
+    /// record offset 28, u16 y at record offset 30.
+    pub x: u16,
+    pub y: u16,
+}
+
+const SHIP4_RECORD_BYTES: usize = 436;
+const SHIP4_NAME_BYTES: usize = 28;
+
 /// Per-island city info parsed from a STADT4 chunk (168 bytes).
 ///
 /// Layout (verified across A Plague of Pirates / Atoll /
@@ -80,6 +103,9 @@ pub struct SzsFile {
     /// (`MISSNR`, `PLAYERMIN`, `PLAYERMAX`, `RANKING`). Each is
     /// a single u32; absent chunks come back as `None`.
     pub scenario: ScenarioMeta,
+    /// Initial ship layout parsed from the SHIP4 chunk. Empty
+    /// when the scenario contains no ships.
+    pub ships: Vec<Ship>,
 }
 
 /// Scenario-level metadata (mission #, player range, difficulty
@@ -270,7 +296,29 @@ impl SzsFile {
             ranking: read_u32("SZENE_RANKING"),
         };
 
-        Ok(SzsFile { chunks, islands, players, mission, scenario })
+        let ships = chunks.iter()
+            .find(|c| c.name == "SHIP4")
+            .map(|c| Self::parse_ship4(&c.data))
+            .unwrap_or_default();
+
+        Ok(SzsFile { chunks, islands, players, mission, scenario, ships })
+    }
+
+    fn parse_ship4(data: &[u8]) -> Vec<Ship> {
+        let count = data.len() / SHIP4_RECORD_BYTES;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = i * SHIP4_RECORD_BYTES;
+            let name_bytes = &data[off..off + SHIP4_NAME_BYTES];
+            let name_end = name_bytes.iter().position(|&b| b == 0)
+                .unwrap_or(SHIP4_NAME_BYTES);
+            let name: String = name_bytes[..name_end]
+                .iter().map(|&b| char::from(b)).collect();
+            let x = u16::from_le_bytes([data[off + 28], data[off + 29]]);
+            let y = u16::from_le_bytes([data[off + 30], data[off + 31]]);
+            out.push(Ship { name, x, y });
+        }
+        out
     }
 
     fn parse_auftrag4(data: &[u8]) -> Option<Mission> {
@@ -563,6 +611,27 @@ mod tests {
         assert_eq!(szs.scenario.player_min, Some(1));
         assert_eq!(szs.scenario.player_max, Some(1));
         assert_eq!(szs.scenario.ranking, Some(3));
+    }
+
+    #[test]
+    fn ship4_extracts_initial_ships() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/Tutorial0.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Tutorial0");
+        // Tutorial0 has a single starting ship "Seehind" at
+        // approximately (210, 128) in map coords.
+        assert_eq!(szs.ships.len(), 1, "Tutorial0 has one starting ship");
+        assert_eq!(szs.ships[0].name, "Seehind");
+        assert_eq!(szs.ships[0].x, 0xd2);
+        assert_eq!(szs.ships[0].y, 0x80);
     }
 
     #[test]

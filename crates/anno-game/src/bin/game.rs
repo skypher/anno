@@ -932,6 +932,15 @@ fn main() {
             }
         }
     }
+    if !szs.ships.is_empty() {
+        let named: Vec<&str> = szs.ships.iter()
+            .filter(|s| !s.name.is_empty())
+            .map(|s| s.name.as_str())
+            .collect();
+        if !named.is_empty() {
+            println!("Starting ships ({}): {}", named.len(), named.join(", "));
+        }
+    }
     if let Some(mission) = szs.mission.as_ref() {
         if !mission.briefing.is_empty() {
             println!("Mission flags 0x{:04x}", mission.flags);
