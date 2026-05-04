@@ -7,7 +7,6 @@
 //! - For each demand category: fulfillment = (supply << 7) / demand (0-128 scale)
 //! - Per-tier satisfaction is a weighted sum of fulfilled demands
 //! - Satisfaction decays by 15/16 per tick
-//! - Unrest decays by 255/256 per tick
 //! - Citizens leave when satisfaction drops below 60% (0x4C)
 
 use crate::player::{Player, NUM_DEMAND_CATEGORIES};

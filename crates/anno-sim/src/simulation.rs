@@ -72,7 +72,6 @@ pub struct Simulation {
     pub paused: bool,
 
     // Subsystem cadences (1000-ms tick aligned).
-    timer_animation: SubsystemTimer,  // 40_000 ms
     timer_production: SubsystemTimer, // PRODUCTION_TICK_MS (1000)
     timer_population: SubsystemTimer, // 10_000
     timer_events: SubsystemTimer,     // 10_000
@@ -147,11 +146,6 @@ pub struct Simulation {
     /// the player can keep building, matching the original endless
     /// behaviour).
     pub outcome: GameOutcome,
-    /// Global tile-animation frame counter, advanced once per
-    /// 40 000 ms `timer_animation` tick. Saves and replays preserve
-    /// it so animation phase stays deterministic across
-    /// load / multiplayer / state diffs.
-    pub animation_frame: u32,
     /// Indigenous-village trade posts placed by the scenario.
     /// See `crate::native` for the barter mechanics.
     pub native_villages: Vec<crate::native::NativeVillage>,
@@ -190,7 +184,6 @@ impl Simulation {
             // Subsystem cadences mirror the binary's `-1000` ms
             // game-tick decrement (1602_exe.c:16110); the off-by-one
             // values (999 / 9999 / 29999 / 4999) were unjustified.
-            timer_animation: SubsystemTimer::new(40_000),
             timer_production: SubsystemTimer::new(crate::production::PRODUCTION_TICK_MS),
             timer_population: SubsystemTimer::new(10_000),
             timer_events: SubsystemTimer::new(10_000),
@@ -231,7 +224,6 @@ impl Simulation {
             free_trader_cooldown: 0,
             last_treasury_warn_gold: i32::MAX,
             outcome: GameOutcome::Pending,
-            animation_frame: 0,
             native_villages: Vec::new(),
         }
     }
@@ -430,12 +422,7 @@ impl Simulation {
 
     /// Single simulation step (max 200ms).
     fn step(&mut self, dt_ms: u32) {
-        // 1. Tile animation
-        if self.timer_animation.advance(dt_ms) {
-            self.tick_animations();
-        }
-
-        // 2. Building production
+        // 1. Building production
         if self.timer_production.advance(dt_ms) {
             self.tick_production();
         }
@@ -472,19 +459,6 @@ impl Simulation {
 
         // Entity movement (every step)
         self.tick_entities(dt_ms);
-    }
-
-    fn tick_animations(&mut self) {
-        // Advance the global animation frame counter. The original
-        // engine drives all tile/building animations from a single
-        // 40s-period frame counter (`timer_animation` in our naming);
-        // each sprite cycle uses its own AnimAdd / AnimAnz from
-        // figuren.cod / haeuser.cod relative to this base. The
-        // renderer reads `animation_frame` if it wants deterministic
-        // sim-driven animation phase (otherwise it can keep using
-        // its own real-time clock). Keeping this in the sim layer
-        // means save/load and multiplayer stay frame-aligned.
-        self.animation_frame = self.animation_frame.wrapping_add(1);
     }
 
     fn tick_production(&mut self) {
