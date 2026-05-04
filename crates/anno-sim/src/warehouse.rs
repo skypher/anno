@@ -12,11 +12,11 @@ use std::collections::HashMap;
 /// Maximum goods slots per warehouse.
 pub const MAX_GOOD_TYPES: usize = 32;
 
-/// Per-tier warehouse storage capacity (tons per good).
-/// RE: timhowgego.wordpress.com/anno_1602/gameplay/trade_diplomacy
-/// — "Warehouse I: 30t, Warehouse II: 50t, Warehouse III: 75t,
-/// Warehouse IV: 100t". Index by upgrade level (0..=3); the
-/// default warehouse uses tier 0 (30t).
+/// Per-tier warehouse storage capacity (tons per good). Verified
+/// against `haeuser.cod`: the four `Kind: KONTOR` building
+/// definitions carry `Maxlager: 30 / 50 / 75 / 100` paired with
+/// `Bauinfra: INFRA_KONTOR_1 .. INFRA_KONTOR_3`. Index by upgrade
+/// level (0..=3); the default warehouse uses tier 0 (30 t).
 pub const WAREHOUSE_CAPACITIES: [u16; 4] = [30, 50, 75, 100];
 
 /// A warehouse on an island, tracking inventory for one player.

@@ -20,6 +20,9 @@ use crate::types::Good;
 use crate::warehouse::{self, Warehouse};
 
 /// Carrier walking speed in sub-tiles per movement tick (100ms).
+/// Matches figuren.cod `Nummer: TRAEGER` `Speed: 220` (and the
+/// alternate TRAEGER2 entry, also 220) once normalised against
+/// our 100 ms step granularity.
 const CARRIER_SPEED: u16 = 4;
 
 /// Try to spawn a carrier for a production building.

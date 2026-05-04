@@ -1,12 +1,11 @@
 //! Building definitions and instances.
 //!
-//! Ported from the building definition table at DAT_00619b60 (136 bytes each)
-//! and the active building array at PTR_DAT_0049aebc (20-byte stride, 1037 entries).
+//! Ported from the building definition table at DAT_00619b60
+//! (136-byte stride). The active-building array at
+//! `PTR_DAT_0049aebc` is 20-byte stride × 1037 entries in the
+//! original; we use Vec sizing instead of a fixed cap.
 
 use crate::types::{Good, ProductionType};
-
-/// Maximum active building instances.
-pub const MAX_BUILDINGS: usize = 1037;
 
 /// Building definition (loaded from haeuser.cod).
 #[derive(Debug, Clone)]
@@ -208,9 +207,6 @@ pub struct BuildingInstance {
 }
 
 fn default_remaining_ore() -> u16 { u16::MAX }
-
-/// Production ticks a building must idle before its maintenance halves.
-pub const IDLE_MAINTENANCE_THRESHOLD: u32 = 5;
 
 fn default_building_health() -> u16 { BUILDING_MAX_HEALTH }
 pub const BUILDING_MAX_HEALTH: u16 = 100;
