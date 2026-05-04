@@ -343,7 +343,10 @@ impl Simulation {
         for j in 0..6u8 {
             self.diplomacy.set(PIRATE, j, Diplomacy::War);
         }
-        let mut pirate = MilitaryUnit::new(UnitType::SmallWarship, PIRATE, px, py);
+        // Pirate spawns use the dedicated PIRAT ship figure
+        // (figuren.cod `Nummer: PIRAT`), not the player-buildable
+        // KRIEG1 hull.
+        let mut pirate = MilitaryUnit::new(UnitType::PirateShip, PIRATE, px, py);
         pirate.target_x = sx;
         pirate.target_y = sy;
         self.military_units.push(pirate);

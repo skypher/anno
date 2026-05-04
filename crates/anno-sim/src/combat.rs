@@ -17,13 +17,14 @@ const ATTACK_RANGE: u32 = 3;
 
 /// Military unit types (from FUN_00451890 switch cases).
 ///
-/// Land-unit roster RE-cited from `figuren.cod`: there are
-/// exactly four land FIGTYP values — `SCHWERT` (sword/infantry),
-/// `KAVALERIE` (cavalry), `MUSKETIER` (musketeer), and `KANONIER`
-/// (artillery / cannon). `text.cod [FIGKIND]` confirms the same
-/// four entries (Infantryman / Cavalryman / Musketeer /
-/// Artilleryman). There is no separate Pikeman or Archer in the
-/// original game, so neither appears here.
+/// Roster RE-cited from `figuren.cod`. Land entries are the four
+/// FIGTYP values (`SCHWERT`, `KAVALERIE`, `MUSKETIER`, `KANONIER`),
+/// confirmed by `text.cod [FIGKIND]` (Infantryman / Cavalryman /
+/// Musketeer / Artilleryman). Naval entries are the `KRIEG1`,
+/// `KRIEG2`, and `PIRAT` ship figures — KRIEG1/KRIEG2 are the two
+/// player-buildable warships and PIRAT is the dedicated pirate
+/// ship spawned by hideouts. There is no Pikeman, no Archer, no
+/// medium warship or flagship in the original.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum UnitType {
@@ -31,11 +32,10 @@ pub enum UnitType {
     Musketeer = 3,
     Cavalry = 4,
     Cannon = 6,
-    // Naval
-    SmallWarship = 11,
-    MediumWarship = 12,
-    LargeWarship = 13,
-    Flagship = 14,
+    // Naval (figuren.cod ship-figure names in parens).
+    SmallWarship = 11, // KRIEG1
+    PirateShip = 12,   // PIRAT
+    LargeWarship = 13, // KRIEG2
 }
 
 /// Unit stats table (damage, health, speed, range).
@@ -113,15 +113,6 @@ impl UnitType {
                 is_ranged: true,
                 is_naval: true,
             },
-            UnitType::MediumWarship => UnitStats {
-                max_health: 90.0 / 40.0,  // interpolated, no appendix value
-                attack_damage: 0.15,
-                attack_speed_ms: 2500,
-                attack_range: 6,
-                move_speed: 4,
-                is_ranged: true,
-                is_naval: true,
-            },
             UnitType::LargeWarship => UnitStats {
                 max_health: 120.0 / 40.0, // = 3.0
                 attack_damage: 0.20,
@@ -131,12 +122,16 @@ impl UnitType {
                 is_ranged: true,
                 is_naval: true,
             },
-            UnitType::Flagship => UnitStats {
-                max_health: 4.0,
-                attack_damage: 0.25,
-                attack_speed_ms: 3500,
-                attack_range: 8,
-                move_speed: 2,
+            // Pirate ship — figuren.cod `Nummer: PIRAT`, `Maxkanon`
+            // = 10. Stats interpolated between Small and Large
+            // warships since the original tables don't surface a
+            // distinct pirate hull profile.
+            UnitType::PirateShip => UnitStats {
+                max_health: 90.0 / 40.0,
+                attack_damage: 0.15,
+                attack_speed_ms: 2500,
+                attack_range: 6,
+                move_speed: 4,
                 is_ranged: true,
                 is_naval: true,
             },
@@ -151,9 +146,8 @@ impl UnitType {
             4 => Some(UnitType::Cavalry),
             6 => Some(UnitType::Cannon),
             11 => Some(UnitType::SmallWarship),
-            12 => Some(UnitType::MediumWarship),
+            12 => Some(UnitType::PirateShip),
             13 => Some(UnitType::LargeWarship),
-            14 => Some(UnitType::Flagship),
             _ => None,
         }
     }
@@ -205,20 +199,17 @@ fn default_escort_ship() -> i32 { -1 }
 /// Maximum cannons each ship class can mount. Values RE-cited
 /// from `figuren.cod` `Maxkanon:` field on the ship-figure
 /// entries:
-///   HANDEL1 = 6  (SmallTradeShip)
-///   HANDEL2 = 10 (LargeTradeShip — UnitType has no variant)
+///   HANDEL1 = 6  (small trade ship — not a UnitType)
+///   HANDEL2 = 10 (large trade ship — not a UnitType)
 ///   KRIEG1  = 8  (SmallWarship)
 ///   KRIEG2  = 14 (LargeWarship)
-///   HANDLER = 12 (free trader, UnitType has no variant)
-///   PIRAT   = 10 (pirate ship)
-/// MediumWarship / Flagship aren't in the original 4-class naval
-/// line-up; speculative interpolated values.
+///   HANDLER = 12 (free trader's ship — not a UnitType)
+///   PIRAT   = 10 (PirateShip)
 pub fn cannon_capacity(t: UnitType) -> u8 {
     match t {
         UnitType::SmallWarship => 8,
-        UnitType::MediumWarship => 11,
         UnitType::LargeWarship => 14,
-        UnitType::Flagship => 14,
+        UnitType::PirateShip => 10,
         _ => 0,
     }
 }
@@ -246,9 +237,10 @@ pub fn unit_build_cost(t: UnitType) -> i32 {
         UnitType::Musketeer => 400,
         UnitType::Cannon => 200,
         UnitType::SmallWarship => 600,
-        UnitType::MediumWarship => 750,
         UnitType::LargeWarship => 900,
-        UnitType::Flagship => 1_200,
+        // Pirate ships aren't player-buildable; cost is unused
+        // but the match must be exhaustive.
+        UnitType::PirateShip => 0,
     }
 }
 
@@ -259,9 +251,9 @@ pub fn unit_build_resources(t: UnitType) -> (u16, u16, u16, u16, u16, u16, u16) 
     match t {
         // Wood, Bricks, Cloth — naval hulls + sails.
         UnitType::SmallWarship   => (32, 4, 8,  0, 0, 0, 0),
-        UnitType::MediumWarship  => (40, 5, 10, 0, 0, 0, 0),
         UnitType::LargeWarship   => (60, 7, 14, 0, 0, 0, 0),
-        UnitType::Flagship       => (80, 9, 18, 0, 0, 0, 0),
+        // Pirate ships aren't player-buildable.
+        UnitType::PirateShip     => (0, 0, 0, 0, 0, 0, 0),
         // Land units — Tools, Swords/Muskets/Cannons by role.
         UnitType::Infantry       => (0, 0, 0, 3, 5, 0, 0),
         UnitType::Cavalry        => (0, 0, 0, 3, 8, 0, 0),
