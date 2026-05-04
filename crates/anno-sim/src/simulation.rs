@@ -894,7 +894,7 @@ impl Simulation {
                             crate::types::Good::Bricks, crate::types::Good::Swords,
                             crate::types::Good::Cannons, crate::types::Good::Muskets,
                             crate::types::Good::Stone, crate::types::Good::Cocoa,
-                            crate::types::Good::Spices, crate::types::Good::Hides,
+                            crate::types::Good::Spices, crate::types::Good::WildGame,
                             crate::types::Good::Cotton, crate::types::Good::Silk,
                             crate::types::Good::Fish, crate::types::Good::Grapes,
                             crate::types::Good::GoldOre,

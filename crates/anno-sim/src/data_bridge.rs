@@ -47,7 +47,7 @@ fn parse_good(name: &str) -> Good {
         "GEWUERZ" | "GEWUERZE" | "GEWUERZBAUM" => Good::Spices,
         "KAKAO" | "KAKAOBAUM" => Good::Cocoa,
         "WEINTRAUBEN" | "WEIN" => Good::Grapes,
-        "HAEUTE" => Good::Hides,
+        "WILD" => Good::WildGame,
         "BAUMWOLLE" => Good::Cotton,
         "SEIDE" => Good::Silk,
         "SCHMUCK" => Good::Jewelry,
@@ -169,7 +169,7 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         Good::Alcohol => 15,              // Distillery
         Good::Grapes => 35,               // Winery
         Good::TobaccoProducts => 25,
-        Good::Hides => 5,
+        Good::WildGame => 5,
         Good::Silk => 20,
         Good::Fish => 5,
         // Non-production buildings (markets etc.) — fall through.

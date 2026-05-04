@@ -34,7 +34,7 @@ pub fn price_of(good: Good) -> GoodPrice {
         // Animals / plantation raw goods
         Wool    => GoodPrice { buy: 6,  sell: 3  },
         Cotton  => GoodPrice { buy: 7,  sell: 4  },
-        Hides   => GoodPrice { buy: 7,  sell: 4  },
+        WildGame   => GoodPrice { buy: 7,  sell: 4  },
         Cattle  => GoodPrice { buy: 5,  sell: 3  },
         Grain   => GoodPrice { buy: 5,  sell: 3  },
         Sugar   => GoodPrice { buy: 9,  sell: 5  },

@@ -23,9 +23,9 @@ pub const NUM_POP_TIERS: usize = 5;
 /// terrain growth pseudo-goods like GRAS/BAUM/TABAKBAUM that don't
 /// surface to the player). The 25 player-facing economic goods from
 /// the manual's WARE list are all enumerated below; we add a handful
-/// of extras (Stone, GoldOre, Hides, Cotton, Silk, Fish, Grapes) that
-/// appear in haeuser.cod production chains but aren't shown as
-/// distinct entries in the manual.
+/// of extras (Stone, GoldOre, WildGame, Cotton, Silk, Fish, Grapes)
+/// that appear in haeuser.cod production chains but aren't shown
+/// as distinct entries in the manual.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum Good {
@@ -56,7 +56,10 @@ pub enum Good {
     Stone = 22,      // STEINE — quarried stone
     Ore = 23,        // EISENERZ — iron ore (before smelting)
     GoldOre = 24,    // GOLDERZ — gold ore (before smelting)
-    Hides = 25,      // HAEUTE — animal hides
+    WildGame = 25,   // WILD — wild game from hunting lodges
+                     // (not "HAEUTE"/hides — that string never
+                     // appears in any COD file; the actual
+                     // huntable raw material is `WILD`)
     Cotton = 26,     // BAUMWOLLE — cotton (alternative to wool)
     Silk = 27,       // SEIDE — silk
     Jewelry = 28,    // SCHMUCK — jewelry

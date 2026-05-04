@@ -41,7 +41,7 @@ pub fn allows_production(climate: Climate, good: Good) -> bool {
     );
     let needs_north = matches!(
         good,
-        Good::Wool | Good::Grain | Good::Flour | Good::Cattle | Good::Hides
+        Good::Wool | Good::Grain | Good::Flour | Good::Cattle | Good::WildGame
     );
     if needs_south { return climate == Climate::South; }
     if needs_north { return climate == Climate::North; }

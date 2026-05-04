@@ -1453,7 +1453,7 @@ fn main() {
                             Good::Grain, Good::Flour, Good::Food, Good::Alcohol,
                             Good::Cloth, Good::Clothing, Good::Jewelry, Good::Tools,
                             Good::Bricks, Good::Swords, Good::Cannons, Good::Muskets,
-                            Good::Stone, Good::Cocoa, Good::Spices, Good::Hides,
+                            Good::Stone, Good::Cocoa, Good::Spices, Good::WildGame,
                             Good::Cotton, Good::Silk, Good::Fish, Good::Grapes,
                             Good::GoldOre, Good::TobaccoProducts,
                         ];
@@ -1897,7 +1897,7 @@ fn main() {
                                         Good::Clothing, Good::Jewelry, Good::Tools,
                                         Good::Bricks, Good::Swords, Good::Cannons,
                                         Good::Muskets, Good::Stone, Good::Cocoa,
-                                        Good::Spices, Good::Hides, Good::Cotton,
+                                        Good::Spices, Good::WildGame, Good::Cotton,
                                         Good::Silk, Good::Fish, Good::Grapes,
                                         Good::GoldOre, Good::TobaccoProducts,
                                     ];
@@ -2815,7 +2815,7 @@ fn main() {
                                     Good::Cloth, Good::Clothing, Good::Jewelry,
                                     Good::Tools, Good::Bricks, Good::Swords, Good::Cannons,
                                     Good::Muskets, Good::Stone, Good::Cocoa, Good::Spices,
-                                    Good::Hides, Good::Cotton, Good::Silk, Good::Fish,
+                                    Good::WildGame, Good::Cotton, Good::Silk, Good::Fish,
                                     Good::Grapes, Good::GoldOre, Good::TobaccoProducts,
                                 ];
                                 for &g in &all_goods {
@@ -5323,7 +5323,7 @@ fn main() {
                 Good::Grain, Good::Flour, Good::Food, Good::Alcohol,
                 Good::Cloth, Good::Clothing, Good::Jewelry, Good::Tools,
                 Good::Bricks, Good::Swords, Good::Cannons, Good::Muskets,
-                Good::Stone, Good::Cocoa, Good::Spices, Good::Hides,
+                Good::Stone, Good::Cocoa, Good::Spices, Good::WildGame,
                 Good::Cotton, Good::Silk, Good::Fish, Good::Grapes,
                 Good::GoldOre, Good::TobaccoProducts,
             ];
