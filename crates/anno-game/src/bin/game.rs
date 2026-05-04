@@ -6243,6 +6243,18 @@ fn init_simulation(
     sim.ai_controllers
         .push(AiController::new(1, AiPersonality::Economic, Difficulty::Medium));
 
+    // Reserved-faction slots (2..=6). The PLAYER4 chunk holds
+    // their starting balances — slot 4 = free trader (1M),
+    // slot 5 = native (50k), slot 6 = pirate (5k). Empty slots
+    // 2/3 just get a placeholder Player so indexing is uniform.
+    for slot in 2u8..=6 {
+        let mut p = Player::new_ai(slot, 0);
+        if let Some(init) = szs.players.get(slot as usize) {
+            p.gold = init.starting_gold;
+        }
+        sim.players.push(p);
+    }
+
     // Military setup
     sim.diplomacy.set(0, 1, Diplomacy::War);
     sim.military_units
