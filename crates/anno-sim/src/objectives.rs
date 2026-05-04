@@ -162,12 +162,79 @@ impl ObjectiveSet {
             Objective::StockGood { good: Good::Tools, qty: 50 },
         ])
     }
+
+    /// Build an objective set from a parsed AUFTRAG4 scenario
+    /// briefing. Translates the bit-flagged goals_raw fields into
+    /// the corresponding `Objective` variants:
+    ///
+    ///   `MISSION_FLAG_POPULATION` + `goals_raw[0..4]` + tier idx
+    ///       → `ReachPopulation`
+    ///   `MISSION_FLAG_COOPERATIVE` + `goals_raw[18*4..]`
+    ///       → `SupportFellowPlayer { who: 1, .. }` (the
+    ///         conventional cooperative neighbour slot is the
+    ///         first AI rival, slot 1)
+    ///
+    /// Returns an empty set when the mission carries no flagged
+    /// goals — caller can fall back to `default_starter`.
+    pub fn from_mission_flags(
+        flags: u32,
+        primary_population: Option<u32>,
+        primary_tier: Option<u8>,
+        cooperative_population: Option<u32>,
+    ) -> Self {
+        const POP: u32 = 1 << 0;
+        const COOP: u32 = 1 << 4;
+        let mut items = Vec::new();
+        if flags & POP != 0 {
+            if let Some(count) = primary_population {
+                items.push(Objective::ReachPopulation {
+                    tier: primary_tier.unwrap_or(PopTier::Aristocrat as u8),
+                    count,
+                });
+            }
+        }
+        if flags & COOP != 0 {
+            if let Some(target) = cooperative_population {
+                items.push(Objective::SupportFellowPlayer {
+                    who: 1,
+                    target_population: target,
+                });
+            }
+        }
+        Self::new(items)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::player::Player;
+
+    #[test]
+    fn from_mission_flags_translates_population_and_cooperative() {
+        // Plague-of-Pirates style: just population, no neighbour.
+        let s = ObjectiveSet::from_mission_flags(
+            0x0401, Some(5_000), None, None,
+        );
+        assert_eq!(s.items.len(), 1);
+        assert!(matches!(s.items[0].0,
+            Objective::ReachPopulation { count: 5_000, .. }));
+
+        // Good-Neighbors style: pop + cooperative neighbour.
+        let s = ObjectiveSet::from_mission_flags(
+            0x0011, Some(1_000), Some(3), Some(1_000),
+        );
+        assert_eq!(s.items.len(), 2);
+        assert!(matches!(s.items[0].0,
+            Objective::ReachPopulation { tier: 3, count: 1_000 }));
+        assert!(matches!(s.items[1].0,
+            Objective::SupportFellowPlayer { who: 1, target_population: 1_000 }));
+
+        // Tutorial / no-flag: empty objective set so caller can fall
+        // back to default_starter.
+        let s = ObjectiveSet::from_mission_flags(0, None, None, None);
+        assert!(s.items.is_empty());
+    }
 
     #[test]
     fn population_objective_completes() {

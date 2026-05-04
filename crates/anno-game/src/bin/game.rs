@@ -981,6 +981,23 @@ fn main() {
         sim.island_maps.len()
     );
 
+    // Replace dev-default objectives with the scenario's actual
+    // AUFTRAG4 goals when the briefing's flag bits are set. Falls
+    // back to the dev defaults when the scenario carries no
+    // flagged goals (Tutorials, Continous-Play templates).
+    if let Some(mission) = szs.mission.as_ref() {
+        let g = mission.goals();
+        let scenario_set = anno_sim::objectives::ObjectiveSet::from_mission_flags(
+            mission.flags,
+            g.primary_population,
+            g.primary_tier,
+            g.cooperative_population,
+        );
+        if !scenario_set.items.is_empty() {
+            sim.objectives = scenario_set;
+        }
+    }
+
     // Initialize building placer
     let mut placer = BuildingPlacer::new(&cod, &defs);
     println!("Building placer: {} buildable types", placer.buildable.len());
