@@ -180,11 +180,17 @@ const AUFTRAG4_TOTAL_BYTES: usize = 2244;
 pub struct PlayerSlotInit {
     /// Starting gold (first u32 of the slot record).
     pub starting_gold: i32,
-    /// True when this slot is a human player. RE-derived from
-    /// byte offset 12 of the slot record: `0x00` = human / fixed
-    /// faction, `0xff` = not present (AI fills the slot when the
-    /// scenario configures one).
-    pub is_human: bool,
+    /// Raw value of byte 12 of the slot record. Cross-scenario
+    /// sample shows this isn't a clean `is_human` flag — Atoll
+    /// (single-player free-for-all) sets it to `0x00` for slots
+    /// 0 / 4 / 5 / 6 and `0xff` for unused AI slots, while
+    /// Tutorial0 leaves every slot at `0xff` and Plague of
+    /// Pirates puts `0x00` on slots 0..=3. Most plausible
+    /// interpretation: `0x00` = "scenario explicitly configured
+    /// this slot" / `0xff` = default fill — but the binary's
+    /// PLAYER4 reader hasn't been traced so the semantic stays
+    /// raw for now.
+    pub slot_byte12: u8,
 }
 
 const PLAYER4_SLOT_BYTES: usize = 1072;
@@ -351,8 +357,8 @@ impl SzsFile {
             ]);
             // Byte 12 = 0x00 (active player / fixed faction) vs
             // 0xff (slot inactive — AI fills it on game start).
-            let is_human = data[off + 12] == 0x00 && slot < 4;
-            out.push(PlayerSlotInit { starting_gold, is_human });
+            let slot_byte12 = data[off + 12];
+            out.push(PlayerSlotInit { starting_gold, slot_byte12 });
         }
         out
     }
