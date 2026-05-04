@@ -3,17 +3,20 @@
 //! Ported from FUN_00451890 (unit movement/combat tick) and related functions.
 //!
 //! Combat model:
-//! - Units detect enemies within engagement range (96 pixels / ~6 tiles)
-//! - Combat triggers when units are within attack range (48 pixels / ~3 tiles)
-//! - Damage is applied per tick based on unit type stats
-//! - Health is normalized 0.0-1.0; units die at ≈0.0
-//! - Projectiles spawn for ranged units (musketeers, cannons, ships)
-//! - Nation interaction matrix determines who can fight whom
+//! - Units detect enemies within DETECTION_RANGE (6 tiles).
+//! - Each unit has a per-type `attack_range` from `UnitStats`
+//!   (Infantry/Cavalry 1, Musketeer 4, Cannon 8, naval 5..7).
+//!   A unit only deals damage once it has closed to that range.
+//! - Damage is applied per tick based on unit type stats.
+//! - Health is normalized 0.0-1.0; units die at ≈0.02.
+//! - Projectiles spawn for ranged units (musketeers, cannons, ships).
+//! - Nation interaction matrix determines who can fight whom.
 
-/// Maximum engagement detection range in tiles.
+/// Maximum engagement detection range in tiles. Combat will be
+/// initiated against any hostile inside this radius; the per-type
+/// `UnitStats::attack_range` then decides how close the unit has
+/// to close before it can land hits.
 const DETECTION_RANGE: u32 = 6;
-/// Attack range in tiles (must be within this to deal damage).
-const ATTACK_RANGE: u32 = 3;
 
 /// Military unit types (from FUN_00451890 switch cases).
 ///

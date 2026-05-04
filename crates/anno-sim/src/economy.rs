@@ -13,8 +13,11 @@
 use crate::player::{Player, NUM_DEMAND_CATEGORIES};
 use crate::types::NUM_POP_TIERS;
 
-/// Economy tick interval in milliseconds.
-pub const ECONOMY_TICK_MS: u32 = 9999;
+/// Economy tick interval in milliseconds. Aligned to the
+/// binary's `-1000` ms game-tick decrement at `1602_exe.c:16110`
+/// — there is no half-ms cadence in the original, so a 9999 ms
+/// approximation has no RE basis.
+pub const ECONOMY_TICK_MS: u32 = 10_000;
 
 /// Satisfaction threshold below which citizens leave (60%).
 pub const LEAVE_THRESHOLD: u8 = 0x4C;

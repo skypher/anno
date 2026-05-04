@@ -190,17 +190,20 @@ impl Simulation {
             speed_multiplier: 1,
             paused: false,
 
+            // Subsystem cadences mirror the binary's `-1000` ms
+            // game-tick decrement (1602_exe.c:16110); the off-by-one
+            // values (999 / 9999 / 29999 / 4999) were unjustified.
             timer_animation: SubsystemTimer::new(40_000),
-            timer_production: SubsystemTimer::new(999),
-            timer_population: SubsystemTimer::new(9_999),
+            timer_production: SubsystemTimer::new(crate::production::PRODUCTION_TICK_MS),
+            timer_population: SubsystemTimer::new(10_000),
             timer_citizen: SubsystemTimer::new(15_000),
-            timer_island: SubsystemTimer::new(29_999),
+            timer_island: SubsystemTimer::new(30_000),
             timer_events: SubsystemTimer::new(10_000),
             timer_ships: SubsystemTimer::new(1_000),
             timer_market: SubsystemTimer::new(1_000),
-            timer_military: SubsystemTimer::new(9_999),
-            timer_projectile: SubsystemTimer::new(9_999),
-            timer_diplomacy: SubsystemTimer::new(4_999),
+            timer_military: SubsystemTimer::new(10_000),
+            timer_projectile: SubsystemTimer::new(10_000),
+            timer_diplomacy: SubsystemTimer::new(5_000),
 
             players: Vec::new(),
             buildings: Vec::new(),
