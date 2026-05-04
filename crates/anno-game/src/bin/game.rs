@@ -912,6 +912,18 @@ fn main() {
         scenario_name,
         szs.islands.len()
     );
+    {
+        let m = &szs.scenario;
+        if m.mission_nr.is_some() || m.ranking.is_some() {
+            println!(
+                "Scenario meta: mission #{} players {}-{} ranking {}",
+                m.mission_nr.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                m.player_min.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                m.player_max.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                m.ranking.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            );
+        }
+    }
     for island in &szs.islands {
         if let Some(city) = island.city.as_ref() {
             if !city.name.is_empty() {

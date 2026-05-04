@@ -76,6 +76,28 @@ pub struct SzsFile {
     /// `None` for files without that chunk (rare; even tutorial
     /// scenarios carry an AUFTRAG4 with all-zero goal flags).
     pub mission: Option<Mission>,
+    /// Scenario metadata parsed from the four `SZENE_*` chunks
+    /// (`MISSNR`, `PLAYERMIN`, `PLAYERMAX`, `RANKING`). Each is
+    /// a single u32; absent chunks come back as `None`.
+    pub scenario: ScenarioMeta,
+}
+
+/// Scenario-level metadata (mission #, player range, difficulty
+/// ranking) extracted from the four `SZENE_*` chunks at the top
+/// of every shipping `.szs` file. Each field is `Option<u32>`
+/// because tutorial scenarios omit the player-count chunks (they
+/// are implicit single-player) and standalone "Continous Play"
+/// maps omit the mission number.
+///
+/// Cross-scenario sample shows `SZENE_RANKING` 0 in tutorials,
+/// 2-3 in scripted missions; `SZENE_MISSNR` is the campaign
+/// slot index visible in the original mission picker.
+#[derive(Debug, Clone, Default)]
+pub struct ScenarioMeta {
+    pub mission_nr: Option<u32>,
+    pub player_min: Option<u32>,
+    pub player_max: Option<u32>,
+    pub ranking: Option<u32>,
 }
 
 /// Mission metadata extracted from the `AUFTRAG4` chunk.
@@ -235,7 +257,20 @@ impl SzsFile {
             .find(|c| c.name == "AUFTRAG4")
             .and_then(|c| Self::parse_auftrag4(&c.data));
 
-        Ok(SzsFile { chunks, islands, players, mission })
+        let read_u32 = |name: &str| -> Option<u32> {
+            chunks.iter()
+                .find(|c| c.name == name)
+                .filter(|c| c.data.len() >= 4)
+                .map(|c| u32::from_le_bytes([c.data[0], c.data[1], c.data[2], c.data[3]]))
+        };
+        let scenario = ScenarioMeta {
+            mission_nr: read_u32("SZENE_MISSNR"),
+            player_min: read_u32("SZENE_PLAYERMIN"),
+            player_max: read_u32("SZENE_PLAYERMAX"),
+            ranking: read_u32("SZENE_RANKING"),
+        };
+
+        Ok(SzsFile { chunks, islands, players, mission, scenario })
     }
 
     fn parse_auftrag4(data: &[u8]) -> Option<Mission> {
@@ -507,6 +542,27 @@ mod tests {
             .expect("at least one island has a STADT4 city");
         assert_eq!(city.name, "Larrach");
         assert_eq!(city.owner, 1);
+    }
+
+    #[test]
+    fn scenario_meta_extracts_szene_chunks() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/A Plague of Pirates.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Plague");
+        // Plague of Pirates: campaign mission #15, single-player,
+        // ranking 3 (matches the in-game mission picker).
+        assert_eq!(szs.scenario.mission_nr, Some(15));
+        assert_eq!(szs.scenario.player_min, Some(1));
+        assert_eq!(szs.scenario.player_max, Some(1));
+        assert_eq!(szs.scenario.ranking, Some(3));
     }
 
     #[test]
