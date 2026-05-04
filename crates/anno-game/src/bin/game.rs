@@ -6522,17 +6522,18 @@ fn render_island(
 }
 
 /// Distinctive RGBA color per player slot, used for ownership rings on
-/// units and (eventually) building outlines. Slot 0 = blue (human), 1-5
-/// = AI rivals, 6 = pirate red.
+/// Player owner colour. Slot 0 = blue (human), 1-3 = AI rivals,
+/// 4 = free trader (white sail), 5 = natives (tan), 6 = pirates
+/// (red).
 fn player_color(owner: u8) -> [u8; 4] {
     match owner {
-        0 => [0x40, 0x80, 0xFF, 0xFF], // human: blue
-        1 => [0xFF, 0x80, 0x40, 0xFF], // AI 1: orange
-        2 => [0x40, 0xFF, 0x80, 0xFF], // AI 2: green
-        3 => [0xC0, 0x40, 0xFF, 0xFF], // AI 3: purple
-        4 => [0xFF, 0x40, 0xC0, 0xFF], // AI 4: pink
-        5 => [0xFF, 0xFF, 0x40, 0xFF], // AI 5: yellow
-        6 => [0xFF, 0x40, 0x40, 0xFF], // pirate: red
+        0 => [0x40, 0x80, 0xFF, 0xFF], // human:   blue
+        1 => [0xFF, 0x80, 0x40, 0xFF], // AI 1:    orange
+        2 => [0x40, 0xFF, 0x80, 0xFF], // AI 2:    green
+        3 => [0xC0, 0x40, 0xFF, 0xFF], // AI 3:    purple
+        4 => [0xF0, 0xF0, 0xF0, 0xFF], // trader:  white
+        5 => [0xC0, 0x90, 0x60, 0xFF], // natives: tan
+        6 => [0xFF, 0x40, 0x40, 0xFF], // pirates: red
         _ => [0xCC, 0xCC, 0xCC, 0xFF], // fallback gray
     }
 }
