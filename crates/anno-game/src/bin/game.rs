@@ -4533,8 +4533,8 @@ fn main() {
                             && p.state != anno_sim::player::PlayerState::Defeated)
                     .unwrap_or(false);
                 let label = match tgt {
-                    4 => "Natives",
-                    5 => "Free Trader",
+                    4 => "Free Trader",
+                    5 => "Natives",
                     6 => "Pirates",
                     _ => "Player",
                 };
