@@ -951,6 +951,21 @@ fn main() {
             if mission.flags & MISSION_FLAG_PIRATE      != 0 { tags.push("pirate-combat"); }
             let tag_str = if tags.is_empty() { String::new() } else { format!("  [{}]", tags.join(", ")) };
             println!("Mission flags 0x{:04x}{}", mission.flags, tag_str);
+            let goals = mission.goals();
+            if let Some(pop) = goals.primary_population {
+                let tier = match goals.primary_tier {
+                    Some(0) => " of Pioneer tier",
+                    Some(1) => " of Settler tier",
+                    Some(2) => " of Citizen tier",
+                    Some(3) => " of Merchant tier",
+                    Some(4) => " at Aristocrat tier",
+                    _ => "",
+                };
+                println!("Goal: reach {} inhabitants{}", pop, tier);
+            }
+            if let Some(coop) = goals.cooperative_population {
+                println!("Goal: assist neighbour to {} inhabitants", coop);
+            }
             println!("---");
             println!("{}", mission.briefing.trim_end());
             println!("---");

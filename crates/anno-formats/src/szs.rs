@@ -178,6 +178,42 @@ pub struct Mission {
     pub goals_raw: Vec<u8>,
 }
 
+impl Mission {
+    /// Decode the goal numbers each `MISSION_FLAG_*` bit
+    /// references. Cross-scenario survey of all 60 shipping
+    /// `.szs` files showed the layout:
+    ///
+    ///   goals_raw u32  0 = primary population threshold
+    ///   goals_raw u32  1 = primary tier index (0..=4)
+    ///   goals_raw u32 18 = cooperative-neighbour population
+    ///                       (when `MISSION_FLAG_COOPERATIVE`)
+    ///
+    /// Other slots (u32s 2..=7) hold per-tier sub-goals — e.g.
+    /// "500 of these must be Merchants" — but the per-flag
+    /// layout there isn't fully stable across scenarios, so
+    /// they're left to callers via `goals_raw`.
+    pub fn goals(&self) -> MissionGoals {
+        let read_u32 = |i: usize| -> Option<u32> {
+            let off = i * 4;
+            if off + 4 > self.goals_raw.len() { return None; }
+            Some(u32::from_le_bytes([
+                self.goals_raw[off], self.goals_raw[off + 1],
+                self.goals_raw[off + 2], self.goals_raw[off + 3],
+            ]))
+        };
+        let pop_active = self.flags & MISSION_FLAG_POPULATION != 0;
+        let coop_active = self.flags & MISSION_FLAG_COOPERATIVE != 0;
+        MissionGoals {
+            primary_population: pop_active.then(|| read_u32(0).unwrap_or(0))
+                .filter(|&v| v > 0),
+            primary_tier: pop_active.then(|| read_u32(1).unwrap_or(0) as u8)
+                .filter(|&t| t <= 4),
+            cooperative_population: coop_active.then(|| read_u32(18).unwrap_or(0))
+                .filter(|&v| v > 0),
+        }
+    }
+}
+
 const AUFTRAG4_BRIEFING_OFFSET: usize = 0x68;
 const AUFTRAG4_GOALS_OFFSET: usize = 0x870;
 
@@ -200,6 +236,27 @@ pub const MISSION_FLAG_RANKING: u32 = 1 << 8;
 /// combat goal (Plague of Pirates, Pirata, Fortress, Exile,
 /// Dark Clouds on the Horizon, To Each his Own).
 pub const MISSION_FLAG_PIRATE: u32 = 1 << 10;
+
+/// Decoded mission-goal numbers. Each field is `Option<…>`
+/// because not every flag bit is set in every scenario; callers
+/// should read these together with `Mission::flags`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MissionGoals {
+    /// Primary population threshold (`MISSION_FLAG_POPULATION`).
+    /// Stored at goals_raw u32 0. The accompanying tier index
+    /// at u32 1 says which tier the population must reach
+    /// (0 = Pioneer, 4 = Aristocrat).
+    pub primary_population: Option<u32>,
+    /// Tier index that `primary_population` must be at
+    /// (0..=4). `None` when the scenario carries no population
+    /// goal.
+    pub primary_tier: Option<u8>,
+    /// Cooperative neighbour-population requirement
+    /// (`MISSION_FLAG_COOPERATIVE`). Stored at goals_raw u32 18
+    /// (chunk offset 0x8B8). Both Good Neighbors and
+    /// New Horizons2 use this slot.
+    pub cooperative_population: Option<u32>,
+}
 const AUFTRAG4_TOTAL_BYTES: usize = 2244;
 
 /// One player-slot record parsed from the SZS PLAYER4 chunk.
@@ -760,6 +817,33 @@ mod tests {
         // Tutorials carry no flags.
         let m = load("Tutorial0.szs").expect("Tutorial0");
         assert_eq!(m.flags, 0);
+    }
+
+    #[test]
+    fn mission_goals_decode_per_scenario() {
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let load = |name: &str| -> Option<Mission> {
+            SzsFile::parse(&std::fs::read(scenes.join(name)).ok()?).ok()?.mission
+        };
+        // Plague of Pirates: 5 000 inhabitants (tier 4, Aristocrat
+        // — the briefing says "Your capital should have a
+        // population of at least 5 000 inhabitants" without
+        // specifying tier; goals_raw u32 1 stays at 0 here).
+        let g = load("A Plague of Pirates.szs").unwrap().goals();
+        assert_eq!(g.primary_population, Some(5_000));
+        assert_eq!(g.cooperative_population, None);
+        // Good Neighbors: 1 000 in own city + 1 000 in neighbour.
+        let g = load("Good Neighbors.szs").unwrap().goals();
+        assert_eq!(g.primary_population, Some(1_000));
+        assert_eq!(g.primary_tier, Some(3)); // Merchant
+        assert_eq!(g.cooperative_population, Some(1_000));
+        // Tutorial0: no flags → no decoded goals.
+        let g = load("Tutorial0.szs").unwrap().goals();
+        assert_eq!(g.primary_population, None);
+        assert_eq!(g.cooperative_population, None);
     }
 
     #[test]
