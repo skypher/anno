@@ -328,14 +328,14 @@ impl Simulation {
         // Slot 6 is the pirate faction. Make them at war with everyone
         // else (idempotent — set on every spawn).
         use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
-        const PIRATE: u8 = 6;
-        for j in 0..6u8 {
-            self.diplomacy.set(PIRATE, j, Diplomacy::War);
+        use crate::free_trader::PIRATE_SLOT;
+        for j in 0..PIRATE_SLOT {
+            self.diplomacy.set(PIRATE_SLOT, j, Diplomacy::War);
         }
         // Pirate spawns use the dedicated PIRAT ship figure
         // (figuren.cod `Nummer: PIRAT`), not the player-buildable
         // KRIEG1 hull.
-        let mut pirate = MilitaryUnit::new(UnitType::PirateShip, PIRATE, px, py);
+        let mut pirate = MilitaryUnit::new(UnitType::PirateShip, PIRATE_SLOT, px, py);
         pirate.target_x = sx;
         pirate.target_y = sy;
         self.military_units.push(pirate);
@@ -1313,11 +1313,12 @@ impl Simulation {
         //      via `FUN_0044f000` and pick a random one with
         //      `aiStack_258[rand() % count]`.
         //
-        // We approximate the relations score with a sign-flip: humans
-        // (slot 0..4) are preferred candidates, AI slots come second.
-        // Without the actual `FUN_00475c60` formula decoded, all
-        // human-owned warehouses are scored equally (best); we then
-        // pick a random one uniformly.
+        // We approximate the relations score with a sign-flip:
+        // human / AI slots (0..=3) are the preferred candidates;
+        // the reserved factions (4 = trader itself, 5 = natives,
+        // 6 = pirates) never host trader visits. Without the actual
+        // `FUN_00475c60` formula decoded, all human-/AI-owned
+        // warehouses are scored equally (best) and picked uniformly.
         let r = self.next_rand() as usize;
         let candidates: Vec<usize> = self.warehouses.iter()
             .enumerate()

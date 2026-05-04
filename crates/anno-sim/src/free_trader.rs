@@ -52,6 +52,12 @@ pub const FREE_TRADER_SLOT: u8 = 4;
 /// slot 5 at 50 000 gold across all surveyed scenarios.
 pub const NATIVE_SLOT: u8 = 5;
 
+/// Diplomacy / player slot reserved for the pirate faction.
+/// PLAYER4 gives slot 6 a 5 000-gold balance in every shipping
+/// scenario; the binary's pirate-event handler hard-codes the
+/// same slot when emitting hideout-spawned ships.
+pub const PIRATE_SLOT: u8 = 6;
+
 // Visit count and dock duration. Anno 1602 manual section 8.1
 // "Free traders" + section 11.4.3 "Placing ships" + binary RE:
 //
