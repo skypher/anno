@@ -9,7 +9,8 @@
 //!   Settler:     Food, Cloth
 //!   Citizen:     Food, Cloth, Alcohol, TobaccoProducts
 //!   Merchant:    Food, Cloth, Alcohol, TobaccoProducts, Spices
-//!   Aristocrat:  Food, Cloth, Alcohol, TobaccoProducts, Spices, Cocoa
+//!   Aristocrat:  Food, Cloth, Alcohol, TobaccoProducts, Spices,
+//!                Cocoa, Jewelry, Clothing
 
 use crate::player::{DemandSlot, Player, NUM_DEMAND_CATEGORIES};
 use crate::types::{Good, PopTier, NUM_POP_TIERS};
@@ -32,7 +33,10 @@ pub const TIER_DEMANDS: &[&[Good]] = &[
         Good::TobaccoProducts,
         Good::Spices,
     ],
-    // Aristocrat
+    // Aristocrat — full eight-good roster (manual sec. 7.3
+    // "Aristokraten").  The DEMAND_GOODS table already reserves
+    // slots 6/7 for Jewelry and Clothing; this is the only tier
+    // that consumes them.
     &[
         Good::Food,
         Good::Cloth,
@@ -40,6 +44,8 @@ pub const TIER_DEMANDS: &[&[Good]] = &[
         Good::TobaccoProducts,
         Good::Spices,
         Good::Cocoa,
+        Good::Jewelry,
+        Good::Clothing,
     ],
 ];
 
