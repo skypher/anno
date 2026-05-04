@@ -289,6 +289,8 @@ fn good_from_u8(val: u8) -> Good {
         28 => Good::Jewelry,
         29 => Good::Clothing,
         30 => Good::Fish,
+        31 => Good::Meat,
+        32 => Good::SugarCane,
         _ => Good::None,
     }
 }

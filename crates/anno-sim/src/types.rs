@@ -65,6 +65,10 @@ pub enum Good {
     Jewelry = 28,    // SCHMUCK — jewelry
     Clothing = 29,   // KLEIDUNG — clothing
     Fish = 30,       // FISCHE — fish
+    Meat = 31,       // FLEISCH — butcher's output, distinct from
+                     // raw cattle / hunted game
+    SugarCane = 32,  // ZUCKERROHR — plantation raw, separate
+                     // good from the refined ZUCKER (Sugar)
 }
 
 /// Military unit types — mirrors the four `FIGTYP_*` land entries
