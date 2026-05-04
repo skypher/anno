@@ -6245,10 +6245,14 @@ fn init_simulation(
 
     // Reserved-faction slots (2..=6). The PLAYER4 chunk holds
     // their starting balances — slot 4 = free trader (1M),
-    // slot 5 = native (50k), slot 6 = pirate (5k). Empty slots
-    // 2/3 just get a placeholder Player so indexing is uniform.
+    // slot 5 = native (50k), slot 6 = pirate (5k). They run
+    // outside the defeat check (no settlement / pop / tax model)
+    // so we tag them PlayerState::Empty; the trader / native /
+    // pirate subsystems read the gold field directly without
+    // needing an AiActive marker.
     for slot in 2u8..=6 {
         let mut p = Player::new_ai(slot, 0);
+        p.state = anno_sim::player::PlayerState::Empty;
         if let Some(init) = szs.players.get(slot as usize) {
             p.gold = init.starting_gold;
         }
