@@ -5,7 +5,7 @@
 //! Renders the game world as a diamond-grid isometric view with
 //! two passes per row (ground layer, then buildings).
 
-use crate::camera::{Camera, ZoomLevel};
+use crate::camera::Camera;
 use crate::framebuffer::Framebuffer;
 use crate::palette::RemapTable;
 use crate::sprite::{SpriteCategory, SpriteManager};

@@ -3,7 +3,7 @@
 //! Ported from player data at DAT_005b7680 (stride 0xA0, max 7 players)
 //! and settlement data embedded within.
 
-use crate::types::{PopTier, NUM_POP_TIERS};
+use crate::types::NUM_POP_TIERS;
 
 /// Maximum number of players.
 pub const MAX_PLAYERS: usize = 7;

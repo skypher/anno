@@ -12,7 +12,7 @@
 //!   Aristocrat:  Food, Cloth, Alcohol, TobaccoProducts, Spices,
 //!                Cocoa, Jewelry, Clothing
 
-use crate::player::{DemandSlot, Player, NUM_DEMAND_CATEGORIES};
+use crate::player::{Player, NUM_DEMAND_CATEGORIES};
 use crate::types::{Good, PopTier, NUM_POP_TIERS};
 use crate::warehouse::Warehouse;
 

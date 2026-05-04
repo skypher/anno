@@ -1227,7 +1227,6 @@ fn main() {
     }
     let mut chat_active = false;
     let mut chat_input = String::new();
-    let mut last_alarm: Option<std::time::Instant> = None;
     // Recently received chat lines (oldest first) with timestamp for TTL.
     let mut chat_log: std::collections::VecDeque<(String, std::time::Instant)> =
         std::collections::VecDeque::new();

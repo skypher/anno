@@ -9,7 +9,7 @@
 //! - Satisfaction decays by 15/16 per tick
 //! - Citizens leave when satisfaction drops below 60% (0x4C)
 
-use crate::player::{Player, NUM_DEMAND_CATEGORIES};
+use crate::player::Player;
 use crate::types::NUM_POP_TIERS;
 
 /// Economy tick interval in milliseconds. Aligned to the

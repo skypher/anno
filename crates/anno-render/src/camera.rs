@@ -141,8 +141,6 @@ impl Camera {
 
     /// Update the tile origin from scroll position (inverse isometric projection).
     fn update_origin(&mut self) {
-        let ((sx_dx, sx_dy), (sy_dx, sy_dy)) = self.rotation.step_vectors();
-
         // The scroll-to-tile conversion depends on rotation.
         // For rotation 0: origin_x = (scroll_x + scroll_y) / 2
         //                  origin_y = (scroll_y - scroll_x) / 2

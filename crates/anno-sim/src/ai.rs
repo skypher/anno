@@ -164,7 +164,7 @@ impl AiController {
         player: &Player,
         buildings: &[BuildingInstance],
         building_defs: &[BuildingDef],
-        warehouses: &[Warehouse],
+        _warehouses: &[Warehouse],
         actions: &mut Vec<AiAction>,
     ) {
         if self.build_cooldown > 0 {
