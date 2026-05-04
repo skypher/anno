@@ -71,18 +71,15 @@ pub struct Simulation {
     /// Is the game paused?
     pub paused: bool,
 
-    // Subsystem timers (matching original intervals)
-    timer_animation: SubsystemTimer,  // 40000ms base
-    timer_production: SubsystemTimer, // 999ms
-    timer_population: SubsystemTimer, // 9999ms
-    timer_citizen: SubsystemTimer,    // 15000ms
-    timer_island: SubsystemTimer,     // 29999ms
-    timer_events: SubsystemTimer,     // variable
-    timer_ships: SubsystemTimer,      // 1000ms
-    timer_market: SubsystemTimer,     // 1000ms
-    timer_military: SubsystemTimer,   // 9999ms
-    timer_projectile: SubsystemTimer, // 9999ms
-    timer_diplomacy: SubsystemTimer,  // 4999ms
+    // Subsystem cadences (1000-ms tick aligned).
+    timer_animation: SubsystemTimer,  // 40_000 ms
+    timer_production: SubsystemTimer, // PRODUCTION_TICK_MS (1000)
+    timer_population: SubsystemTimer, // 10_000
+    timer_events: SubsystemTimer,     // 10_000
+    timer_ships: SubsystemTimer,      // 1_000
+    timer_market: SubsystemTimer,     // 1_000
+    timer_military: SubsystemTimer,   // 10_000
+    timer_diplomacy: SubsystemTimer,  // 5_000
 
     // Game state
     pub players: Vec<Player>,
@@ -196,13 +193,10 @@ impl Simulation {
             timer_animation: SubsystemTimer::new(40_000),
             timer_production: SubsystemTimer::new(crate::production::PRODUCTION_TICK_MS),
             timer_population: SubsystemTimer::new(10_000),
-            timer_citizen: SubsystemTimer::new(15_000),
-            timer_island: SubsystemTimer::new(30_000),
             timer_events: SubsystemTimer::new(10_000),
             timer_ships: SubsystemTimer::new(1_000),
             timer_market: SubsystemTimer::new(1_000),
             timer_military: SubsystemTimer::new(10_000),
-            timer_projectile: SubsystemTimer::new(10_000),
             timer_diplomacy: SubsystemTimer::new(5_000),
 
             players: Vec::new(),

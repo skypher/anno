@@ -43,24 +43,6 @@ const WALKABLE_KINDS: &[&str] = &[
     "TOR",        // Gate
 ];
 
-/// Building kinds that are explicitly blocked (buildings, resources, etc.)
-const BLOCKED_KINDS: &[&str] = &[
-    "HANDWERK",   // Production building
-    "ROHSTOFF",   // Raw resource
-    "PLANTAGE",   // Plantation
-    "BERGWERK",   // Mine
-    "WOHN",       // Residence
-    "KONTOR",     // Trading post
-    "MARKT",      // Market
-    "TURM",       // Tower
-    "BURG",       // Castle
-    "KIRCHE",     // Church
-    "HAFEN",      // Harbor
-    "MILITAR",    // Military
-    "STEINBRUCH", // Quarry
-    "FISCHEREI",  // Fishery (building itself blocks)
-];
-
 impl IslandMap {
     /// Build a walkability map from island tile data and building definitions.
     pub fn from_island(island: &Island, cod_buildings: &[CodBuilding]) -> Self {

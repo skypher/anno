@@ -462,14 +462,6 @@ impl BuildingPlacer {
         if start >= cat.len() { Vec::new() } else { cat[start..end].to_vec() }
     }
 
-    /// Convenience: borrowed view of the items on this page.
-    fn page_items(&self) -> Vec<&BuildableBuilding> {
-        self.page_index_slice()
-            .into_iter()
-            .map(|i| &self.buildable[i])
-            .collect()
-    }
-
     fn select_on_page(&mut self, slot: usize) {
         let cat = self.category_indices();
         let idx = self.page * 9 + slot;
