@@ -1,7 +1,8 @@
 //! Production chain simulation.
 //!
 //! Ported from FUN_0047daf0 (building production/processing tick).
-//! Timer: 999ms intervals.
+//! Timer: 1000 ms intervals (binary uses `-1000` decrement at
+//! `1602_exe.c:16110`).
 //!
 //! Production model:
 //! - Each building has input/output goods and a cycle time
@@ -11,8 +12,9 @@
 
 use crate::building::{BuildingDef, BuildingInstance};
 
-/// Production tick interval in milliseconds.
-pub const PRODUCTION_TICK_MS: u32 = 999;
+/// Production tick interval in milliseconds. RE-cited from the
+/// binary's `-1000` accumulator decrement at `1602_exe.c:16110`.
+pub const PRODUCTION_TICK_MS: u32 = 1000;
 
 /// Minimum efficiency threshold for production (50% = 64/128).
 pub const MIN_EFFICIENCY: u8 = 64;
