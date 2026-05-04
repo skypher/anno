@@ -176,7 +176,7 @@ const AUFTRAG4_TOTAL_BYTES: usize = 2244;
 /// factions: slot 4 = free trader (1 000 000 gold, matching
 /// `1602_exe.c:83179` `s_Trader_d`), slot 5 = native faction
 /// (50 000), slot 6 = pirates (5 000).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PlayerSlotInit {
     /// Starting gold (first u32 of the slot record).
     pub starting_gold: i32,
@@ -191,7 +191,17 @@ pub struct PlayerSlotInit {
     /// PLAYER4 reader hasn't been traced so the semantic stays
     /// raw for now.
     pub slot_byte12: u8,
+    /// Player display name. Verified at byte offset 0x3C0 of
+    /// each slot record (a 16-byte CP1252 null-terminated field):
+    /// Tutorial0 / Cooperation = "Wilfried" (the default German
+    /// male player name); Atoll = "Namenlos" (German for
+    /// "Nameless"); custom-named scenarios store whatever the
+    /// editor was asked to call the player.
+    pub name: String,
 }
+
+const PLAYER4_NAME_OFFSET: usize = 0x3C0;
+const PLAYER4_NAME_BYTES: usize = 16;
 
 const PLAYER4_SLOT_BYTES: usize = 1072;
 const PLAYER4_MAX_SLOTS: usize = 7;
@@ -358,7 +368,16 @@ impl SzsFile {
             // Byte 12 = 0x00 (active player / fixed faction) vs
             // 0xff (slot inactive — AI fills it on game start).
             let slot_byte12 = data[off + 12];
-            out.push(PlayerSlotInit { starting_gold, slot_byte12 });
+            let name_off = off + PLAYER4_NAME_OFFSET;
+            let name = if name_off + PLAYER4_NAME_BYTES <= data.len() {
+                let name_bytes = &data[name_off..name_off + PLAYER4_NAME_BYTES];
+                let end = name_bytes.iter().position(|&b| b == 0)
+                    .unwrap_or(PLAYER4_NAME_BYTES);
+                name_bytes[..end].iter().map(|&b| char::from(b)).collect()
+            } else {
+                String::new()
+            };
+            out.push(PlayerSlotInit { starting_gold, slot_byte12, name });
         }
         out
     }
@@ -573,6 +592,9 @@ mod tests {
         // Slot 6 is the pirate faction.
         assert_eq!(szs.players[6].starting_gold, 5_000,
             "slot 6 (pirates) should have 5 000 gold");
+        // Tutorial0 ships the default German male player name.
+        assert_eq!(szs.players[0].name, "Wilfried",
+            "slot 0 player name should be the default 'Wilfried'");
     }
 
     #[test]

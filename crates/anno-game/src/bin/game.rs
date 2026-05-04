@@ -904,6 +904,11 @@ fn main() {
         scenario_name,
         szs.islands.len()
     );
+    if let Some(p0) = szs.players.first() {
+        if !p0.name.is_empty() {
+            println!("Player: {}  (starting gold {})", p0.name, p0.starting_gold);
+        }
+    }
     {
         let m = &szs.scenario;
         if m.mission_nr.is_some() || m.ranking.is_some() {
