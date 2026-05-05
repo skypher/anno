@@ -93,6 +93,17 @@ fn main() {
 
     // Raw slot 0x400..0x440 dump for one scenario to confirm
     // whether the binary's second strcpy source is non-empty.
+    println!("byte 0x18 across non-Plague scenarios with non-zero values:");
+    for (name, body) in &player4_bodies {
+        let row: Vec<u8> = (0..SLOTS).map(|s| {
+            let pos = s * SLOT_STRIDE + 0x18;
+            if pos < body.len() { body[pos] } else { 0 }
+        }).collect();
+        if row.iter().any(|&v| v != 0) {
+            println!("  {name}: {row:?}");
+        }
+    }
+    println!();
     if let Some((name, body)) = player4_bodies.iter().find(|(n, _)| n == "Tutorial0") {
         println!("Tutorial0 raw slot 0x400..0x440 hex dump:");
         for slot in 0..SLOTS {

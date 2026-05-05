@@ -433,6 +433,27 @@ pub struct PlayerSlotInit {
     /// raw u32 is exposed so callers can correlate it with
     /// observed AI behaviour (e.g. a tech-unlock mask).
     pub slot_u32_0x34: u32,
+    /// Raw value of byte 0x18 of the slot record. Cross-scenario
+    /// audit (62 shipping `.szs` files × 7 slots = 434 samples)
+    /// finds 21 scenarios with non-zero values 0x01..0x07
+    /// distributed irregularly per slot:
+    ///
+    /// ```text
+    /// Atoll                    [1, 0, 0, 0, 0, 0, 0]
+    /// Exile                    [1, 1, 1, 1, 0, 0, 0]
+    /// New Horizons0            [2, 1, 0, 0, 0, 0, 0]
+    /// On His Majesty's Service0 [0, 6, 2, 0, 0, 0, 0]
+    /// The Magnate2             [2, 5, 6, 6, 0, 0, 0]
+    /// Trust no one2            [3, 0, 7, 5, 0, 7, 0]
+    /// ```
+    ///
+    /// The values track per-scenario AI difficulty (Magnate2
+    /// is the hardest "Magnate" tier and carries the largest
+    /// numbers on its rivals), suggesting an AI-personality
+    /// or portrait-index byte, but the binary reader hasn't
+    /// been traced yet so the raw byte is exposed for
+    /// downstream callers.
+    pub slot_byte_0x18: u8,
     /// Seven u32 values at slot offsets 0x140, 0x148, … 0x170
     /// (stride 8; the upper four bytes between each element are
     /// uniformly zero across all 434 surveyed slots). Each row
@@ -637,6 +658,9 @@ impl SzsFile {
             } else {
                 true
             };
+            let slot_byte_0x18 = if off + 0x19 <= data.len() {
+                data[off + 0x18]
+            } else { 0 };
             let slot_u32_0x34 = if off + 0x38 <= data.len() {
                 u32::from_le_bytes([
                     data[off + 0x34], data[off + 0x35],
@@ -665,6 +689,7 @@ impl SzsFile {
             out.push(PlayerSlotInit {
                 starting_gold, state_byte, color_idx, slot_byte12,
                 ai_active, name, slot_u32_0x34, relationships,
+                slot_byte_0x18,
             });
         }
         out
@@ -905,6 +930,36 @@ mod tests {
         for slot in 0..7 {
             assert!(szs.players[slot].ai_active,
                 "Tutorial0 slot {slot} should be ai_active");
+        }
+    }
+
+    #[test]
+    fn player4_byte_0x18_carries_per_slot_index() {
+        // Magnate2 ships values 0x05/0x06/0x06 on its three AI
+        // rivals — the most distinctive non-zero per-slot row
+        // in the corpus. Plague of Pirates is a control sample
+        // (all zero).
+        for (scenario, expected) in &[
+            ("A Plague of Pirates", [0u8; 7]),
+            // Atoll: only slot 0 carries 0x01.
+            ("Atoll", [1, 0, 0, 0, 0, 0, 0]),
+            ("The Magnate2", [2, 5, 6, 6, 0, 0, 0]),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent().unwrap().parent().unwrap()
+                .join(format!("extracted/Szenes/{scenario}.szs"));
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => {
+                    println!("Skipping: {path:?} not found");
+                    continue;
+                }
+            };
+            let szs = SzsFile::parse(&data).expect("parse");
+            for slot in 0..7 {
+                assert_eq!(szs.players[slot].slot_byte_0x18, expected[slot],
+                    "{scenario} slot {slot} byte 0x18");
+            }
         }
     }
 
