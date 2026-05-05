@@ -433,10 +433,12 @@ pub struct PlayerSlotInit {
     /// raw u32 is exposed so callers can correlate it with
     /// observed AI behaviour (e.g. a tech-unlock mask).
     pub slot_u32_0x34: u32,
-    /// Raw value of byte 0x18 of the slot record. Cross-scenario
-    /// audit (62 shipping `.szs` files × 7 slots = 434 samples)
-    /// finds 21 scenarios with non-zero values 0x01..0x07
-    /// distributed irregularly per slot:
+    /// Little-endian u16 at slot offset 0x18..0x1A.
+    /// `1602_exe.c::FUN_00478160:85417` reads/writes this as a
+    /// `*(u16*)` — the high byte is always 0 in shipping
+    /// content, so the effective range is 0x0000..0x0007. Audit
+    /// (62 shipping `.szs` × 7 slots = 434 samples) finds 21
+    /// scenarios with non-zero values per slot:
     ///
     /// ```text
     /// Atoll                    [1, 0, 0, 0, 0, 0, 0]
@@ -447,13 +449,34 @@ pub struct PlayerSlotInit {
     /// Trust no one2            [3, 0, 7, 5, 0, 7, 0]
     /// ```
     ///
-    /// The values track per-scenario AI difficulty (Magnate2
-    /// is the hardest "Magnate" tier and carries the largest
-    /// numbers on its rivals), suggesting an AI-personality
-    /// or portrait-index byte, but the binary reader hasn't
-    /// been traced yet so the raw byte is exposed for
-    /// downstream callers.
-    pub slot_byte_0x18: u8,
+    /// The values track per-scenario AI difficulty (Magnate2 is
+    /// the hardest "Magnate" tier and carries the largest
+    /// numbers on its rivals), so this is most likely an AI
+    /// personality / portrait index. Concrete semantics aren't
+    /// pinned to a binary function yet, so the raw u16 is
+    /// exposed for downstream callers.
+    pub slot_u16_0x18: u16,
+    /// Seven u32 values at slot offsets 0xC0, 0xC8, … 0xF0
+    /// (stride 8; padding +4 uniformly zero). Sourced from the
+    /// runtime player struct's `+0xF0` array in
+    /// `1602_exe.c::FUN_00478160:85440`. Cross-scenario audit
+    /// surfaces a similar 0/3 pattern to `relationships` but
+    /// with a different masking — Tutorial0 slot 0 has
+    /// `[3, 3, 3, 3, 3, 0, 3]` here vs `[0, 0, 0, 0, 3, 3, 3]`
+    /// in `relationships`. Concrete semantics aren't yet RE'd.
+    pub relations_0xc0: [u32; 7],
+    /// Seven u32 values at slot offsets 0x1C0, 0x1C8, … 0x1F0
+    /// (stride 8). Sourced from the runtime player struct's
+    /// `+0x170` array in `1602_exe.c::FUN_00478160:85447`. The
+    /// values are NOT 0/3 like the other tables — Magnate0
+    /// rival N (1..=3) has N entries of `(N << 8) | 2`
+    /// against rivals 1..=N (so AI 1 holds `[0x102]`, AI 2
+    /// holds `[0x102, 0x202]`, AI 3 holds
+    /// `[0x102, 0x202, 0x302]`). The pirate slot (6) carries
+    /// a distinct `[0x301, 0x303, …]` encoding. Suggests an
+    /// `(slot << 8) | event_type` per-slot event log.
+    /// Tutorial0 leaves it all-zero.
+    pub events_0x1c0: [u32; 7],
     /// Seven u32 values at slot offsets 0x140, 0x148, … 0x170
     /// (stride 8; the upper four bytes between each element are
     /// uniformly zero across all 434 surveyed slots). Each row
@@ -658,8 +681,8 @@ impl SzsFile {
             } else {
                 true
             };
-            let slot_byte_0x18 = if off + 0x19 <= data.len() {
-                data[off + 0x18]
+            let slot_u16_0x18 = if off + 0x1A <= data.len() {
+                u16::from_le_bytes([data[off + 0x18], data[off + 0x19]])
             } else { 0 };
             let slot_u32_0x34 = if off + 0x38 <= data.len() {
                 u32::from_le_bytes([
@@ -667,16 +690,22 @@ impl SzsFile {
                     data[off + 0x36], data[off + 0x37],
                 ])
             } else { 0 };
-            let mut relationships = [0u32; 7];
-            for (i, slot_val) in relationships.iter_mut().enumerate() {
-                let rel_off = off + 0x140 + i * 8;
-                if rel_off + 4 <= data.len() {
-                    *slot_val = u32::from_le_bytes([
-                        data[rel_off], data[rel_off + 1],
-                        data[rel_off + 2], data[rel_off + 3],
-                    ]);
+            let read_array = |start: usize| -> [u32; 7] {
+                let mut arr = [0u32; 7];
+                for (i, slot_val) in arr.iter_mut().enumerate() {
+                    let o = off + start + i * 8;
+                    if o + 4 <= data.len() {
+                        *slot_val = u32::from_le_bytes([
+                            data[o], data[o + 1],
+                            data[o + 2], data[o + 3],
+                        ]);
+                    }
                 }
-            }
+                arr
+            };
+            let relations_0xc0 = read_array(0xC0);
+            let relationships  = read_array(0x140);
+            let events_0x1c0   = read_array(0x1C0);
             let name_off = off + PLAYER4_NAME_OFFSET;
             let name = if name_off + PLAYER4_NAME_BYTES <= data.len() {
                 let name_bytes = &data[name_off..name_off + PLAYER4_NAME_BYTES];
@@ -688,8 +717,9 @@ impl SzsFile {
             };
             out.push(PlayerSlotInit {
                 starting_gold, state_byte, color_idx, slot_byte12,
-                ai_active, name, slot_u32_0x34, relationships,
-                slot_byte_0x18,
+                ai_active, name, slot_u32_0x34,
+                relations_0xc0, relationships, events_0x1c0,
+                slot_u16_0x18,
             });
         }
         out
@@ -940,7 +970,7 @@ mod tests {
         // in the corpus. Plague of Pirates is a control sample
         // (all zero).
         for (scenario, expected) in &[
-            ("A Plague of Pirates", [0u8; 7]),
+            ("A Plague of Pirates", [0u16; 7]),
             // Atoll: only slot 0 carries 0x01.
             ("Atoll", [1, 0, 0, 0, 0, 0, 0]),
             ("The Magnate2", [2, 5, 6, 6, 0, 0, 0]),
@@ -957,7 +987,7 @@ mod tests {
             };
             let szs = SzsFile::parse(&data).expect("parse");
             for slot in 0..7 {
-                assert_eq!(szs.players[slot].slot_byte_0x18, expected[slot],
+                assert_eq!(szs.players[slot].slot_u16_0x18, expected[slot],
                     "{scenario} slot {slot} byte 0x18");
             }
         }
@@ -992,6 +1022,58 @@ mod tests {
         assert_eq!(szs.players[5].relationships, [0, 0, 0, 0, 0, 3, 0]);
         // Pirates: same shape as trader.
         assert_eq!(szs.players[6].relationships, [3, 3, 3, 3, 0, 0, 0]);
+    }
+
+    #[test]
+    fn player4_companion_arrays_match_binary_encoder() {
+        // FUN_00478160 writes three 7-element stride-8 u32 arrays
+        // at chunk offsets 0xC0, 0x140, 0x1C0. Tutorial0 leaves
+        // 0x1C0 entirely zero; Magnate0 fills it with an
+        // (slot << 8) | type per-slot event log whose Nth slot
+        // carries N entries against rivals 1..=N.
+        let load = |stem: &str| -> Option<SzsFile> {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent().unwrap().parent().unwrap()
+                .join(format!("extracted/Szenes/{stem}.szs"));
+            std::fs::read(&path).ok().and_then(|d| SzsFile::parse(&d).ok())
+        };
+
+        if let Some(t) = load("Tutorial0") {
+            // Tutorial0 leaves 0x1C0 entirely zero.
+            for slot in 0..7 {
+                assert_eq!(t.players[slot].events_0x1c0, [0; 7],
+                    "Tutorial0 slot {slot} 0x1C0 array");
+            }
+            // 0xC0 array — slot 0 has 3s everywhere except
+            // position 5 (natives).
+            assert_eq!(t.players[0].relations_0xc0,
+                [3, 3, 3, 3, 3, 0, 3]);
+            // Slot 5 (natives) — only positions 4, 5 = 3.
+            assert_eq!(t.players[5].relations_0xc0,
+                [0, 0, 0, 0, 3, 3, 0]);
+        }
+
+        if let Some(m) = load("The Magnate0") {
+            // Magnate0 events log: slot N (1..=3, the AI rivals)
+            // carries N entries of `(N << 8) | 2` against rivals
+            // 1..=N. Slots 0 / 4 / 5 stay empty; slot 6 (pirates)
+            // carries a different encoding [0x301, 0x303, …].
+            assert_eq!(m.players[0].events_0x1c0, [0; 7],
+                "slot 0 (player) has no events");
+            assert_eq!(m.players[1].events_0x1c0,
+                [0x102, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(m.players[2].events_0x1c0,
+                [0x102, 0x202, 0, 0, 0, 0, 0]);
+            assert_eq!(m.players[3].events_0x1c0,
+                [0x102, 0x202, 0x302, 0, 0, 0, 0]);
+            assert_eq!(m.players[4].events_0x1c0, [0; 7],
+                "slot 4 (trader) has no events");
+            assert_eq!(m.players[5].events_0x1c0, [0; 7],
+                "slot 5 (natives) has no events");
+            assert_eq!(m.players[6].events_0x1c0,
+                [0x301, 0x303, 0, 0, 0, 0, 0],
+                "slot 6 (pirates) carries the distinct encoding");
+        }
     }
 
     #[test]

@@ -194,8 +194,10 @@ fn main() {
                     body[base + o + 2], body[base + o + 3],
                 ]);
                 let s_0x3c = read_u32(0x3C);
-                let block_c0: Vec<u32> = (0..4).map(|i| read_u32(0xC0 + i * 8)).collect();
+                let block_c0: Vec<u32> = (0..7).map(|i| read_u32(0xC0 + i * 8)).collect();
                 let arr_140: Vec<u32> = (0..7).map(|i| read_u32(0x140 + i * 8)).collect();
+                let arr_1c0: Vec<u32> = (0..7).map(|i| read_u32(0x1C0 + i * 8)).collect();
+                println!("    {:>14} 0x1C0/8 = {arr_1c0:08x?}", "");
                 // Confirm padding at +4 within stride-8 is zero
                 // (or report non-zero so future RE catches it).
                 let pad_144: Vec<u32> = (0..7).map(|i| read_u32(0x144 + i * 8)).collect();
