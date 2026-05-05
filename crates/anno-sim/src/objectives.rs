@@ -11,6 +11,11 @@ use crate::types::{Good, PopTier};
 pub enum Objective {
     /// Player owns at least `count` people in `tier`.
     ReachPopulation { tier: u8, count: u32 },
+    /// Player's total inhabitants (summed across all tiers) reach
+    /// at least `count`. Mirrors the AUFTRAG4 triple's `total`
+    /// component, which is independent of any tier sub-goal — see
+    /// `MissionGoals` in anno-formats.
+    ReachTotalPopulation { count: u32 },
     /// Player has at least `count` built buildings whose def `prod_kind`
     /// matches the value (case-insensitive).
     Build { prod_kind: String, count: u32 },
@@ -40,6 +45,9 @@ impl Objective {
                     3 => "Merchants", _ => "Aristocrats",
                 };
                 format!("Reach {count} {name}")
+            }
+            Objective::ReachTotalPopulation { count } => {
+                format!("Reach {count} total inhabitants")
             }
             Objective::Build { prod_kind, count } => {
                 format!("Build {count} × {prod_kind}")
@@ -95,6 +103,9 @@ impl ObjectiveSet {
                 Objective::ReachPopulation { tier, count } => {
                     let t = (*tier as usize).min(crate::types::NUM_POP_TIERS - 1);
                     player.population[t] >= *count
+                }
+                Objective::ReachTotalPopulation { count } => {
+                    player.total_population() >= *count
                 }
                 Objective::Build { prod_kind, count } => {
                     let needle = prod_kind.to_ascii_uppercase();
@@ -164,15 +175,19 @@ impl ObjectiveSet {
     }
 
     /// Build an objective set from a parsed AUFTRAG4 scenario
-    /// briefing. Translates the bit-flagged goals_raw fields into
-    /// the corresponding `Objective` variants:
+    /// briefing. Each `(total, tier, at_tier)` triple decodes to:
     ///
-    ///   `MISSION_FLAG_POPULATION` + `goals_raw[0..4]` + tier idx
-    ///       → `ReachPopulation`
-    ///   `MISSION_FLAG_COOPERATIVE` + `goals_raw[18*4..]`
-    ///       → `SupportFellowPlayer { who: 1, .. }` (the
-    ///         conventional cooperative neighbour slot is the
-    ///         first AI rival, slot 1)
+    ///   • `ReachTotalPopulation { count: total }` — always.
+    ///   • `ReachPopulation { tier, count: at_tier }` — only when
+    ///     `tier` is set and `at_tier > 0`. Cooperation's
+    ///     `[2000, 4, 1300]` therefore yields TWO objectives:
+    ///     "Reach 2000 total inhabitants" + "Reach 1300
+    ///     Aristocrats", both of which must clear before the
+    ///     scenario is won.
+    ///
+    /// `MISSION_FLAG_COOPERATIVE` adds a
+    /// `SupportFellowPlayer { who: 1, .. }` (the conventional
+    /// cooperative neighbour slot is the first AI rival, slot 1).
     ///
     /// Returns an empty set when the mission carries no flagged
     /// goals — caller can fall back to `default_starter`.
@@ -182,10 +197,17 @@ impl ObjectiveSet {
         let mut items = Vec::new();
         for slot in [goals.primary, goals.secondary, goals.tertiary] {
             if let Some(p) = slot {
-                items.push(Objective::ReachPopulation {
-                    tier: p.tier.unwrap_or(PopTier::Aristocrat as u8),
+                items.push(Objective::ReachTotalPopulation {
                     count: p.total,
                 });
+                if let Some(tier) = p.tier {
+                    if p.at_tier > 0 {
+                        items.push(Objective::ReachPopulation {
+                            tier,
+                            count: p.at_tier,
+                        });
+                    }
+                }
             }
         }
         if let Some(target) = goals.cooperative_population {
@@ -207,29 +229,46 @@ mod tests {
     fn from_mission_goals_translates_triples_and_cooperative() {
         use anno_formats::szs::{MissionGoals, PopulationGoal};
 
-        // Plague-of-Pirates style: just primary, no neighbour.
+        // Plague-of-Pirates style: just primary total, no tier
+        // sub-goal. One ReachTotalPopulation only.
         let s = ObjectiveSet::from_mission_goals(&MissionGoals {
             primary: Some(PopulationGoal { total: 5_000, tier: None, at_tier: 0 }),
             ..Default::default()
         });
         assert_eq!(s.items.len(), 1);
         assert!(matches!(s.items[0].0,
-            Objective::ReachPopulation { count: 5_000, .. }));
+            Objective::ReachTotalPopulation { count: 5_000 }));
 
-        // Good-Neighbors: primary + cooperative neighbour.
+        // Cooperation [2000, 4, 1300]: total + tier sub-goal,
+        // both of which must clear.
+        let s = ObjectiveSet::from_mission_goals(&MissionGoals {
+            primary: Some(PopulationGoal { total: 2_000, tier: Some(4), at_tier: 1_300 }),
+            ..Default::default()
+        });
+        assert_eq!(s.items.len(), 2);
+        assert!(matches!(s.items[0].0,
+            Objective::ReachTotalPopulation { count: 2_000 }));
+        assert!(matches!(s.items[1].0,
+            Objective::ReachPopulation { tier: 4, count: 1_300 }));
+
+        // Good-Neighbors: primary tier sub-goal + cooperative
+        // neighbour. Three objectives: total, at-tier, support.
         let s = ObjectiveSet::from_mission_goals(&MissionGoals {
             primary: Some(PopulationGoal { total: 1_000, tier: Some(3), at_tier: 500 }),
             cooperative_population: Some(1_000),
             ..Default::default()
         });
-        assert_eq!(s.items.len(), 2);
+        assert_eq!(s.items.len(), 3);
         assert!(matches!(s.items[0].0,
-            Objective::ReachPopulation { tier: 3, count: 1_000 }));
+            Objective::ReachTotalPopulation { count: 1_000 }));
         assert!(matches!(s.items[1].0,
+            Objective::ReachPopulation { tier: 3, count: 500 }));
+        assert!(matches!(s.items[2].0,
             Objective::SupportFellowPlayer { who: 1, target_population: 1_000 }));
 
-        // The Continent: three city goals. All three triples
-        // produce ReachPopulation objectives.
+        // The Continent: three city goals, each a triple with
+        // tier + at_tier — six objectives total (3 × total +
+        // 3 × at-tier).
         let triple = PopulationGoal { total: 5_000, tier: Some(4), at_tier: 5_000 };
         let s = ObjectiveSet::from_mission_goals(&MissionGoals {
             primary: Some(triple),
@@ -237,12 +276,30 @@ mod tests {
             tertiary: Some(triple),
             ..Default::default()
         });
-        assert_eq!(s.items.len(), 3);
+        assert_eq!(s.items.len(), 6);
 
         // Empty MissionGoals → empty set, caller falls back to
         // default_starter.
         let s = ObjectiveSet::from_mission_goals(&MissionGoals::default());
         assert!(s.items.is_empty());
+    }
+
+    #[test]
+    fn total_population_objective_completes_on_sum() {
+        // ReachTotalPopulation sums every tier rather than
+        // looking at one slot — Plague's 5000 should clear when
+        // the player has 3000 Settlers + 2500 Citizens.
+        let mut set = ObjectiveSet::new(vec![
+            Objective::ReachTotalPopulation { count: 5_000 },
+        ]);
+        let mut p = Player::new_human(0);
+        p.population[1] = 3_000;
+        p.population[2] = 1_000;
+        let done = set.evaluate(&p, &[], &[], &[], &[p.clone()], 0);
+        assert!(done.is_empty(), "4_000 < 5_000");
+        p.population[2] = 2_500;
+        let done = set.evaluate(&p, &[], &[], &[], &[p.clone()], 0);
+        assert_eq!(done, vec![0]);
     }
 
     #[test]

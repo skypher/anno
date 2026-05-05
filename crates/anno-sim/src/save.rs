@@ -21,7 +21,11 @@ use std::path::Path;
 ///      4 / 5 (binary-confirmed). Pre-v13 saves have building /
 ///      unit owner values for those factions swapped — refuse
 ///      to load them rather than produce a corrupt world.
-pub const SAVE_VERSION: u32 = 13;
+/// v14: `Objective` gained a `ReachTotalPopulation` variant for
+///      AUFTRAG4 triples whose `total` is independent of any
+///      tier sub-goal. Bincode enum-variant indices shift, so
+///      pre-v14 saves cannot decode the new variant.
+pub const SAVE_VERSION: u32 = 14;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
