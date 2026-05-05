@@ -433,6 +433,29 @@ pub struct PlayerSlotInit {
     /// raw u32 is exposed so callers can correlate it with
     /// observed AI behaviour (e.g. a tech-unlock mask).
     pub slot_u32_0x34: u32,
+    /// Seven u32 values at slot offsets 0x140, 0x148, … 0x170
+    /// (stride 8; the upper four bytes between each element are
+    /// uniformly zero across all 434 surveyed slots). Each row
+    /// has one entry per player slot, so this is almost certainly
+    /// the per-slot relationship matrix the engine seeds into
+    /// the diplomacy table at scenario load.
+    ///
+    /// Cross-scenario pattern (Tutorial0 / Plague / Atoll all
+    /// agree, with Magnate0 modulating only the AI rows):
+    ///
+    /// ```text
+    /// row 0 (player):  [0, 0, 0, 0, 3, 3, 3]
+    /// row 1..=3 (AIs): [0, 0, 0, 0, 3, 3, 3]   // same as player
+    /// row 4 (trader):  [3, 3, 3, 3, 0, 0, 0]
+    /// row 5 (natives): [0, 0, 0, 0, 0, 3, 0]   // only self
+    /// row 6 (pirates): [3, 3, 3, 3, 0, 0, 0]   // same as trader
+    /// ```
+    ///
+    /// Values are limited to 0 or 3 in the shipping content;
+    /// concrete diplomacy semantics ("0 = at war", "3 = neutral
+    /// pact") aren't pinned to a binary function yet, so the
+    /// raw u32 array is exposed for downstream interpretation.
+    pub relationships: [u32; 7],
 }
 
 const PLAYER4_NAME_OFFSET: usize = 0x3C0;
@@ -620,6 +643,16 @@ impl SzsFile {
                     data[off + 0x36], data[off + 0x37],
                 ])
             } else { 0 };
+            let mut relationships = [0u32; 7];
+            for (i, slot_val) in relationships.iter_mut().enumerate() {
+                let rel_off = off + 0x140 + i * 8;
+                if rel_off + 4 <= data.len() {
+                    *slot_val = u32::from_le_bytes([
+                        data[rel_off], data[rel_off + 1],
+                        data[rel_off + 2], data[rel_off + 3],
+                    ]);
+                }
+            }
             let name_off = off + PLAYER4_NAME_OFFSET;
             let name = if name_off + PLAYER4_NAME_BYTES <= data.len() {
                 let name_bytes = &data[name_off..name_off + PLAYER4_NAME_BYTES];
@@ -631,7 +664,7 @@ impl SzsFile {
             };
             out.push(PlayerSlotInit {
                 starting_gold, state_byte, color_idx, slot_byte12,
-                ai_active, name, slot_u32_0x34,
+                ai_active, name, slot_u32_0x34, relationships,
             });
         }
         out
@@ -873,6 +906,37 @@ mod tests {
             assert!(szs.players[slot].ai_active,
                 "Tutorial0 slot {slot} should be ai_active");
         }
+    }
+
+    #[test]
+    fn player4_relationships_table_matches_observed_pattern() {
+        // Tutorial0 / Plague / Atoll all share the canonical
+        // diplomacy seed shown in `PlayerSlotInit::relationships`.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/Tutorial0.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Tutorial0");
+        // Active rows (player + AIs): zero against active slots,
+        // 3 against trader/native/pirate.
+        for slot in 0..=3 {
+            assert_eq!(szs.players[slot].relationships,
+                [0, 0, 0, 0, 3, 3, 3],
+                "active slot {slot} relationship row");
+        }
+        // Trader: mirror image — 3 against actives, 0 against
+        // specials.
+        assert_eq!(szs.players[4].relationships, [3, 3, 3, 3, 0, 0, 0]);
+        // Natives: only self-position = 3.
+        assert_eq!(szs.players[5].relationships, [0, 0, 0, 0, 0, 3, 0]);
+        // Pirates: same shape as trader.
+        assert_eq!(szs.players[6].relationships, [3, 3, 3, 3, 0, 0, 0]);
     }
 
     #[test]

@@ -129,6 +129,33 @@ fn main() {
         }
     }
     let total = (player4_bodies.len() * SLOTS) as u32;
+    // Verify the 0x140..0x178 array has 4 bytes of zero padding
+    // between each u32 element across ALL slots — if any slot
+    // has a non-zero u32 at +4 within the stride, the array
+    // structure is wrong.
+    let mut padding_violations = 0;
+    for (name, body) in &player4_bodies {
+        for slot in 0..SLOTS {
+            let base = slot * SLOT_STRIDE;
+            for i in 0..7 {
+                let off = base + 0x144 + i * 8;
+                if off + 4 > body.len() { continue; }
+                let v = u32::from_le_bytes([
+                    body[off], body[off+1], body[off+2], body[off+3],
+                ]);
+                if v != 0 {
+                    println!("  PADDING VIOLATION: {name} slot {slot} +0x{:x} = 0x{v:x}",
+                             0x144 + i * 8);
+                    padding_violations += 1;
+                }
+            }
+        }
+    }
+    if padding_violations == 0 {
+        println!("0x140..0x178 stride-8 array padding (offset +4) is uniformly zero across {total} slots ✓");
+    }
+    println!();
+
     println!("Non-zero density per slot offset (>5% across {total} samples):");
     for i in 0..SLOT_STRIDE {
         let pct = nonzero_count[i] * 100 / total.max(1);
@@ -158,6 +185,14 @@ fn main() {
                 let s_0x3c = read_u32(0x3C);
                 let block_c0: Vec<u32> = (0..4).map(|i| read_u32(0xC0 + i * 8)).collect();
                 let arr_140: Vec<u32> = (0..7).map(|i| read_u32(0x140 + i * 8)).collect();
+                // Confirm padding at +4 within stride-8 is zero
+                // (or report non-zero so future RE catches it).
+                let pad_144: Vec<u32> = (0..7).map(|i| read_u32(0x144 + i * 8)).collect();
+                let pad_nonzero = pad_144.iter().any(|&v| v != 0);
+                if pad_nonzero {
+                    println!("    slot {slot}: padding at 0x144 stride 8 = {pad_144:08x?}  ← nonzero!");
+                }
+                let _ = pad_144;
                 println!("  slot {slot}: 0x3C={s_0x3c:#010x}  0xC0/8={block_c0:08x?}  0x140/8={arr_140:08x?}");
             }
             println!();
