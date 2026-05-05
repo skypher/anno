@@ -387,6 +387,23 @@ pub struct PlayerSlotInit {
     /// PLAYER4 reader hasn't been traced so the semantic stays
     /// raw for now.
     pub slot_byte12: u8,
+    /// Whether `1602_exe.c::FUN_00473c50` will populate this
+    /// slot at scenario load time. The decompiled chunk reader
+    /// at line 82622 includes a slot only when:
+    ///
+    /// ```text
+    /// state_byte == 0x00                  // human / special
+    ///   OR (state_byte == 0x0c            // AI rival
+    ///       AND slot_byte_0x0d == 0x00)
+    /// ```
+    ///
+    /// `slot_byte_0x0d == 0x01` therefore means "AI rival pre-
+    /// configured but disabled in the scenario." The audit run
+    /// counts 21 such slots across the shipping corpus (Exile,
+    /// New Horizons2, etc.). For non-AI slots the byte is
+    /// always 0, so this flag effectively gates AI rivals
+    /// only.
+    pub ai_active: bool,
     /// Player display name. Verified at byte offset 0x3C0 of
     /// each slot record (a 16-byte CP1252 null-terminated field):
     /// Tutorial0 / Cooperation = "Wilfried" (the default German
@@ -588,6 +605,15 @@ impl SzsFile {
             let state_byte = data[off + 4];
             let color_idx  = data[off + 7];
             let slot_byte12 = data[off + 12];
+            // 1602_exe.c FUN_00473c50:82622 includes the slot
+            // only when byte 0x0d is 0 for AI rivals (state_byte
+            // == 0x0c). For human / special-faction slots the
+            // gate doesn't apply, so we report `true` there.
+            let ai_active = if state_byte == 0x0c {
+                data[off + 13] == 0x00
+            } else {
+                true
+            };
             let slot_u32_0x34 = if off + 0x38 <= data.len() {
                 u32::from_le_bytes([
                     data[off + 0x34], data[off + 0x35],
@@ -604,8 +630,8 @@ impl SzsFile {
                 String::new()
             };
             out.push(PlayerSlotInit {
-                starting_gold, state_byte, color_idx, slot_byte12, name,
-                slot_u32_0x34,
+                starting_gold, state_byte, color_idx, slot_byte12,
+                ai_active, name, slot_u32_0x34,
             });
         }
         out
@@ -839,6 +865,40 @@ mod tests {
         assert_eq!(szs.players[0].slot_u32_0x34, 0);
         assert_eq!(szs.players[5].slot_u32_0x34, 0xFFFF_FFFF);
         assert_eq!(szs.players[6].slot_u32_0x34, 0xFFFF_FFFF);
+
+        // ai_active mirrors `1602_exe.c::FUN_00473c50`'s slot
+        // filter. Tutorial0 has byte 0x0d == 0x00 for every AI
+        // rival (slots 1..=3), so all four are `true`.
+        for slot in 0..7 {
+            assert!(szs.players[slot].ai_active,
+                "Tutorial0 slot {slot} should be ai_active");
+        }
+    }
+
+    #[test]
+    fn player4_ai_active_skips_disabled_rivals() {
+        // Exile pre-configures but disables some AI rivals via
+        // byte 0x0d == 0x01. The audit run counts 21 such slots
+        // across shipping content; Exile is one of them.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/Exile.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Exile");
+        // Slots 1 and 3 carry `state_byte == 0x0c` (AI) but
+        // byte 0x0d == 0x01, so the binary skips them.
+        assert_eq!(szs.players[1].state_byte, 0x0c);
+        assert!(!szs.players[1].ai_active,
+            "Exile slot 1 has byte 0x0d == 0x01 → AI disabled");
+        assert_eq!(szs.players[3].state_byte, 0x0c);
+        assert!(!szs.players[3].ai_active,
+            "Exile slot 3 has byte 0x0d == 0x01 → AI disabled");
     }
 
     #[test]

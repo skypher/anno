@@ -6294,11 +6294,23 @@ fn init_simulation(
     // trader / native / pirate subsystems address those slots
     // directly by index. Slots without a PLAYER4 record fall back
     // to PlayerState::Empty as a placeholder.
+    //
+    // AI rivals further gate on `ai_active`: when byte 0x0d of
+    // the slot record is 0x01, `1602_exe.c::FUN_00473c50:82622`
+    // skips the slot entirely, so we mirror that by promoting
+    // it to PlayerState::Empty. Exile / New Horizons2 ship
+    // pre-configured-but-disabled AI rosters this way.
     use anno_sim::player::PlayerState;
     for slot in 0u8..7 {
         let init = szs.players.get(slot as usize);
         let state_byte = init.map(|p| p.state_byte).unwrap_or(0xff);
-        let mut p = match state_byte {
+        let ai_active = init.map(|p| p.ai_active).unwrap_or(true);
+        let effective_state = if state_byte == 0x0c && !ai_active {
+            0xff // disabled AI → treat as empty
+        } else {
+            state_byte
+        };
+        let mut p = match effective_state {
             0x00 => Player::new_human(slot),
             0x0c => Player::new_ai(slot, 0),
             _    => {
@@ -6315,7 +6327,7 @@ fn init_simulation(
         sim.players.push(p);
 
         // Spawn an AI controller alongside every AI rival slot.
-        if state_byte == 0x0c {
+        if effective_state == 0x0c {
             sim.ai_controllers.push(AiController::new(
                 slot, AiPersonality::Economic, Difficulty::Medium,
             ));
