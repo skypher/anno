@@ -60,6 +60,35 @@ fn main() {
         }
     }
 
+    // Audit AUFTRAG4 chunk size — the binary's encoder
+    // FUN_00478380:85539 allocates 0x2310 bytes = 4 × 0x8c4
+    // mission slots, but only writes the actively-used ones.
+    println!("AUFTRAG4 chunk-size distribution:");
+    let mut size_counts: std::collections::BTreeMap<usize, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) { continue; }
+        let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+        let parsed = match szs::SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+        if let Some(c) = parsed.chunks.iter().find(|c| c.name == "AUFTRAG4") {
+            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+            size_counts.entry(c.data.len()).or_default().push(stem);
+        }
+    }
+    for (sz, users) in &size_counts {
+        let in_slots = sz / 0x8c4;
+        println!("  {sz} bytes (0x{sz:X}) — {} files; / 0x8c4 = {in_slots}",
+                 users.len());
+        for u in users.iter().take(4) {
+            println!("    {u}");
+        }
+        if users.len() > 4 {
+            println!("    … (+{})", users.len() - 4);
+        }
+    }
+    println!();
+
     if bit_users.is_empty() {
         println!("No scenarios use unmodelled mission flag bits.");
         return;

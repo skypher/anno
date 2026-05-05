@@ -57,6 +57,22 @@ pub struct Ship {
     /// record offset 28, u16 y at record offset 30.
     pub x: u16,
     pub y: u16,
+    /// Owning player slot (0 = human, 1..=3 = AI rivals,
+    /// 5 = native faction). Audit of 418 ship records across
+    /// the shipping corpus surfaces only values {0, 1, 2, 3, 5}
+    /// at byte offset 0x4B — slot 4 (free trader) and slot 6
+    /// (pirate) never carry static SHIP4 records, presumably
+    /// because their fleets spawn dynamically at runtime.
+    pub owner: u8,
+    /// Ship class byte at record offset 0x48. Audit surfaces
+    /// exactly 5 distinct values across all shipping content:
+    /// 0x15, 0x17, 0x19, 0x1B, 0x1F — one per ship type
+    /// (small trader / large trader / small warship / large
+    /// warship / pirate ship). The mapping to figuren.cod's
+    /// HANDEL1/HANDEL2/KRIEG1/KRIEG2/PIRAT entries hasn't
+    /// been verified against a binary function yet; the raw
+    /// byte is exposed for downstream interpretation.
+    pub ship_class: u8,
 }
 
 const SHIP4_RECORD_BYTES: usize = 436;
@@ -634,7 +650,9 @@ impl SzsFile {
                 .iter().map(|&b| char::from(b)).collect();
             let x = u16::from_le_bytes([data[off + 28], data[off + 29]]);
             let y = u16::from_le_bytes([data[off + 30], data[off + 31]]);
-            out.push(Ship { name, x, y });
+            let ship_class = if off + 0x49 <= data.len() { data[off + 0x48] } else { 0 };
+            let owner      = if off + 0x4C <= data.len() { data[off + 0x4B] } else { 0 };
+            out.push(Ship { name, x, y, owner, ship_class });
         }
         out
     }
@@ -1198,6 +1216,44 @@ mod tests {
         assert_eq!(szs.ships[0].name, "Seehind");
         assert_eq!(szs.ships[0].x, 0xd2);
         assert_eq!(szs.ships[0].y, 0x80);
+        // Tutorial0's lone ship is the human player's small
+        // trader: owner = slot 0, ship_class one of the five
+        // observed values {0x15, 0x17, 0x19, 0x1B, 0x1F}.
+        assert_eq!(szs.ships[0].owner, 0,
+            "Tutorial0 starting ship is owned by the human player");
+        assert!(matches!(szs.ships[0].ship_class,
+                         0x15 | 0x17 | 0x19 | 0x1B | 0x1F),
+            "ship_class falls within the observed shipping-corpus set, got 0x{:02X}",
+            szs.ships[0].ship_class);
+    }
+
+    #[test]
+    fn ship4_owner_distribution_covers_player_and_ai() {
+        // Plague of Pirates has 19 ships across multiple owners,
+        // so it's the best test of the owner-byte interpretation.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/A Plague of Pirates.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Plague");
+        let mut owners: std::collections::BTreeSet<u8> =
+            std::collections::BTreeSet::new();
+        for s in &szs.ships {
+            owners.insert(s.owner);
+        }
+        assert!(owners.contains(&0),
+            "Plague includes at least one human-owned ship");
+        // The full surveyed set across the corpus is {0,1,2,3,5}
+        // — Plague should cover at least 0 and one rival.
+        let has_rival = owners.iter().any(|&o| matches!(o, 1 | 2 | 3 | 5));
+        assert!(has_rival,
+            "Plague should also include a non-player owner; got {owners:?}");
     }
 
     #[test]
