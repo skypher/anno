@@ -264,6 +264,25 @@ pub const MISSION_FLAG_RANKING: u32 = 1 << 8;
 /// Dark Clouds on the Horizon, To Each his Own).
 pub const MISSION_FLAG_PIRATE: u32 = 1 << 10;
 
+/// Mission flag bits observed in shipping scenarios but whose
+/// binary semantics are not yet reverse-engineered. Audit script:
+/// `cargo run --example audit_mission_flags -p anno-formats`.
+/// All carry NO data in `goals_raw` — pure flag-only objectives,
+/// presumably evaluated against simulation state by 1602.exe's
+/// goal-check function.
+///
+/// | bit  | scenarios                               | briefing hint |
+/// |------|-----------------------------------------|---------------|
+/// | 0x80 | The Magnate2                            | "spice monopoly… aura of peace and prosperity" |
+/// | 0x200 | Competition                            | "first competitors do arrive" — defend |
+/// | 0x1000 | Magnate0, Quest for Ore, Trust no one1 | wealth/treasury/tools-and-weapons |
+/// | 0x4000 | Magnate1, Monopoly                    | settlement / cocoa-tobacco markets |
+/// | 0x8000 | Monopoly                              | second monopoly slot |
+/// | 0x10000 | On His Majesty's Service0, Monopoly  | "rare resources" |
+pub const MISSION_FLAG_OBSERVED_UNMODELLED: u32 =
+    0x0000_0080 | 0x0000_0200 | 0x0000_1000 |
+    0x0000_4000 | 0x0000_8000 | 0x0001_0000;
+
 /// One population requirement: total inhabitants, optional tier,
 /// and how many of those total must be at that tier. Cross-
 /// scenario evidence: Cooperation `[2000, 4, 1300]` = "2000

@@ -941,14 +941,34 @@ fn main() {
     if let Some(mission) = szs.mission.as_ref() {
         if !mission.briefing.is_empty() {
             use anno_formats::szs::{
-                MISSION_FLAG_POPULATION, MISSION_FLAG_COOPERATIVE,
+                MISSION_FLAG_POPULATION, MISSION_FLAG_POPULATION2,
+                MISSION_FLAG_POPULATION3, MISSION_FLAG_COOPERATIVE,
                 MISSION_FLAG_RANKING, MISSION_FLAG_PIRATE,
             };
-            let mut tags = Vec::new();
-            if mission.flags & MISSION_FLAG_POPULATION  != 0 { tags.push("population"); }
-            if mission.flags & MISSION_FLAG_COOPERATIVE != 0 { tags.push("cooperative"); }
-            if mission.flags & MISSION_FLAG_RANKING     != 0 { tags.push("ranking"); }
-            if mission.flags & MISSION_FLAG_PIRATE      != 0 { tags.push("pirate-combat"); }
+            // Enumerate every set bit and label the known ones —
+            // unrecognised bits print as `unknown(0x...)` so a new
+            // scenario flips them into view at run time.
+            let mut tags: Vec<String> = Vec::new();
+            let mut seen = 0u32;
+            let mut tag = |bit: u32, name: &str, seen: &mut u32, tags: &mut Vec<String>| {
+                if mission.flags & bit != 0 {
+                    tags.push(name.to_string());
+                    *seen |= bit;
+                }
+            };
+            tag(MISSION_FLAG_POPULATION,  "population",     &mut seen, &mut tags);
+            tag(MISSION_FLAG_POPULATION2, "population2",    &mut seen, &mut tags);
+            tag(MISSION_FLAG_POPULATION3, "population3",    &mut seen, &mut tags);
+            tag(MISSION_FLAG_COOPERATIVE, "cooperative",    &mut seen, &mut tags);
+            tag(MISSION_FLAG_RANKING,     "ranking",        &mut seen, &mut tags);
+            tag(MISSION_FLAG_PIRATE,      "pirate-combat",  &mut seen, &mut tags);
+            let leftover = mission.flags & !seen;
+            for bit in 0..32 {
+                let mask = 1u32 << bit;
+                if leftover & mask != 0 {
+                    tags.push(format!("unknown(0x{mask:X})"));
+                }
+            }
             let tag_str = if tags.is_empty() { String::new() } else { format!("  [{}]", tags.join(", ")) };
             println!("Mission flags 0x{:04x}{}", mission.flags, tag_str);
             let goals = mission.goals();
