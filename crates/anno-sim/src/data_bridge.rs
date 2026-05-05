@@ -353,11 +353,16 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
 /// Cultural-building tags (INFRA_KIRCHE, INFRA_SCHULE, INFRA_ARZT,
 /// INFRA_BADE, INFRA_THEATER, INFRA_TRIUMPH, INFRA_DENKMAL,
 /// INFRA_HOCHSCHULE, INFRA_KATHETRALE, INFRA_SCHLOSS,
-/// INFRA_GALGEN, INFRA_WIRT) are not aliased to STUFE rungs in
-/// haeuser.cod's marker block — they appear directly as Bauinfra
-/// values on residences, and the binary's ladder resolver maps
-/// them at runtime from a separate table we haven't located.
-/// Until that table is RE'd, these return 0 (no tier gate).
+/// INFRA_GALGEN, INFRA_WIRT) appear on the cultural BUILDINGS
+/// themselves (church, school, doctor, etc.) — not as Bauinfra
+/// requirements on residences. Audit confirmed by
+/// `cargo run --example audit_bauinfra_tags`: every Kind=HQ
+/// (residence-like) entry uses INFRA_STUFE_* or INFRA_KONTOR_*
+/// tags, never a cultural tag. The cultural tags identify which
+/// building IS the cultural one, and the runtime tier
+/// progression checks for an active such building on the island
+/// (a check we haven't traced to a specific binary function).
+/// As a Bauinfra-on-residence tier gate, these return 0.
 fn parse_bauinfra(token: &str) -> u8 {
     if token.is_empty() { return 0; }
     let resolved = resolve_infra_alias(token).unwrap_or(token);

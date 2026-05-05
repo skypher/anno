@@ -93,6 +93,47 @@ fn main() {
 
     // Raw slot 0x400..0x440 dump for one scenario to confirm
     // whether the binary's second strcpy source is non-empty.
+    println!("Five u16 at slot offset 0x10..0x1A — candidate per-tier tax rates:");
+    let probe_for_taxes = ["Tutorial0", "A Plague of Pirates", "Atoll", "Cooperation"];
+    for probe in &probe_for_taxes {
+        if let Some((_, body)) = player4_bodies.iter().find(|(n, _)| n == probe) {
+            println!("  {probe}:");
+            for slot in 0..SLOTS {
+                let base = slot * SLOT_STRIDE;
+                if base + 0x1A > body.len() { continue; }
+                let read_u16 = |o: usize| u16::from_le_bytes([
+                    body[base + o], body[base + o + 1],
+                ]);
+                let row: Vec<u16> = (0..5).map(|i| read_u16(0x10 + i * 2)).collect();
+                println!("    slot {slot}: {row:?}  (decimal)");
+            }
+        }
+    }
+    println!();
+
+    println!("u32 at slot offset 0x1C (FUN_00478160:85424, sourced from player+0x70):");
+    let mut u32_1c_distinct: std::collections::BTreeMap<u32, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (name, body) in &player4_bodies {
+        for slot in 0..SLOTS {
+            let pos = slot * SLOT_STRIDE + 0x1C;
+            if pos + 4 > body.len() { continue; }
+            let v = u32::from_le_bytes([
+                body[pos], body[pos+1], body[pos+2], body[pos+3],
+            ]);
+            u32_1c_distinct.entry(v).or_default()
+                .push(format!("{name}#{slot}"));
+        }
+    }
+    for (v, users) in u32_1c_distinct.iter().take(10) {
+        let head: Vec<_> = users.iter().take(3).cloned().collect();
+        let suffix = if users.len() > 3 {
+            format!(" … (+{})", users.len() - 3)
+        } else { String::new() };
+        println!("  0x{v:08X} ({} samples): {}{suffix}", users.len(), head.join(", "));
+    }
+    println!();
+
     println!("byte 0x18 across non-Plague scenarios with non-zero values:");
     for (name, body) in &player4_bodies {
         let row: Vec<u8> = (0..SLOTS).map(|s| {
