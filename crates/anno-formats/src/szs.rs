@@ -394,6 +394,28 @@ pub struct PlayerSlotInit {
     /// "Nameless"); custom-named scenarios store whatever the
     /// editor was asked to call the player.
     pub name: String,
+    /// Little-endian u32 starting at byte offset 0x34 of the slot
+    /// record. Cross-scenario sample (60 shipping `.szs` files via
+    /// `cargo run --example audit_player4_bytes`):
+    ///
+    ///   * Plague-of-Pirates scripts always assign 0x0000_0003 to
+    ///     the AI rivals (slots 1..=3) and 0 to the special
+    ///     factions (slots 4..=6).
+    ///   * Continuous-Play / Tutorial0 leave every active slot at
+    ///     0 and clamp the unused native + pirate slots (5, 6) to
+    ///     0xFFFF_FFFF.
+    ///   * Difficulty-tiered scripts grow the mask with the AI
+    ///     index — Magnate0 has slot 0 = 0x0000_0003, slot 1 =
+    ///     0x003F_C00F, slots 2/3 = 0x0FFF_C33F, suggesting a
+    ///     bitset that widens for stronger opponents.
+    ///   * Cooperation / Good Neighbors set the same mask on
+    ///     every team slot (0x003F_C00F and 0x007F_CFFF
+    ///     respectively), so the field is per-slot, not per-side.
+    ///
+    /// Binary semantics aren't yet RE'd from `1602_exe.c`; the
+    /// raw u32 is exposed so callers can correlate it with
+    /// observed AI behaviour (e.g. a tech-unlock mask).
+    pub slot_u32_0x34: u32,
 }
 
 const PLAYER4_NAME_OFFSET: usize = 0x3C0;
@@ -566,6 +588,12 @@ impl SzsFile {
             let state_byte = data[off + 4];
             let color_idx  = data[off + 7];
             let slot_byte12 = data[off + 12];
+            let slot_u32_0x34 = if off + 0x38 <= data.len() {
+                u32::from_le_bytes([
+                    data[off + 0x34], data[off + 0x35],
+                    data[off + 0x36], data[off + 0x37],
+                ])
+            } else { 0 };
             let name_off = off + PLAYER4_NAME_OFFSET;
             let name = if name_off + PLAYER4_NAME_BYTES <= data.len() {
                 let name_bytes = &data[name_off..name_off + PLAYER4_NAME_BYTES];
@@ -577,6 +605,7 @@ impl SzsFile {
             };
             out.push(PlayerSlotInit {
                 starting_gold, state_byte, color_idx, slot_byte12, name,
+                slot_u32_0x34,
             });
         }
         out
@@ -802,6 +831,47 @@ mod tests {
         assert_eq!(szs.players[4].state_byte, 0x0d, "slot 4 = trader");
         assert_eq!(szs.players[5].state_byte, 0x0e, "slot 5 = native");
         assert_eq!(szs.players[6].state_byte, 0x0b, "slot 6 = pirate");
+
+        // The 0x34 u32 is currently a raw bitfield exposed for
+        // future RE work. Tutorial0 has every value at 0 except
+        // the unused native + pirate slots, which are clamped to
+        // 0xFFFF_FFFF (matches the audit-script output).
+        assert_eq!(szs.players[0].slot_u32_0x34, 0);
+        assert_eq!(szs.players[5].slot_u32_0x34, 0xFFFF_FFFF);
+        assert_eq!(szs.players[6].slot_u32_0x34, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn player4_slot_u32_0x34_grows_with_difficulty() {
+        // Magnate0 ships a difficulty-tiered AI roster: stronger
+        // rivals carry strictly larger 0x34 bitsets. This is the
+        // strongest cross-scenario signal that the field encodes
+        // an AI feature/unlock mask.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/The Magnate0.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Magnate0");
+        assert_eq!(szs.players[0].slot_u32_0x34, 0x0000_0003,
+            "slot 0 (player) baseline mask");
+        assert_eq!(szs.players[1].slot_u32_0x34, 0x003F_C00F,
+            "slot 1 (easy AI) mid-tier mask");
+        assert_eq!(szs.players[2].slot_u32_0x34, 0x0FFF_C33F,
+            "slot 2 (harder AI) wide mask");
+        assert_eq!(szs.players[3].slot_u32_0x34, 0x0FFF_C33F,
+            "slot 3 (harder AI) wide mask");
+        // Strict monotone growth across rivals — 0 ⊂ 1 ⊂ 2.
+        let masks: Vec<u32> = (0..4).map(|i| szs.players[i].slot_u32_0x34).collect();
+        assert!(masks[0] & masks[1] == masks[0],
+            "slot 1 mask is a superset of slot 0");
+        assert!(masks[1] & masks[2] == masks[1],
+            "slot 2 mask is a superset of slot 1");
     }
 
     #[test]
