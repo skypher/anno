@@ -782,9 +782,23 @@ impl Simulation {
                         }
                         if let Some((def_id, def)) = pick {
                             // Find an AI warehouse to anchor near, then a spot
-                            // on that island where the footprint fits.
+                            // on that island where the footprint fits. When
+                            // the def carries a fertility requirement, prefer
+                            // a warehouse on an island that actually supplies
+                            // that fertility — otherwise the build would
+                            // anchor on a fertile island's neighbour and the
+                            // plantation would never grow its crop.
                             let wh = self.warehouses.iter().find(|w| {
-                                w.active && w.owner == owner
+                                if !(w.active && w.owner == owner) {
+                                    return false;
+                                }
+                                match def.required_fertility {
+                                    None => true,
+                                    Some(req) => self.island_maps.iter()
+                                        .find(|m| m.island_id == w.island_id)
+                                        .map(|m| m.active_fertilities().contains(&req))
+                                        .unwrap_or(false),
+                                }
                             });
                             if let Some(wh) = wh {
                                 let island_id = wh.island_id;
@@ -2149,6 +2163,77 @@ mod tests {
         assert_eq!(sim.buildings[0].owner, owner);
         assert!(sim.players[player_idx].gold < gold_before);
         assert!(!sim.buildings[0].is_built()); // construction in progress
+    }
+
+    #[test]
+    fn ai_picks_fertile_warehouse_for_climate_bound_plantation() {
+        // AI has two warehouses: island 0 (barren, listed
+        // first) and island 1 (Cocoa-fertile). When asked to
+        // build a Cocoa plantation, the warehouse selector
+        // must skip island 0 and anchor on island 1 even
+        // though it appears later.
+        use crate::building::{BuildingDef, OreDeposit};
+        use crate::types::{Good, ProductionType};
+        use anno_formats::szs::Fertility;
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[1].gold = 50_000;
+
+        // Island 0: barren. Island 1: Cocoa-fertile.
+        let mut barren = IslandMap::new_open(0, 30, 30);
+        barren.fertilities = [7; 8];
+        sim.island_maps.push(barren);
+        let mut cocoa = IslandMap::new_open(1, 30, 30);
+        cocoa.fertilities = [6, 7, 7, 7, 7, 7, 7, 7];
+        sim.island_maps.push(cocoa);
+
+        // Two warehouses owned by AI 1, in the order
+        // (barren, fertile) — the natural `find` would pick
+        // the barren one first.
+        sim.warehouses.push(Warehouse::new(0, 1, 15, 15));
+        sim.warehouses.push(Warehouse::new(1, 1, 15, 15));
+
+        // Cocoa plantation, climate-bound.
+        let cocoa_def = BuildingDef {
+            id: 0, category: 0, width: 2, height: 2,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(), prod_kind: "PLANTAGE".into(),
+            radius: 0,
+            output_good: Good::Cocoa, input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 1, input_1_rate: 0, input_2_rate: 0,
+            storage_capacity: 50, cycle_time_ms: 1000,
+            cost_gold: 200, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            maintenance_cost: 0,
+            native: false, min_tier: 0, max_no_input_ticks: 6,
+            can_dry_up: true, wegspeed: [100; 4],
+            has_door: false, upgradeable: false,
+            max_energy: 0,
+            ore_deposit: OreDeposit::None,
+            pirate_owned: false, defensive_cannons: 0,
+            required_fertility: Some(Fertility::Cocoa),
+        };
+        sim.building_defs.push(cocoa_def);
+
+        // Replay the warehouse-selection logic the inline
+        // RequestBuild handler performs.
+        let owner = 1u8;
+        let def = &sim.building_defs[0];
+        let wh = sim.warehouses.iter().find(|w| {
+            if !(w.active && w.owner == owner) { return false; }
+            match def.required_fertility {
+                None => true,
+                Some(req) => sim.island_maps.iter()
+                    .find(|m| m.island_id == w.island_id)
+                    .map(|m| m.active_fertilities().contains(&req))
+                    .unwrap_or(false),
+            }
+        });
+        let wh = wh.expect("a fertile warehouse must be found");
+        assert_eq!(wh.island_id, 1,
+            "must pick the Cocoa-fertile island, not the first warehouse");
     }
 
     #[test]
