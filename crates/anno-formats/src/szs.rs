@@ -110,6 +110,49 @@ impl Island {
     }
 }
 
+/// One of the five ship types `SHIP4` records track. Order
+/// follows figuren.cod's HANDEL1 / HANDEL2 / KRIEG1 / KRIEG2
+/// / PIRAT entries; the byte values 0x15..0x1F map onto them
+/// in ascending size/strength.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum ShipClass {
+    /// HANDEL1 — small trade ship (raw byte 0x15).
+    SmallTrader = 0x15,
+    /// HANDEL2 — large trade ship (0x17).
+    LargeTrader = 0x17,
+    /// KRIEG1 — small warship (0x19).
+    SmallWarship = 0x19,
+    /// KRIEG2 — large warship (0x1B).
+    LargeWarship = 0x1B,
+    /// PIRAT — pirate ship (0x1F).
+    PirateShip = 0x1F,
+}
+
+impl ShipClass {
+    /// Decode a raw ship-class byte. Returns `None` for any
+    /// value not in the observed shipping-corpus set
+    /// `{0x15, 0x17, 0x19, 0x1B, 0x1F}`.
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0x15 => Some(ShipClass::SmallTrader),
+            0x17 => Some(ShipClass::LargeTrader),
+            0x19 => Some(ShipClass::SmallWarship),
+            0x1B => Some(ShipClass::LargeWarship),
+            0x1F => Some(ShipClass::PirateShip),
+            _ => None,
+        }
+    }
+
+    /// True when this ship class is a combat-capable warship
+    /// (small / large warship or pirate). Used by callers to
+    /// route SHIP4 records to the simulation's MilitaryUnit
+    /// path versus the TradeShip path.
+    pub fn is_warship(self) -> bool {
+        matches!(self, ShipClass::SmallWarship | ShipClass::LargeWarship | ShipClass::PirateShip)
+    }
+}
+
 /// One ship record from the SHIP4 chunk (436 bytes per slot).
 ///
 /// Cross-scenario sample (Tutorial0 = 1 record, Continous Play00
@@ -144,6 +187,7 @@ pub struct Ship {
     /// been verified against a binary function yet; the raw
     /// byte is exposed for downstream interpretation.
     pub ship_class: u8,
+    /// (See `ShipClass::from_byte` for the typed decode.)
     /// Up to 7 cargo manifest slots at record offsets 0x174,
     /// 0x17C, 0x184, 0x18C, 0x194, 0x19C, 0x1A4 (stride 8 with
     /// the +4 word always zero). Cross-scenario audit:
@@ -163,6 +207,16 @@ pub struct Ship {
     /// surface ship cargo without committing to a specific
     /// (good, qty) decode.
     pub cargo_slots: [u32; 7],
+}
+
+impl Ship {
+    /// Decode the raw `ship_class` byte into a typed `ShipClass`.
+    /// Returns `None` if the byte falls outside the observed
+    /// shipping-corpus set — useful for callers that want to
+    /// short-circuit on malformed scenarios.
+    pub fn class(&self) -> Option<ShipClass> {
+        ShipClass::from_byte(self.ship_class)
+    }
 }
 
 const SHIP4_RECORD_BYTES: usize = 436;
@@ -1490,6 +1544,59 @@ mod tests {
                 "high16 should be a multiple of 32, got 0x{high:04X}");
             assert!(high > 0 && high <= 4000,
                 "high16 should fall within observed range, got {high}");
+        }
+    }
+
+    #[test]
+    fn ship_class_decoder_pins_observed_byte_set() {
+        // The five distinct values surveyed across the SHIP4
+        // corpus map onto figuren.cod's ship-figure ladder in
+        // ascending order of size/strength.
+        assert_eq!(ShipClass::from_byte(0x15), Some(ShipClass::SmallTrader));
+        assert_eq!(ShipClass::from_byte(0x17), Some(ShipClass::LargeTrader));
+        assert_eq!(ShipClass::from_byte(0x19), Some(ShipClass::SmallWarship));
+        assert_eq!(ShipClass::from_byte(0x1B), Some(ShipClass::LargeWarship));
+        assert_eq!(ShipClass::from_byte(0x1F), Some(ShipClass::PirateShip));
+        // Anything outside the set is None.
+        assert_eq!(ShipClass::from_byte(0x00), None);
+        assert_eq!(ShipClass::from_byte(0x16), None);
+        assert_eq!(ShipClass::from_byte(0xFF), None);
+
+        // Warship classification matches the combat-capable
+        // half of the ladder.
+        assert!(!ShipClass::SmallTrader.is_warship());
+        assert!(!ShipClass::LargeTrader.is_warship());
+        assert!(ShipClass::SmallWarship.is_warship());
+        assert!(ShipClass::LargeWarship.is_warship());
+        assert!(ShipClass::PirateShip.is_warship());
+    }
+
+    #[test]
+    fn ship_class_decoder_runs_clean_on_corpus() {
+        // Every shipping `.szs` file should yield a known
+        // ShipClass for every static SHIP4 record. A failure
+        // here means a new ship-class byte appeared in the
+        // corpus and the enum needs to grow.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() {
+            println!("Skipping: scenes dir not found");
+            return;
+        }
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let szs = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            for s in &szs.ships {
+                let stem = path.file_stem().unwrap().to_string_lossy();
+                assert!(s.class().is_some(),
+                    "{stem}: ship \"{}\" has unknown ship_class byte 0x{:02X}",
+                    s.name, s.ship_class);
+            }
         }
     }
 

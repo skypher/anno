@@ -944,12 +944,27 @@ fn main() {
         }
     }
     if !szs.ships.is_empty() {
+        // Tally ship classes so the user sees the fleet shape
+        // (warship vs trader vs pirate) at a glance, plus the
+        // named ships separately.
+        use anno_formats::szs::ShipClass;
+        let mut tally: std::collections::BTreeMap<ShipClass, u32> = Default::default();
+        for s in &szs.ships {
+            if let Some(c) = s.class() {
+                *tally.entry(c).or_default() += 1;
+            }
+        }
         let named: Vec<&str> = szs.ships.iter()
             .filter(|s| !s.name.is_empty())
             .map(|s| s.name.as_str())
             .collect();
         if !named.is_empty() {
-            println!("Starting ships ({}): {}", named.len(), named.join(", "));
+            let class_summary: Vec<String> = tally.iter()
+                .map(|(c, n)| format!("{n}× {c:?}"))
+                .collect();
+            println!("Starting ships ({}): {} [{}]",
+                named.len(), named.join(", "),
+                class_summary.join(", "));
         }
     }
     if let Some(mission) = szs.mission.as_ref() {
