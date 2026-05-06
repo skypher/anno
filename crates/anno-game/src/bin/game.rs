@@ -6401,6 +6401,18 @@ fn init_simulation(
             .push(MilitaryUnit::new(UnitType::Musketeer, 1, 27, 20));
     }
 
+    // Spawn warships from SHIP4: SmallWarship / LargeWarship /
+    // PirateShip records become MilitaryUnit instances at the
+    // exact spawn coordinates the scenario author placed them.
+    // Trader records (SmallTrader / LargeTrader) are skipped —
+    // those need a TradeShip with a route, which is handled
+    // separately below.
+    let warships = anno_sim::data_bridge::warships_from_ships(&szs.ships);
+    if !warships.is_empty() {
+        println!("Spawning {} static warship(s) from SHIP4", warships.len());
+        sim.military_units.extend(warships);
+    }
+
     // Trade route between first two islands with warehouses
     let wh_islands: Vec<(u8, u16, u16)> = sim
         .warehouses

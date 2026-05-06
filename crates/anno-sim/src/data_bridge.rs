@@ -546,6 +546,37 @@ pub fn load_building_instances(
     instances
 }
 
+/// Convert SHIP4 records whose `ShipClass::is_warship()` is
+/// true into `MilitaryUnit` instances for the simulation's
+/// naval combat path. Trader ships are skipped — those need a
+/// `TradeShip` with a route, which the scenario doesn't seed
+/// directly. Returns the new units in the same order as the
+/// underlying SHIP4 records, so callers can correlate by
+/// index when annotating ship names later.
+pub fn warships_from_ships(
+    ships: &[anno_formats::szs::Ship],
+) -> Vec<crate::combat::MilitaryUnit> {
+    use anno_formats::szs::ShipClass;
+    use crate::combat::{MilitaryUnit, UnitType};
+    ships.iter()
+        .filter_map(|s| {
+            let class = s.class()?;
+            let unit_type = match class {
+                ShipClass::SmallWarship => UnitType::SmallWarship,
+                ShipClass::LargeWarship => UnitType::LargeWarship,
+                ShipClass::PirateShip   => UnitType::PirateShip,
+                _ => return None,
+            };
+            Some(MilitaryUnit::new(
+                unit_type,
+                s.owner,
+                s.x as i32,
+                s.y as i32,
+            ))
+        })
+        .collect()
+}
+
 /// Whether a plantation/farm building can be placed on the
 /// given island. The check is purely a fertility lookup —
 /// ownership, infrastructure tier, and tile-level placement
@@ -575,6 +606,37 @@ pub fn island_can_host_building(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warships_from_ships_routes_warships_only() {
+        use anno_formats::szs::Ship;
+        use crate::combat::UnitType;
+        let mk = |owner: u8, class: u8, x: u16, y: u16| Ship {
+            name: "test".into(),
+            x, y,
+            owner,
+            ship_class: class,
+            cargo_slots: [0; 7],
+        };
+        let ships = vec![
+            mk(0, 0x15, 10, 10), // SmallTrader  → skip
+            mk(1, 0x19, 20, 20), // SmallWarship → keep
+            mk(2, 0x1B, 30, 30), // LargeWarship → keep
+            mk(0, 0x17, 40, 40), // LargeTrader  → skip
+            mk(6, 0x1F, 50, 50), // PirateShip   → keep
+            mk(0, 0xFE,  0,  0), // unknown     → skip
+        ];
+        let units = warships_from_ships(&ships);
+        assert_eq!(units.len(), 3);
+        assert_eq!(units[0].unit_type, UnitType::SmallWarship);
+        assert_eq!(units[0].owner, 1);
+        assert_eq!(units[1].unit_type, UnitType::LargeWarship);
+        assert_eq!(units[2].unit_type, UnitType::PirateShip);
+        assert_eq!(units[2].owner, 6);
+        // Position should round-trip from u16 → i32.
+        assert_eq!(units[0].tile_x, 20);
+        assert_eq!(units[0].tile_y, 20);
+    }
 
     #[test]
     fn island_can_host_building_gates_climate_bound_plantations() {
