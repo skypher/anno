@@ -73,6 +73,25 @@ pub struct Ship {
     /// been verified against a binary function yet; the raw
     /// byte is exposed for downstream interpretation.
     pub ship_class: u8,
+    /// Up to 7 cargo manifest slots at record offsets 0x174,
+    /// 0x17C, 0x184, 0x18C, 0x194, 0x19C, 0x1A4 (stride 8 with
+    /// the +4 word always zero). Cross-scenario audit:
+    ///
+    ///   * High 16 bits of each non-zero u32 are clean
+    ///     multiples of 32 — most commonly 0x0640 (= 1600).
+    ///     These look like quantities in a 100-unit-per-ton
+    ///     scale (16 tons = 1600 units).
+    ///   * Low 16 bits cluster around a small set of values
+    ///     (20 distinct across the corpus) — likely a good /
+    ///     ware identifier, but the encoding doesn't match a
+    ///     simple small-int good_id (values up to ~10000
+    ///     occur), so semantics aren't pinned to a binary
+    ///     function yet.
+    ///
+    /// The raw u32 array is exposed so downstream callers can
+    /// surface ship cargo without committing to a specific
+    /// (good, qty) decode.
+    pub cargo_slots: [u32; 7],
 }
 
 const SHIP4_RECORD_BYTES: usize = 436;
@@ -652,7 +671,16 @@ impl SzsFile {
             let y = u16::from_le_bytes([data[off + 30], data[off + 31]]);
             let ship_class = if off + 0x49 <= data.len() { data[off + 0x48] } else { 0 };
             let owner      = if off + 0x4C <= data.len() { data[off + 0x4B] } else { 0 };
-            out.push(Ship { name, x, y, owner, ship_class });
+            let mut cargo_slots = [0u32; 7];
+            for (i, slot) in cargo_slots.iter_mut().enumerate() {
+                let o = off + 0x174 + i * 8;
+                if o + 4 <= data.len() {
+                    *slot = u32::from_le_bytes([
+                        data[o], data[o + 1], data[o + 2], data[o + 3],
+                    ]);
+                }
+            }
+            out.push(Ship { name, x, y, owner, ship_class, cargo_slots });
         }
         out
     }
@@ -1225,6 +1253,40 @@ mod tests {
                          0x15 | 0x17 | 0x19 | 0x1B | 0x1F),
             "ship_class falls within the observed shipping-corpus set, got 0x{:02X}",
             szs.ships[0].ship_class);
+    }
+
+    #[test]
+    fn ship4_cargo_slots_carry_three_loaded_entries_in_tutorial0() {
+        // Tutorial0 starts the player with one ship loaded with
+        // three goods. Audit surfaces the raw u32 cargo entries
+        // 0x03C00003, 0x03C00011, 0x03200033 at slot 0 of the
+        // SHIP4 record's cargo manifest (high16 = quantity,
+        // low16 = good identifier of unknown encoding).
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/Tutorial0.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Tutorial0");
+        assert_eq!(szs.ships.len(), 1);
+        assert_eq!(szs.ships[0].cargo_slots,
+            [62915075, 62916561, 52429875, 0, 0, 0, 0],
+            "Tutorial0 starting cargo");
+        // The high 16 bits of each non-zero entry should be a
+        // quantity-style multiple of 32 in the observed range.
+        for slot in &szs.ships[0].cargo_slots {
+            if *slot == 0 { continue; }
+            let high = (slot >> 16) as u16;
+            assert!(high % 32 == 0,
+                "high16 should be a multiple of 32, got 0x{high:04X}");
+            assert!(high > 0 && high <= 4000,
+                "high16 should fall within observed range, got {high}");
+        }
     }
 
     #[test]

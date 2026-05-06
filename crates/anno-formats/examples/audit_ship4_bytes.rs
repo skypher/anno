@@ -100,6 +100,84 @@ fn main() {
     }
     println!();
 
+    // Audit the candidate cargo-manifest region: 7 stride-8
+    // entries from 0x174..0x1AC. Decode each as (good_id: u32,
+    // quantity: u32) and dump per-ship.
+    println!("Cargo manifest dump (offsets 0x174..0x1AC, 7 stride-8 entries):");
+    let mut shown_cargo = 0;
+    for (name, idx, body) in &all_records {
+        let ship_name: String = body[0..28].iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| char::from(b))
+            .collect();
+        if ship_name.is_empty() { continue; }
+        let entries: Vec<(u32, u32)> = (0..7)
+            .map(|i| {
+                let o = 0x174 + i * 8;
+                let a = u32::from_le_bytes([body[o], body[o+1], body[o+2], body[o+3]]);
+                let b = u32::from_le_bytes([body[o+4], body[o+5], body[o+6], body[o+7]]);
+                (a, b)
+            })
+            .collect();
+        let any_nonzero = entries.iter().any(|&(a, b)| a != 0 || b != 0);
+        if !any_nonzero { continue; }
+        if shown_cargo >= 12 { break; }
+        let pretty: Vec<String> = entries.iter()
+            .map(|(a, b)| format!("({a}, {b})"))
+            .collect();
+        println!("  {name}#{idx} \"{ship_name}\": {}", pretty.join("  "));
+        shown_cargo += 1;
+    }
+    println!();
+
+    // Distribution of the first u32 of each cargo entry — if it's
+    // a good_id, values should be small (< ~30 for Anno 1602's
+    // ware count) and bounded.
+    let mut first_u32_of_entry0: std::collections::BTreeMap<u32, u32> =
+        std::collections::BTreeMap::new();
+    for (_, _, body) in &all_records {
+        let v = u32::from_le_bytes([body[0x174], body[0x175], body[0x176], body[0x177]]);
+        *first_u32_of_entry0.entry(v).or_default() += 1;
+    }
+    println!("Cargo entry[0] first-u32 distribution (top 10):");
+    let mut sorted: Vec<_> = first_u32_of_entry0.iter().collect();
+    sorted.sort_by_key(|&(_, c)| std::cmp::Reverse(*c));
+    for (v, c) in sorted.iter().take(10) {
+        println!("  0x{v:08X} ({}): {c} samples", v);
+    }
+    println!();
+
+    // Distribution of the LOW 16 bits and HIGH 16 bits across
+    // every non-zero entry of every ship's cargo array.
+    let mut low16_dist: std::collections::BTreeMap<u16, u32> =
+        std::collections::BTreeMap::new();
+    let mut high16_dist: std::collections::BTreeMap<u16, u32> =
+        std::collections::BTreeMap::new();
+    for (_, _, body) in &all_records {
+        for i in 0..7 {
+            let o = 0x174 + i * 8;
+            let v = u32::from_le_bytes([body[o], body[o+1], body[o+2], body[o+3]]);
+            if v == 0 { continue; }
+            *low16_dist.entry((v & 0xFFFF) as u16).or_default() += 1;
+            *high16_dist.entry((v >> 16) as u16).or_default() += 1;
+        }
+    }
+    println!("Cargo entry low-16-bits distinct values: {}", low16_dist.len());
+    println!("  most common 10:");
+    let mut sl: Vec<_> = low16_dist.iter().collect();
+    sl.sort_by_key(|&(_, c)| std::cmp::Reverse(*c));
+    for (v, c) in sl.iter().take(10) {
+        println!("    0x{v:04X} ({:5}): {c}", v);
+    }
+    println!("Cargo entry high-16-bits distinct values: {}", high16_dist.len());
+    println!("  most common 10:");
+    let mut sh: Vec<_> = high16_dist.iter().collect();
+    sh.sort_by_key(|&(_, c)| std::cmp::Reverse(*c));
+    for (v, c) in sh.iter().take(10) {
+        println!("    0x{v:04X} ({:5}): {c}", v);
+    }
+    println!();
+
     println!("Per-ship dump (offsets 0x1C..0x60 — past x/y):");
     let mut shown = 0;
     for (name, idx, body) in &all_records {
