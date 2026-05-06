@@ -924,23 +924,23 @@ fn main() {
     for island in &szs.islands {
         // Print every island with at least one fertility OR a
         // settled city — surfaces the new INSEL5 fertility map.
-        let active_fertilities: Vec<u8> = island.fertilities.iter()
-            .copied()
-            .filter(|&v| v != 7)
+        let active = island.active_fertilities();
+        let fert_names: Vec<String> = active.iter()
+            .map(|f| format!("{f:?}"))
             .collect();
         if let Some(city) = island.city.as_ref() {
             if !city.name.is_empty() {
-                let fert_tag = if active_fertilities.is_empty() {
+                let fert_tag = if fert_names.is_empty() {
                     String::new()
                 } else {
-                    format!("  fertilities={active_fertilities:?}")
+                    format!("  fertilities=[{}]", fert_names.join(", "))
                 };
                 println!("  Island {}: city '{}' (owner_slot {}, island_index {}){fert_tag}",
                     island.number, city.name, city.owner_slot, city.island_index);
             }
-        } else if !active_fertilities.is_empty() {
-            println!("  Island {} (uninhabited): fertilities={active_fertilities:?}",
-                island.number);
+        } else if !fert_names.is_empty() {
+            println!("  Island {} (uninhabited): fertilities=[{}]",
+                island.number, fert_names.join(", "));
         }
     }
     if !szs.ships.is_empty() {

@@ -24,6 +24,53 @@ pub struct Chunk {
     pub data: Vec<u8>,
 }
 
+/// One of the seven climate-dependent crop fertilities the
+/// engine recognises. Values match the order of the
+/// `[ROHST]` section in `editor.cod`:
+///
+///   0 = Grain      (KORN)
+///   1 = Tobacco    (TABAK)
+///   2 = Spices     (GEWUERZE)
+///   3 = Sugarcane  (ZUCKER / ZUCKERROHR)
+///   4 = Cotton     (BAUMWOLLE)
+///   5 = Vines      (WEIN)
+///   6 = Cocoa      (KAKAO)
+///
+/// 7 is the sentinel "grazing land / no special crop"
+/// (matches editor.cod's "Grazing land" entry at the same
+/// position). 93% of fertility slots in shipping content
+/// carry 7, leaving 0..=6 to mark which one or two specific
+/// crops a fertile island supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Fertility {
+    Grain = 0,
+    Tobacco = 1,
+    Spices = 2,
+    Sugarcane = 3,
+    Cotton = 4,
+    Vines = 5,
+    Cocoa = 6,
+}
+
+impl Fertility {
+    /// Decode a raw INSEL5 fertility byte. Returns `None` for
+    /// the sentinel value 7 (grazing land / no crop) and any
+    /// out-of-range value.
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Fertility::Grain),
+            1 => Some(Fertility::Tobacco),
+            2 => Some(Fertility::Spices),
+            3 => Some(Fertility::Sugarcane),
+            4 => Some(Fertility::Cotton),
+            5 => Some(Fertility::Vines),
+            6 => Some(Fertility::Cocoa),
+            _ => None,
+        }
+    }
+}
+
 /// Island metadata from an INSEL5 chunk.
 #[derive(Debug, Clone)]
 pub struct Island {
@@ -32,23 +79,35 @@ pub struct Island {
     pub height: u8,
     pub x_pos: u16,
     pub y_pos: u16,
-    /// Eight fertility bytes at INSEL5 offsets 0x0C..0x14. The
-    /// default value 0x07 marks "no fertility in this slot";
-    /// values 0x00..0x06 select one of seven fertility types
-    /// (matching the seven climate-dependent crops in Anno
-    /// 1602: tobacco / sugarcane / cocoa / cotton / spices /
-    /// wine / wool, in some binary-defined order). Audit
-    /// (`cargo run --example audit_insel5_bytes`) confirms
-    /// 4058/4368 (93%) of bytes are 0x07 across 546 islands;
-    /// most islands have one or two slots populated, with
-    /// `[07 07 07 07 07 07 07 07]` (no fertilities) as the
-    /// most common pattern (270 islands).
+    /// Eight fertility bytes at INSEL5 offsets 0x0C..0x14.
+    /// The mapping is pinned by the `[ROHST]` section of
+    /// `editor.cod`: 0=Grain, 1=Tobacco, 2=Spices,
+    /// 3=Sugarcane, 4=Cotton, 5=Vines, 6=Cocoa, 7=Grazing
+    /// land (sentinel "no specific crop here").
+    ///
+    /// 93% of bytes are 7 across 546 islands; most islands
+    /// fill one or two slots with 0..=6 to flag specific
+    /// fertilities. Use `Fertility::from_byte` to decode each
+    /// entry into the typed enum (returning `None` for the
+    /// sentinel).
     pub fertilities: [u8; 8],
     pub tiles: Vec<IslandTile>,
     /// Optional city info from the matching `STADT4` chunk that
     /// follows this island's INSELHAUS in chunk order. Populated
     /// only when the island carries a settled town.
     pub city: Option<City>,
+}
+
+impl Island {
+    /// Active (non-sentinel) fertilities decoded into the
+    /// typed enum. Yields at most 8 entries; preserves the
+    /// slot order so callers can correlate with the binary's
+    /// internal indexing.
+    pub fn active_fertilities(&self) -> Vec<Fertility> {
+        self.fertilities.iter()
+            .filter_map(|&b| Fertility::from_byte(b))
+            .collect()
+    }
 }
 
 /// One ship record from the SHIP4 chunk (436 bytes per slot).
@@ -1222,6 +1281,23 @@ mod tests {
             "slot 1 mask is a superset of slot 0");
         assert!(masks[1] & masks[2] == masks[1],
             "slot 2 mask is a superset of slot 1");
+    }
+
+    #[test]
+    fn fertility_byte_maps_to_editor_cod_rohst_order() {
+        // editor.cod's [ROHST] section pins the order:
+        //   Grain / Tobacco / Spices / Sugarcane / Cotton /
+        //   Vines / Cocoa / Grazing land
+        assert_eq!(Fertility::from_byte(0), Some(Fertility::Grain));
+        assert_eq!(Fertility::from_byte(1), Some(Fertility::Tobacco));
+        assert_eq!(Fertility::from_byte(2), Some(Fertility::Spices));
+        assert_eq!(Fertility::from_byte(3), Some(Fertility::Sugarcane));
+        assert_eq!(Fertility::from_byte(4), Some(Fertility::Cotton));
+        assert_eq!(Fertility::from_byte(5), Some(Fertility::Vines));
+        assert_eq!(Fertility::from_byte(6), Some(Fertility::Cocoa));
+        // 7 = sentinel, 8+ = invalid → None
+        assert_eq!(Fertility::from_byte(7), None);
+        assert_eq!(Fertility::from_byte(8), None);
     }
 
     #[test]
