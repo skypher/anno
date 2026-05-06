@@ -32,6 +32,18 @@ pub struct Island {
     pub height: u8,
     pub x_pos: u16,
     pub y_pos: u16,
+    /// Eight fertility bytes at INSEL5 offsets 0x0C..0x14. The
+    /// default value 0x07 marks "no fertility in this slot";
+    /// values 0x00..0x06 select one of seven fertility types
+    /// (matching the seven climate-dependent crops in Anno
+    /// 1602: tobacco / sugarcane / cocoa / cotton / spices /
+    /// wine / wool, in some binary-defined order). Audit
+    /// (`cargo run --example audit_insel5_bytes`) confirms
+    /// 4058/4368 (93%) of bytes are 0x07 across 546 islands;
+    /// most islands have one or two slots populated, with
+    /// `[07 07 07 07 07 07 07 07]` (no fertilities) as the
+    /// most common pattern (270 islands).
+    pub fertilities: [u8; 8],
     pub tiles: Vec<IslandTile>,
     /// Optional city info from the matching `STADT4` chunk that
     /// follows this island's INSELHAUS in chunk order. Populated
@@ -828,12 +840,17 @@ impl SzsFile {
     }
 
     fn parse_insel5(data: &[u8]) -> Island {
+        let mut fertilities = [0x07u8; 8];
+        if data.len() >= 0x14 {
+            fertilities.copy_from_slice(&data[0x0C..0x14]);
+        }
         Island {
             number: data[0],
             width: data[1],
             height: data[2],
             x_pos: u16::from_le_bytes([data[4], data[5]]),
             y_pos: u16::from_le_bytes([data[6], data[7]]),
+            fertilities,
             tiles: Vec::new(),
             city: None,
         }
@@ -907,12 +924,14 @@ mod tests {
                         orientation: 0, anim_count: 2, flags: 1,
                     },
                 ],
+                fertilities: [7; 8],
                 city: None,
             },
             Island {
                 number: 4, width: 60, height: 40,
                 x_pos: 500, y_pos: 600,
                 tiles: vec![],
+                fertilities: [7; 8],
                 city: None,
             },
         ];
@@ -1203,6 +1222,40 @@ mod tests {
             "slot 1 mask is a superset of slot 0");
         assert!(masks[1] & masks[2] == masks[1],
             "slot 2 mask is a superset of slot 1");
+    }
+
+    #[test]
+    fn insel5_extracts_fertility_map() {
+        // Atoll has 35 islands with varied fertility patterns.
+        // The audit shows most islands carry the no-fertility
+        // sentinel `[07; 8]` while a handful encode 1-2 active
+        // fertility slots.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/Atoll.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Atoll");
+        // At least one island has the all-default `[07; 8]`
+        // pattern, and at least one has a non-default slot.
+        let any_default = szs.islands.iter()
+            .any(|i| i.fertilities == [7; 8]);
+        let any_active = szs.islands.iter()
+            .any(|i| i.fertilities.iter().any(|&v| v != 7));
+        assert!(any_default, "Atoll should include at least one fertility-free island");
+        assert!(any_active, "Atoll should include at least one fertile island");
+        // No fertility byte should exceed 7 (the binary's value
+        // range is 0..=7 with 7 being the no-fertility sentinel).
+        for i in &szs.islands {
+            for &b in &i.fertilities {
+                assert!(b <= 7, "fertility byte must be in 0..=7, got {b}");
+            }
+        }
     }
 
     #[test]
