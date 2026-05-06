@@ -924,8 +924,8 @@ fn main() {
     for island in &szs.islands {
         if let Some(city) = island.city.as_ref() {
             if !city.name.is_empty() {
-                println!("  Island {}: city '{}' (owner {})",
-                    island.number, city.name, city.owner);
+                println!("  Island {}: city '{}' (owner_slot {}, island_index {})",
+                    island.number, city.name, city.owner_slot, city.island_index);
             }
         }
     }

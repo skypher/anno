@@ -63,6 +63,55 @@ fn main() {
         *type_distribution.entry(body[0x48]).or_default() += 1;
         if (*idx as u8) == body[0x46] { idx_matches_byte_46 += 1; }
     }
+    // Check the 100%-density constant-looking bytes 0x3D and 0x41.
+    let mut byte_3d_dist: std::collections::BTreeMap<u8, u32> = Default::default();
+    let mut byte_41_dist: std::collections::BTreeMap<u8, u32> = Default::default();
+    let mut byte_4d_dist: std::collections::BTreeMap<u8, u32> = Default::default();
+    let mut byte_4a_dist: std::collections::BTreeMap<u8, u32> = Default::default();
+    for (_, _, body) in &all_records {
+        if body.len() >= 0x50 {
+            *byte_3d_dist.entry(body[0x3D]).or_default() += 1;
+            *byte_41_dist.entry(body[0x41]).or_default() += 1;
+            *byte_4d_dist.entry(body[0x4D]).or_default() += 1;
+            *byte_4a_dist.entry(body[0x4A]).or_default() += 1;
+        }
+    }
+    println!("byte 0x3D distribution: {byte_3d_dist:?}");
+    println!("byte 0x41 distribution: {byte_41_dist:?}");
+    println!("byte 0x4A distribution: {byte_4a_dist:?}");
+    println!("byte 0x4D distribution: {byte_4d_dist:?}");
+
+    // Cross-tab byte 0x4A vs byte 0x4B (owner) — does 0x4A
+    // distinguish native ships from human/AI ships?
+    let mut crosstab: std::collections::BTreeMap<(u8, u8), u32> = Default::default();
+    for (_, _, body) in &all_records {
+        if body.len() >= 0x50 {
+            *crosstab.entry((body[0x4A], body[0x4B])).or_default() += 1;
+        }
+    }
+    let mut crosstab_4d: std::collections::BTreeMap<(u8, u8), u32> = Default::default();
+    for (_, _, body) in &all_records {
+        if body.len() >= 0x50 {
+            let bucket = if body[0x4D] == 0xFF { 0xFFu8 } else if body[0x4D] < 32 { 1u8 } else { 2u8 };
+            *crosstab_4d.entry((bucket, body[0x4B])).or_default() += 1;
+        }
+    }
+    println!("byte 0x4D bucket × owner cross-tab:");
+    for ((bucket, owner), c) in &crosstab_4d {
+        let name = match bucket {
+            1 => "small int",
+            0xFF => "0xFF",
+            _ => "other",
+        };
+        println!("  ({}, owner={}): {}", name, owner, c);
+    }
+    println!();
+    println!("byte 0x4A × byte 0x4B (owner) cross-tab:");
+    for ((a, b), c) in &crosstab {
+        println!("  (0x4A={a}, owner={b}): {c}");
+    }
+    println!();
+
     println!("byte 0x46 == chunk-index in {idx_matches_byte_46} / {} records",
         all_records.len());
     println!("byte 0x4B (owner candidate) distribution: {owner_distribution:?}");

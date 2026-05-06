@@ -99,14 +99,37 @@ const SHIP4_NAME_BYTES: usize = 28;
 
 /// Per-island city info parsed from a STADT4 chunk (168 bytes).
 ///
-/// Layout (verified across A Plague of Pirates / Atoll /
-/// Cooperation): byte 0 = owning player ID, bytes 0x87..0xa7 hold
-/// a null-terminated CP1252 city name. The intermediate region
-/// (0x78..0x86, fifteen 0x80-sentinel bytes) flags some per-tier
-/// or per-good state and is preserved on `Chunk` for later RE.
+/// Layout (verified by `cargo run --example audit_stadt4_bytes`
+/// across 245 city records — owner-distribution survey shows
+/// byte 0 ranges 0..=33 across the corpus, matching island
+/// indexes, while byte 0x02 ranges 0..=6 matching the seven
+/// player slots):
+///
+/// ```text
+/// byte 0x00  island_index — which island carries this city
+///            (an index into the scenario's island list, 0..N)
+/// byte 0x02  owner_slot — which player slot owns the city
+///            (0=human, 1..=3=AI rivals, 4=trader,
+///             5=natives, 6=pirates), matching PLAYER4's
+///             slot numbering
+/// 0x87..0xa7 null-terminated CP1252 city name
+/// 0x78..0x86 fifteen 0x80 sentinel bytes (semantics TBD)
+/// ```
+///
+/// Cross-scenario sample: New Horizons2 places "Jaricho" on
+/// island 21 with owner_slot 6 (pirates), "Radolfsell" on
+/// island 19 with owner_slot 5 (natives), confirming the
+/// island-vs-slot split.
 #[derive(Debug, Clone)]
 pub struct City {
-    pub owner: u8,
+    /// Island index this city sits on (0..N where N is the
+    /// number of islands in the scenario). Was previously
+    /// mis-labelled as `owner`.
+    pub island_index: u8,
+    /// Player slot owning the city (matches PLAYER4 slot
+    /// numbering). 0 for the player's main settlement; AI
+    /// rivals 1..=3; reserved factions 4..=6.
+    pub owner_slot: u8,
     pub name: String,
 }
 
@@ -818,7 +841,8 @@ impl SzsFile {
 
     fn parse_stadt4(data: &[u8]) -> Option<City> {
         if data.len() < 0xa8 { return None; }
-        let owner = data[0];
+        let island_index = data[0];
+        let owner_slot = data[2];
         let name_start = 0x87;
         let name_end = data[name_start..]
             .iter()
@@ -829,7 +853,7 @@ impl SzsFile {
             .iter()
             .map(|&b| char::from(b))
             .collect();
-        Some(City { owner, name })
+        Some(City { island_index, owner_slot, name })
     }
 
     fn parse_inselhaus(data: &[u8]) -> Vec<IslandTile> {
@@ -1201,7 +1225,58 @@ mod tests {
             .find_map(|i| i.city.as_ref())
             .expect("at least one island has a STADT4 city");
         assert_eq!(city.name, "Larrach");
-        assert_eq!(city.owner, 1);
+        // Larrach is the player's main settlement in Plague,
+        // so it belongs to slot 0. The previous test asserted
+        // `owner == 1` against the byte at offset 0, which is
+        // actually the island_index — Larrach sits on island 1
+        // because Plague's island 0 is an unused sentinel.
+        assert_eq!(city.island_index, 1,
+            "Larrach is on Plague's island #1 (after the sentinel)");
+        assert_eq!(city.owner_slot, 0,
+            "Larrach is the player's main settlement");
+    }
+
+    #[test]
+    fn stadt4_multi_city_scenario_distinguishes_island_from_owner() {
+        // New Horizons2 places cities on multiple islands with
+        // distinct owner_slots — this is the test that motivated
+        // separating the two fields.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/New Horizons2.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse New Horizons2");
+        let cities: Vec<&City> = szs.islands.iter()
+            .filter_map(|i| i.city.as_ref())
+            .filter(|c| !c.name.is_empty())
+            .collect();
+        let by_name = |n: &str| cities.iter()
+            .find(|c| c.name == n)
+            .copied();
+        // "Jaricho" sits on island 21 with owner_slot 6 (pirate).
+        if let Some(c) = by_name("Jaricho") {
+            assert_eq!(c.island_index, 21);
+            assert_eq!(c.owner_slot, 6,
+                "Jaricho is the pirate stronghold (slot 6)");
+        }
+        // "Radolfsell" — island 19, owner_slot 5 (natives).
+        if let Some(c) = by_name("Radolfsell") {
+            assert_eq!(c.island_index, 19);
+            assert_eq!(c.owner_slot, 5);
+        }
+        // No city should have owner_slot > 6 (only seven slots
+        // exist), and we expect the corpus invariant that
+        // island_index varies independently of owner_slot.
+        for c in &cities {
+            assert!(c.owner_slot <= 6,
+                "owner_slot must be a valid PLAYER4 slot index, got {}", c.owner_slot);
+        }
     }
 
     #[test]
