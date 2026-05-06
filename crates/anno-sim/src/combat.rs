@@ -984,6 +984,7 @@ mod tests {
             ore_deposit: OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: cannons,
+            required_fertility: None,
         };
         let defs = vec![mk_tower(2)];
         let mut tower = BuildingInstance::new(0, 0, 5, 5, 0);

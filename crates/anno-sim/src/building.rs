@@ -102,6 +102,15 @@ pub struct BuildingDef {
     /// turret/castle buildings carry `Kanon: 2`. Drives passive
     /// defensive damage radiating from owned towers/castles.
     pub defensive_cannons: u8,
+    /// Fertility this building's plantation/farm requires on
+    /// the host island. Derived from haeuser.cod's `Rohstoff`
+    /// field via the editor.cod-pinned name mapping
+    /// (TABAKBAUM → Tobacco, KAKAOBAUM → Cocoa, ZUCKERROHR
+    /// → Sugarcane, WEINTRAUBEN → Vines, BAUMWOLLE → Cotton,
+    /// GEWUERZBAUM → Spices, GETREIDE → Grain). `None` for
+    /// universal buildings (wood/stone/cloth chain) that work
+    /// on any island.
+    pub required_fertility: Option<anno_formats::szs::Fertility>,
 }
 
 /// Ore-deposit size. Manual sec. 6.7 + Tim Howgego's resources

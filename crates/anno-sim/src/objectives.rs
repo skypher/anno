@@ -344,6 +344,7 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            required_fertility: None,
         };
         let defs = vec![mk_def(Good::Tools), mk_def(Good::Cloth)];
         let mk_b = |def_id: u16, owner: u8| {

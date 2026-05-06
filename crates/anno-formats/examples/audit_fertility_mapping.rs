@@ -52,6 +52,24 @@ fn main() {
     }
     println!("PLANTAGE wares in haeuser.cod: {plantage_wares:?}\n");
 
+    // Dump all properties for plantation buildings producing
+    // TABAK/ZUCKER/KAKAO/GEWUERZE/WEIN/KORN — looking for a
+    // Bodentyp / Rohstoff / Stoff field that pins required
+    // fertility.
+    println!("Plantation building properties (looking for fertility gate):");
+    for b in &cod.buildings {
+        let pk = b.properties.get("ProdKind").cloned().unwrap_or_default();
+        if pk != "PLANTAGE" { continue; }
+        let w = b.properties.get("Ware").cloned().unwrap_or_default();
+        let w0 = w.split(',').next().unwrap_or("").trim().to_string();
+        // Show every PLANTAGE plus its Rohstoff so we can pin
+        // the Rohstoff → Fertility mapping.
+        let rohstoff = b.properties.get("Rohstoff").cloned().unwrap_or_default();
+        let bodentyp = b.properties.get("Bodentyp").cloned().unwrap_or_default();
+        println!("  Nummer={} Ware={w0} Rohstoff={rohstoff} Bodentyp={bodentyp}",
+            b.nummer);
+    }
+
     // Building Nummers per fertility-bound ware.
     let mut ware_to_nummers: BTreeMap<String, Vec<i32>> = BTreeMap::new();
     for b in &cod.buildings {

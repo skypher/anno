@@ -94,6 +94,33 @@ fn parse_good_covers_all_haeuser_cod_tokens() {
 
 #[cfg(test)]
 #[test]
+fn rohstoff_to_fertility_matches_audit_pairs() {
+    use anno_formats::szs::Fertility;
+    // Pairs derived from `cargo run --example audit_fertility_mapping`
+    // — every PLANTAGE entry's Rohstoff field paired with the
+    // climate-bound crop it grows.
+    let pairs: &[(&str, Option<Fertility>)] = &[
+        ("GETREIDE",    Some(Fertility::Grain)),
+        ("TABAKBAUM",   Some(Fertility::Tobacco)),
+        ("GEWUERZBAUM", Some(Fertility::Spices)),
+        ("ZUCKERROHR",  Some(Fertility::Sugarcane)),
+        ("BAUMWOLLE",   Some(Fertility::Cotton)),
+        ("WEINTRAUBEN", Some(Fertility::Vines)),
+        ("KAKAOBAUM",   Some(Fertility::Cocoa)),
+        // Universal raw materials should NOT bind a fertility.
+        ("BAUM",        None),
+        ("STEINE",      None),
+        ("ERZE",        None),
+        ("",            None),
+    ];
+    for (rohstoff, want) in pairs {
+        assert_eq!(rohstoff_to_fertility(rohstoff), *want,
+            "rohstoff_to_fertility({rohstoff:?})");
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn parse_bauinfra_matches_haeuser_cod_ladder() {
     // Aliases from haeuser.cod's `BESONDERE INFRASTRUKTUR
     // MARKPUNKTE` block, paired with the PopTier index they
@@ -325,7 +352,34 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         },
         pirate_owned: prop("Piratflg") == "1",
         defensive_cannons: prop_int("Kanon").max(0) as u8,
+        required_fertility: rohstoff_to_fertility(good_name("Rohstoff")),
     }
+}
+
+/// Map haeuser.cod's `Rohstoff` raw-material name to the typed
+/// fertility the host island must carry. Audit-derived from
+/// `cargo run --example audit_fertility_mapping`:
+///
+///   TABAKBAUM    → Tobacco
+///   KAKAOBAUM    → Cocoa
+///   ZUCKERROHR   → Sugarcane
+///   WEINTRAUBEN  → Vines      (Nummer 408 → Alkohol/Wine)
+///   BAUMWOLLE    → Cotton     (Nummer 404 → Wolle/Cotton)
+///   GEWUERZBAUM  → Spices
+///   GETREIDE     → Grain
+///   (BAUM, STEINE, …) — universal, no fertility gate
+fn rohstoff_to_fertility(name: &str) -> Option<anno_formats::szs::Fertility> {
+    use anno_formats::szs::Fertility::*;
+    Some(match name {
+        "GETREIDE" => Grain,
+        "TABAKBAUM" => Tobacco,
+        "GEWUERZBAUM" => Spices,
+        "ZUCKERROHR" => Sugarcane,
+        "BAUMWOLLE" => Cotton,
+        "WEINTRAUBEN" => Vines,
+        "KAKAOBAUM" => Cocoa,
+        _ => return None,
+    })
 }
 
 /// Map a `Bauinfra` token from haeuser.cod to a population tier
@@ -492,9 +546,92 @@ pub fn load_building_instances(
     instances
 }
 
+/// Whether a plantation/farm building can be placed on the
+/// given island. The check is purely a fertility lookup —
+/// ownership, infrastructure tier, and tile-level placement
+/// rules are validated by other passes.
+///
+/// Universal buildings (`required_fertility = None`, e.g.
+/// foresters, brick kilns) always pass. Climate-bound
+/// plantations (`Some(Fertility::Tobacco)`, etc.) require
+/// the corresponding non-sentinel byte in the island's
+/// 8-slot fertility map.
+///
+/// Pre-placed scenario buildings are NOT subject to this
+/// check — `load_building_instances` honours the scenario
+/// author's decisions verbatim. The check applies to the
+/// player/AI build-action path, where the original engine
+/// rejects placements that violate the fertility gate.
+pub fn island_can_host_building(
+    def: &BuildingDef,
+    island: &anno_formats::szs::Island,
+) -> bool {
+    let Some(req) = def.required_fertility else {
+        return true;
+    };
+    island.active_fertilities().contains(&req)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn island_can_host_building_gates_climate_bound_plantations() {
+        use crate::types::ProductionType;
+        use anno_formats::szs::{Fertility, Island};
+        let mk_island = |ferts: [u8; 8]| Island {
+            number: 0, width: 10, height: 10, x_pos: 0, y_pos: 0,
+            fertilities: ferts, tiles: Vec::new(), city: None,
+        };
+        let mk_def = |req: Option<Fertility>| {
+            let mut d = BuildingDef {
+                id: 0, category: 0, width: 1, height: 1,
+                production_type: ProductionType::Craft,
+                kind: "PLANTAGE".into(), prod_kind: "PLANTAGE".into(),
+                radius: 0,
+                output_good: Good::None,
+                input_good_1: Good::None, input_good_2: Good::None,
+                output_rate: 1, input_1_rate: 0, input_2_rate: 0,
+                storage_capacity: 0, cycle_time_ms: 1000,
+                cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+                maintenance_cost: 0,
+                native: false, min_tier: 0, max_no_input_ticks: 6,
+                can_dry_up: false, wegspeed: [100; 4],
+                has_door: false, upgradeable: false,
+                max_energy: 0,
+                ore_deposit: crate::building::OreDeposit::None,
+                pirate_owned: false, defensive_cannons: 0,
+                required_fertility: req,
+            };
+            d.required_fertility = req;
+            d
+        };
+
+        // Universal building (no fertility requirement) passes
+        // even on a barren island.
+        let universal = mk_def(None);
+        let barren = mk_island([7; 8]);
+        assert!(island_can_host_building(&universal, &barren));
+
+        // Tobacco plantation requires byte 1 in the map.
+        let tobacco = mk_def(Some(Fertility::Tobacco));
+        assert!(!island_can_host_building(&tobacco, &barren),
+            "barren island should reject tobacco");
+        let tobacco_isle = mk_island([1, 7, 7, 7, 7, 7, 7, 7]);
+        assert!(island_can_host_building(&tobacco, &tobacco_isle),
+            "byte=1 island should accept tobacco");
+
+        // Multi-fertility island accepts every matching crop.
+        let multi = mk_island([3, 6, 7, 7, 7, 7, 7, 7]);
+        let sugarcane = mk_def(Some(Fertility::Sugarcane));
+        let cocoa = mk_def(Some(Fertility::Cocoa));
+        let cotton = mk_def(Some(Fertility::Cotton));
+        assert!(island_can_host_building(&sugarcane, &multi));
+        assert!(island_can_host_building(&cocoa, &multi));
+        assert!(!island_can_host_building(&cotton, &multi),
+            "cotton missing from {{Sugarcane, Cocoa}} island");
+    }
 
     #[test]
     fn load_defs_from_cod() {

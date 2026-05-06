@@ -260,6 +260,7 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            required_fertility: None,
         }
     }
 
@@ -298,6 +299,7 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            required_fertility: None,
         }
     }
 
