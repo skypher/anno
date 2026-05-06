@@ -723,6 +723,26 @@ impl Simulation {
                         // break on cost so cheaper alternatives still win.
                         let owner = self.ai_controllers[ai_idx].player_idx;
                         let gold = self.players[player_idx].gold;
+                        // Fertility gate: gather the set of fertilities
+                        // available on islands the AI has a warehouse on.
+                        // A climate-bound plantation can only build if at
+                        // least one of those islands carries the required
+                        // fertility byte.
+                        let mut available_fertilities:
+                            std::collections::HashSet<anno_formats::szs::Fertility> =
+                            std::collections::HashSet::new();
+                        let owner_warehouse_islands:
+                            std::collections::HashSet<u8> = self.warehouses.iter()
+                            .filter(|w| w.active && w.owner == owner)
+                            .map(|w| w.island_id)
+                            .collect();
+                        for map in &self.island_maps {
+                            if owner_warehouse_islands.contains(&map.island_id) {
+                                for f in map.active_fertilities() {
+                                    available_fertilities.insert(f);
+                                }
+                            }
+                        }
                         let mut counts: std::collections::HashMap<u16, u32> =
                             std::collections::HashMap::new();
                         for b in &self.buildings {
@@ -732,7 +752,11 @@ impl Simulation {
                         }
                         let pick = self.building_defs.iter().enumerate()
                             .filter(|(_, d)| d.output_good == good
-                                && d.cost_gold as i32 <= gold)
+                                && d.cost_gold as i32 <= gold
+                                && match d.required_fertility {
+                                    Some(req) => available_fertilities.contains(&req),
+                                    None => true,
+                                })
                             .min_by_key(|(idx, d)| {
                                 let n = counts.get(&(*idx as u16)).copied().unwrap_or(0);
                                 (n, d.cost_gold)

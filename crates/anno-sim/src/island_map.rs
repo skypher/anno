@@ -27,6 +27,10 @@ pub struct IslandMap {
     /// they're available — RE: haeuser.cod `Wegspeed: 145, 120,
     /// 170, 100` (plain ground vs road quad).
     road: Vec<bool>,
+    /// Eight raw INSEL5 fertility bytes carried over from the
+    /// scenario file. Use `active_fertilities()` to iterate the
+    /// non-sentinel typed values.
+    pub fertilities: [u8; 8],
 }
 
 /// Building kinds that represent walkable terrain or roads.
@@ -97,7 +101,18 @@ impl IslandMap {
             height,
             walkable,
             road,
+            fertilities: island.fertilities,
         }
+    }
+
+    /// Active (non-sentinel) fertilities decoded into the typed
+    /// `Fertility` enum. Mirrors `Island::active_fertilities`
+    /// but on the simulation-side map so callers don't need to
+    /// keep the original `Island` around.
+    pub fn active_fertilities(&self) -> Vec<anno_formats::szs::Fertility> {
+        self.fertilities.iter()
+            .filter_map(|&b| anno_formats::szs::Fertility::from_byte(b))
+            .collect()
     }
 
     /// Check if a tile is walkable.
@@ -252,6 +267,7 @@ impl IslandMap {
             height,
             walkable: vec![true; size],
             road: vec![false; size],
+            fertilities: [7; 8],
         }
     }
 
