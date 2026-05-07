@@ -6410,6 +6410,14 @@ fn init_simulation(
     let warships = anno_sim::data_bridge::warships_from_ships(&szs.ships);
     if !warships.is_empty() {
         println!("Spawning {} static warship(s) from SHIP4", warships.len());
+        // Native-faction warships (owner 5, including those that
+        // sail under the PIRAT figure) are hostile to the player
+        // by default — the scenario authors place them as
+        // raiders, not as neutral ships. Mark slot 0 ↔ slot 5
+        // at war so the combat tick treats them properly.
+        if warships.iter().any(|u| u.owner == 5) {
+            sim.diplomacy.set(0, 5, Diplomacy::War);
+        }
         sim.military_units.extend(warships);
     }
 

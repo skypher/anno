@@ -177,6 +177,14 @@ pub struct Ship {
     /// at byte offset 0x4B — slot 4 (free trader) and slot 6
     /// (pirate) never carry static SHIP4 records, presumably
     /// because their fleets spawn dynamically at runtime.
+    ///
+    /// Notably, every `ShipClass::PirateShip` record in shipping
+    /// content carries `owner == 5` (the NATIVE slot) — the
+    /// PIRAT figure is the visual hull used by the hostile
+    /// native faction, not by the dedicated pirate slot 6.
+    /// Slot 6's pirates only ship dynamically from the pirate
+    /// Kontor at runtime. Crosstab: 27/27 PirateShip records
+    /// → owner 5; 0/418 SHIP4 records → owner 6.
     pub owner: u8,
     /// Ship class byte at record offset 0x48. Audit surfaces
     /// exactly 5 distinct values across all shipping content:
@@ -1569,6 +1577,48 @@ mod tests {
         assert!(ShipClass::SmallWarship.is_warship());
         assert!(ShipClass::LargeWarship.is_warship());
         assert!(ShipClass::PirateShip.is_warship());
+    }
+
+    #[test]
+    fn ship4_never_uses_owner_slot_6_in_corpus() {
+        // Pirates (PLAYER4 slot 6) spawn dynamically from the
+        // pirate Kontor; SHIP4 only carries static ships, and
+        // every PirateShip-class record in the corpus is owned
+        // by slot 5 (the hostile native faction, which uses
+        // the PIRAT figure as its visual hull).
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() {
+            println!("Skipping: scenes dir not found");
+            return;
+        }
+        let mut pirate_class_count = 0;
+        let mut total = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let szs = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            for s in &szs.ships {
+                total += 1;
+                assert_ne!(s.owner, 6,
+                    "{:?}: SHIP4 must not carry owner == 6 (pirates)",
+                    path.file_stem().unwrap());
+                if s.class() == Some(ShipClass::PirateShip) {
+                    assert_eq!(s.owner, 5,
+                        "{:?}: PirateShip-class records must be owner 5",
+                        path.file_stem().unwrap());
+                    pirate_class_count += 1;
+                }
+            }
+        }
+        assert!(pirate_class_count > 0,
+            "corpus should include at least one PirateShip record");
+        assert!(total > 0,
+            "corpus should include at least one SHIP4 record");
     }
 
     #[test]

@@ -117,6 +117,19 @@ fn main() {
     println!("byte 0x4B (owner candidate) distribution: {owner_distribution:?}");
     println!("byte 0x48 (ship-type candidate) distribution: {type_distribution:?}");
 
+    // Crosstab class × owner so we can see, e.g., whether
+    // PirateShip (0x1F) records use owner 5 or owner 6.
+    let mut class_owner: std::collections::BTreeMap<(u8, u8), u32> = Default::default();
+    for (_, _, body) in &all_records {
+        if body.len() < 0x4C { continue; }
+        *class_owner.entry((body[0x48], body[0x4B])).or_default() += 1;
+    }
+    println!("\nclass × owner crosstab (class, owner) → count:");
+    for ((class, owner), count) in &class_owner {
+        println!("  (0x{class:02X} class, owner {owner}): {count}");
+    }
+    println!();
+
     // Resolve byte 0x48 candidates against figuren.cod symbolic
     // names so we can name the ship types.
     let fig_path = "/home/sky/anno/extracted/figuren.cod";
