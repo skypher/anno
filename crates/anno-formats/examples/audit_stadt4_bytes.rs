@@ -118,6 +118,26 @@ fn main() {
     }
     println!();
 
+    // Probe the head region 0x04..0x14 for a treasury-shaped
+    // u32 — the Chamnitz dump showed 0x6d9f = 28063 at 0x08.
+    println!("u32 at 0x08 (treasury candidate) for cities with population:");
+    let mut shown = 0;
+    for (scen, _owner, name, body) in &all_records {
+        let pop_any = (0x60..0x78).any(|i| body.get(i).copied().unwrap_or(0) != 0);
+        if !pop_any { continue; }
+        if shown >= 15 { break; }
+        let read_u32 = |o: usize| u32::from_le_bytes([
+            body[o], body[o+1], body[o+2], body[o+3],
+        ]);
+        let h_u32_4  = read_u32(0x04);
+        let h_u32_8  = read_u32(0x08);
+        let h_u32_c  = read_u32(0x0C);
+        let h_u32_10 = read_u32(0x10);
+        println!("  {scen} \"{name}\": [0x04]={h_u32_4} [0x08]={h_u32_8} [0x0C]={h_u32_c} [0x10]={h_u32_10}");
+        shown += 1;
+    }
+    println!();
+
     println!("First-12 records dump (offsets 0x00..0x88, before name):");
     for (scen, owner, name, body) in all_records.iter().take(12) {
         let bytes_dump: Vec<String> = (0..0x88).step_by(4)

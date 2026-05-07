@@ -531,12 +531,23 @@ pub fn load_building_instances(
                     continue;
                 }
 
+                // Each island's STADT4 chunk carries the slot
+                // number that owns its city — that's the closest
+                // proxy to per-tile ownership, since INSELHAUS
+                // tiles don't carry an explicit owner byte.
+                // Islands without a city default to slot 0 (the
+                // player) which matches the original engine's
+                // behaviour for player-built tiles on uncolonised
+                // land.
+                let owner = island.city.as_ref()
+                    .map(|c| c.owner_slot)
+                    .unwrap_or(0);
                 let instance = BuildingInstance::new(
                     def_idx as u16,
                     island.number,
                     tile.x as u16,
                     tile.y as u16,
-                    0, // owner unknown from SZS alone
+                    owner,
                 );
                 instances.push(instance);
             }
@@ -700,6 +711,61 @@ mod tests {
         assert_eq!(traders[0].world_x, 10);
         assert_eq!(traders[1].owner, 2);
         assert_eq!(traders[1].world_x, 30);
+    }
+
+    #[test]
+    fn load_building_instances_picks_owner_from_stadt4() {
+        // New Horizons2 has cities owned by multiple slots
+        // (player on island 0, AI rivals on later islands,
+        // pirates on island 21). Building instances on those
+        // islands should inherit the city's owner_slot.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let cod_data = match std::fs::read(base.join("extracted/haeuser.cod")) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: haeuser.cod not found");
+                return;
+            }
+        };
+        let szs_data = match std::fs::read(
+            base.join("extracted/Szenes/New Horizons2.szs")) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: New Horizons2.szs not found");
+                return;
+            }
+        };
+        let cod = CodFile::parse(&cod_data).unwrap();
+        let defs = load_building_defs(&cod);
+        let szs = SzsFile::parse(&szs_data).unwrap();
+        let instances = load_building_instances(&szs, &cod, &defs);
+
+        // Map island_number → expected owner_slot from STADT4.
+        let mut expected_owner: std::collections::HashMap<u8, u8> =
+            std::collections::HashMap::new();
+        for island in &szs.islands {
+            if let Some(city) = island.city.as_ref() {
+                expected_owner.insert(island.number, city.owner_slot);
+            }
+        }
+        // Every instance's owner should match its island's
+        // STADT4 owner_slot.
+        for inst in &instances {
+            if let Some(want) = expected_owner.get(&inst.island_id) {
+                assert_eq!(inst.owner, *want,
+                    "building on island {} should be owned by slot {}, got {}",
+                    inst.island_id, want, inst.owner);
+            }
+        }
+        // Cross-slot diversity: at least 2 distinct owners
+        // across the building set, otherwise the wiring is
+        // probably broken (everything would be slot 0).
+        let owners: std::collections::HashSet<u8> = instances.iter()
+            .map(|b| b.owner)
+            .collect();
+        assert!(owners.len() >= 2,
+            "expected ≥2 distinct owners across New Horizons2's buildings, got {owners:?}");
     }
 
     #[test]
