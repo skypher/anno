@@ -546,6 +546,15 @@ pub fn load_building_instances(
     instances
 }
 
+/// `route_id` value used for SHIP4 traders that have no
+/// configured route. Picked so it can never collide with a
+/// real `TradeRoute::id` (those start at 0 and grow
+/// monotonically). `tick_trade_ship` skips ships whose
+/// route_id doesn't match any active route, so these
+/// "stranded" traders sit at their spawn coordinates until
+/// the player or AI assigns them to a route.
+pub const UNROUTED_TRADER_ROUTE_ID: u16 = u16::MAX;
+
 /// Convert SHIP4 records whose `ShipClass::is_warship()` is
 /// true into `MilitaryUnit` instances for the simulation's
 /// naval combat path. Trader ships are skipped — those need a
@@ -574,6 +583,30 @@ pub fn warships_from_ships(
                 s.y as i32,
             ))
         })
+        .collect()
+}
+
+/// Convert SHIP4 records whose class is `SmallTrader` or
+/// `LargeTrader` into `TradeShip` instances. The resulting
+/// ships have `route_id = UNROUTED_TRADER_ROUTE_ID` (a
+/// sentinel that never matches a real route), so the trade
+/// tick leaves them inert until a route is assigned. They
+/// still spawn at their authored coordinates so the player
+/// sees them in the world.
+pub fn traders_from_ships(
+    ships: &[anno_formats::szs::Ship],
+) -> Vec<crate::trade::TradeShip> {
+    use anno_formats::szs::ShipClass;
+    use crate::trade::TradeShip;
+    ships.iter()
+        .filter(|s| matches!(s.class(),
+            Some(ShipClass::SmallTrader | ShipClass::LargeTrader)))
+        .map(|s| TradeShip::new(
+            s.owner,
+            UNROUTED_TRADER_ROUTE_ID,
+            s.x as i32,
+            s.y as i32,
+        ))
         .collect()
 }
 
@@ -636,6 +669,37 @@ mod tests {
         // Position should round-trip from u16 → i32.
         assert_eq!(units[0].tile_x, 20);
         assert_eq!(units[0].tile_y, 20);
+    }
+
+    #[test]
+    fn traders_from_ships_routes_traders_only_with_sentinel_id() {
+        use anno_formats::szs::Ship;
+        let mk = |owner: u8, class: u8, x: u16, y: u16| Ship {
+            name: "test".into(),
+            x, y,
+            owner,
+            ship_class: class,
+            cargo_slots: [0; 7],
+        };
+        let ships = vec![
+            mk(0, 0x15, 10, 10), // SmallTrader  → keep
+            mk(1, 0x19, 20, 20), // SmallWarship → skip
+            mk(2, 0x17, 30, 30), // LargeTrader  → keep
+            mk(0, 0x1B, 40, 40), // LargeWarship → skip
+            mk(0, 0x1F, 50, 50), // PirateShip   → skip
+            mk(0, 0xFE,  0,  0), // unknown     → skip
+        ];
+        let traders = traders_from_ships(&ships);
+        assert_eq!(traders.len(), 2);
+        for t in &traders {
+            assert_eq!(t.route_id, UNROUTED_TRADER_ROUTE_ID,
+                "spawn ships use the sentinel route id");
+            assert!(t.active, "spawn ships start active");
+        }
+        assert_eq!(traders[0].owner, 0);
+        assert_eq!(traders[0].world_x, 10);
+        assert_eq!(traders[1].owner, 2);
+        assert_eq!(traders[1].world_x, 30);
     }
 
     #[test]

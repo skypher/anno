@@ -6404,9 +6404,6 @@ fn init_simulation(
     // Spawn warships from SHIP4: SmallWarship / LargeWarship /
     // PirateShip records become MilitaryUnit instances at the
     // exact spawn coordinates the scenario author placed them.
-    // Trader records (SmallTrader / LargeTrader) are skipped —
-    // those need a TradeShip with a route, which is handled
-    // separately below.
     let warships = anno_sim::data_bridge::warships_from_ships(&szs.ships);
     if !warships.is_empty() {
         println!("Spawning {} static warship(s) from SHIP4", warships.len());
@@ -6419,6 +6416,16 @@ fn init_simulation(
             sim.diplomacy.set(0, 5, Diplomacy::War);
         }
         sim.military_units.extend(warships);
+    }
+    // Spawn trader hulls from SHIP4 too: SmallTrader / LargeTrader
+    // records become TradeShip instances at their authored
+    // coordinates with a sentinel route_id so the trade tick
+    // leaves them inert until a route is assigned. Below the dev-
+    // default trade route still adds its own routed ship.
+    let traders = anno_sim::data_bridge::traders_from_ships(&szs.ships);
+    if !traders.is_empty() {
+        println!("Spawning {} static trader(s) from SHIP4", traders.len());
+        sim.trade_ships.extend(traders);
     }
 
     // Trade route between first two islands with warehouses
