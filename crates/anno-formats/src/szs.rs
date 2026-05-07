@@ -263,6 +263,16 @@ pub struct City {
     /// numbering). 0 for the player's main settlement; AI
     /// rivals 1..=3; reserved factions 4..=6.
     pub owner_slot: u8,
+    /// Per-tier inhabitant counts at offsets 0x60, 0x64,
+    /// 0x68, 0x6C, 0x70. Five u32 values matching the five
+    /// population tiers (Pioneer, Settler, Citizen, Merchant,
+    /// Aristocrat). Audit-confirmed by `cargo run --example
+    /// audit_stadt4_bytes`: shipping scenarios pre-populate
+    /// cities with totals like Saint Claer 438 Pioneers,
+    /// Falkenstain [85 Settlers, 800 Citizens], Queckborm
+    /// [775 Citizens, 440 Merchants]. Empty placeholder
+    /// cities leave the array all-zero.
+    pub tier_population: [u32; 5],
     pub name: String,
 }
 
@@ -981,6 +991,13 @@ impl SzsFile {
         if data.len() < 0xa8 { return None; }
         let island_index = data[0];
         let owner_slot = data[2];
+        let read_u32 = |off: usize| u32::from_le_bytes([
+            data[off], data[off + 1], data[off + 2], data[off + 3],
+        ]);
+        let tier_population = [
+            read_u32(0x60), read_u32(0x64), read_u32(0x68),
+            read_u32(0x6C), read_u32(0x70),
+        ];
         let name_start = 0x87;
         let name_end = data[name_start..]
             .iter()
@@ -991,7 +1008,7 @@ impl SzsFile {
             .iter()
             .map(|&b| char::from(b))
             .collect();
-        Some(City { island_index, owner_slot, name })
+        Some(City { island_index, owner_slot, tier_population, name })
     }
 
     fn parse_inselhaus(data: &[u8]) -> Vec<IslandTile> {
@@ -1425,6 +1442,42 @@ mod tests {
             "Larrach is on Plague's island #1 (after the sentinel)");
         assert_eq!(city.owner_slot, 0,
             "Larrach is the player's main settlement");
+    }
+
+    #[test]
+    fn stadt4_extracts_per_tier_population() {
+        // Peaceful Reign's "Falkenstain" carries
+        // [0, 85, 800, 0, 0] (85 Settlers + 800 Citizens) per
+        // the audit; "Fraiburg" has [8, 596, 0, 0, 0].
+        // Empty placeholders stay all-zero.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/Peaceful Reign.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Peaceful Reign");
+        let by_name = |n: &str| szs.islands.iter()
+            .filter_map(|i| i.city.as_ref())
+            .find(|c| c.name == n);
+        if let Some(c) = by_name("Falkenstain") {
+            assert_eq!(c.tier_population, [0, 85, 800, 0, 0]);
+        }
+        if let Some(c) = by_name("Fraiburg") {
+            assert_eq!(c.tier_population, [8, 596, 0, 0, 0]);
+        }
+        // Total inhabitants across every populated city must be
+        // strictly positive — sanity-check that the parser
+        // captured at least one non-empty city.
+        let total: u64 = szs.islands.iter()
+            .filter_map(|i| i.city.as_ref())
+            .flat_map(|c| c.tier_population.iter().map(|&v| v as u64))
+            .sum();
+        assert!(total > 0, "Peaceful Reign should have non-empty city populations");
     }
 
     #[test]

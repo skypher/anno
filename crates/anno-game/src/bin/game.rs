@@ -6363,18 +6363,41 @@ fn init_simulation(
         }
     }
 
-    // Seed the human player and slot 1 with starting populations
-    // (the original game's scripted starting settlement). Other
-    // AI rivals get a smaller seed; reserved factions stay at 0.
+    // Seed populations from STADT4 city records when the
+    // scenario provides them. Each city's tier_population
+    // contributes to its owner_slot's player_population. Falls
+    // back to dev defaults when no STADT4 carries population
+    // for slots 0 and 1 (Continous-Play templates ship empty
+    // cities).
+    let mut seeded_from_stadt4: std::collections::HashSet<u8> =
+        std::collections::HashSet::new();
+    for island in &szs.islands {
+        let Some(city) = island.city.as_ref() else { continue };
+        if city.tier_population.iter().all(|&v| v == 0) { continue; }
+        let slot = city.owner_slot as usize;
+        if let Some(p) = sim.players.get_mut(slot) {
+            for tier in 0..5 {
+                p.population[tier] += city.tier_population[tier];
+            }
+            seeded_from_stadt4.insert(city.owner_slot);
+        }
+    }
     if let Some(p) = sim.players.get_mut(0) {
-        p.population[0] = 200;
-        p.population[1] = 100;
-        p.population[2] = 50;
+        p.total_population = p.population.iter().sum();
+        if !seeded_from_stadt4.contains(&0) {
+            p.population[0] = 200;
+            p.population[1] = 100;
+            p.population[2] = 50;
+            p.total_population = p.population.iter().sum();
+        }
     }
     if let Some(p) = sim.players.get_mut(1) {
         if p.state != PlayerState::Empty {
-            p.population[0] = 150;
-            p.population[1] = 50;
+            if !seeded_from_stadt4.contains(&1) {
+                p.population[0] = 150;
+                p.population[1] = 50;
+            }
+            p.total_population = p.population.iter().sum();
         }
     }
 

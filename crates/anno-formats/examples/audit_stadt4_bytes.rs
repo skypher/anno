@@ -96,6 +96,28 @@ fn main() {
     }
     println!();
 
+    // Probe the 0x60..0x78 region as 5 u32s — candidate for
+    // per-tier population in cities that ship pre-populated.
+    println!("Per-tier population candidate (5 u32 at 0x60..0x74):");
+    let mut shown = 0;
+    for (scen, owner, name, body) in &all_records {
+        // Only show cities with at least one non-zero value here.
+        let any = (0x60..0x78).any(|i| body.get(i).copied().unwrap_or(0) != 0);
+        if !any { continue; }
+        if shown >= 12 { break; }
+        let read_u32 = |o: usize| u32::from_le_bytes([
+            body[o], body[o+1], body[o+2], body[o+3],
+        ]);
+        let tiers = [
+            read_u32(0x60), read_u32(0x64), read_u32(0x68),
+            read_u32(0x6C), read_u32(0x70),
+        ];
+        let total: u64 = tiers.iter().map(|&v| v as u64).sum();
+        println!("  {scen} \"{name}\" island_index={owner}: {tiers:?} (sum={total})");
+        shown += 1;
+    }
+    println!();
+
     println!("First-12 records dump (offsets 0x00..0x88, before name):");
     for (scen, owner, name, body) in all_records.iter().take(12) {
         let bytes_dump: Vec<String> = (0..0x88).step_by(4)
