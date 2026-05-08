@@ -118,6 +118,31 @@ fn main() {
     }
     println!();
 
+    // Correlate byte 0x05 with highest populated tier index
+    // (Pioneer=0, Settler=1, Citizen=2, Merchant=3, Aristocrat=4).
+    println!("byte 0x05 vs highest populated tier:");
+    let mut hits: std::collections::BTreeMap<(u8, usize), u32> = Default::default();
+    for (_, _, _, body) in &all_records {
+        let read_u32 = |o: usize| u32::from_le_bytes([
+            body[o], body[o+1], body[o+2], body[o+3],
+        ]);
+        let tiers = [
+            read_u32(0x60), read_u32(0x64), read_u32(0x68),
+            read_u32(0x6C), read_u32(0x70),
+        ];
+        if tiers.iter().all(|&v| v == 0) { continue; }
+        let highest = tiers.iter().enumerate()
+            .filter(|&(_, &v)| v > 0)
+            .map(|(i, _)| i)
+            .max().unwrap_or(0);
+        let b5 = body.get(0x05).copied().unwrap_or(0);
+        *hits.entry((b5, highest)).or_default() += 1;
+    }
+    for ((b5, tier), c) in &hits {
+        println!("  byte 0x05 = 0x{b5:02X}, highest tier = {tier} : {c} cities");
+    }
+    println!();
+
     // Probe the head region 0x04..0x14 for a treasury-shaped
     // u32 — the Chamnitz dump showed 0x6d9f = 28063 at 0x08.
     println!("u32 at 0x08 (treasury candidate) for cities with population:");

@@ -557,6 +557,48 @@ pub fn load_building_instances(
     instances
 }
 
+/// Locate KONTOR (warehouse) tiles in INSELHAUS data and
+/// emit a `Warehouse` per occurrence, anchored on the actual
+/// tile position rather than an averaged centroid. This is
+/// faithful to where the scenario author placed the Kontor.
+///
+/// Caller pairs this with each island's `city.owner_slot`
+/// when present so the warehouse inherits the right slot;
+/// uncolonised islands default to slot 0.
+///
+/// Capacity comes from haeuser.cod's `Maxlager` field on the
+/// matching building def — KONTOR_1 = 50, KONTOR_2 = 75,
+/// KONTOR_3 = 100.
+pub fn kontor_warehouses_from_szs(
+    szs: &anno_formats::szs::SzsFile,
+    cod: &CodFile,
+    building_defs: &[BuildingDef],
+) -> Vec<crate::warehouse::Warehouse> {
+    use crate::warehouse::Warehouse;
+    let gfx_map = nummer_to_def_index(cod);
+    let mut out = Vec::new();
+    for island in &szs.islands {
+        let owner = island.city.as_ref()
+            .map(|c| c.owner_slot)
+            .unwrap_or(0);
+        for tile in &island.tiles {
+            // INSELHAUS tile sprite_idx → COD gfx → def index.
+            let sprite_idx = tile.building_id as i32;
+            let Some(&def_idx) = gfx_map.get(&sprite_idx) else { continue };
+            let Some(def) = building_defs.get(def_idx) else { continue };
+            // ProdKind=KONTOR identifies warehouse tiles.
+            if def.prod_kind != "KONTOR" { continue; }
+            // Only the base tile of a multi-tile Kontor counts.
+            if sprite_idx != cod.buildings[def_idx].gfx { continue; }
+            out.push(Warehouse::new(
+                island.number, owner,
+                tile.x as u16, tile.y as u16,
+            ));
+        }
+    }
+    out
+}
+
 /// `route_id` value used for SHIP4 traders that have no
 /// configured route. Picked so it can never collide with a
 /// real `TradeRoute::id` (those start at 0 and grow

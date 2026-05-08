@@ -57,6 +57,20 @@ fn main() {
     }
     println!();
 
+    // Buildings with Bauinfra=INFRA_KONTOR_* are the Kontor
+    // (warehouse) tiles. List each Nummer + Kind so we can
+    // wire INSELHAUS lookups to the right tile.
+    println!("Buildings with INFRA_KONTOR_* Bauinfra (warehouse tiles):\n");
+    for b in &cod.buildings {
+        let bi = b.properties.get("Bauinfra").cloned().unwrap_or_default();
+        if !bi.starts_with("INFRA_KONTOR") { continue; }
+        let prod_kind = b.properties.get("ProdKind").cloned().unwrap_or_default();
+        let max_lager = b.properties.get("Maxlager").cloned().unwrap_or_default();
+        println!("  Nr={:3} Kind={} Bauinfra={bi} ProdKind={prod_kind} Maxlager={max_lager}",
+            b.nummer, b.kind);
+    }
+    println!();
+
     println!("Residence-like buildings (Kind=HQ) by Bauinfra tag:\n");
     let mut wohn_by_bauinfra: std::collections::BTreeMap<String, Vec<&anno_formats::cod::BuildingDef>> =
         std::collections::BTreeMap::new();

@@ -6264,8 +6264,18 @@ fn init_simulation(
     island_ids.sort();
     island_ids.dedup();
 
-    let mut warehouses = Vec::new();
+    // Prefer the actual KONTOR tile placement from INSELHAUS
+    // when the scenario provides it. Falls back to a centroid
+    // of production buildings only when no Kontor is placed
+    // (Continous-Play templates with bare land).
+    let mut warehouses =
+        anno_sim::data_bridge::kontor_warehouses_from_szs(szs, cod, defs);
+    let kontor_islands: std::collections::HashSet<u8> =
+        warehouses.iter().map(|w| w.island_id).collect();
     for &island_id in &island_ids {
+        if kontor_islands.contains(&island_id) {
+            continue;
+        }
         let island_buildings: Vec<_> = instances
             .iter()
             .filter(|b| b.island_id == island_id)
@@ -6277,9 +6287,8 @@ fn init_simulation(
             / island_buildings.len() as u32;
         let avg_y = island_buildings.iter().map(|b| b.tile_y as u32).sum::<u32>()
             / island_buildings.len() as u32;
-        // Pick the warehouse owner from the island's STADT4
-        // city when present — same wiring as the per-tile
-        // building owner. Uncolonised islands default to slot 0.
+        // Pick the fallback warehouse owner from the island's
+        // STADT4 city when present.
         let owner = szs.islands.iter()
             .find(|i| i.number == island_id)
             .and_then(|i| i.city.as_ref())
