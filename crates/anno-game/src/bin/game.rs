@@ -6277,7 +6277,15 @@ fn init_simulation(
             / island_buildings.len() as u32;
         let avg_y = island_buildings.iter().map(|b| b.tile_y as u32).sum::<u32>()
             / island_buildings.len() as u32;
-        warehouses.push(Warehouse::new(island_id, 0, avg_x as u16, avg_y as u16));
+        // Pick the warehouse owner from the island's STADT4
+        // city when present — same wiring as the per-tile
+        // building owner. Uncolonised islands default to slot 0.
+        let owner = szs.islands.iter()
+            .find(|i| i.number == island_id)
+            .and_then(|i| i.city.as_ref())
+            .map(|c| c.owner_slot)
+            .unwrap_or(0);
+        warehouses.push(Warehouse::new(island_id, owner, avg_x as u16, avg_y as u16));
     }
 
     // Build island walkability maps
