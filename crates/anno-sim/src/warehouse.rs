@@ -9,6 +9,8 @@
 use crate::types::Good;
 use std::collections::HashMap;
 
+fn default_capacity_fallback() -> u16 { 30 }
+
 /// Per-tier warehouse storage capacity (tons per good). Verified
 /// against `haeuser.cod`: the four `Kind: KONTOR` building
 /// definitions carry `Maxlager: 30 / 50 / 75 / 100` paired with
@@ -24,6 +26,13 @@ pub struct Warehouse {
     pub tile_x: u16,
     pub tile_y: u16,
     pub active: bool,
+
+    /// Default per-good cap when a good has no entry yet in
+    /// `inventory`. Sourced from the Kontor's `Maxlager` field
+    /// in haeuser.cod (50/75/100/20 across the four levels).
+    /// Falls back to 30 for legacy / placeholder warehouses.
+    #[serde(default = "default_capacity_fallback")]
+    pub default_capacity: u16,
 
     /// Inventory: good → (current_stock, max_capacity)
     inventory: HashMap<Good, (u16, u16)>,
@@ -71,12 +80,21 @@ pub struct TradeSlider {
 
 impl Warehouse {
     pub fn new(island_id: u8, owner: u8, tile_x: u16, tile_y: u16) -> Self {
+        Self::with_capacity(island_id, owner, tile_x, tile_y, 30)
+    }
+
+    /// Construct a warehouse with an explicit per-good
+    /// default capacity (sourced from the matching Kontor's
+    /// `Maxlager` in haeuser.cod when loading a scenario).
+    pub fn with_capacity(island_id: u8, owner: u8, tile_x: u16, tile_y: u16,
+                         default_capacity: u16) -> Self {
         Self {
             island_id,
             owner,
             tile_x,
             tile_y,
             active: true,
+            default_capacity,
             inventory: HashMap::new(),
             sliders: HashMap::new(),
         }
@@ -140,12 +158,14 @@ impl Warehouse {
 
     /// Get maximum capacity for a good.
     pub fn capacity(&self, good: Good) -> u16 {
-        self.inventory.get(&good).map(|&(_, c)| c).unwrap_or(30)
+        self.inventory.get(&good).map(|&(_, c)| c)
+            .unwrap_or(self.default_capacity)
     }
 
     /// Deposit goods into the warehouse. Returns amount actually deposited.
     pub fn deposit(&mut self, good: Good, amount: u16) -> u16 {
-        let entry = self.inventory.entry(good).or_insert((0, 30));
+        let cap = self.default_capacity;
+        let entry = self.inventory.entry(good).or_insert((0, cap));
         let space = entry.1.saturating_sub(entry.0);
         let deposited = amount.min(space);
         entry.0 += deposited;

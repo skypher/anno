@@ -575,14 +575,15 @@ pub fn kontor_warehouses_from_szs(
     building_defs: &[BuildingDef],
 ) -> Vec<crate::warehouse::Warehouse> {
     use crate::warehouse::Warehouse;
-    let gfx_map = nummer_to_def_index(cod);
+    // INSELHAUS tile.building_id is a sprite index, so use the
+    // gfx → def lookup (not the Nummer-keyed one).
+    let gfx_map = gfx_to_def_index(cod);
     let mut out = Vec::new();
     for island in &szs.islands {
         let owner = island.city.as_ref()
             .map(|c| c.owner_slot)
             .unwrap_or(0);
         for tile in &island.tiles {
-            // INSELHAUS tile sprite_idx → COD gfx → def index.
             let sprite_idx = tile.building_id as i32;
             let Some(&def_idx) = gfx_map.get(&sprite_idx) else { continue };
             let Some(def) = building_defs.get(def_idx) else { continue };
@@ -590,9 +591,20 @@ pub fn kontor_warehouses_from_szs(
             if def.prod_kind != "KONTOR" { continue; }
             // Only the base tile of a multi-tile Kontor counts.
             if sprite_idx != cod.buildings[def_idx].gfx { continue; }
-            out.push(Warehouse::new(
+            // Carry the Kontor's authored storage capacity (50/
+            // 75/100 tons across KONTOR_1/2/3, 20 t for the
+            // small variants) into the warehouse so deposits
+            // hit the right ceiling instead of the legacy 30 t
+            // default.
+            let cap = if def.storage_capacity > 0 {
+                def.storage_capacity
+            } else {
+                30
+            };
+            out.push(Warehouse::with_capacity(
                 island.number, owner,
                 tile.x as u16, tile.y as u16,
+                cap,
             ));
         }
     }
@@ -808,6 +820,49 @@ mod tests {
             .collect();
         assert!(owners.len() >= 2,
             "expected ≥2 distinct owners across New Horizons2's buildings, got {owners:?}");
+    }
+
+    #[test]
+    fn shipping_scenarios_do_not_pre_place_kontors() {
+        // Audit finding: every shipping `.szs` in the corpus has
+        // INSELHAUS tile sprite indices ≤ 2822, but Kontor
+        // building gfx values start at 3416. So the original
+        // engine doesn't write Kontor tiles into INSELHAUS —
+        // Kontors get placed dynamically when a player first
+        // lands on an island. `kontor_warehouses_from_szs`
+        // therefore returns an empty Vec for every shipping
+        // scenario; the centroid fallback in the game-side
+        // init does the real placement.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let cod_data = match std::fs::read(base.join("extracted/haeuser.cod")) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: haeuser.cod not found");
+                return;
+            }
+        };
+        let cod = CodFile::parse(&cod_data).unwrap();
+        let defs = load_building_defs(&cod);
+        let szenes = base.join("extracted/Szenes");
+        if !szenes.exists() {
+            println!("Skipping: scenes dir not found");
+            return;
+        }
+        let mut total = 0;
+        for entry in std::fs::read_dir(&szenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(d) => d, Err(_) => continue };
+            let szs = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let whs = kontor_warehouses_from_szs(&szs, &cod, &defs);
+            assert!(whs.is_empty(),
+                "{:?} unexpectedly has pre-placed Kontors", path.file_stem().unwrap());
+            total += 1;
+        }
+        assert!(total > 0, "audit must cover at least one scenario");
     }
 
     #[test]

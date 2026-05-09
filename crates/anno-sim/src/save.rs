@@ -25,7 +25,11 @@ use std::path::Path;
 ///      AUFTRAG4 triples whose `total` is independent of any
 ///      tier sub-goal. Bincode enum-variant indices shift, so
 ///      pre-v14 saves cannot decode the new variant.
-pub const SAVE_VERSION: u32 = 14;
+/// v15: `Warehouse` gained `default_capacity: u16` carrying the
+///      Kontor's `Maxlager` (50/75/100/20). `#[serde(default)]`
+///      makes pre-v15 saves loadable with the legacy 30 cap,
+///      but `Warehouse` field order shifts so we bump anyway.
+pub const SAVE_VERSION: u32 = 15;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
