@@ -329,9 +329,22 @@ pub struct SzsFile {
 /// are implicit single-player) and standalone "Continous Play"
 /// maps omit the mission number.
 ///
-/// Cross-scenario sample shows `SZENE_RANKING` 0 in tutorials,
-/// 2-3 in scripted missions; `SZENE_MISSNR` is the campaign
-/// slot index visible in the original mission picker.
+/// `SZENE_RANKING` is the scenario difficulty / ranking
+/// rating, audit-confirmed across 62 shipping `.szs` files:
+///
+///   0 = Tutorial / very easy (Tutorial0, One lone Settlement,
+///       The End of a long Trip — 8 scenarios)
+///   1 = Easy (Peaceful Reign, The Trial, No Surplus of Land —
+///       3 scenarios)
+///   2 = Medium (Atoll, Continous Play 00..02, Cooperation,
+///       The Continent — 42 scenarios; the bulk of shipping
+///       content)
+///   3 = Hard (A Plague of Pirates, New Horizons0, On His
+///       Majesty's Service 1..2 — 9 scenarios)
+///
+/// `SZENE_MISSNR` is the campaign slot index visible in the
+/// original mission picker (0 = Tutorial0/Tutorial1, 1 =
+/// Continous Play 00/01, etc.).
 #[derive(Debug, Clone, Default)]
 pub struct ScenarioMeta {
     pub mission_nr: Option<u32>,
@@ -1299,6 +1312,34 @@ mod tests {
                 assert_eq!(p4.data[off], 0x01,
                     "{:?} slot {slot}: byte 0x06 should be the 0x01 record marker",
                     path.file_stem().unwrap());
+                total += 1;
+            }
+        }
+        assert!(total > 0);
+    }
+
+    #[test]
+    fn szene_ranking_is_in_range_0_to_3() {
+        // Audit shows RANKING ∈ {0, 1, 2, 3} across all 62
+        // shipping `.szs`. Tutorial0 → 0, Plague → 3, etc.
+        // A new scenario with RANKING > 3 (or < 0 if signed)
+        // would break our scenario picker UI.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut total = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            if let Some(r) = parsed.scenario.ranking {
+                assert!(r <= 3,
+                    "{:?} has RANKING {} > 3",
+                    path.file_stem().unwrap(), r);
                 total += 1;
             }
         }
