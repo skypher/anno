@@ -167,8 +167,14 @@ pub struct Ship {
     /// "Carnera", "Seehind", "Palstek"). 28-byte slot, CP1252,
     /// null-terminated.
     pub name: String,
-    /// Spawn position in island-grid coordinates. u16 x at
-    /// record offset 28, u16 y at record offset 30.
+    /// Spawn position in world tile coordinates (u16 x at
+    /// record offset 28, u16 y at offset 30). Audit of 418
+    /// records confirms the values span the full 0..~330
+    /// range typical of Anno 1602 maps (Geraldine = (301, 237),
+    /// Defender = (311, 86), Tutorial0 Seehind = (210, 128)),
+    /// not the per-island 0..~50 range. Callers spawning these
+    /// into the simulation use them as `MilitaryUnit::tile_x`
+    /// or `TradeShip::world_x` directly.
     pub x: u16,
     pub y: u16,
     /// Owning player slot (0 = human, 1..=3 = AI rivals,
