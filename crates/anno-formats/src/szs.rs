@@ -1244,6 +1244,140 @@ mod tests {
     }
 
     #[test]
+    fn player4_byte_05_is_slot_index_echo_corpus_wide() {
+        // FUN_00478160:85404 writes `local_8` (the iteration
+        // counter, 0..6) into chunk[5] of each slot.
+        // Equivalent assertion: every PLAYER4 slot's byte 5
+        // matches its slot index. Corpus-wide invariant.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut total = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let Some(p4) = parsed.chunks.iter().find(|c| c.name == "PLAYER4") else { continue };
+            for slot in 0..7 {
+                let off = slot * 1072 + 5;
+                if off >= p4.data.len() { continue; }
+                assert_eq!(p4.data[off], slot as u8,
+                    "{:?} slot {slot}: byte 0x05 should echo slot index",
+                    path.file_stem().unwrap());
+                total += 1;
+            }
+        }
+        assert!(total > 0);
+    }
+
+    #[test]
+    fn player4_byte_06_is_constant_one_corpus_wide() {
+        // byte 0x06 == 0x01 in every PLAYER4 slot of every
+        // shipping `.szs`. The binary writes
+        // (undefined1)DAT_005bafdc here at FUN_00478160:85405
+        // — a "record-version / valid-slot" marker.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut total = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let Some(p4) = parsed.chunks.iter().find(|c| c.name == "PLAYER4") else { continue };
+            for slot in 0..7 {
+                let off = slot * 1072 + 6;
+                if off >= p4.data.len() { continue; }
+                assert_eq!(p4.data[off], 0x01,
+                    "{:?} slot {slot}: byte 0x06 should be the 0x01 record marker",
+                    path.file_stem().unwrap());
+                total += 1;
+            }
+        }
+        assert!(total > 0);
+    }
+
+    #[test]
+    fn insel5_byte_03_only_nonzero_in_trust_no_one0() {
+        // Audit shows INSEL5 byte 0x03 == 0 for all islands
+        // except Trust no one0's six islands (all of them set
+        // to 0x02). Plausible interpretation: a scenario-wide
+        // "ruined / starts-colonized" flag the editor stamps
+        // on every island in that scenario, since Trust-no-
+        // one0 is one of the Pirata-style scenarios where the
+        // entire map starts in an unusual state.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut total_islands = 0;
+        let mut nonzero = Vec::new();
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+            for chunk in parsed.chunks.iter().filter(|c| c.name == "INSEL5") {
+                if chunk.data.len() < 4 { continue; }
+                total_islands += 1;
+                if chunk.data[3] != 0 {
+                    nonzero.push((stem.clone(), chunk.data[3]));
+                }
+            }
+        }
+        assert!(total_islands > 0);
+        // Only Trust no one0 should hit the non-zero branch.
+        for (scen, val) in &nonzero {
+            assert_eq!(scen, "Trust no one0",
+                "unexpected INSEL5 byte 0x03 outlier: {scen} value 0x{val:02X}");
+            assert_eq!(*val, 2,
+                "Trust no one0 should consistently use byte 0x03 = 2");
+        }
+        assert!(!nonzero.is_empty(),
+            "Trust no one0 must contribute the documented outliers");
+    }
+
+    #[test]
+    fn ship4_byte_41_constant_80_corpus_wide() {
+        // byte 0x41 == 80 in every SHIP4 record across the
+        // corpus. Likely a record-format / sprite-anchor
+        // constant the engine never varies.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut total = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let Some(s4) = parsed.chunks.iter().find(|c| c.name == "SHIP4") else { continue };
+            for record in s4.data.chunks_exact(436) {
+                if record.len() < 0x42 { continue; }
+                assert_eq!(record[0x41], 80,
+                    "{:?}: SHIP4 byte 0x41 should be 80, got {}",
+                    path.file_stem().unwrap(), record[0x41]);
+                total += 1;
+            }
+        }
+        assert!(total > 0);
+    }
+
+    #[test]
     fn auftrag4_chunk_size_is_one_mission_in_shipping_corpus() {
         // The binary's encoder FUN_00478380 allocates 0x2310 =
         // 4 × 0x8C4 = up to 4 mission slots and writes

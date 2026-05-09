@@ -78,6 +78,18 @@ fn main() {
     }
     println!("byte 0x03 distribution: {byte3_dist:?}");
 
+    // Identify the 6 outliers with byte 0x03 == 2.
+    println!("byte 0x03 == 2 outliers (scenario, island number, fertility row):");
+    for (scen, body) in &all_bodies {
+        if body.len() < 4 || body[3] != 2 { continue; }
+        let mut fert = [0u8; 8];
+        if body.len() >= 0x14 {
+            fert.copy_from_slice(&body[0x0C..0x14]);
+        }
+        println!("  {scen}: island #{}, fertilities {:?}", body[0], fert);
+    }
+    println!();
+
     // Cross-tab byte 0x0C..0x13 — looks like an 8-byte
     // per-island fertility/resource map.
     let mut fertility_value_dist: std::collections::BTreeMap<u8, u32> = Default::default();
