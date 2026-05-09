@@ -1197,6 +1197,42 @@ mod tests {
     }
 
     #[test]
+    fn player4_state_byte_layout_is_corpus_invariant() {
+        // Every shipping `.szs` carries exactly the same
+        // state_byte sequence at PLAYER4: slot 0 = 0x00 (human),
+        // slots 1..=3 = 0x0C (AI rival), slot 4 = 0x0D (free
+        // trader), slot 5 = 0x0E (native), slot 6 = 0x0B
+        // (pirate). The slot index and state_byte are
+        // therefore redundant — every scenario uses the same
+        // PLAYER4 ordering. New scenarios that violate this
+        // invariant should fail this test loudly.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() {
+            println!("Skipping: scenes dir not found");
+            return;
+        }
+        let want: [u8; 7] = [0x00, 0x0C, 0x0C, 0x0C, 0x0D, 0x0E, 0x0B];
+        let mut total = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let szs = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            for (i, p) in szs.players.iter().enumerate().take(7) {
+                assert_eq!(p.state_byte, want[i],
+                    "{:?} slot {i} has state_byte 0x{:02X}, want 0x{:02X}",
+                    path.file_stem().unwrap(), p.state_byte, want[i]);
+            }
+            total += 1;
+        }
+        assert!(total > 0, "audit must scan at least one scenario");
+    }
+
+    #[test]
     fn player4_byte_0x18_carries_per_slot_index() {
         // Magnate2 ships values 0x05/0x06/0x06 on its three AI
         // rivals — the most distinctive non-zero per-slot row

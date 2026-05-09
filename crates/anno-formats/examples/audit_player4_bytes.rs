@@ -134,6 +134,25 @@ fn main() {
     }
     println!();
 
+    // PLAYER4 state_byte (offset 4) distribution per slot.
+    // Different scenarios may shape ownership differently —
+    // any unexpected value here means our slot-init logic
+    // hasn't covered something.
+    let mut state_dist: std::collections::BTreeMap<(usize, u8), u32> = Default::default();
+    for (_, body) in &player4_bodies {
+        for slot in 0..SLOTS {
+            let pos = slot * SLOT_STRIDE + 4;
+            if pos < body.len() {
+                *state_dist.entry((slot, body[pos])).or_default() += 1;
+            }
+        }
+    }
+    println!("PLAYER4 state_byte distribution (slot, value → count):");
+    for ((slot, value), count) in &state_dist {
+        println!("  slot {slot}, 0x{value:02X}: {count}");
+    }
+    println!();
+
     println!("byte 0x18 across non-Plague scenarios with non-zero values:");
     for (name, body) in &player4_bodies {
         let row: Vec<u8> = (0..SLOTS).map(|s| {
