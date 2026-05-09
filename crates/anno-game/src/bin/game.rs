@@ -6468,10 +6468,15 @@ fn init_simulation(
         sim.trade_ships.extend(traders);
     }
 
-    // Trade route between first two islands with warehouses
+    // Dev-default trade route between the first two
+    // PLAYER-OWNED warehouses. Now that warehouses inherit
+    // their owner from STADT4, picking the first two
+    // warehouses indiscriminately could route a player ship
+    // through pirate or native ports — restrict to slot 0.
     let wh_islands: Vec<(u8, u16, u16)> = sim
         .warehouses
         .iter()
+        .filter(|w| w.owner == 0)
         .map(|w| (w.island_id, w.tile_x, w.tile_y))
         .collect();
     if wh_islands.len() >= 2 {
