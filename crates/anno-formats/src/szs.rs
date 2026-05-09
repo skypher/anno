@@ -26,7 +26,8 @@ pub struct Chunk {
 
 /// One of the seven climate-dependent crop fertilities the
 /// engine recognises. Values match the order of the
-/// `[ROHST]` section in `editor.cod`:
+/// `[ROHST]` section in `editor.cod` and are echoed by the
+/// `[ROHSTFELD]` (raw-resource field) section:
 ///
 ///   0 = Grain      (KORN)
 ///   1 = Tobacco    (TABAK)
@@ -41,6 +42,12 @@ pub struct Chunk {
 /// position). 93% of fertility slots in shipping content
 /// carry 7, leaving 0..=6 to mark which one or two specific
 /// crops a fertile island supports.
+///
+/// `[ROHSTFELD]` extends this ladder past 7 with non-crop
+/// resource markers — 8 = Forest, 9 = Stones, 10 = Ore,
+/// 11 = Wild game, 12 = Fishing grounds — but no shipping
+/// `.szs` carries a fertility byte > 7, so we treat them as
+/// the sentinel here and leave them for future RE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Fertility {
@@ -1194,6 +1201,81 @@ mod tests {
             assert!(szs.players[slot].ai_active,
                 "Tutorial0 slot {slot} should be ai_active");
         }
+    }
+
+    #[test]
+    fn player4_secondary_string_at_0x400_is_empty_in_corpus() {
+        // FUN_00473cc9 reads a null-terminated CP1252 string at
+        // each PLAYER4 slot's offset 0x400 and copies it to the
+        // runtime player struct + 0x34 (likely an AI personality
+        // / scripted-behaviour identifier). Audit confirms the
+        // field is empty (first byte 0x00) in every slot of
+        // every shipping `.szs`. This invariant gates the future
+        // semantic decode: when a custom scenario writes a
+        // non-empty value here, the test will fail and the
+        // reader can grow to expose the field.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() {
+            println!("Skipping: scenes dir not found");
+            return;
+        }
+        let mut scanned_slots = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            // Inspect the raw PLAYER4 chunk for byte at slot+0x400.
+            let Some(p4) = parsed.chunks.iter().find(|c| c.name == "PLAYER4") else { continue };
+            for slot in 0..7 {
+                let off = slot * 1072 + 0x400;
+                if off >= p4.data.len() { continue; }
+                assert_eq!(p4.data[off], 0,
+                    "{:?} slot {slot}: PLAYER4 byte 0x400 should be NUL (empty string), got 0x{:02X}",
+                    path.file_stem().unwrap(), p4.data[off]);
+                scanned_slots += 1;
+            }
+        }
+        assert!(scanned_slots > 0, "audit must scan at least one slot");
+    }
+
+    #[test]
+    fn auftrag4_chunk_size_is_one_mission_in_shipping_corpus() {
+        // The binary's encoder FUN_00478380 allocates 0x2310 =
+        // 4 × 0x8C4 = up to 4 mission slots and writes
+        // `iVar7 * 0x8C4` bytes (active count). Across all 62
+        // shipping `.szs` files we observe exactly 1 mission
+        // per AUFTRAG4 chunk. New scenarios with multi-mission
+        // chunks will fail this invariant — at which point our
+        // `Mission::from_chunks` reader needs to grow N-mission
+        // support (see also TaskList #128).
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() {
+            println!("Skipping: scenes dir not found");
+            return;
+        }
+        let mut total = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            if let Some(c) = parsed.chunks.iter().find(|c| c.name == "AUFTRAG4") {
+                assert_eq!(c.data.len(), 0x8C4,
+                    "{:?}: AUFTRAG4 chunk size {} ≠ 1 × 0x8C4",
+                    path.file_stem().unwrap(), c.data.len());
+                total += 1;
+            }
+        }
+        assert!(total > 0, "audit must scan at least one scenario");
     }
 
     #[test]
