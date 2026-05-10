@@ -290,6 +290,22 @@ pub struct City {
 }
 
 /// A single tile/building record from INSELHAUS (8 bytes).
+///
+/// `flags` audit (`cargo run --example audit_inselhaus_flags`)
+/// across 333,354 tiles in 62 shipping `.szs` files surfaces:
+///
+///   * bit 0 (0x0001):  2% set — sparse, likely a true flag
+///                      (under-construction / damaged-marker)
+///   * bits 1..=7:      45-58% set each — looks like a per-tile
+///                      randomization seed the engine uses to
+///                      pick between the building's animation
+///                      / rotation variants
+///   * bit 8 (0x0100):  7% set — second sparse flag candidate
+///
+/// 224 distinct values across the corpus, dominated by the
+/// 0x0040..0x007E range (bits 1-6 set in various combinations).
+/// The semantic decode of bits 0 / 8 hasn't been pinned to a
+/// specific binary function yet.
 #[derive(Debug, Clone, Copy)]
 pub struct IslandTile {
     pub building_id: u16,
