@@ -209,6 +209,11 @@ pub struct Ship {
     /// byte is exposed for downstream interpretation.
     pub ship_class: u8,
     /// (See `ShipClass::from_byte` for the typed decode.)
+    /// Compass-heading byte at record offset 0x42. Raw value
+    /// ranges 0..14 across the corpus; 95% are even. Likely a
+    /// `(heading × 2) + frame_phase` packing — use
+    /// `Ship::heading()` for the typed 0..7 cardinal direction.
+    pub heading_byte: u8,
     /// Up to 7 cargo manifest slots at record offsets 0x174,
     /// 0x17C, 0x184, 0x18C, 0x194, 0x19C, 0x1A4 (stride 8 with
     /// the +4 word always zero). Cross-scenario audit:
@@ -237,6 +242,17 @@ impl Ship {
     /// short-circuit on malformed scenarios.
     pub fn class(&self) -> Option<ShipClass> {
         ShipClass::from_byte(self.ship_class)
+    }
+
+    /// Compass heading 0..7 (N, NE, E, SE, S, SW, W, NW)
+    /// derived from byte 0x42 of the SHIP4 record. The raw
+    /// byte ranges 0..14 with 95% of records carrying an
+    /// even value; the binary appears to pack `heading × 2 +
+    /// frame_phase`, so `heading_byte / 2` yields the cardinal
+    /// direction. Renderers can feed this straight to the
+    /// existing `TradeShip::heading` / sprite-rotation logic.
+    pub fn heading(&self) -> u8 {
+        self.heading_byte / 2
     }
 }
 
@@ -888,6 +904,7 @@ impl SzsFile {
             let y = u16::from_le_bytes([data[off + 30], data[off + 31]]);
             let ship_class = if off + 0x49 <= data.len() { data[off + 0x48] } else { 0 };
             let owner      = if off + 0x4C <= data.len() { data[off + 0x4B] } else { 0 };
+            let heading_byte = if off + 0x43 <= data.len() { data[off + 0x42] } else { 0 };
             let mut cargo_slots = [0u32; 7];
             for (i, slot) in cargo_slots.iter_mut().enumerate() {
                 let o = off + 0x174 + i * 8;
@@ -897,7 +914,9 @@ impl SzsFile {
                     ]);
                 }
             }
-            out.push(Ship { name, x, y, owner, ship_class, cargo_slots });
+            out.push(Ship {
+                name, x, y, owner, ship_class, heading_byte, cargo_slots,
+            });
         }
         out
     }
@@ -1412,6 +1431,37 @@ mod tests {
         }
         assert!(!nonzero.is_empty(),
             "Trust no one0 must contribute the documented outliers");
+    }
+
+    #[test]
+    fn ship4_heading_byte_packs_compass_direction() {
+        // 95% of corpus records carry an even heading_byte
+        // (heading × 2). Ship::heading() halves it to recover
+        // the 0..=7 cardinal direction.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut total = 0;
+        let mut max_heading = 0u8;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            for s in &parsed.ships {
+                let h = s.heading();
+                assert!(h <= 7, "{:?} ship {:?} heading {} > 7",
+                    path.file_stem().unwrap(), s.name, h);
+                if h > max_heading { max_heading = h; }
+                total += 1;
+            }
+        }
+        assert!(total > 0);
+        assert!(max_heading > 0,
+            "audit must include at least one non-N heading");
     }
 
     #[test]

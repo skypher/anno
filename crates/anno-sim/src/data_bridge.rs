@@ -666,12 +666,18 @@ pub fn traders_from_ships(
     ships.iter()
         .filter(|s| matches!(s.class(),
             Some(ShipClass::SmallTrader | ShipClass::LargeTrader)))
-        .map(|s| TradeShip::new(
-            s.owner,
-            UNROUTED_TRADER_ROUTE_ID,
-            s.x as i32,
-            s.y as i32,
-        ))
+        .map(|s| {
+            let mut t = TradeShip::new(
+                s.owner,
+                UNROUTED_TRADER_ROUTE_ID,
+                s.x as i32,
+                s.y as i32,
+            );
+            // Carry the authored heading so the renderer
+            // shows the ship facing the right direction.
+            t.heading = s.heading();
+            t
+        })
         .collect()
 }
 
@@ -714,6 +720,7 @@ mod tests {
             x, y,
             owner,
             ship_class: class,
+            heading_byte: 0,
             cargo_slots: [0; 7],
         };
         let ships = vec![
@@ -744,6 +751,7 @@ mod tests {
             x, y,
             owner,
             ship_class: class,
+            heading_byte: 0,
             cargo_slots: [0; 7],
         };
         let ships = vec![

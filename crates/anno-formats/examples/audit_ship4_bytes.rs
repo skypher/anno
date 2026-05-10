@@ -81,6 +81,15 @@ fn main() {
     println!("byte 0x4A distribution: {byte_4a_dist:?}");
     println!("byte 0x4D distribution: {byte_4d_dist:?}");
 
+    // byte 0x42 — heading candidate.
+    let mut byte_42_dist: std::collections::BTreeMap<u8, u32> = Default::default();
+    for (_, _, body) in &all_records {
+        if body.len() >= 0x43 {
+            *byte_42_dist.entry(body[0x42]).or_default() += 1;
+        }
+    }
+    println!("byte 0x42 distribution: {byte_42_dist:?}");
+
     // Cross-tab byte 0x4A vs byte 0x4B (owner) — does 0x4A
     // distinguish native ships from human/AI ships?
     let mut crosstab: std::collections::BTreeMap<(u8, u8), u32> = Default::default();
