@@ -84,10 +84,25 @@ impl FigureDef {
     /// 4 for civilian/Träger figures, 6 for KARREN (cart).
     pub fn max_load(&self) -> i32 { self.prop_int("Maxtrag") }
 
-    /// Hit-points for combat figures (`Hitpoint:`). Land units are
-    /// tagged in the appendix; ships use HP from haeuser.cod /
-    /// ship-class tables.
-    pub fn hit_points(&self) -> i32 { self.prop_int("Hitpoint") }
+    /// Hit-points for combat figures (`Hitpoint:`) as a float.
+    /// Naval ships carry fractional values (KRIEG1 = 2.0,
+    /// KRIEG2 = 4.0 etc.); land units use whole numbers.
+    pub fn hit_points_f32(&self) -> f32 {
+        self.properties.get("Hitpoint")
+            .and_then(|s| s.split(',').next().and_then(|t| t.trim().parse().ok()))
+            .unwrap_or(0.0)
+    }
+
+    /// Hit-points truncated to i32 for callers that want
+    /// integer HP. Use `hit_points_f32` if you need the
+    /// authentic fractional value (KRIEG1 = 2.0, etc.).
+    pub fn hit_points(&self) -> i32 { self.hit_points_f32() as i32 }
+
+    /// Maximum energy (`Maxenergy:`) — legacy "stamina" cap
+    /// that doubles as the ship's HP-for-display value
+    /// (KRIEG1 = 65, KRIEG2 = 120 — matches Tim Howgego's
+    /// military-data appendix).
+    pub fn max_energy(&self) -> i32 { self.prop_int("Maxenergy") }
 
     /// Build cost in gold (`Preis:`). Used for non-Soldat figures
     /// (ships, carts) that aren't gated through the SOLDAT lookup.
@@ -445,5 +460,33 @@ Nummer: ESEL
         assert_eq!(handel1.gfx, 0);
         assert_eq!(handel1.rotate, 1);
         assert_eq!(handel1.walk_anim().unwrap().anim_anz, 40);
+    }
+
+    #[test]
+    fn ship_stats_from_figuren_cod() {
+        // Pin the canonical figuren.cod ship stats so combat.rs's
+        // hard-coded UnitStats can be cross-referenced. Sourced
+        // directly from the encrypted figuren.cod entries.
+        let path = "../../extracted/figuren.cod";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skipping: {} not found", path);
+            return;
+        };
+        let f = FiguresFile::parse(&bytes);
+        // KRIEG1 (small warship): Hitpoint 2.0, Maxenergy 65,
+        // Maxkanon 8, Speed 550.
+        let krieg1 = f.find("KRIEG1").expect("KRIEG1 in figuren.cod");
+        assert_eq!(krieg1.hit_points_f32(), 2.0);
+        assert_eq!(krieg1.max_energy(), 65);
+        assert_eq!(krieg1.max_cannons(), 8);
+        assert_eq!(krieg1.speed(), 550);
+        // KRIEG2 (large warship): Maxkanon 14, Speed 600 — hp via
+        // Maxenergy is 120, matching combat.rs's /40 scale to 3.0.
+        let krieg2 = f.find("KRIEG2").expect("KRIEG2 in figuren.cod");
+        assert_eq!(krieg2.max_energy(), 120);
+        assert_eq!(krieg2.max_cannons(), 14);
+        // PIRAT: 10 cannon, sits between the two warships.
+        let pirat = f.find("PIRAT").expect("PIRAT in figuren.cod");
+        assert_eq!(pirat.max_cannons(), 10);
     }
 }
