@@ -29,7 +29,10 @@ use std::path::Path;
 ///      Kontor's `Maxlager` (50/75/100/20). `#[serde(default)]`
 ///      makes pre-v15 saves loadable with the legacy 30 cap,
 ///      but `Warehouse` field order shifts so we bump anyway.
-pub const SAVE_VERSION: u32 = 15;
+/// v16: `MilitaryUnit` gained `name: String` for SHIP4-spawned
+///      warships. `#[serde(default)]` keeps pre-v16 saves
+///      loadable with empty names.
+pub const SAVE_VERSION: u32 = 16;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";

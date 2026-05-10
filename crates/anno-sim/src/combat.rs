@@ -177,6 +177,12 @@ pub struct MilitaryUnit {
     /// none. Updated each tick so the unit's `target` shadows the ship.
     #[serde(default = "default_escort_ship")]
     pub escort_ship: i32,
+    /// Optional ship/unit name. Populated for SHIP4-spawned
+    /// warships from the authored 28-byte name field
+    /// ("Defender", "Imperator", etc.) so the UI can show
+    /// the original ship names. Empty for all other units.
+    #[serde(default)]
+    pub name: String,
     /// Number of cannons mounted on this naval unit (manual sec.
     /// 9.2.3 "Arming your ships"). For land units this stays 0.
     /// `attack_damage` of the unit's stats is multiplied by
@@ -282,10 +288,21 @@ impl MilitaryUnit {
             combat_target: -1,
             active: true,
             escort_ship: -1,
+            name: String::new(),
             cannons: 0,
             patrol: Vec::new(),
             patrol_idx: 0,
         }
+    }
+
+    /// Construct a unit and attach an authored name (e.g. for
+    /// SHIP4-spawned warships).
+    pub fn with_name(
+        unit_type: UnitType, owner: u8, tile_x: i32, tile_y: i32, name: String,
+    ) -> Self {
+        let mut u = Self::new(unit_type, owner, tile_x, tile_y);
+        u.name = name;
+        u
     }
 
     pub fn is_alive(&self) -> bool {

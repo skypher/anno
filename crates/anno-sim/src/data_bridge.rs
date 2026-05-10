@@ -641,11 +641,12 @@ pub fn warships_from_ships(
                 ShipClass::PirateShip   => UnitType::PirateShip,
                 _ => return None,
             };
-            Some(MilitaryUnit::new(
+            Some(MilitaryUnit::with_name(
                 unit_type,
                 s.owner,
                 s.x as i32,
                 s.y as i32,
+                s.name.clone(),
             ))
         })
         .collect()

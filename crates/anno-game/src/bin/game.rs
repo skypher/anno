@@ -6446,7 +6446,20 @@ fn init_simulation(
     // exact spawn coordinates the scenario author placed them.
     let warships = anno_sim::data_bridge::warships_from_ships(&szs.ships);
     if !warships.is_empty() {
-        println!("Spawning {} static warship(s) from SHIP4", warships.len());
+        let named: Vec<&str> = warships.iter()
+            .filter(|u| !u.name.is_empty())
+            .map(|u| u.name.as_str())
+            .take(5)
+            .collect();
+        let suffix = if named.is_empty() {
+            String::new()
+        } else if warships.iter().filter(|u| !u.name.is_empty()).count() > 5 {
+            format!(" — {} …", named.join(", "))
+        } else {
+            format!(" — {}", named.join(", "))
+        };
+        println!("Spawning {} static warship(s) from SHIP4{suffix}",
+            warships.len());
         // Native-faction warships (owner 5, including those that
         // sail under the PIRAT figure) are hostile to the player
         // by default — the scenario authors place them as
