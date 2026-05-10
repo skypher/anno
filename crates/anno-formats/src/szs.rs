@@ -291,6 +291,15 @@ pub struct City {
 
 /// A single tile/building record from INSELHAUS (8 bytes).
 ///
+/// `anim_count` audit across 333,354 tiles surfaces:
+///   * values 0..=6 cover 81% of tiles (typical animation
+///     frame index, max 6 matches the longest animations in
+///     haeuser.cod's `AnimAnz`)
+///   * values 64..=68 cover 6% — high-bit-set patterns
+///     suggesting (frame_idx, flag) packing where bits 6/7
+///     encode something else (under-construction overlay?)
+///   * value 192 (= bits 6+7 set) on 1% of tiles
+///
 /// `flags` audit (`cargo run --example audit_inselhaus_flags`)
 /// across 333,354 tiles in 62 shipping `.szs` files surfaces:
 ///

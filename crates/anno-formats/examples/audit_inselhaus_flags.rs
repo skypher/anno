@@ -15,6 +15,7 @@ fn main() {
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
+    let mut anim_count_dist: std::collections::BTreeMap<u8, u32> = Default::default();
     let mut flag_dist: std::collections::BTreeMap<u16, u32> = Default::default();
     let mut bit_freq = [0u32; 16];
     let mut total = 0;
@@ -25,6 +26,7 @@ fn main() {
         for island in &parsed.islands {
             for tile in &island.tiles {
                 total += 1;
+                *anim_count_dist.entry(tile.anim_count).or_default() += 1;
                 *flag_dist.entry(tile.flags).or_default() += 1;
                 for bit in 0..16 {
                     if tile.flags & (1 << bit) != 0 {
@@ -34,6 +36,17 @@ fn main() {
             }
         }
     }
+
+    println!("INSELHAUS tile.anim_count distribution:");
+    let mut total_anim = 0u32;
+    for (v, c) in &anim_count_dist {
+        let pct = *c * 100 / total.max(1);
+        if pct > 0 {
+            println!("  {v}: {pct}% ({c})");
+        }
+        total_anim += c;
+    }
+    println!("  ({} tiles)\n", total_anim);
 
     println!("INSELHAUS tile.flags: {} tiles total", total);
     println!("Distinct values: {}", flag_dist.len());
