@@ -682,6 +682,68 @@ pub fn traders_from_ships(
         .collect()
 }
 
+/// Build a default round-trip trade route for each owner
+/// that has at least two warehouses, mutating the matching
+/// traders' `route_id` to point at the new route. Each route
+/// stops at the owner's first two warehouses with a generic
+/// load/unload of Wood ↔ Tools so the spawned traders start
+/// circulating goods immediately.
+///
+/// Routes start at `route_id_start` and increment per owner.
+/// Returns the new routes; the caller appends them to
+/// `Simulation::trade_routes`.
+pub fn auto_routes_for_traders(
+    traders: &mut [crate::trade::TradeShip],
+    warehouses: &[crate::warehouse::Warehouse],
+    mut route_id_start: u16,
+) -> Vec<crate::trade::TradeRoute> {
+    use crate::trade::{RouteStop, TradeRoute};
+    use crate::types::Good;
+    // Group warehouses by owner (in stable order).
+    let mut by_owner: std::collections::BTreeMap<u8, Vec<&crate::warehouse::Warehouse>> =
+        Default::default();
+    for w in warehouses {
+        if !w.active { continue; }
+        by_owner.entry(w.owner).or_default().push(w);
+    }
+    let mut routes = Vec::new();
+    let mut owner_route: std::collections::HashMap<u8, u16> = Default::default();
+    for (&owner, whs) in &by_owner {
+        if whs.len() < 2 { continue; }
+        let mut r = TradeRoute::new(route_id_start, owner);
+        r.add_stop(RouteStop {
+            island_id: whs[0].island_id,
+            warehouse_x: whs[0].tile_x,
+            warehouse_y: whs[0].tile_y,
+            load_goods: vec![(Good::Wood, 10)],
+            unload_goods: vec![Good::Tools],
+        });
+        r.add_stop(RouteStop {
+            island_id: whs[1].island_id,
+            warehouse_x: whs[1].tile_x,
+            warehouse_y: whs[1].tile_y,
+            load_goods: vec![(Good::Tools, 10)],
+            unload_goods: vec![Good::Wood],
+        });
+        r.activate();
+        owner_route.insert(owner, route_id_start);
+        routes.push(r);
+        route_id_start = route_id_start.wrapping_add(1);
+        if route_id_start == UNROUTED_TRADER_ROUTE_ID {
+            // Skip the sentinel value if we ever run that long.
+            route_id_start = route_id_start.wrapping_add(1);
+        }
+    }
+    // Re-route each unrouted trader to its owner's new route.
+    for t in traders.iter_mut() {
+        if t.route_id != UNROUTED_TRADER_ROUTE_ID { continue; }
+        if let Some(&id) = owner_route.get(&t.owner) {
+            t.route_id = id;
+        }
+    }
+    routes
+}
+
 /// Whether a plantation/farm building can be placed on the
 /// given island. The check is purely a fertility lookup —
 /// ownership, infrastructure tier, and tile-level placement
@@ -872,6 +934,40 @@ mod tests {
             total += 1;
         }
         assert!(total > 0, "audit must cover at least one scenario");
+    }
+
+    #[test]
+    fn auto_routes_for_traders_assigns_per_owner_routes() {
+        use crate::trade::TradeShip;
+        use crate::warehouse::Warehouse;
+        // Two owners, each with two warehouses.
+        let warehouses = vec![
+            Warehouse::new(0, 0, 10, 10), // owner 0
+            Warehouse::new(1, 0, 20, 20), // owner 0
+            Warehouse::new(2, 1, 30, 30), // owner 1
+            Warehouse::new(3, 1, 40, 40), // owner 1
+        ];
+        let mut traders = vec![
+            TradeShip::new(0, UNROUTED_TRADER_ROUTE_ID, 10, 10),
+            TradeShip::new(1, UNROUTED_TRADER_ROUTE_ID, 30, 30),
+        ];
+        let routes = auto_routes_for_traders(&mut traders, &warehouses, 100);
+        assert_eq!(routes.len(), 2,
+            "one route per owner with ≥2 warehouses");
+        assert_eq!(routes[0].owner, 0);
+        assert_eq!(routes[1].owner, 1);
+        // Each trader must now point at its owner's route.
+        assert_ne!(traders[0].route_id, UNROUTED_TRADER_ROUTE_ID);
+        assert_ne!(traders[1].route_id, UNROUTED_TRADER_ROUTE_ID);
+        assert_eq!(traders[0].route_id, routes[0].id);
+        assert_eq!(traders[1].route_id, routes[1].id);
+        // An owner with only ONE warehouse gets no route.
+        let warehouses_one = vec![Warehouse::new(0, 0, 5, 5)];
+        let mut traders_one = vec![TradeShip::new(0, UNROUTED_TRADER_ROUTE_ID, 5, 5)];
+        let routes = auto_routes_for_traders(&mut traders_one, &warehouses_one, 0);
+        assert!(routes.is_empty(), "owner with 1 warehouse skipped");
+        assert_eq!(traders_one[0].route_id, UNROUTED_TRADER_ROUTE_ID,
+            "no route → trader stays inert");
     }
 
     #[test]

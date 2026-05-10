@@ -6475,9 +6475,21 @@ fn init_simulation(
     // coordinates with a sentinel route_id so the trade tick
     // leaves them inert until a route is assigned. Below the dev-
     // default trade route still adds its own routed ship.
-    let traders = anno_sim::data_bridge::traders_from_ships(&szs.ships);
+    let mut traders = anno_sim::data_bridge::traders_from_ships(&szs.ships);
     if !traders.is_empty() {
-        println!("Spawning {} static trader(s) from SHIP4", traders.len());
+        // Auto-generate a per-owner round-trip route between
+        // the owner's first two warehouses so the spawned
+        // traders start carrying goods on scenario load.
+        let next_route_id = sim.trade_routes.iter()
+            .map(|r| r.id).max().unwrap_or(0).wrapping_add(1);
+        let routes = anno_sim::data_bridge::auto_routes_for_traders(
+            &mut traders, &sim.warehouses, next_route_id);
+        let routed_count = traders.iter()
+            .filter(|t| t.route_id != anno_sim::data_bridge::UNROUTED_TRADER_ROUTE_ID)
+            .count();
+        println!("Spawning {} static trader(s) from SHIP4 ({} auto-routed)",
+            traders.len(), routed_count);
+        sim.trade_routes.extend(routes);
         sim.trade_ships.extend(traders);
     }
 
