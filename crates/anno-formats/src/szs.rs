@@ -158,6 +158,23 @@ impl ShipClass {
     pub fn is_warship(self) -> bool {
         matches!(self, ShipClass::SmallWarship | ShipClass::LargeWarship | ShipClass::PirateShip)
     }
+
+    /// Per-cargo-slot maximum quantity for this ship class,
+    /// in the 100-units-per-ton scale used by the SHIP4
+    /// cargo_slots high-16-bit value. Audit-derived from the
+    /// shipping corpus (`probe_cargo_per_class`):
+    ///
+    ///   SmallTrader   1600 (16 t/slot × 7 slots = 112 t)
+    ///   LargeTrader   1600
+    ///   SmallWarship  1600
+    ///   LargeWarship  1600
+    ///   PirateShip     800 (smaller hold, 8 t/slot)
+    pub fn cargo_slot_max_units(self) -> u16 {
+        match self {
+            ShipClass::PirateShip => 800,
+            _ => 1600,
+        }
+    }
 }
 
 /// One ship record from the SHIP4 chunk (436 bytes per slot).
@@ -222,6 +239,9 @@ pub struct Ship {
     ///     multiples of 32 — most commonly 0x0640 (= 1600).
     ///     These look like quantities in a 100-unit-per-ton
     ///     scale (16 tons = 1600 units).
+    ///   * Per-class max quantity (`probe_cargo_per_class`):
+    ///     SmallTrader/LargeTrader/SmallWarship/LargeWarship
+    ///     all cap at 1600 units; PirateShip caps at 800.
     ///   * Low 16 bits cluster around a small set of values
     ///     (20 distinct across the corpus) — likely a good /
     ///     ware identifier, but the encoding doesn't match a
