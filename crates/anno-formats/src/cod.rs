@@ -409,6 +409,25 @@ mod tests {
             cod.buildings.len()
         );
 
+        // Residence/HQ-kind buildings carry the per-pop
+        // baseline rates. Audit confirms every non-Kontor
+        // HQ entry (Nr 270 plus the native chief huts at
+        // 442/448/455) uses Nahrung 1.3 / Steuer 2.6 — those
+        // are the per-population food consumption and tax
+        // baseline values feeding the simulation's
+        // population.rs CONSUMPTION_PER_100 table.
+        for b in &cod.buildings {
+            if b.kind != "HQ" { continue; }
+            if b.properties.get("Bauinfra")
+                .map(|s| s.starts_with("INFRA_KONTOR")).unwrap_or(false) {
+                continue;
+            }
+            assert_eq!(b.properties.get("Nahrung").map(|s| s.as_str()),
+                Some("1.3"), "Nr={}", b.nummer);
+            assert_eq!(b.properties.get("Steuer").map(|s| s.as_str()),
+                Some("2.6"), "Nr={}", b.nummer);
+        }
+
         // Print sample buildings
         println!("\nSample buildings:");
         for b in cod.buildings.iter().take(5) {

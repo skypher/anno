@@ -69,6 +69,15 @@ pub const TIER_DEMANDS: &[&[Good]] = &[
 /// Scaled to per-100-pop-per-economy-tick (10 000 ms = 1/6 minute)
 /// and rounded so the integer math at tick time is meaningful:
 /// Pioneer 2, Settler 4, Citizen 5, Merchant 7, Aristocrat 7.
+///
+/// haeuser.cod's residence buildings (Nr=270/442/448/455) all
+/// carry `Nahrung: 1.3` and `Steuer: 2.6` — the per-pop food
+/// consumption and gold-per-pop tax baseline the original
+/// engine seeds for every tier. These represent the BASE
+/// rates; the per-tier demand multiplier above is empirically
+/// derived to match observed game balance. Pinning the COD
+/// baseline values via `cargo run --example
+/// probe_residence_demands`.
 const CONSUMPTION_PER_100: [u16; NUM_POP_TIERS] = [
     2, // Pioneer
     4, // Settler
