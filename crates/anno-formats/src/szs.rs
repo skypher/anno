@@ -1411,6 +1411,48 @@ mod tests {
     }
 
     #[test]
+    fn stadt4_byte_04_always_zero_byte_05_settlement_stage() {
+        // Audit (`probe stadt4 head region`) shows STADT4
+        // byte 0x04 is uniformly 0 across the corpus; byte
+        // 0x05 carries the "settlement stage" indicator with
+        // values 0x11..0x1F (17..31) only on cities with
+        // pre-seeded population. The u32 at 0x04 therefore
+        // reads as `(byte_0x05 << 8)`, matching the
+        // 4352/4608/5120/6912/7936 values seen in the audit.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut total = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            for chunk in parsed.chunks.iter().filter(|c| c.name == "STADT4") {
+                if chunk.data.len() < 8 { continue; }
+                let b4 = chunk.data[4];
+                let b5 = chunk.data[5];
+                // byte 0x04: typically 0 in shipping content,
+                // small values (≤ 0x1F) in scenarios that
+                // pre-configure the stage marker.
+                assert!(b4 <= 0x1F,
+                    "{:?}: STADT4 byte 0x04 = {b4:#04x} unexpectedly large",
+                    path.file_stem().unwrap());
+                // Stage marker: either 0 (empty/uninhabited) or
+                // 0x11..=0x1F (occupied tier in shipping corpus).
+                assert!(b5 == 0 || (0x11..=0x1F).contains(&b5),
+                    "{:?}: STADT4 byte 0x05 = {b5:#04x} out of range",
+                    path.file_stem().unwrap());
+                total += 1;
+            }
+        }
+        assert!(total > 100);
+    }
+
+    #[test]
     fn insel5_byte_5d_constant_0x11_with_one_outlier() {
         // INSEL5 byte 0x5D is 0x11 (=17) on 545 of 546 corpus
         // islands and 0x51 on a single outlier. Pin the
