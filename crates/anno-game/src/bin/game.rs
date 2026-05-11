@@ -6495,7 +6495,27 @@ fn init_simulation(
         if warships.iter().any(|u| u.owner == 5) {
             sim.diplomacy.set(0, 5, Diplomacy::War);
         }
-        sim.military_units.extend(warships);
+        // Native warships (owner 5) get a 4-waypoint square
+        // patrol around their spawn so they roam instead of
+        // sitting idle when no enemies are visible. The
+        // existing tick_combat logic will interrupt the patrol
+        // when a hostile unit comes into range.
+        for mut u in warships {
+            if u.owner == 5 {
+                let cx = u.tile_x;
+                let cy = u.tile_y;
+                let r = 16i32;
+                u.patrol = vec![
+                    (cx + r, cy),
+                    (cx,     cy + r),
+                    (cx - r, cy),
+                    (cx,     cy - r),
+                ];
+                u.target_x = u.patrol[0].0;
+                u.target_y = u.patrol[0].1;
+            }
+            sim.military_units.push(u);
+        }
     }
     // Spawn trader hulls from SHIP4 too: SmallTrader / LargeTrader
     // records become TradeShip instances at their authored
