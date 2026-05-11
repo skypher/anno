@@ -28,8 +28,13 @@ pub fn tick_building(building: &mut BuildingInstance, def: &BuildingDef, dt_ms: 
     // Maxenergy cap: once cumulative work hits the per-building
     // limit (RE: haeuser.cod `Maxenergy`), the building stops
     // producing — analogous to needing repair / overhaul. 0 means
-    // uncapped.
+    // uncapped. Repair happens passively: each tick while
+    // fatigued decays `total_work` by `def.max_energy / 32`
+    // (rounded up), so a fully-fatigued building recovers over
+    // roughly 32 ticks before resuming production.
     if def.max_energy > 0 && building.total_work >= def.max_energy {
+        let decay = (def.max_energy / 32).max(1);
+        building.total_work = building.total_work.saturating_sub(decay);
         return 0;
     }
     // Ore-deposit depletion: when a mine's remaining-ore counter
@@ -189,6 +194,34 @@ mod tests {
         // Already built (defaults)
         let produced = tick_building(&mut b, &def, 2_000);
         assert!(produced > 0);
+    }
+
+    #[test]
+    fn maxenergy_fatigue_pauses_then_repairs() {
+        let mut def = test_def();
+        def.max_energy = 32; // small cap so we can fatigue quickly
+        let mut b = BuildingInstance::new(1, 0, 0, 0, 0);
+        b.input_1_stock = 5_000;
+        // Force the building into a fatigued state.
+        b.total_work = 32;
+        // First tick should reject production AND decay total_work.
+        let produced = tick_building(&mut b, &def, 2_000);
+        assert_eq!(produced, 0);
+        assert!(b.total_work < 32,
+            "total_work should decay during fatigue, was {}", b.total_work);
+        // Ticking until repair completes brings total_work back to 0.
+        for _ in 0..200 {
+            tick_building(&mut b, &def, 2_000);
+            if b.total_work == 0 { break; }
+        }
+        // After repair, production can resume — total_work climbs
+        // from 0 again.
+        for _ in 0..3 {
+            tick_building(&mut b, &def, 2_000);
+        }
+        assert!(b.total_work > 0 && b.total_work < def.max_energy,
+            "production should resume post-repair, total_work={}",
+            b.total_work);
     }
 
     #[test]
