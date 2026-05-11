@@ -1411,6 +1411,53 @@ mod tests {
     }
 
     #[test]
+    fn stadt4_sparse_region_carries_native_pirate_stockpile() {
+        // STADT4 offsets 0x18, 0x1C, 0x20, 0x24 (four u32) are
+        // zero on every player/AI city but uniformly 200 on
+        // native + pirate settlements (Jaricho, Citaltepetl,
+        // Uga Bunga, Manakaru, ...). The pattern almost
+        // certainly seeds the hostile-faction stockpile.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut natives_seen = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            for chunk in parsed.chunks.iter().filter(|c| c.name == "STADT4") {
+                if chunk.data.len() < 0x28 { continue; }
+                let r = |o: usize| u32::from_le_bytes([
+                    chunk.data[o], chunk.data[o + 1],
+                    chunk.data[o + 2], chunk.data[o + 3],
+                ]);
+                let v = [r(0x18), r(0x1C), r(0x20), r(0x24)];
+                let owner = chunk.data[2];
+                if v == [0; 4] {
+                    // player/AI city — fine.
+                } else {
+                    // Non-zero must be (200,200,200,200) AND
+                    // owner must be a non-active faction
+                    // (5 native or 6 pirate).
+                    assert_eq!(v, [200; 4],
+                        "{:?}: STADT4 0x18..0x28 stockpile must be [200; 4], got {v:?}",
+                        path.file_stem().unwrap());
+                    assert!(owner == 5 || owner == 6,
+                        "{:?}: stockpile only on native/pirate, owner={owner}",
+                        path.file_stem().unwrap());
+                    natives_seen += 1;
+                }
+            }
+        }
+        assert!(natives_seen > 0,
+            "audit must include at least one native/pirate stockpiled city");
+    }
+
+    #[test]
     fn stadt4_byte_04_always_zero_byte_05_settlement_stage() {
         // Audit (`probe stadt4 head region`) shows STADT4
         // byte 0x04 is uniformly 0 across the corpus; byte

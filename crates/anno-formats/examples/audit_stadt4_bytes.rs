@@ -98,6 +98,22 @@ fn main() {
 
     // Probe the 0x60..0x78 region as 5 u32s — candidate for
     // per-tier population in cities that ship pre-populated.
+    // Probe the sparse 0x18..0x28 region for non-zero cities.
+    println!("0x18..0x28 region — cities with non-zero values:");
+    let mut shown_sparse = 0;
+    for (scen, _owner, name, body) in &all_records {
+        let has = (0x18..0x28).any(|i| body.get(i).copied().unwrap_or(0) != 0);
+        if !has { continue; }
+        if shown_sparse >= 12 { break; }
+        let r = |o: usize| u32::from_le_bytes([
+            body[o], body[o+1], body[o+2], body[o+3],
+        ]);
+        println!("  {scen} \"{name}\": [0x18]={} [0x1C]={} [0x20]={} [0x24]={}",
+            r(0x18), r(0x1C), r(0x20), r(0x24));
+        shown_sparse += 1;
+    }
+    println!();
+
     println!("Per-tier population candidate (5 u32 at 0x60..0x74):");
     let mut shown = 0;
     for (scen, owner, name, body) in &all_records {
