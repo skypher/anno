@@ -11,6 +11,21 @@ pub const MAX_PLAYERS: usize = 7;
 /// Number of demand categories.
 pub const NUM_DEMAND_CATEGORIES: usize = 8;
 
+/// Per-tier tax multiplier in 16-fixed-point. The canonical
+/// Anno 1602 progression has higher tiers paying more gold
+/// per inhabitant than lower tiers — the manual quotes ratios
+/// of roughly 1 (Pioneer) → 2 → 3 → 5 → 8 (Aristocrat). We
+/// keep the Citizen tier near 16 (= 1.0×) so existing
+/// economy tuning stays close to its legacy curve, scaling
+/// Pioneer down and Aristocrat up around that anchor.
+pub const TAX_TIER_MULTIPLIER_16: [u8; NUM_POP_TIERS] = [
+    4,  // Pioneer    (0.25×)
+    8,  // Settler    (0.5×)
+    16, // Citizen    (1.0× = legacy baseline)
+    24, // Merchant   (1.5×)
+    32, // Aristocrat (2.0×)
+];
+
 /// Bankruptcy threshold (gold balance).
 pub const BANKRUPTCY_THRESHOLD: i32 = -1001;
 
@@ -97,14 +112,31 @@ impl Player {
     }
 
     /// Calculate tax income for this player.
-    /// Formula: sum over tiers of (population[tier] * tax_rate[tier] * satisfaction[tier] / 128)
+    ///
+    /// Per-tier formula:
+    ///   `pop × tax_rate × satisfaction × tier_multiplier
+    ///    / (128 × 128 × 16)`
+    ///
+    /// where `tax_rate` and `satisfaction` are both in
+    /// 0..=128 scale (=0..=100%) and `tier_multiplier` comes
+    /// from `TAX_TIER_MULTIPLIER_16` — a 16-fixed-point per-
+    /// tier scale that rises with population tier (the
+    /// canonical Anno 1602 progression has Aristocrats paying
+    /// roughly 8× Pioneers per inhabitant).
+    ///
+    /// The /16 denominator keeps the integer-math output near
+    /// the legacy single-tier value at the Citizen baseline,
+    /// so existing scenario tuning stays close to its prior
+    /// gold curve.
     pub fn calculate_income(&self) -> i32 {
         let mut income = 0i32;
         for tier in 0..NUM_POP_TIERS {
+            let mult = TAX_TIER_MULTIPLIER_16[tier] as i32;
             income += (self.population[tier] as i32
                 * self.tax_rates[tier] as i32
-                * self.satisfaction[tier] as i32)
-                / (128 * 128);
+                * self.satisfaction[tier] as i32
+                * mult)
+                / (128 * 128 * 16);
         }
         income
     }
@@ -132,5 +164,47 @@ impl Player {
 
     pub fn total_population(&self) -> u32 {
         self.population.iter().sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tax_income_scales_per_tier() {
+        // At full satisfaction + tax_rate, an Aristocrat
+        // should pay ~8× a Pioneer per inhabitant (the
+        // canonical Anno 1602 manual ratio). Citizen sits at
+        // the 1.0× legacy baseline.
+        let mk = |tier: usize| {
+            let mut p = Player::new_human(0);
+            // 100 inhabitants in just this tier, 100% tax / sat.
+            p.population[tier] = 100;
+            p.tax_rates[tier] = 128;
+            p.satisfaction[tier] = 128;
+            p.calculate_income()
+        };
+        let pioneer = mk(0);
+        let citizen = mk(2);
+        let aristo = mk(4);
+        assert!(citizen > 0);
+        // Aristocrat should out-earn Pioneer by ≥4× per 100 pop.
+        assert!(aristo >= pioneer * 4,
+            "Aristocrat income {aristo} should be ≥4× Pioneer {pioneer}");
+        // Citizen ≈ legacy baseline (100 pop × full settings).
+        // The TAX_TIER_MULTIPLIER_16 for Citizen is 16, so
+        // the /16 division cancels and we recover the legacy
+        // pop × rate × sat / 128² formula → 100.
+        assert_eq!(citizen, 100);
+    }
+
+    #[test]
+    fn calculate_income_zero_at_zero_satisfaction() {
+        let mut p = Player::new_human(0);
+        p.population[0] = 100;
+        p.tax_rates[0] = 128;
+        p.satisfaction[0] = 0;
+        assert_eq!(p.calculate_income(), 0);
     }
 }
