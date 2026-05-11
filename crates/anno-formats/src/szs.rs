@@ -1607,6 +1607,46 @@ mod tests {
     }
 
     #[test]
+    fn player4_relationship_arrays_carry_diplomacy_codes_0_3() {
+        // Corpus invariant: PLAYER4 0xC0 and 0x140 arrays
+        // (7 u32 stride-8 each) carry values from {0, 1, 2, 3}
+        // across all 62 shipping `.szs` files. 0 and 3 are the
+        // two dominant codes (peace / default-state); 1 and 2
+        // appear as rare outliers in scenarios that pre-set
+        // mid-state diplomacy (e.g., Magnate2's pre-cooled
+        // relationships). Concrete semantics aren't yet pinned
+        // (TaskList #115); this invariant guards the value
+        // range against corruption.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut total_slots = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            for player in &parsed.players {
+                for v in player.relations_0xc0 {
+                    assert!(v <= 3,
+                        "{:?}: PLAYER4 0xC0 entry {v} > 3",
+                        path.file_stem().unwrap());
+                }
+                for v in player.relationships {
+                    assert!(v <= 3,
+                        "{:?}: PLAYER4 0x140 entry {v} > 3",
+                        path.file_stem().unwrap());
+                }
+                total_slots += 1;
+            }
+        }
+        assert!(total_slots > 100);
+    }
+
+    #[test]
     fn ship4_byte_4a_correlates_strictly_with_owner() {
         // Audit shows byte 0x4A == 0x01 for every record with
         // owner ∈ {0, 1, 2, 3} (player + AI rivals) and
