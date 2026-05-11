@@ -1485,6 +1485,45 @@ mod tests {
     }
 
     #[test]
+    fn ship4_byte_4a_correlates_strictly_with_owner() {
+        // Audit shows byte 0x4A == 0x01 for every record with
+        // owner ∈ {0, 1, 2, 3} (player + AI rivals) and
+        // 0x4A == 0x03 for every record with owner == 5
+        // (native faction, including PIRAT-figure ships).
+        // Pin the correlation as a corpus invariant — gives
+        // us a redundant cross-check on the owner byte.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut total = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let Some(s4) = parsed.chunks.iter().find(|c| c.name == "SHIP4") else { continue };
+            for record in s4.data.chunks_exact(436) {
+                if record.len() < 0x4C { continue; }
+                let b4a = record[0x4A];
+                let owner = record[0x4B];
+                let want = match owner {
+                    0..=3 => 0x01,
+                    5     => 0x03,
+                    _     => unreachable!("owner {owner} unexpected"),
+                };
+                assert_eq!(b4a, want,
+                    "{:?}: SHIP4 byte 0x4A {:#04x} doesn't match owner {} pattern",
+                    path.file_stem().unwrap(), b4a, owner);
+                total += 1;
+            }
+        }
+        assert!(total > 0);
+    }
+
+    #[test]
     fn ship4_byte_41_constant_80_corpus_wide() {
         // byte 0x41 == 80 in every SHIP4 record across the
         // corpus. Likely a record-format / sprite-anchor
