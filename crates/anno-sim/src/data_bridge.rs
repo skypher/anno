@@ -657,6 +657,37 @@ pub fn code_to_diplomacy(code: u32) -> crate::combat::Diplomacy {
     }
 }
 
+/// Building Nummer references for native + pirate dwellings,
+/// derived from haeuser.cod's `Nativflg=1` / `Piratflg=1`
+/// tagged entries (`cargo run --example
+/// probe_native_pirate_buildings`).
+///
+/// Native village (slot 5):
+///   442 = Chief's hut / Kontor (variant A)
+///   443 = Warrior's hut (MILITAR)
+///   444 = Native dwelling (PIRATWOHN)
+///   445 = Spice plantation (GEWUERZE)
+///   446–447 = Tobacco plantations (TABAKWAREN)
+///   448 = Chief's hut / Kontor (variant B)
+///   449–450 = Additional native dwellings + warrior hut
+///   451–454 = More native plantations (incl. cliff-side TABAK)
+///
+/// Pirate stronghold (slot 6):
+///   455 = Pirate Kontor (also Nativflg=1 in COD — the same
+///         building doubles as both faction's hub)
+///   456–458 = Pirate dwellings (PIRATWOHN)
+///   459–460 = Pirate watchtowers (WACHTURM)
+pub const NATIVE_KONTOR_A: i32 = 442;
+pub const NATIVE_KONTOR_B: i32 = 448;
+pub const PIRATE_KONTOR: i32 = 455;
+
+/// All native-faction building Nummers (442..=458 inclusive).
+pub const NATIVE_BUILDING_NUMMERS: std::ops::RangeInclusive<i32> = 442..=458;
+
+/// All pirate-faction building Nummers (455..=460 inclusive,
+/// overlapping the native range at 455-458).
+pub const PIRATE_BUILDING_NUMMERS: std::ops::RangeInclusive<i32> = 455..=460;
+
 /// `route_id` value used for SHIP4 traders that have no
 /// configured route. Picked so it can never collide with a
 /// real `TradeRoute::id` (those start at 0 and grow
@@ -980,6 +1011,34 @@ mod tests {
             total += 1;
         }
         assert!(total > 0, "audit must cover at least one scenario");
+    }
+
+    #[test]
+    fn native_pirate_kontor_constants_match_haeuser_cod() {
+        // Pin the canonical Kontor Nummers for native + pirate
+        // settlements against haeuser.cod.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let cod_data = match std::fs::read(base.join("extracted/haeuser.cod")) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: haeuser.cod not found");
+                return;
+            }
+        };
+        let cod = CodFile::parse(&cod_data).unwrap();
+        for &nr in &[NATIVE_KONTOR_A, NATIVE_KONTOR_B, PIRATE_KONTOR] {
+            let b = cod.buildings.iter().find(|b| b.nummer == nr)
+                .unwrap_or_else(|| panic!("Nr={nr} not in haeuser.cod"));
+            assert_eq!(b.kind, "HQ", "Nr={nr} should be Kind=HQ");
+            assert_eq!(b.properties.get("ProdKind").map(|s| s.as_str()),
+                Some("KONTOR"),
+                "Nr={nr} should be ProdKind=KONTOR");
+        }
+        // Pirate Kontor must carry both flags.
+        let pirat = cod.buildings.iter().find(|b| b.nummer == PIRATE_KONTOR).unwrap();
+        assert_eq!(pirat.properties.get("Piratflg").map(|s| s.as_str()),
+            Some("1"));
     }
 
     #[test]
