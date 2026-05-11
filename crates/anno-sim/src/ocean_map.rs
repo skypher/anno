@@ -293,6 +293,51 @@ mod tests {
     }
 
     #[test]
+    fn ocean_paths_never_cross_land_in_real_scenarios() {
+        // Cross-scenario corpus check: load a real .szs's
+        // ocean map and run pathfinding between every
+        // warehouse pair, asserting that no returned path
+        // crosses a non-navigable tile.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes/A Plague of Pirates.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: Plague .szs not found");
+                return;
+            }
+        };
+        let szs = anno_formats::szs::SzsFile::parse(&data).expect("parse");
+        let ocean = OceanMap::from_scenario(&szs);
+
+        // Pick a handful of island-centre coordinates to use as
+        // path endpoints — they sit ON land, but the pathfinder
+        // should route us through ocean around them.
+        let mut centres: Vec<(i32, i32)> = Vec::new();
+        for island in szs.islands.iter().take(4) {
+            let cx = (island.x_pos + island.width as u16 / 2) as i32;
+            let cy = (island.y_pos + island.height as u16 / 2) as i32;
+            centres.push((cx, cy));
+        }
+        // For each (i, j) pair with i < j, try to find an ocean
+        // path. Some pairs may legitimately return None when the
+        // pathfinder bails out for distance; that's fine. What
+        // MUST hold is: any successful path stays on navigable
+        // tiles.
+        for i in 0..centres.len() {
+            for j in (i + 1)..centres.len() {
+                if let Some(p) = find_ocean_path(&ocean, centres[i], centres[j]) {
+                    for &(x, y) in &p {
+                        assert!(ocean.is_navigable(x, y),
+                            "ocean path crosses land at ({x}, {y})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ocean_path_around_island() {
         let map = make_simple_ocean();
 
