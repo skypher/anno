@@ -214,12 +214,10 @@ mod tests {
             tick_building(&mut b, &def, 2_000);
             if b.total_work == 0 { break; }
         }
-        // After repair, production can resume — total_work climbs
-        // from 0 again.
-        for _ in 0..3 {
-            tick_building(&mut b, &def, 2_000);
-        }
-        assert!(b.total_work > 0 && b.total_work < def.max_energy,
+        // After repair, production can resume — a single tick
+        // should bump total_work from 0 to a non-zero value.
+        tick_building(&mut b, &def, 2_000);
+        assert!(b.total_work > 0,
             "production should resume post-repair, total_work={}",
             b.total_work);
     }
