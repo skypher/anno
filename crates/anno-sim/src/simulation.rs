@@ -115,6 +115,14 @@ pub struct Simulation {
     /// Game binary consumes these to push events into the chat log.
     pub objective_completions: Vec<usize>,
 
+    /// `true` once every scenario objective has completed at
+    /// least once. Edge-triggered in the objectives tick: stays
+    /// `false` until the last objective flips, then flips to
+    /// `true` and emits a "[victory] Scenario complete!" line
+    /// in `event_log`. Renderers should freeze input + draw a
+    /// victory banner when this flips.
+    pub scenario_complete: bool,
+
     /// xorshift RNG state for the event ticker. Persisted as a sim field
     /// only; not serialized into save files (each load reseeds).
     rng_state: u64,
@@ -214,6 +222,7 @@ impl Simulation {
 
             objectives: crate::objectives::ObjectiveSet::default_starter(),
             objective_completions: Vec::new(),
+            scenario_complete: false,
 
             rng_state: 0xCBF29CE484222325,
 
@@ -524,7 +533,7 @@ impl Simulation {
         self.figures.extend(new_carriers);
     }
 
-    fn tick_population(&mut self) {
+    pub(crate) fn tick_population(&mut self) {
         // Refresh building maintenance totals per player so the economy
         // tick has up-to-date running costs. Also compute per-player
         // housing capacity from completed WOHN residences, scaled by
@@ -596,7 +605,18 @@ impl Simulation {
                 &p0, &self.buildings, &self.building_defs,
                 &self.warehouses, &self.players, 0,
             );
+            let any_just_done = !just_done.is_empty();
             self.objective_completions.extend(just_done);
+            // Edge-triggered scenario-complete: fire once when
+            // the LAST objective flips from pending to done.
+            if any_just_done && !self.scenario_complete {
+                let (done, total) = self.objectives.progress();
+                if total > 0 && done == total {
+                    self.scenario_complete = true;
+                    self.event_log.push(
+                        "[victory] Scenario complete!".to_string());
+                }
+            }
             let p0 = &p0;
 
             // Voice announcement: fire on entry into the bankruptcy
@@ -2163,6 +2183,41 @@ mod tests {
         assert_eq!(sim.buildings[0].owner, owner);
         assert!(sim.players[player_idx].gold < gold_before);
         assert!(!sim.buildings[0].is_built()); // construction in progress
+    }
+
+    #[test]
+    fn scenario_complete_flips_on_last_objective() {
+        use crate::objectives::{Objective, ObjectiveSet};
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        // Single objective: reach 10 000 gold.
+        sim.objectives = ObjectiveSet::new(vec![
+            Objective::AccumulateGold { amount: 10_000 },
+        ]);
+
+        // Below threshold — scenario_complete must stay false.
+        sim.players[0].gold = 1_000;
+        sim.tick_population();
+        assert!(!sim.scenario_complete);
+        assert!(!sim.event_log.iter().any(|l| l.starts_with("[victory]")));
+
+        // Cross the threshold — the next tick must flip
+        // scenario_complete and emit the victory line exactly
+        // once.
+        sim.players[0].gold = 12_000;
+        sim.tick_population();
+        assert!(sim.scenario_complete);
+        let victory_lines: usize = sim.event_log.iter()
+            .filter(|l| l.starts_with("[victory]")).count();
+        assert_eq!(victory_lines, 1,
+            "victory line should fire exactly once on the flip");
+
+        // Tick again — must NOT re-emit (edge-triggered).
+        sim.event_log.clear();
+        sim.tick_population();
+        assert!(sim.scenario_complete);
+        assert!(!sim.event_log.iter().any(|l| l.starts_with("[victory]")),
+            "victory line is edge-triggered");
     }
 
     #[test]

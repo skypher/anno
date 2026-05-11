@@ -3213,6 +3213,7 @@ fn main() {
                     } else if line.starts_with("[diplo]")
                         || line.starts_with("[outcome]")
                         || line.starts_with("[obj]")
+                        || line.starts_with("[victory]")
                     {
                         voice_trader_slot // triumph.wav for positive
                                           // diplomacy / objective /
