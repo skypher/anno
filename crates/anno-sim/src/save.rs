@@ -34,6 +34,18 @@ use std::path::Path;
 ///      loadable with empty names.
 pub const SAVE_VERSION: u32 = 16;
 
+/// Oldest save version this build can still deserialize. Versions
+/// between `MIN_LOADABLE_VERSION` and `SAVE_VERSION` rely on the
+/// `#[serde(default)]` attributes on newly-added fields to fill
+/// in zero/empty values. Anything older has either a hard binary
+/// incompatibility (enum-variant index shift, struct field
+/// reorder) or a known data-corruption risk and is hard-rejected.
+///
+/// v14 baseline: ObjectiveSet's `ReachTotalPopulation` variant
+/// shifted the bincode discriminants for every variant after
+/// it, so v13 saves cannot decode through this build at all.
+pub const MIN_LOADABLE_VERSION: u32 = 14;
+
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
 
@@ -148,7 +160,11 @@ pub fn load_from_file(path: &Path) -> Result<SaveState, SaveError> {
     }
     let state: SaveState = bincode::deserialize(&bytes[SAVE_MAGIC.len()..])
         .map_err(|e| SaveError::Decode(e.to_string()))?;
-    if state.version != SAVE_VERSION {
+    // Newer versions are unsupported (this build's struct schema
+    // doesn't know how to reach forward) and pre-v14 saves carry
+    // a different bincode enum layout that this build can't
+    // decode safely.
+    if state.version > SAVE_VERSION || state.version < MIN_LOADABLE_VERSION {
         return Err(SaveError::VersionMismatch {
             found: state.version,
             expected: SAVE_VERSION,
@@ -161,6 +177,50 @@ pub fn load_from_file(path: &Path) -> Result<SaveState, SaveError> {
 mod tests {
     use super::*;
     use crate::player::Player;
+
+    #[test]
+    fn load_from_file_accepts_intermediate_versions() {
+        // Build a save payload with version = MIN_LOADABLE_VERSION,
+        // verify the loader accepts it instead of hard-rejecting.
+        let tmp = std::env::temp_dir().join("anno_save_intermediate.bin");
+        let mut state = SaveState {
+            version: MIN_LOADABLE_VERSION,
+            game_clock: 0,
+            speed_multiplier: 1,
+            paused: false,
+            autosave_timer_ms: 0,
+            players: vec![Player::new_human(0)],
+            buildings: vec![],
+            warehouses: vec![],
+            figures: vec![],
+            military_units: vec![],
+            diplomacy: crate::combat::DiplomacyMatrix::new(),
+            trade_routes: vec![],
+            trade_ships: vec![],
+            history: Default::default(),
+            objectives: Default::default(),
+        };
+        let payload = bincode::serialize(&state).unwrap();
+        let mut buf = Vec::with_capacity(SAVE_MAGIC.len() + payload.len());
+        buf.extend_from_slice(&SAVE_MAGIC);
+        buf.extend_from_slice(&payload);
+        std::fs::write(&tmp, &buf).unwrap();
+        let loaded = load_from_file(&tmp).expect("intermediate version should load");
+        assert_eq!(loaded.version, MIN_LOADABLE_VERSION);
+
+        // A version below MIN_LOADABLE_VERSION must hard-reject.
+        state.version = MIN_LOADABLE_VERSION - 1;
+        let payload = bincode::serialize(&state).unwrap();
+        let mut buf = Vec::with_capacity(SAVE_MAGIC.len() + payload.len());
+        buf.extend_from_slice(&SAVE_MAGIC);
+        buf.extend_from_slice(&payload);
+        std::fs::write(&tmp, &buf).unwrap();
+        match load_from_file(&tmp) {
+            Err(SaveError::VersionMismatch { .. }) => {}
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
 
     #[test]
     fn round_trip_minimal_simulation() {
