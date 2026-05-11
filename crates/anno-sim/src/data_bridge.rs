@@ -611,6 +611,52 @@ pub fn kontor_warehouses_from_szs(
     out
 }
 
+/// Seed an initial `DiplomacyMatrix` from PLAYER4's per-slot
+/// `relationships` arrays. The audit-derived value mapping is
+/// HEURISTIC (binary semantics not yet pinned — see TaskList
+/// #126):
+///
+///   0 → Neutral (no explicit relationship; default state)
+///   1 → Neutral (rare, possibly cooldown — treat as neutral)
+///   2 → Neutral (rare, possibly treaty-pending — treat as neutral)
+///   3 → Neutral (peace/pact)
+///
+/// Currently all four PLAYER4 codes resolve to `Neutral`,
+/// because we don't have a confident "this code means war"
+/// reading. Callers should still apply additional War-edge
+/// seeding (e.g. native-ship spawn → War with slot 5) on top
+/// of this matrix.
+pub fn diplomacy_from_player4_relationships(
+    players: &[anno_formats::szs::PlayerSlotInit],
+) -> crate::combat::DiplomacyMatrix {
+    let mut dm = crate::combat::DiplomacyMatrix::new();
+    let n = players.len().min(7);
+    for i in 0..n {
+        for j in 0..n {
+            if i == j { continue; }
+            let code = players[i].relationships[j];
+            let state = code_to_diplomacy(code);
+            // Only downgrade default Neutral to War / upgrade
+            // to Allied; never overwrite an already-set War.
+            if dm.get(i as u8, j as u8) != crate::combat::Diplomacy::War {
+                dm.set(i as u8, j as u8, state);
+            }
+        }
+    }
+    dm
+}
+
+/// Map a raw PLAYER4 relationship code to the sim's
+/// `Diplomacy` enum. Heuristic-only; see
+/// `diplomacy_from_player4_relationships` doc-comment.
+pub fn code_to_diplomacy(code: u32) -> crate::combat::Diplomacy {
+    use crate::combat::Diplomacy;
+    match code {
+        0..=3 => Diplomacy::Neutral,
+        _ => Diplomacy::Neutral,
+    }
+}
+
 /// `route_id` value used for SHIP4 traders that have no
 /// configured route. Picked so it can never collide with a
 /// real `TradeRoute::id` (those start at 0 and grow
@@ -934,6 +980,34 @@ mod tests {
             total += 1;
         }
         assert!(total > 0, "audit must cover at least one scenario");
+    }
+
+    #[test]
+    fn diplomacy_from_relationships_defaults_neutral_for_now() {
+        use anno_formats::szs::PlayerSlotInit;
+        use crate::combat::Diplomacy;
+        // Synthesise three slots with the typical pattern:
+        // slots 0..=2 with relationships [0, 0, 0, 3, 3, 3, 3].
+        let mk = |relationships: [u32; 7]| PlayerSlotInit {
+            relationships,
+            ..Default::default()
+        };
+        let players = vec![
+            mk([0, 0, 0, 3, 3, 3, 3]),
+            mk([0, 0, 0, 3, 3, 3, 3]),
+            mk([0, 0, 0, 3, 3, 3, 3]),
+        ];
+        let dm = diplomacy_from_player4_relationships(&players);
+        // Heuristic mapping currently produces Neutral for
+        // every pair — until the code semantics are pinned,
+        // we don't synthesise War from these arrays alone.
+        for i in 0..3u8 {
+            for j in 0..3u8 {
+                if i == j { continue; }
+                assert_eq!(dm.get(i, j), Diplomacy::Neutral,
+                    "default mapping should be Neutral for ({i}, {j})");
+            }
+        }
     }
 
     #[test]
