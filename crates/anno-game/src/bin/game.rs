@@ -6260,10 +6260,24 @@ fn init_simulation(
         }
     }
 
-    // Create warehouses — one per island with production buildings
-    let mut island_ids: Vec<u8> = instances.iter().map(|i| i.island_id).collect();
-    island_ids.sort();
-    island_ids.dedup();
+    // Create warehouses — one per island with production
+    // buildings OR a STADT4 city. The STADT4 fallback covers
+    // pirate / native islands that ship as dwelling-only
+    // settlements with no production tiles in INSELHAUS; the
+    // original engine spawns a Kontor for those slots
+    // dynamically at scenario start.
+    let mut island_ids: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+    for inst in &instances {
+        island_ids.insert(inst.island_id);
+    }
+    for island in &szs.islands {
+        if let Some(city) = island.city.as_ref() {
+            if !city.name.is_empty() {
+                island_ids.insert(island.number);
+            }
+        }
+    }
+    let island_ids: Vec<u8> = island_ids.into_iter().collect();
 
     // Prefer the actual KONTOR tile placement from INSELHAUS
     // when the scenario provides it. Falls back to a centroid
@@ -6281,21 +6295,29 @@ fn init_simulation(
             .iter()
             .filter(|b| b.island_id == island_id)
             .collect();
-        if island_buildings.is_empty() {
-            continue;
-        }
-        let avg_x = island_buildings.iter().map(|b| b.tile_x as u32).sum::<u32>()
-            / island_buildings.len() as u32;
-        let avg_y = island_buildings.iter().map(|b| b.tile_y as u32).sum::<u32>()
-            / island_buildings.len() as u32;
         // Pick the fallback warehouse owner from the island's
         // STADT4 city when present.
-        let owner = szs.islands.iter()
-            .find(|i| i.number == island_id)
+        let island = szs.islands.iter().find(|i| i.number == island_id);
+        let owner = island
             .and_then(|i| i.city.as_ref())
             .map(|c| c.owner_slot)
             .unwrap_or(0);
-        warehouses.push(Warehouse::new(island_id, owner, avg_x as u16, avg_y as u16));
+        let (avg_x, avg_y) = if !island_buildings.is_empty() {
+            let ax = island_buildings.iter().map(|b| b.tile_x as u32).sum::<u32>()
+                / island_buildings.len() as u32;
+            let ay = island_buildings.iter().map(|b| b.tile_y as u32).sum::<u32>()
+                / island_buildings.len() as u32;
+            (ax as u16, ay as u16)
+        } else if let Some(island) = island {
+            // Dwelling-only pirate/native settlements: anchor on
+            // the island centre. The original engine drops a
+            // Kontor here on first sight.
+            (island.x_pos + island.width as u16 / 2,
+             island.y_pos + island.height as u16 / 2)
+        } else {
+            continue;
+        };
+        warehouses.push(Warehouse::new(island_id, owner, avg_x, avg_y));
     }
 
     // Build island walkability maps
