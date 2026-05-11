@@ -1411,6 +1411,39 @@ mod tests {
     }
 
     #[test]
+    fn insel5_byte_5d_constant_0x11_with_one_outlier() {
+        // INSEL5 byte 0x5D is 0x11 (=17) on 545 of 546 corpus
+        // islands and 0x51 on a single outlier. Pin the
+        // overwhelming majority and document the outlier.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut total = 0;
+        let mut outliers = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            for chunk in parsed.chunks.iter().filter(|c| c.name == "INSEL5") {
+                if chunk.data.len() < 0x60 { continue; }
+                let b = chunk.data[0x5D];
+                if b != 0x11 {
+                    outliers += 1;
+                    assert_eq!(b, 0x51,
+                        "unexpected INSEL5 byte 0x5D outlier: {b:#04x}");
+                }
+                total += 1;
+            }
+        }
+        assert!(total > 100);
+        assert!(outliers <= 1, "only one corpus-wide 0x5D outlier expected");
+    }
+
+    #[test]
     fn insel5_byte_03_only_nonzero_in_trust_no_one0() {
         // Audit shows INSEL5 byte 0x03 == 0 for all islands
         // except Trust no one0's six islands (all of them set

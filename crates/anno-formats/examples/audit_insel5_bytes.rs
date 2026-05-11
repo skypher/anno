@@ -50,6 +50,28 @@ fn main() {
     println!();
 
     // Dump first records of selected scenarios.
+    // Probe the 100%-density region around 0x5C..0x70 across
+    // the corpus.
+    let mut byte_5c_dist: std::collections::BTreeMap<u8, u32> = Default::default();
+    let mut byte_5d_dist: std::collections::BTreeMap<u8, u32> = Default::default();
+    let mut u32_60_dist: std::collections::BTreeMap<u32, u32> = Default::default();
+    for (_, body) in &all_bodies {
+        if body.len() < 0x68 { continue; }
+        *byte_5c_dist.entry(body[0x5C]).or_default() += 1;
+        *byte_5d_dist.entry(body[0x5D]).or_default() += 1;
+        let v = u32::from_le_bytes([body[0x60], body[0x61], body[0x62], body[0x63]]);
+        *u32_60_dist.entry(v).or_default() += 1;
+    }
+    println!("\nbyte 0x5C distribution: {byte_5c_dist:?}");
+    println!("byte 0x5D distribution: {byte_5d_dist:?}");
+    println!("u32 at 0x60 top 10:");
+    let mut sorted: Vec<_> = u32_60_dist.iter().collect();
+    sorted.sort_by_key(|&(_, c)| std::cmp::Reverse(*c));
+    for (v, c) in sorted.iter().take(10) {
+        println!("  {v}  (0x{v:X}): {c} islands");
+    }
+    println!();
+
     println!("Per-island dumps for representative scenarios (offsets 0..=0x40):");
     let want = ["Tutorial0", "A Plague of Pirates", "Atoll", "New Horizons2"];
     for (scen, body) in &all_bodies {
