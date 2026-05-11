@@ -1607,6 +1607,38 @@ mod tests {
     }
 
     #[test]
+    fn player4_slot_u32_0x34_trader_always_zero() {
+        // Audit-derived corpus invariant: PLAYER4 slot 4 (the
+        // free trader) carries `slot_u32_0x34 == 0` across all
+        // 62 shipping `.szs` files. Slot 5 (native) and slot 6
+        // (pirate) each carry only 2 distinct values
+        // (typically 0 or 0xFFFFFFFF). The active player + AI
+        // rivals (slots 0..=3) vary widely (12-20 distinct
+        // values each) since this field encodes per-slot AI
+        // unlocks / starting-state mask.
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() { return; }
+        let mut slot4_seen = 0;
+        for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
+            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            if let Some(p) = parsed.players.get(4) {
+                assert_eq!(p.slot_u32_0x34, 0,
+                    "{:?}: slot 4 (trader) slot_u32_0x34 must be 0, got 0x{:08X}",
+                    path.file_stem().unwrap(), p.slot_u32_0x34);
+                slot4_seen += 1;
+            }
+        }
+        assert!(slot4_seen > 50);
+    }
+
+    #[test]
     fn player4_relationship_arrays_carry_diplomacy_codes_0_3() {
         // Corpus invariant: PLAYER4 0xC0 and 0x140 arrays
         // (7 u32 stride-8 each) carry values from {0, 1, 2, 3}
