@@ -32,6 +32,30 @@ pub enum Difficulty {
     Expert = 3,
 }
 
+/// Decode PLAYER4's `slot_u16_0x18` byte into an
+/// `(AiPersonality, Difficulty)` pair. Audit-derived mapping
+/// (binary semantics not yet pinned, see TaskList #120):
+///
+///   0     → Economic / Medium  (default)
+///   1, 2  → Economic / Easy
+///   3, 4  → Balanced / Medium
+///   5     → Balanced / Hard
+///   6, 7  → Military / Hard
+///
+/// The slot_u16_0x18 values correlate with per-scenario
+/// difficulty (Magnate2 [2,5,6,6,...] is the hardest "Magnate"
+/// tier; Plague leaves every slot at 0). The mapping prefers
+/// stronger personalities for higher numbers.
+pub fn personality_from_slot_byte(b: u16) -> (AiPersonality, Difficulty) {
+    match b {
+        0 => (AiPersonality::Economic, Difficulty::Medium),
+        1 | 2 => (AiPersonality::Economic, Difficulty::Easy),
+        3 | 4 => (AiPersonality::Balanced, Difficulty::Medium),
+        5 => (AiPersonality::Balanced, Difficulty::Hard),
+        _ => (AiPersonality::Military, Difficulty::Hard),
+    }
+}
+
 /// Building construction priority for AI decision-making.
 /// Ordered by importance within each phase.
 #[derive(Debug, Clone)]
@@ -405,6 +429,31 @@ mod tests {
         if let AiAction::SetTaxRate { rate, .. } = tax_actions[0] {
             assert!(*rate < 64, "Should lower tax rate");
         }
+    }
+
+    #[test]
+    fn personality_from_slot_byte_pins_heuristic_mapping() {
+        // 0 → default Economic / Medium.
+        assert_eq!(personality_from_slot_byte(0),
+            (AiPersonality::Economic, Difficulty::Medium));
+        // 1, 2 → easy economic.
+        assert_eq!(personality_from_slot_byte(1).1, Difficulty::Easy);
+        assert_eq!(personality_from_slot_byte(2).1, Difficulty::Easy);
+        // 3, 4 → balanced medium.
+        assert_eq!(personality_from_slot_byte(3),
+            (AiPersonality::Balanced, Difficulty::Medium));
+        assert_eq!(personality_from_slot_byte(4),
+            (AiPersonality::Balanced, Difficulty::Medium));
+        // 5 → balanced hard.
+        assert_eq!(personality_from_slot_byte(5),
+            (AiPersonality::Balanced, Difficulty::Hard));
+        // 6, 7 → military hard (the toughest tier).
+        assert_eq!(personality_from_slot_byte(6),
+            (AiPersonality::Military, Difficulty::Hard));
+        assert_eq!(personality_from_slot_byte(7),
+            (AiPersonality::Military, Difficulty::Hard));
+        // Out-of-range (anything > 7) lands in the same tough bucket.
+        assert_eq!(personality_from_slot_byte(99).0, AiPersonality::Military);
     }
 
     #[test]

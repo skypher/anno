@@ -6374,10 +6374,14 @@ fn init_simulation(
         sim.players.push(p);
 
         // Spawn an AI controller alongside every AI rival slot.
+        // Personality + difficulty derive from PLAYER4's
+        // `slot_u16_0x18` (heuristic mapping, see
+        // `ai::personality_from_slot_byte`).
         if effective_state == 0x0c {
-            sim.ai_controllers.push(AiController::new(
-                slot, AiPersonality::Economic, Difficulty::Medium,
-            ));
+            let slot_byte = init.map(|p| p.slot_u16_0x18).unwrap_or(0);
+            let (personality, difficulty) =
+                anno_sim::ai::personality_from_slot_byte(slot_byte);
+            sim.ai_controllers.push(AiController::new(slot, personality, difficulty));
         }
     }
 
