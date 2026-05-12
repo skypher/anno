@@ -1,1 +1,1 @@
-// anno-game: ties all subsystems together
+pub mod input;

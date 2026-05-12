@@ -1908,6 +1908,31 @@ fn main() {
                                     sim.speed_multiplier -= 1;
                                 }
                             }
+                            Keycode::G if editor_mode => {
+                                // In editor mode: append a sample
+                                // gold-target objective. Cycles
+                                // the threshold 5k/10k/20k/50k.
+                                use anno_sim::objectives::Objective;
+                                let amounts = [5_000, 10_000, 20_000, 50_000];
+                                let cur = sim.objectives.items.iter()
+                                    .filter_map(|(o, _)| match o {
+                                        Objective::AccumulateGold { amount } => Some(*amount),
+                                        _ => None,
+                                    })
+                                    .last()
+                                    .unwrap_or(0);
+                                let next = amounts.iter()
+                                    .find(|&&a| a > cur)
+                                    .copied()
+                                    .unwrap_or(amounts[0]);
+                                sim.objectives.items.push((
+                                    Objective::AccumulateGold { amount: next }, false,
+                                ));
+                                save_banner = Some((
+                                    format!("editor: added gold target {next}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
                             Keycode::G => {
                                 if sim.speed_multiplier < 8 {
                                     sim.speed_multiplier += 1;
@@ -2072,6 +2097,9 @@ fn main() {
                                     }
                                 }
                             }
+                            Keycode::V if shift_held => {
+                                eval_panel = !eval_panel;
+                            }
                             Keycode::V => {
                                 // Cycle volume: 0.2 → 0.4 → 0.6 → 0.8 → 1.0 → 0.0 → 0.2...
                                 music_volume = if music_volume >= 0.95 {
@@ -2092,11 +2120,17 @@ fn main() {
                             Keycode::H => {
                                 show_hud = !show_hud;
                             }
+                            Keycode::C if shift_held => {
+                                cities_panel = !cities_panel;
+                            }
                             Keycode::C => {
                                 show_coverage = !show_coverage;
                             }
                             Keycode::A => {
                                 market_panel = !market_panel;
+                            }
+                            Keycode::J if shift_held => {
+                                music_panel = !music_panel;
                             }
                             Keycode::J => {
                                 ship_panel = !ship_panel;
@@ -2118,40 +2152,6 @@ fn main() {
                             }
                             Keycode::F12 => {
                                 show_perf = !show_perf;
-                            }
-                            Keycode::V if shift_held => {
-                                eval_panel = !eval_panel;
-                            }
-                            Keycode::C if shift_held => {
-                                cities_panel = !cities_panel;
-                            }
-                            Keycode::J if shift_held => {
-                                music_panel = !music_panel;
-                            }
-                            Keycode::G if editor_mode => {
-                                // In editor mode: append a sample
-                                // gold-target objective. Cycles
-                                // the threshold 5k/10k/20k/50k.
-                                use anno_sim::objectives::Objective;
-                                let amounts = [5_000, 10_000, 20_000, 50_000];
-                                let cur = sim.objectives.items.iter()
-                                    .filter_map(|(o, _)| match o {
-                                        Objective::AccumulateGold { amount } => Some(*amount),
-                                        _ => None,
-                                    })
-                                    .last()
-                                    .unwrap_or(0);
-                                let next = amounts.iter()
-                                    .find(|&&a| a > cur)
-                                    .copied()
-                                    .unwrap_or(amounts[0]);
-                                sim.objectives.items.push((
-                                    Objective::AccumulateGold { amount: next }, false,
-                                ));
-                                save_banner = Some((
-                                    format!("editor: added gold target {next}"),
-                                    std::time::Instant::now(),
-                                ));
                             }
                             Keycode::P if editor_mode => {
                                 // Append a population objective:

@@ -12,6 +12,7 @@ pub mod disaster;
 pub mod economy;
 pub mod entity;
 pub mod exploration;
+pub mod fidelity;
 pub mod formation;
 pub mod free_trader;
 pub mod hiscore;

@@ -22,12 +22,6 @@ use crate::trade::{self, TradeRoute, TradeShip};
 use crate::types::TICKS_PER_MINUTE;
 use crate::warehouse::Warehouse;
 
-/// Maximum delta time per simulation step (prevents physics jumps).
-const MAX_STEP_MS: u32 = 200;
-
-/// Delta time clamp if scaled time exceeds this (prevents runaway).
-const MAX_TOTAL_MS: u32 = 2999;
-
 /// Auto-save interval in game ticks (~10 minutes of game time).
 pub const AUTOSAVE_INTERVAL_MS: u32 = 599_999;
 
@@ -193,12 +187,12 @@ impl Simulation {
             // game-tick decrement (1602_exe.c:16110); the off-by-one
             // values (999 / 9999 / 29999 / 4999) were unjustified.
             timer_production: SubsystemTimer::new(crate::production::PRODUCTION_TICK_MS),
-            timer_population: SubsystemTimer::new(10_000),
-            timer_events: SubsystemTimer::new(10_000),
-            timer_ships: SubsystemTimer::new(1_000),
-            timer_market: SubsystemTimer::new(1_000),
-            timer_military: SubsystemTimer::new(10_000),
-            timer_diplomacy: SubsystemTimer::new(5_000),
+            timer_population: SubsystemTimer::new(crate::fidelity::POPULATION_TICK_MS),
+            timer_events: SubsystemTimer::new(crate::fidelity::EVENT_TICK_MS),
+            timer_ships: SubsystemTimer::new(crate::fidelity::SHIP_TICK_MS),
+            timer_market: SubsystemTimer::new(crate::fidelity::MARKET_TICK_MS),
+            timer_military: SubsystemTimer::new(crate::fidelity::MILITARY_TICK_MS),
+            timer_diplomacy: SubsystemTimer::new(crate::fidelity::DIPLOMACY_TICK_MS),
 
             players: Vec::new(),
             buildings: Vec::new(),
@@ -241,6 +235,19 @@ impl Simulation {
     /// Returns the static price from `prices::price_of`.
     pub fn current_price(&self, good: crate::types::Good) -> crate::prices::GoodPrice {
         crate::prices::price_of(good)
+    }
+
+    pub fn subsystem_timing_snapshot(&self) -> Vec<(crate::fidelity::Subsystem, u32)> {
+        use crate::fidelity::Subsystem;
+        vec![
+            (Subsystem::Production, self.timer_production.interval_ms),
+            (Subsystem::Population, self.timer_population.interval_ms),
+            (Subsystem::Diplomacy, self.timer_diplomacy.interval_ms),
+            (Subsystem::MarketCoverage, self.timer_market.interval_ms),
+            (Subsystem::Ships, self.timer_ships.interval_ms),
+            (Subsystem::Military, self.timer_military.interval_ms),
+            (Subsystem::Events, self.timer_events.interval_ms),
+        ]
     }
 
     /// Civilization-power score for a player slot. Combines settled
@@ -302,9 +309,10 @@ impl Simulation {
         let Some(ship) = target_ship else { return; };
         let (sx, sy) = (ship.world_x, ship.world_y);
 
-        // 1-in-3 chance per event tick.
+        // 1-in-3 chance per event tick. Tracked in fidelity specs as
+        // speculative until the pirate event scheduler is decoded.
         let r = self.next_rand();
-        if r % 3 != 0 { return; }
+        if r % crate::fidelity::PIRATE_EVENT_GATE != 0 { return; }
 
         // Pirate origin: prefer an active PIRATWOHN hideout building
         // (manual sec. 7.5 "Pirates and Natives" — pirates have
@@ -404,15 +412,15 @@ impl Simulation {
             return;
         }
 
-        // Scale by game speed
-        let mut remaining = real_dt_ms * self.speed_multiplier;
-        if remaining > MAX_TOTAL_MS {
-            remaining = 50; // Clamp runaway (matches original behavior)
-        }
+        // Scale by game speed.
+        let mut remaining = crate::fidelity::scaled_sim_ms(
+            real_dt_ms,
+            self.speed_multiplier,
+        );
 
         // Process in chunks of MAX_STEP_MS
         while remaining > 0 {
-            let dt = remaining.min(MAX_STEP_MS);
+            let dt = remaining.min(crate::fidelity::MAX_STEP_MS);
             remaining -= dt;
 
             self.step(dt);
@@ -1316,7 +1324,7 @@ impl Simulation {
         // binary uses for the trader's "seek next target" decision.
         if need_one_more {
             let r = self.next_rand();
-            if (r & 3) != 0 {
+            if (r & crate::fidelity::FREE_TRADER_TARGET_GATE_MASK) != 0 {
                 return;
             }
             // Spawn at a random map edge.
@@ -1374,7 +1382,7 @@ impl Simulation {
             // (`1602_exe.c:57713`). The fixed minimum gap is 60
             // ship-ticks (~6 s in our 10 Hz tick rate, decoded from
             // `:98053` `DAT_005b6040 / 600` minute display).
-            self.free_trader_cooldown = 60;
+            self.free_trader_cooldown = crate::fidelity::FREE_TRADER_RESPAWN_COOLDOWN_TICKS;
         }
     }
 
