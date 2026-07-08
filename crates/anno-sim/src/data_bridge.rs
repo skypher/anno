@@ -74,20 +74,48 @@ fn parse_good_covers_all_haeuser_cod_tokens() {
     // / Workstoff: lines (excluding the literal "ALLWARE" / "NOWARE"
     // wildcards which always resolve to None).
     let tokens = [
-        "ALKOHOL", "BAUM", "BAUMWOLLE", "EISEN", "EISENERZ", "ERZE",
-        "FISCHE", "FLEISCH", "GETREIDE", "GEWUERZBAUM", "GEWUERZE",
-        "GOLD", "GRAS", "HOLZ", "KAKAO", "KAKAOBAUM", "KANONEN",
-        "KLEIDUNG", "KORN", "MEHL", "MUSKETEN", "NAHRUNG",
-        "SCHMUCK", "SCHWERTER", "STEINE", "STOFFE", "TABAK",
-        "TABAKBAUM", "TABAKWAREN", "WEINTRAUBEN", "WERKZEUG", "WILD",
-        "WOLLE", "ZIEGEL", "ZUCKER", "ZUCKERROHR",
+        "ALKOHOL",
+        "BAUM",
+        "BAUMWOLLE",
+        "EISEN",
+        "EISENERZ",
+        "ERZE",
+        "FISCHE",
+        "FLEISCH",
+        "GETREIDE",
+        "GEWUERZBAUM",
+        "GEWUERZE",
+        "GOLD",
+        "GRAS",
+        "HOLZ",
+        "KAKAO",
+        "KAKAOBAUM",
+        "KANONEN",
+        "KLEIDUNG",
+        "KORN",
+        "MEHL",
+        "MUSKETEN",
+        "NAHRUNG",
+        "SCHMUCK",
+        "SCHWERTER",
+        "STEINE",
+        "STOFFE",
+        "TABAK",
+        "TABAKBAUM",
+        "TABAKWAREN",
+        "WEINTRAUBEN",
+        "WERKZEUG",
+        "WILD",
+        "WOLLE",
+        "ZIEGEL",
+        "ZUCKER",
+        "ZUCKERROHR",
     ];
     for tok in tokens {
         let g = parse_good(tok);
         // GRAS is the only one that legitimately maps to None.
         if tok != "GRAS" {
-            assert_ne!(g, Good::None,
-                "token {tok} should map to a real good");
+            assert_ne!(g, Good::None, "token {tok} should map to a real good");
         }
     }
 }
@@ -98,24 +126,27 @@ fn rohstoff_to_fertility_matches_audit_pairs() {
     use anno_formats::szs::Fertility;
     // Pairs derived from `cargo run --example audit_fertility_mapping`
     // — every PLANTAGE entry's Rohstoff field paired with the
-    // climate-bound crop it grows.
+    // fertility-gated crop it grows.
     let pairs: &[(&str, Option<Fertility>)] = &[
-        ("GETREIDE",    Some(Fertility::Grain)),
-        ("TABAKBAUM",   Some(Fertility::Tobacco)),
+        ("GETREIDE", Some(Fertility::Grain)),
+        ("TABAKBAUM", Some(Fertility::Tobacco)),
         ("GEWUERZBAUM", Some(Fertility::Spices)),
-        ("ZUCKERROHR",  Some(Fertility::Sugarcane)),
-        ("BAUMWOLLE",   Some(Fertility::Cotton)),
+        ("ZUCKERROHR", Some(Fertility::Sugarcane)),
+        ("BAUMWOLLE", Some(Fertility::Cotton)),
         ("WEINTRAUBEN", Some(Fertility::Vines)),
-        ("KAKAOBAUM",   Some(Fertility::Cocoa)),
+        ("KAKAOBAUM", Some(Fertility::Cocoa)),
         // Universal raw materials should NOT bind a fertility.
-        ("BAUM",        None),
-        ("STEINE",      None),
-        ("ERZE",        None),
-        ("",            None),
+        ("BAUM", None),
+        ("STEINE", None),
+        ("ERZE", None),
+        ("", None),
     ];
     for (rohstoff, want) in pairs {
-        assert_eq!(rohstoff_to_fertility(rohstoff), *want,
-            "rohstoff_to_fertility({rohstoff:?})");
+        assert_eq!(
+            rohstoff_to_fertility(rohstoff),
+            *want,
+            "rohstoff_to_fertility({rohstoff:?})"
+        );
     }
 }
 
@@ -127,21 +158,21 @@ fn parse_bauinfra_matches_haeuser_cod_ladder() {
     // resolve to (digit - 1 of the STUFE rung).
     let cases: &[(&str, u8)] = &[
         ("INFRA_KONTOR_1", 1), // Settler  (= INFRA_STUFE_2B)
-        ("INFRA_BURG_1",   1), // Settler  (= INFRA_STUFE_2G)
+        ("INFRA_BURG_1", 1),   // Settler  (= INFRA_STUFE_2G)
         ("INFRA_WACHTURM", 1), // Settler  (= INFRA_STUFE_2G)
         ("INFRA_KONTOR_2", 2), // Citizen  (= INFRA_STUFE_3A)
-        ("INFRA_KANON",    2), // Citizen  (= INFRA_STUFE_3E)
+        ("INFRA_KANON", 2),    // Citizen  (= INFRA_STUFE_3E)
         ("INFRA_KONTOR_3", 3), // Merchant (= INFRA_STUFE_4A)
-        ("INFRA_BURG_2",   3), // Merchant (= INFRA_STUFE_4B)
-        ("INFRA_MUSKETE",  3), // Merchant (= INFRA_STUFE_4B)
-        ("INFRA_BURG_3",   4), // Aristo   (= INFRA_STUFE_5B)
+        ("INFRA_BURG_2", 3),   // Merchant (= INFRA_STUFE_4B)
+        ("INFRA_MUSKETE", 3),  // Merchant (= INFRA_STUFE_4B)
+        ("INFRA_BURG_3", 4),   // Aristo   (= INFRA_STUFE_5B)
         // Direct STUFE tokens.
         ("INFRA_STUFE_1A", 0),
         ("INFRA_STUFE_5A", 4),
-        ("",               0),
+        ("", 0),
         // Cultural-building tags (no marker-table alias defined).
-        ("INFRA_KIRCHE",   0),
-        ("INFRA_SCHULE",   0),
+        ("INFRA_KIRCHE", 0),
+        ("INFRA_SCHULE", 0),
     ];
     for (tok, want) in cases {
         let got = parse_bauinfra(tok);
@@ -209,9 +240,9 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
             "FISCHEREI" | "JAGDHAUS" => 5,
             _ => 5, // Bakery / Butcher per appendix
         },
-        Good::Flour => 5,                 // Windmill
-        Good::Grain | Good::Cattle => 5,  // Plantation farms
-        Good::Cotton | Good::Wool => 10,  // Wool/cotton farms
+        Good::Flour => 5,                // Windmill
+        Good::Grain | Good::Cattle => 5, // Plantation farms
+        Good::Cotton | Good::Wool => 10, // Wool/cotton farms
         // Heavy industry.
         Good::Cannons => 60,
         Good::Muskets => 45,
@@ -222,15 +253,15 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         Good::Gold => 60,
         Good::Jewelry => 45,
         // Cloth chain.
-        Good::Cloth => 20,                // Weaving mill / weaver / tailor
+        Good::Cloth => 20, // Weaving mill / weaver / tailor
         Good::Clothing => 20,
         // Plantations.
         Good::Sugar | Good::Tobacco | Good::Spices | Good::Cocoa => 5,
-        Good::Wood => 5,                  // Forester
+        Good::Wood => 5, // Forester
         Good::Stone | Good::Bricks => 25,
         // Drinks.
-        Good::Alcohol => 15,              // Distillery
-        Good::Grapes => 35,               // Winery
+        Good::Alcohol => 15, // Distillery
+        Good::Grapes => 35,  // Winery
         Good::TobaccoProducts => 25,
         Good::WildGame => 5,
         Good::Silk => 20,
@@ -238,8 +269,7 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         // Non-production buildings (markets etc.) — fall through.
         _ => match prod_kind_str {
             "HANDWERK" => 5,
-            "ROHSTOFF" | "PLANTAGE" | "STEINBRUCH" | "BERGWERK"
-            | "JAGDHAUS" | "FISCHEREI" => 3,
+            "ROHSTOFF" | "PLANTAGE" | "STEINBRUCH" | "BERGWERK" | "JAGDHAUS" | "FISCHEREI" => 3,
             "WEIDETIER" | "ROHSTWACHS" => 2,
             _ => 0,
         },
@@ -264,21 +294,18 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
     use crate::types::ProductionType;
     let category: u8 = match cod_building.kind.as_str() {
         // Terrain / nature.
-        "BODEN" | "WALD" | "FELS" | "STRAND" | "MEER" | "FLUSS"
-        | "FLUSSECK" | "MUENDUNG" | "HANG" | "HANGECK" | "HANGQUELL"
-        | "BRANDUNG" | "BRANDECK" | "STRANDECKA" | "STRANDECKI"
-        | "STRANDMUND" | "STRANDRUINE" | "STRANDVARI" | "STRANDHAUS"
+        "BODEN" | "WALD" | "FELS" | "STRAND" | "MEER" | "FLUSS" | "FLUSSECK" | "MUENDUNG"
+        | "HANG" | "HANGECK" | "HANGQUELL" | "BRANDUNG" | "BRANDECK" | "STRANDECKA"
+        | "STRANDECKI" | "STRANDMUND" | "STRANDRUINE" | "STRANDVARI" | "STRANDHAUS"
         | "WEIDETIER" | "MAUERSTRAND" | "TURMSTRAND" => 0,
         // Residential.
         "WOHNUNG" | "PIRATWOHN" => 1,
         // Production / industry / raw materials.
-        "HANDWERK" | "PLANTAGE" | "ROHSTOFF" | "ROHSTERZ"
-        | "ROHSTWACHS" | "BERGWERK" | "STEINBRUCH" | "MINE"
-        | "JAGDHAUS" | "FISCHEREI" | "WMUEHLE" => 2,
+        "HANDWERK" | "PLANTAGE" | "ROHSTOFF" | "ROHSTERZ" | "ROHSTWACHS" | "BERGWERK"
+        | "STEINBRUCH" | "MINE" | "JAGDHAUS" | "FISCHEREI" | "WMUEHLE" => 2,
         // Public services and culture.
-        "KAPELLE" | "KIRCHE" | "SCHULE" | "HOCHSCHULE" | "THEATER"
-        | "BADEHAUS" | "BRUNNEN" | "WIRT" | "DENKMAL" | "TRIUMPH"
-        | "KLINIK" | "GALGEN" | "MARKT" | "PLATZ" => 3,
+        "KAPELLE" | "KIRCHE" | "SCHULE" | "HOCHSCHULE" | "THEATER" | "BADEHAUS" | "BRUNNEN"
+        | "WIRT" | "DENKMAL" | "TRIUMPH" | "KLINIK" | "GALGEN" | "MARKT" | "PLATZ" => 3,
         // Trade / harbour.
         "KONTOR" | "HAFEN" | "WERFT" | "PIER" => 4,
         // Military.
@@ -290,8 +317,8 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
     };
     let production_type = match prod_kind_str {
         "HANDWERK" | "BAECKER" => ProductionType::Craft,
-        "PLANTAGE" | "ROHSTOFF" | "ROHSTERZ" | "ROHSTWACHS"
-        | "JAGDHAUS" | "FISCHEREI" | "WEIDETIER" => ProductionType::Plantation,
+        "PLANTAGE" | "ROHSTOFF" | "ROHSTERZ" | "ROHSTWACHS" | "JAGDHAUS" | "FISCHEREI"
+        | "WEIDETIER" => ProductionType::Plantation,
         "BERGWERK" | "STEINBRUCH" | "MINE" => ProductionType::Mine,
         "WOHNUNG" => ProductionType::Residence,
         _ => ProductionType::Craft,
@@ -328,14 +355,20 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         min_tier: parse_bauinfra(prop("Bauinfra")),
         max_no_input_ticks: {
             let v = prop_int("Maxnorohst");
-            if v > 0 { (v as u8).min(255) } else { 6 }
+            if v > 0 {
+                (v as u8).min(255)
+            } else {
+                6
+            }
         },
         can_dry_up: prop("Doerrflg") == "1",
         wegspeed: {
             let raw = prop("Wegspeed");
             let mut quad = [100u16; 4];
             for (i, tok) in raw.split(',').map(str::trim).enumerate().take(4) {
-                if let Ok(v) = tok.parse::<u16>() { quad[i] = v; }
+                if let Ok(v) = tok.parse::<u16>() {
+                    quad[i] = v;
+                }
             }
             quad
         },
@@ -343,7 +376,11 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         upgradeable: prop("Ausbauflg") == "1",
         max_energy: {
             let v = prop_int("Maxenergy");
-            if v > 0 { v as u16 } else { 0 }
+            if v > 0 {
+                v as u16
+            } else {
+                0
+            }
         },
         ore_deposit: match prop("Erzbergnr") {
             "ERZBERG_KLEIN" => crate::building::OreDeposit::Small,
@@ -352,6 +389,15 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         },
         pirate_owned: prop("Piratflg") == "1",
         defensive_cannons: prop_int("Kanon").max(0) as u8,
+        max_brand_damage_ticks: {
+            let v = prop_int("Maxbrand");
+            if v > 0 {
+                v as u16
+            } else {
+                crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS
+            }
+        },
+        ruin_id: cod_building.ruinenr.clamp(0, 255) as u8,
         required_fertility: rohstoff_to_fertility(good_name("Rohstoff")),
     }
 }
@@ -418,7 +464,9 @@ fn rohstoff_to_fertility(name: &str) -> Option<anno_formats::szs::Fertility> {
 /// (a check we haven't traced to a specific binary function).
 /// As a Bauinfra-on-residence tier gate, these return 0.
 fn parse_bauinfra(token: &str) -> u8 {
-    if token.is_empty() { return 0; }
+    if token.is_empty() {
+        return 0;
+    }
     let resolved = resolve_infra_alias(token).unwrap_or(token);
     if let Some(rest) = resolved.strip_prefix("INFRA_STUFE_") {
         // First char is the tier digit (1..5 → Pioneer..Aristocrat).
@@ -438,22 +486,25 @@ fn parse_bauinfra(token: &str) -> u8 {
 /// rung if the parser is supposed to succeed).
 fn resolve_infra_alias(token: &str) -> Option<&'static str> {
     Some(match token {
-        "INFRA_BURG_1"   => "INFRA_STUFE_2G",
-        "INFRA_BURG_2"   => "INFRA_STUFE_4B",
-        "INFRA_BURG_3"   => "INFRA_STUFE_5B",
+        "INFRA_BURG_1" => "INFRA_STUFE_2G",
+        "INFRA_BURG_2" => "INFRA_STUFE_4B",
+        "INFRA_BURG_3" => "INFRA_STUFE_5B",
         "INFRA_WACHTURM" => "INFRA_STUFE_2G",
-        "INFRA_MUSKETE"  => "INFRA_STUFE_4B",
+        "INFRA_MUSKETE" => "INFRA_STUFE_4B",
         "INFRA_KONTOR_1" => "INFRA_STUFE_2B",
         "INFRA_KONTOR_2" => "INFRA_STUFE_3A",
         "INFRA_KONTOR_3" => "INFRA_STUFE_4A",
-        "INFRA_KANON"    => "INFRA_STUFE_3E",
+        "INFRA_KANON" => "INFRA_STUFE_3E",
         _ => return None,
     })
 }
 
 /// Load all building definitions from a parsed COD file.
 pub fn load_building_defs(cod: &CodFile) -> Vec<BuildingDef> {
-    cod.buildings.iter().map(|b| convert_building_def(b)).collect()
+    cod.buildings
+        .iter()
+        .map(|b| convert_building_def(b))
+        .collect()
 }
 
 /// Build a lookup from COD Nummer → index into building_defs vec.
@@ -539,9 +590,7 @@ pub fn load_building_instances(
                 // player) which matches the original engine's
                 // behaviour for player-built tiles on uncolonised
                 // land.
-                let owner = island.city.as_ref()
-                    .map(|c| c.owner_slot)
-                    .unwrap_or(0);
+                let owner = island.city.as_ref().map(|c| c.owner_slot).unwrap_or(0);
                 let instance = BuildingInstance::new(
                     def_idx as u16,
                     island.number,
@@ -580,17 +629,23 @@ pub fn kontor_warehouses_from_szs(
     let gfx_map = gfx_to_def_index(cod);
     let mut out = Vec::new();
     for island in &szs.islands {
-        let owner = island.city.as_ref()
-            .map(|c| c.owner_slot)
-            .unwrap_or(0);
+        let owner = island.city.as_ref().map(|c| c.owner_slot).unwrap_or(0);
         for tile in &island.tiles {
             let sprite_idx = tile.building_id as i32;
-            let Some(&def_idx) = gfx_map.get(&sprite_idx) else { continue };
-            let Some(def) = building_defs.get(def_idx) else { continue };
+            let Some(&def_idx) = gfx_map.get(&sprite_idx) else {
+                continue;
+            };
+            let Some(def) = building_defs.get(def_idx) else {
+                continue;
+            };
             // ProdKind=KONTOR identifies warehouse tiles.
-            if def.prod_kind != "KONTOR" { continue; }
+            if def.prod_kind != "KONTOR" {
+                continue;
+            }
             // Only the base tile of a multi-tile Kontor counts.
-            if sprite_idx != cod.buildings[def_idx].gfx { continue; }
+            if sprite_idx != cod.buildings[def_idx].gfx {
+                continue;
+            }
             // Carry the Kontor's authored storage capacity (50/
             // 75/100 tons across KONTOR_1/2/3, 20 t for the
             // small variants) into the warehouse so deposits
@@ -602,8 +657,10 @@ pub fn kontor_warehouses_from_szs(
                 30
             };
             out.push(Warehouse::with_capacity(
-                island.number, owner,
-                tile.x as u16, tile.y as u16,
+                island.number,
+                owner,
+                tile.x as u16,
+                tile.y as u16,
                 cap,
             ));
         }
@@ -633,7 +690,9 @@ pub fn diplomacy_from_player4_relationships(
     let n = players.len().min(7);
     for i in 0..n {
         for j in 0..n {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             let code = players[i].relationships[j];
             let state = code_to_diplomacy(code);
             // Only downgrade default Neutral to War / upgrade
@@ -704,18 +763,17 @@ pub const UNROUTED_TRADER_ROUTE_ID: u16 = u16::MAX;
 /// directly. Returns the new units in the same order as the
 /// underlying SHIP4 records, so callers can correlate by
 /// index when annotating ship names later.
-pub fn warships_from_ships(
-    ships: &[anno_formats::szs::Ship],
-) -> Vec<crate::combat::MilitaryUnit> {
-    use anno_formats::szs::ShipClass;
+pub fn warships_from_ships(ships: &[anno_formats::szs::Ship]) -> Vec<crate::combat::MilitaryUnit> {
     use crate::combat::{MilitaryUnit, UnitType};
-    ships.iter()
+    use anno_formats::szs::ShipClass;
+    ships
+        .iter()
         .filter_map(|s| {
             let class = s.class()?;
             let unit_type = match class {
                 ShipClass::SmallWarship => UnitType::SmallWarship,
                 ShipClass::LargeWarship => UnitType::LargeWarship,
-                ShipClass::PirateShip   => UnitType::PirateShip,
+                ShipClass::PirateShip => UnitType::PirateShip,
                 _ => return None,
             };
             Some(MilitaryUnit::with_name(
@@ -738,19 +796,33 @@ pub fn warships_from_ships(
 /// sees them in the world.
 pub fn traders_from_ships(
     ships: &[anno_formats::szs::Ship],
+    cargo_config: crate::trade::ShipCargoConfig,
 ) -> Vec<crate::trade::TradeShip> {
+    use crate::trade::{TradeShip, TradeShipClass};
     use anno_formats::szs::ShipClass;
-    use crate::trade::TradeShip;
-    ships.iter()
-        .filter(|s| matches!(s.class(),
-            Some(ShipClass::SmallTrader | ShipClass::LargeTrader)))
+    ships
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.class(),
+                Some(ShipClass::SmallTrader | ShipClass::LargeTrader)
+            )
+        })
         .map(|s| {
-            let mut t = TradeShip::new(
+            let class = match s.class().expect("filtered trader ship class") {
+                ShipClass::SmallTrader => TradeShipClass::SmallTrader,
+                ShipClass::LargeTrader => TradeShipClass::LargeTrader,
+                _ => unreachable!("filtered to trader classes"),
+            };
+            let mut t = TradeShip::new_with_class(
                 s.owner,
                 UNROUTED_TRADER_ROUTE_ID,
                 s.x as i32,
                 s.y as i32,
-            );
+                class,
+                cargo_config.capacity_for(class),
+            )
+            .with_name(s.name.clone());
             // Carry the authored heading so the renderer
             // shows the ship facing the right direction.
             t.heading = s.heading();
@@ -759,75 +831,13 @@ pub fn traders_from_ships(
         .collect()
 }
 
-/// Build a default round-trip trade route for each owner
-/// that has at least two warehouses, mutating the matching
-/// traders' `route_id` to point at the new route. Each route
-/// stops at the owner's first two warehouses with a generic
-/// load/unload of Wood ↔ Tools so the spawned traders start
-/// circulating goods immediately.
-///
-/// Routes start at `route_id_start` and increment per owner.
-/// Returns the new routes; the caller appends them to
-/// `Simulation::trade_routes`.
-pub fn auto_routes_for_traders(
-    traders: &mut [crate::trade::TradeShip],
-    warehouses: &[crate::warehouse::Warehouse],
-    mut route_id_start: u16,
-) -> Vec<crate::trade::TradeRoute> {
-    use crate::trade::{RouteStop, TradeRoute};
-    use crate::types::Good;
-    // Group warehouses by owner (in stable order).
-    let mut by_owner: std::collections::BTreeMap<u8, Vec<&crate::warehouse::Warehouse>> =
-        Default::default();
-    for w in warehouses {
-        if !w.active { continue; }
-        by_owner.entry(w.owner).or_default().push(w);
-    }
-    let mut routes = Vec::new();
-    let mut owner_route: std::collections::HashMap<u8, u16> = Default::default();
-    for (&owner, whs) in &by_owner {
-        if whs.len() < 2 { continue; }
-        let mut r = TradeRoute::new(route_id_start, owner);
-        r.add_stop(RouteStop {
-            island_id: whs[0].island_id,
-            warehouse_x: whs[0].tile_x,
-            warehouse_y: whs[0].tile_y,
-            load_goods: vec![(Good::Wood, 10)],
-            unload_goods: vec![Good::Tools],
-        });
-        r.add_stop(RouteStop {
-            island_id: whs[1].island_id,
-            warehouse_x: whs[1].tile_x,
-            warehouse_y: whs[1].tile_y,
-            load_goods: vec![(Good::Tools, 10)],
-            unload_goods: vec![Good::Wood],
-        });
-        r.activate();
-        owner_route.insert(owner, route_id_start);
-        routes.push(r);
-        route_id_start = route_id_start.wrapping_add(1);
-        if route_id_start == UNROUTED_TRADER_ROUTE_ID {
-            // Skip the sentinel value if we ever run that long.
-            route_id_start = route_id_start.wrapping_add(1);
-        }
-    }
-    // Re-route each unrouted trader to its owner's new route.
-    for t in traders.iter_mut() {
-        if t.route_id != UNROUTED_TRADER_ROUTE_ID { continue; }
-        if let Some(&id) = owner_route.get(&t.owner) {
-            t.route_id = id;
-        }
-    }
-    routes
-}
-
 /// Whether a plantation/farm building can be placed on the
 /// given island. The check is purely a fertility lookup —
 /// ownership, infrastructure tier, and tile-level placement
 /// rules are validated by other passes.
 ///
 /// Universal buildings (`required_fertility = None`, e.g.
-/// foresters, brick kilns) always pass. Climate-bound
+/// foresters, brick kilns) always pass. Fertility-bound
 /// plantations (`Some(Fertility::Tobacco)`, etc.) require
 /// the corresponding non-sentinel byte in the island's
 /// 8-slot fertility map.
@@ -837,10 +847,7 @@ pub fn auto_routes_for_traders(
 /// author's decisions verbatim. The check applies to the
 /// player/AI build-action path, where the original engine
 /// rejects placements that violate the fertility gate.
-pub fn island_can_host_building(
-    def: &BuildingDef,
-    island: &anno_formats::szs::Island,
-) -> bool {
+pub fn island_can_host_building(def: &BuildingDef, island: &anno_formats::szs::Island) -> bool {
     let Some(req) = def.required_fertility else {
         return true;
     };
@@ -853,11 +860,12 @@ mod tests {
 
     #[test]
     fn warships_from_ships_routes_warships_only() {
-        use anno_formats::szs::Ship;
         use crate::combat::UnitType;
+        use anno_formats::szs::Ship;
         let mk = |owner: u8, class: u8, x: u16, y: u16| Ship {
             name: "test".into(),
-            x, y,
+            x,
+            y,
             owner,
             ship_class: class,
             heading_byte: 0,
@@ -869,7 +877,7 @@ mod tests {
             mk(2, 0x1B, 30, 30), // LargeWarship → keep
             mk(0, 0x17, 40, 40), // LargeTrader  → skip
             mk(6, 0x1F, 50, 50), // PirateShip   → keep
-            mk(0, 0xFE,  0,  0), // unknown     → skip
+            mk(0, 0xFE, 0, 0),   // unknown     → skip
         ];
         let units = warships_from_ships(&ships);
         assert_eq!(units.len(), 3);
@@ -888,7 +896,8 @@ mod tests {
         use anno_formats::szs::Ship;
         let mk = |owner: u8, class: u8, x: u16, y: u16| Ship {
             name: "test".into(),
-            x, y,
+            x,
+            y,
             owner,
             ship_class: class,
             heading_byte: 0,
@@ -900,19 +909,26 @@ mod tests {
             mk(2, 0x17, 30, 30), // LargeTrader  → keep
             mk(0, 0x1B, 40, 40), // LargeWarship → skip
             mk(0, 0x1F, 50, 50), // PirateShip   → skip
-            mk(0, 0xFE,  0,  0), // unknown     → skip
+            mk(0, 0xFE, 0, 0),   // unknown     → skip
         ];
-        let traders = traders_from_ships(&ships);
+        let traders = traders_from_ships(&ships, crate::trade::ShipCargoConfig::default());
         assert_eq!(traders.len(), 2);
         for t in &traders {
-            assert_eq!(t.route_id, UNROUTED_TRADER_ROUTE_ID,
-                "spawn ships use the sentinel route id");
+            assert_eq!(
+                t.route_id, UNROUTED_TRADER_ROUTE_ID,
+                "spawn ships use the sentinel route id"
+            );
             assert!(t.active, "spawn ships start active");
         }
         assert_eq!(traders[0].owner, 0);
+        assert_eq!(traders[0].name, "test");
         assert_eq!(traders[0].world_x, 10);
+        assert_eq!(traders[0].class, crate::trade::TradeShipClass::SmallTrader);
+        assert_eq!(traders[0].cargo_capacity(), 40);
         assert_eq!(traders[1].owner, 2);
         assert_eq!(traders[1].world_x, 30);
+        assert_eq!(traders[1].class, crate::trade::TradeShipClass::LargeTrader);
+        assert_eq!(traders[1].cargo_capacity(), 60);
     }
 
     #[test]
@@ -922,7 +938,10 @@ mod tests {
         // pirates on island 21). Building instances on those
         // islands should inherit the city's owner_slot.
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let cod_data = match std::fs::read(base.join("extracted/haeuser.cod")) {
             Ok(d) => d,
             Err(_) => {
@@ -930,8 +949,7 @@ mod tests {
                 return;
             }
         };
-        let szs_data = match std::fs::read(
-            base.join("extracted/Szenes/New Horizons2.szs")) {
+        let szs_data = match std::fs::read(base.join("extracted/Szenes/New Horizons2.szs")) {
             Ok(d) => d,
             Err(_) => {
                 println!("Skipping: New Horizons2.szs not found");
@@ -955,19 +973,21 @@ mod tests {
         // STADT4 owner_slot.
         for inst in &instances {
             if let Some(want) = expected_owner.get(&inst.island_id) {
-                assert_eq!(inst.owner, *want,
+                assert_eq!(
+                    inst.owner, *want,
                     "building on island {} should be owned by slot {}, got {}",
-                    inst.island_id, want, inst.owner);
+                    inst.island_id, want, inst.owner
+                );
             }
         }
         // Cross-slot diversity: at least 2 distinct owners
         // across the building set, otherwise the wiring is
         // probably broken (everything would be slot 0).
-        let owners: std::collections::HashSet<u8> = instances.iter()
-            .map(|b| b.owner)
-            .collect();
-        assert!(owners.len() >= 2,
-            "expected ≥2 distinct owners across New Horizons2's buildings, got {owners:?}");
+        let owners: std::collections::HashSet<u8> = instances.iter().map(|b| b.owner).collect();
+        assert!(
+            owners.len() >= 2,
+            "expected ≥2 distinct owners across New Horizons2's buildings, got {owners:?}"
+        );
     }
 
     #[test]
@@ -982,7 +1002,10 @@ mod tests {
         // scenario; the centroid fallback in the game-side
         // init does the real placement.
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let cod_data = match std::fs::read(base.join("extracted/haeuser.cod")) {
             Ok(d) => d,
             Err(_) => {
@@ -1000,14 +1023,27 @@ mod tests {
         let mut total = 0;
         for entry in std::fs::read_dir(&szenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(d) => d, Err(_) => continue };
-            let szs = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let szs = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             let whs = kontor_warehouses_from_szs(&szs, &cod, &defs);
-            assert!(whs.is_empty(),
-                "{:?} unexpectedly has pre-placed Kontors", path.file_stem().unwrap());
+            assert!(
+                whs.is_empty(),
+                "{:?} unexpectedly has pre-placed Kontors",
+                path.file_stem().unwrap()
+            );
             total += 1;
         }
         assert!(total > 0, "audit must cover at least one scenario");
@@ -1018,7 +1054,10 @@ mod tests {
         // Pin the canonical Kontor Nummers for native + pirate
         // settlements against haeuser.cod.
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let cod_data = match std::fs::read(base.join("extracted/haeuser.cod")) {
             Ok(d) => d,
             Err(_) => {
@@ -1028,23 +1067,34 @@ mod tests {
         };
         let cod = CodFile::parse(&cod_data).unwrap();
         for &nr in &[NATIVE_KONTOR_A, NATIVE_KONTOR_B, PIRATE_KONTOR] {
-            let b = cod.buildings.iter().find(|b| b.nummer == nr)
+            let b = cod
+                .buildings
+                .iter()
+                .find(|b| b.nummer == nr)
                 .unwrap_or_else(|| panic!("Nr={nr} not in haeuser.cod"));
             assert_eq!(b.kind, "HQ", "Nr={nr} should be Kind=HQ");
-            assert_eq!(b.properties.get("ProdKind").map(|s| s.as_str()),
+            assert_eq!(
+                b.properties.get("ProdKind").map(|s| s.as_str()),
                 Some("KONTOR"),
-                "Nr={nr} should be ProdKind=KONTOR");
+                "Nr={nr} should be ProdKind=KONTOR"
+            );
         }
         // Pirate Kontor must carry both flags.
-        let pirat = cod.buildings.iter().find(|b| b.nummer == PIRATE_KONTOR).unwrap();
-        assert_eq!(pirat.properties.get("Piratflg").map(|s| s.as_str()),
-            Some("1"));
+        let pirat = cod
+            .buildings
+            .iter()
+            .find(|b| b.nummer == PIRATE_KONTOR)
+            .unwrap();
+        assert_eq!(
+            pirat.properties.get("Piratflg").map(|s| s.as_str()),
+            Some("1")
+        );
     }
 
     #[test]
     fn diplomacy_from_relationships_defaults_neutral_for_now() {
-        use anno_formats::szs::PlayerSlotInit;
         use crate::combat::Diplomacy;
+        use anno_formats::szs::PlayerSlotInit;
         // Synthesise three slots with the typical pattern:
         // slots 0..=2 with relationships [0, 0, 0, 3, 3, 3, 3].
         let mk = |relationships: [u32; 7]| PlayerSlotInit {
@@ -1062,73 +1112,68 @@ mod tests {
         // we don't synthesise War from these arrays alone.
         for i in 0..3u8 {
             for j in 0..3u8 {
-                if i == j { continue; }
-                assert_eq!(dm.get(i, j), Diplomacy::Neutral,
-                    "default mapping should be Neutral for ({i}, {j})");
+                if i == j {
+                    continue;
+                }
+                assert_eq!(
+                    dm.get(i, j),
+                    Diplomacy::Neutral,
+                    "default mapping should be Neutral for ({i}, {j})"
+                );
             }
         }
     }
 
     #[test]
-    fn auto_routes_for_traders_assigns_per_owner_routes() {
-        use crate::trade::TradeShip;
-        use crate::warehouse::Warehouse;
-        // Two owners, each with two warehouses.
-        let warehouses = vec![
-            Warehouse::new(0, 0, 10, 10), // owner 0
-            Warehouse::new(1, 0, 20, 20), // owner 0
-            Warehouse::new(2, 1, 30, 30), // owner 1
-            Warehouse::new(3, 1, 40, 40), // owner 1
-        ];
-        let mut traders = vec![
-            TradeShip::new(0, UNROUTED_TRADER_ROUTE_ID, 10, 10),
-            TradeShip::new(1, UNROUTED_TRADER_ROUTE_ID, 30, 30),
-        ];
-        let routes = auto_routes_for_traders(&mut traders, &warehouses, 100);
-        assert_eq!(routes.len(), 2,
-            "one route per owner with ≥2 warehouses");
-        assert_eq!(routes[0].owner, 0);
-        assert_eq!(routes[1].owner, 1);
-        // Each trader must now point at its owner's route.
-        assert_ne!(traders[0].route_id, UNROUTED_TRADER_ROUTE_ID);
-        assert_ne!(traders[1].route_id, UNROUTED_TRADER_ROUTE_ID);
-        assert_eq!(traders[0].route_id, routes[0].id);
-        assert_eq!(traders[1].route_id, routes[1].id);
-        // An owner with only ONE warehouse gets no route.
-        let warehouses_one = vec![Warehouse::new(0, 0, 5, 5)];
-        let mut traders_one = vec![TradeShip::new(0, UNROUTED_TRADER_ROUTE_ID, 5, 5)];
-        let routes = auto_routes_for_traders(&mut traders_one, &warehouses_one, 0);
-        assert!(routes.is_empty(), "owner with 1 warehouse skipped");
-        assert_eq!(traders_one[0].route_id, UNROUTED_TRADER_ROUTE_ID,
-            "no route → trader stays inert");
-    }
-
-    #[test]
-    fn island_can_host_building_gates_climate_bound_plantations() {
+    fn island_can_host_building_gates_fertility_bound_plantations() {
         use crate::types::ProductionType;
         use anno_formats::szs::{Fertility, Island};
         let mk_island = |ferts: [u8; 8]| Island {
-            number: 0, width: 10, height: 10, x_pos: 0, y_pos: 0,
-            fertilities: ferts, tiles: Vec::new(), city: None,
+            number: 0,
+            width: 10,
+            height: 10,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: ferts,
+            tiles: Vec::new(),
+            city: None,
         };
         let mk_def = |req: Option<Fertility>| {
             let mut d = BuildingDef {
-                id: 0, category: 0, width: 1, height: 1,
+                id: 0,
+                category: 0,
+                width: 1,
+                height: 1,
                 production_type: ProductionType::Craft,
-                kind: "PLANTAGE".into(), prod_kind: "PLANTAGE".into(),
+                kind: "PLANTAGE".into(),
+                prod_kind: "PLANTAGE".into(),
                 radius: 0,
                 output_good: Good::None,
-                input_good_1: Good::None, input_good_2: Good::None,
-                output_rate: 1, input_1_rate: 0, input_2_rate: 0,
-                storage_capacity: 0, cycle_time_ms: 1000,
-                cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+                input_good_1: Good::None,
+                input_good_2: Good::None,
+                output_rate: 1,
+                input_1_rate: 0,
+                input_2_rate: 0,
+                storage_capacity: 0,
+                cycle_time_ms: 1000,
+                cost_gold: 0,
+                cost_tools: 0,
+                cost_wood: 0,
+                cost_bricks: 0,
                 maintenance_cost: 0,
-                native: false, min_tier: 0, max_no_input_ticks: 6,
-                can_dry_up: false, wegspeed: [100; 4],
-                has_door: false, upgradeable: false,
+                native: false,
+                min_tier: 0,
+                max_no_input_ticks: 6,
+                can_dry_up: false,
+                wegspeed: [100; 4],
+                has_door: false,
+                upgradeable: false,
                 max_energy: 0,
                 ore_deposit: crate::building::OreDeposit::None,
-                pirate_owned: false, defensive_cannons: 0,
+                pirate_owned: false,
+                defensive_cannons: 0,
+                max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+                ruin_id: crate::building::NO_RUIN_ID,
                 required_fertility: req,
             };
             d.required_fertility = req;
@@ -1143,11 +1188,15 @@ mod tests {
 
         // Tobacco plantation requires byte 1 in the map.
         let tobacco = mk_def(Some(Fertility::Tobacco));
-        assert!(!island_can_host_building(&tobacco, &barren),
-            "barren island should reject tobacco");
+        assert!(
+            !island_can_host_building(&tobacco, &barren),
+            "barren island should reject tobacco"
+        );
         let tobacco_isle = mk_island([1, 7, 7, 7, 7, 7, 7, 7]);
-        assert!(island_can_host_building(&tobacco, &tobacco_isle),
-            "byte=1 island should accept tobacco");
+        assert!(
+            island_can_host_building(&tobacco, &tobacco_isle),
+            "byte=1 island should accept tobacco"
+        );
 
         // Multi-fertility island accepts every matching crop.
         let multi = mk_island([3, 6, 7, 7, 7, 7, 7, 7]);
@@ -1156,8 +1205,10 @@ mod tests {
         let cotton = mk_def(Some(Fertility::Cotton));
         assert!(island_can_host_building(&sugarcane, &multi));
         assert!(island_can_host_building(&cocoa, &multi));
-        assert!(!island_can_host_building(&cotton, &multi),
-            "cotton missing from {{Sugarcane, Cocoa}} island");
+        assert!(
+            !island_can_host_building(&cotton, &multi),
+            "cotton missing from {{Sugarcane, Cocoa}} island"
+        );
     }
 
     #[test]
@@ -1216,25 +1267,59 @@ mod tests {
         );
 
         // Sanity-check the category/production_type mapping landed.
-        let any_residence = defs.iter().any(|d|
-            d.production_type == crate::types::ProductionType::Residence
-        );
-        let any_plantation = defs.iter().any(|d|
-            d.production_type == crate::types::ProductionType::Plantation
-        );
-        let any_mine = defs.iter().any(|d|
-            d.production_type == crate::types::ProductionType::Mine
-        );
+        let any_residence = defs
+            .iter()
+            .any(|d| d.production_type == crate::types::ProductionType::Residence);
+        let any_plantation = defs
+            .iter()
+            .any(|d| d.production_type == crate::types::ProductionType::Plantation);
+        let any_mine = defs
+            .iter()
+            .any(|d| d.production_type == crate::types::ProductionType::Mine);
         assert!(any_residence, "expected at least one Residence");
         assert!(any_plantation, "expected at least one Plantation");
         assert!(any_mine, "expected at least one Mine");
-        let cat_used: std::collections::HashSet<u8> =
-            defs.iter().map(|d| d.category).collect();
+        let cat_used: std::collections::HashSet<u8> = defs.iter().map(|d| d.category).collect();
         assert!(
             cat_used.len() >= 4,
             "category mapping should produce multiple categories, got {:?}",
             cat_used,
         );
+
+        let source_maxbrand_values: std::collections::HashSet<_> = cod
+            .buildings
+            .iter()
+            .filter_map(|b| b.properties.get("Maxbrand"))
+            .map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            source_maxbrand_values,
+            std::collections::HashSet::from(["4"])
+        );
+        assert!(
+            defs.iter().all(
+                |d| d.max_brand_damage_ticks == crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS
+            ),
+            "converted definitions should inherit haeuser.cod Maxbrand: 4",
+        );
+        let ruin_cases = [
+            (270, 8), // RUINE_KONTOR_1
+            (271, 9), // ObjFill: BASE, then @Ruinenr: +1
+            (272, 9), // ObjFill: BASE, then @Ruinenr: +1
+            (273, 9), // ObjFill: BASE, then @Ruinenr: +1
+            (274, 0), // RUINE_HOLZ
+            (275, 0), // RUINE_HOLZ
+            (276, 2), // RUINE_STEIN
+            (277, 2), // RUINE_STEIN
+            (359, crate::building::NO_RUIN_ID),
+        ];
+        for (nummer, ruin_id) in ruin_cases {
+            let def = defs
+                .iter()
+                .find(|d| d.id == nummer)
+                .unwrap_or_else(|| panic!("missing converted building Nr={nummer}"));
+            assert_eq!(def.ruin_id, ruin_id, "Nr={nummer} ruin_id");
+        }
     }
 
     #[test]
@@ -1258,11 +1343,7 @@ mod tests {
         let szs_path = match std::fs::read_dir(&szenes_dir) {
             Ok(entries) => entries
                 .filter_map(|e| e.ok())
-                .find(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .ends_with(".szs")
-                })
+                .find(|e| e.file_name().to_string_lossy().ends_with(".szs"))
                 .map(|e| e.path()),
             Err(_) => None,
         };

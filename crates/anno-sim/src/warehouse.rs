@@ -9,14 +9,19 @@
 use crate::types::Good;
 use std::collections::HashMap;
 
-fn default_capacity_fallback() -> u16 { 30 }
+fn default_capacity_fallback() -> u16 {
+    30
+}
 
-/// Per-tier warehouse storage capacity (tons per good). Verified
-/// against `haeuser.cod`: the four `Kind: KONTOR` building
-/// definitions carry `Maxlager: 30 / 50 / 75 / 100` paired with
-/// `Bauinfra: INFRA_KONTOR_1 .. INFRA_KONTOR_3`. Index by upgrade
-/// level (0..=3); the default warehouse uses tier 0 (30 t).
-pub const WAREHOUSE_CAPACITIES: [u16; 4] = [30, 50, 75, 100];
+/// Source storage capacity for the first player-built Kontor.
+/// `haeuser.cod` Nr=271 (`Bauinfra: INFRA_KONTOR_1`,
+/// `ProdKind: KONTOR`) carries `Maxlager: 50`.
+pub const BASE_KONTOR_CAPACITY: u16 = 50;
+
+/// All authored Kontor `Maxlager` values from `haeuser.cod`, in
+/// Nummer order 271..=277. The first three are the upgrade ladder;
+/// 274..=277 are small/special variants with 20 t per good.
+pub const KONTOR_MAXLAGER_VALUES: [u16; 7] = [50, 75, 100, 20, 20, 20, 20];
 
 /// A warehouse on an island, tracking inventory for one player.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -28,9 +33,10 @@ pub struct Warehouse {
     pub active: bool,
 
     /// Default per-good cap when a good has no entry yet in
-    /// `inventory`. Sourced from the Kontor's `Maxlager` field
-    /// in haeuser.cod (50/75/100/20 across the four levels).
-    /// Falls back to 30 for legacy / placeholder warehouses.
+    /// `inventory`. New warehouses use the base Kontor `Maxlager`;
+    /// loaded scenario Kontors can override this with their authored
+    /// definition, and old save files without the field deserialize
+    /// through the legacy serde fallback.
     #[serde(default = "default_capacity_fallback")]
     pub default_capacity: u16,
 
@@ -80,14 +86,19 @@ pub struct TradeSlider {
 
 impl Warehouse {
     pub fn new(island_id: u8, owner: u8, tile_x: u16, tile_y: u16) -> Self {
-        Self::with_capacity(island_id, owner, tile_x, tile_y, 30)
+        Self::with_capacity(island_id, owner, tile_x, tile_y, BASE_KONTOR_CAPACITY)
     }
 
     /// Construct a warehouse with an explicit per-good
     /// default capacity (sourced from the matching Kontor's
     /// `Maxlager` in haeuser.cod when loading a scenario).
-    pub fn with_capacity(island_id: u8, owner: u8, tile_x: u16, tile_y: u16,
-                         default_capacity: u16) -> Self {
+    pub fn with_capacity(
+        island_id: u8,
+        owner: u8,
+        tile_x: u16,
+        tile_y: u16,
+        default_capacity: u16,
+    ) -> Self {
         Self {
             island_id,
             owner,
@@ -158,7 +169,9 @@ impl Warehouse {
 
     /// Get maximum capacity for a good.
     pub fn capacity(&self, good: Good) -> u16 {
-        self.inventory.get(&good).map(|&(_, c)| c)
+        self.inventory
+            .get(&good)
+            .map(|&(_, c)| c)
             .unwrap_or(self.default_capacity)
     }
 
@@ -223,4 +236,35 @@ pub fn find_nearest_warehouse(
         .filter(|(_, w)| w.active && w.island_id == island_id && w.owner == owner)
         .min_by_key(|(_, w)| w.distance_sq(tile_x, tile_y))
         .map(|(i, _)| i)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_kontor_capacities_match_haeuser_cod_audit() {
+        assert_eq!(BASE_KONTOR_CAPACITY, 50);
+        assert_eq!(KONTOR_MAXLAGER_VALUES, [50, 75, 100, 20, 20, 20, 20]);
+    }
+
+    #[test]
+    fn default_constructor_uses_base_kontor_capacity() {
+        let mut wh = Warehouse::new(0, 0, 10, 10);
+
+        assert_eq!(wh.default_capacity, BASE_KONTOR_CAPACITY);
+        assert_eq!(wh.capacity(Good::Wood), BASE_KONTOR_CAPACITY);
+        assert_eq!(wh.deposit(Good::Wood, 99), BASE_KONTOR_CAPACITY);
+        assert_eq!(wh.stock(Good::Wood), BASE_KONTOR_CAPACITY);
+    }
+
+    #[test]
+    fn explicit_default_capacity_clamps_new_goods() {
+        let mut wh = Warehouse::with_capacity(0, 0, 10, 10, BASE_KONTOR_CAPACITY);
+
+        assert_eq!(wh.capacity(Good::Wood), BASE_KONTOR_CAPACITY);
+        assert_eq!(wh.deposit(Good::Wood, 99), BASE_KONTOR_CAPACITY);
+        assert_eq!(wh.stock(Good::Wood), BASE_KONTOR_CAPACITY);
+        assert_eq!(wh.capacity(Good::Wood), BASE_KONTOR_CAPACITY);
+    }
 }

@@ -25,7 +25,9 @@ pub const NUM_POP_TIERS: usize = 5;
 /// the manual's WARE list are all enumerated below; we add a handful
 /// of extras (Stone, WildGame, Cotton, Silk, Fish, Grapes, Meat,
 /// SugarCane) that appear in haeuser.cod production chains but
-/// aren't shown as distinct entries in the manual.
+/// aren't shown as distinct entries in the manual. These discriminants
+/// are local simulation ids, not `text.cod [WARE]` ids; source tables
+/// that use WARE order need an explicit mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum Good {

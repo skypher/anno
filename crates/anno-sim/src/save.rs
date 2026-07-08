@@ -7,7 +7,6 @@
 use crate::building::BuildingInstance;
 use crate::combat::{DiplomacyMatrix, MilitaryUnit};
 use crate::entity::Figure;
-use crate::history::EconomyHistory;
 use crate::player::Player;
 use crate::simulation::Simulation;
 use crate::trade::{TradeRoute, TradeShip};
@@ -26,25 +25,35 @@ use std::path::Path;
 ///      tier sub-goal. Bincode enum-variant indices shift, so
 ///      pre-v14 saves cannot decode the new variant.
 /// v15: `Warehouse` gained `default_capacity: u16` carrying the
-///      Kontor's `Maxlager` (50/75/100/20). `#[serde(default)]`
+///      Kontor's `Maxlager` (50/75/100/20-small variants).
+///      `#[serde(default)]`
 ///      makes pre-v15 saves loadable with the legacy 30 cap,
 ///      but `Warehouse` field order shifts so we bump anyway.
 /// v16: `MilitaryUnit` gained `name: String` for SHIP4-spawned
 ///      warships. `#[serde(default)]` keeps pre-v16 saves
 ///      loadable with empty names.
-pub const SAVE_VERSION: u32 = 16;
+/// v17: Removed graph-only `EconomyHistory` from save state after the
+///      economy graph / sparkline UI was audited out as non-original.
+/// v18: Removed non-original construction priority from
+///      `BuildingInstance`.
+/// v19: `TradeShip` gained `cargo_capacity` so saved ships retain
+///      their figuren.cod `Maxware × 10` class capacity.
+/// v20: `TradeShip` gained `class` so HANDEL1/HANDEL2 scenario
+///      hull identity survives into source-derived sprite rendering.
+/// v21: `BuildingInstance` gained `fire_damage_ticks` so fire damage
+///      honours haeuser.cod `Maxbrand: 4`.
+/// v22: `TradeShip` gained `name: String` so SHIP4-authored trade-ship
+///      names survive into save files and the manual ships list.
+pub const SAVE_VERSION: u32 = 22;
 
-/// Oldest save version this build can still deserialize. Versions
-/// between `MIN_LOADABLE_VERSION` and `SAVE_VERSION` rely on the
-/// `#[serde(default)]` attributes on newly-added fields to fill
-/// in zero/empty values. Anything older has either a hard binary
-/// incompatibility (enum-variant index shift, struct field
-/// reorder) or a known data-corruption risk and is hard-rejected.
+/// Oldest save version this build can still deserialize. Anything
+/// older has either a hard binary incompatibility (enum-variant
+/// index shift, struct field reorder) or a known data-corruption
+/// risk and is hard-rejected.
 ///
-/// v14 baseline: ObjectiveSet's `ReachTotalPopulation` variant
-/// shifted the bincode discriminants for every variant after
-/// it, so v13 saves cannot decode through this build at all.
-pub const MIN_LOADABLE_VERSION: u32 = 14;
+/// v22 baseline: `TradeShip` includes its authored name, so earlier
+/// payloads have a different bincode struct layout.
+pub const MIN_LOADABLE_VERSION: u32 = 22;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -64,8 +73,6 @@ pub struct SaveState {
     pub diplomacy: DiplomacyMatrix,
     pub trade_routes: Vec<TradeRoute>,
     pub trade_ships: Vec<TradeShip>,
-    #[serde(default)]
-    pub history: EconomyHistory,
     #[serde(default)]
     pub objectives: crate::objectives::ObjectiveSet,
 }
@@ -94,7 +101,9 @@ impl std::fmt::Display for SaveError {
 }
 
 impl From<std::io::Error> for SaveError {
-    fn from(e: std::io::Error) -> Self { SaveError::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        SaveError::Io(e)
+    }
 }
 
 impl Simulation {
@@ -114,7 +123,6 @@ impl Simulation {
             diplomacy: self.diplomacy.clone(),
             trade_routes: self.trade_routes.clone(),
             trade_ships: self.trade_ships.clone(),
-            history: self.history.clone(),
             objectives: self.objectives.clone(),
         }
     }
@@ -135,14 +143,12 @@ impl Simulation {
         self.diplomacy = s.diplomacy;
         self.trade_routes = s.trade_routes;
         self.trade_ships = s.trade_ships;
-        self.history = s.history;
         self.objectives = s.objectives;
     }
 }
 
 pub fn save_to_file(path: &Path, state: &SaveState) -> Result<(), SaveError> {
-    let payload = bincode::serialize(state)
-        .map_err(|e| SaveError::Encode(e.to_string()))?;
+    let payload = bincode::serialize(state).map_err(|e| SaveError::Encode(e.to_string()))?;
     let mut buf = Vec::with_capacity(SAVE_MAGIC.len() + payload.len());
     buf.extend_from_slice(&SAVE_MAGIC);
     buf.extend_from_slice(&payload);
@@ -197,7 +203,6 @@ mod tests {
             diplomacy: crate::combat::DiplomacyMatrix::new(),
             trade_routes: vec![],
             trade_ships: vec![],
-            history: Default::default(),
             objectives: Default::default(),
         };
         let payload = bincode::serialize(&state).unwrap();
@@ -283,11 +288,14 @@ mod tests {
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.players[0].gold = 999;
+        sim.trade_ships
+            .push(TradeShip::new(0, 0, 12, 13).with_name("Seehind".into()));
         let snap = sim.snapshot();
         let path = std::env::temp_dir().join("anno_sim_save_test.bin");
         save_to_file(&path, &snap).unwrap();
         let loaded = load_from_file(&path).unwrap();
         assert_eq!(loaded.players[0].gold, 999);
+        assert_eq!(loaded.trade_ships[0].name, "Seehind");
         assert_eq!(loaded.version, SAVE_VERSION);
         std::fs::remove_file(&path).ok();
     }

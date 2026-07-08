@@ -7,6 +7,15 @@
 
 use crate::types::{Good, ProductionType};
 
+/// Default fire-damage cap from `haeuser.cod` `Maxbrand: 4`.
+/// The parser reads it at `1602_exe.c:68086` and carries it through
+/// the stateful COD definition stream unless a later building
+/// overrides the property.
+pub const DEFAULT_MAX_BRAND_DAMAGE_TICKS: u16 = 4;
+
+/// Original `Ruinenr` sentinel for buildings that do not leave a ruin.
+pub const NO_RUIN_ID: u8 = 0xff;
+
 /// Building definition (loaded from haeuser.cod).
 #[derive(Debug, Clone)]
 pub struct BuildingDef {
@@ -102,6 +111,15 @@ pub struct BuildingDef {
     /// turret/castle buildings carry `Kanon: 2`. Drives passive
     /// defensive damage radiating from owned towers/castles.
     pub defensive_cannons: u8,
+    /// Fire-damage cap from `Maxbrand` in haeuser.cod. The shipping
+    /// file sets the template/default to 4, and the stateful COD
+    /// parser inherits it across building definitions unless a later
+    /// definition overrides it.
+    pub max_brand_damage_ticks: u16,
+    /// Source `Ruinenr` code from haeuser.cod. The original parser's
+    /// token table lives at `1602_exe.c:66354-66367`; `0xff` means
+    /// `NORUINE`.
+    pub ruin_id: u8,
     /// Fertility this building's plantation/farm requires on
     /// the host island. Derived from haeuser.cod's `Rohstoff`
     /// field via the editor.cod-pinned name mapping
@@ -119,8 +137,8 @@ pub struct BuildingDef {
 pub enum OreDeposit {
     #[default]
     None,
-    Small,  // ERZBERG_KLEIN — 80 tons
-    Large,  // ERZBERG_GROSS — 240 tons
+    Small, // ERZBERG_KLEIN — 80 tons
+    Large, // ERZBERG_GROSS — 240 tons
 }
 
 impl OreDeposit {
@@ -175,6 +193,12 @@ pub struct BuildingInstance {
     #[serde(default = "default_building_health")]
     pub health: u16,
 
+    /// Fire damage ticks already applied to this building during its
+    /// current burn cycle. RE: haeuser.cod `Maxbrand: 4` default,
+    /// parsed at `1602_exe.c:68086`.
+    #[serde(default)]
+    pub fire_damage_ticks: u16,
+
     /// Residence tier for `WOHN` buildings: 0=Pioneer, 1=Settler, 2=Citizen,
     /// 3=Merchant, 4=Aristocrat. Promoted when its tier is fully
     /// satisfied. Higher tiers grant more housing capacity. Unused for
@@ -192,19 +216,11 @@ pub struct BuildingInstance {
     #[serde(default)]
     pub bricks_needed: u16,
 
-    /// Consecutive production ticks this building produced 0 output.
-    /// When the count reaches the idle threshold, the building's
-    /// maintenance contribution is halved (and pings back up to full
-    /// once production resumes).
+    /// Consecutive low-efficiency production ticks. Used for
+    /// haeuser.cod `Maxnorohst` warm-up reset and `Doerrflg`
+    /// plantation dry-up.
     #[serde(default)]
     pub idle_ticks: u32,
-    /// Construction priority: higher = drained materials first.
-    /// 0 = normal (default), 1 = high, 2 = critical. The entity
-    /// tick sorts pending-construction buildings by `-priority`
-    /// before trickling materials so the player can override the
-    /// natural placement order.
-    #[serde(default)]
-    pub build_priority: u8,
     /// Remaining-ore counter for ore-mine buildings (RE: haeuser.cod
     /// `Erzbergnr` deposit size). Initialised to the deposit's
     /// `OreDeposit::capacity()` when the mine is placed; each
@@ -215,9 +231,13 @@ pub struct BuildingInstance {
     pub remaining_ore: u16,
 }
 
-fn default_remaining_ore() -> u16 { u16::MAX }
+fn default_remaining_ore() -> u16 {
+    u16::MAX
+}
 
-fn default_building_health() -> u16 { BUILDING_MAX_HEALTH }
+fn default_building_health() -> u16 {
+    BUILDING_MAX_HEALTH
+}
 pub const BUILDING_MAX_HEALTH: u16 = 100;
 
 impl BuildingInstance {
@@ -238,12 +258,12 @@ impl BuildingInstance {
             construction_ms_remaining: 0,
             construction_ms_total: 0,
             health: BUILDING_MAX_HEALTH,
+            fire_damage_ticks: 0,
             house_tier: 0,
             wood_needed: 0,
             tools_needed: 0,
             bricks_needed: 0,
             idle_ticks: 0,
-            build_priority: 0,
             remaining_ore: u16::MAX,
         }
     }

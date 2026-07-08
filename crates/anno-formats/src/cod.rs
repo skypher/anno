@@ -34,6 +34,8 @@ pub struct CodFile {
 pub struct BuildingDef {
     /// Building number (sequential ID used in INSELHAUS records as sprite index)
     pub nummer: i32,
+    /// Source `Id` field from haeuser.cod, resolved through the constant table.
+    pub source_id: i32,
     /// Sprite index in STADTFLD.BSH
     pub gfx: i32,
     /// Building sprite index (for construction display)
@@ -44,12 +46,21 @@ pub struct BuildingDef {
     pub size: (i32, i32),
     /// Number of rotations
     pub rotate: i32,
+    /// Random variant count (`RandAnz`, ushort at building-definition offset 0x60).
+    pub rand_anz: u16,
+    /// Random variant stride in building-definition records (`RandAdd`, offset 0x62).
+    pub rand_add: u16,
     /// Animation frame count
     pub anim_anz: i32,
     /// Animation sprite offset per frame
     pub anim_add: i32,
     /// Animation speed in milliseconds per frame (0 = use default 200ms)
     pub anim_time: i32,
+    /// Resolved `Ruinenr` code from haeuser.cod. The original parser
+    /// registers symbolic tokens in `1602_exe.c:66354-66367`
+    /// (`RUINE_HOLZ = 0`, `RUINE_STEIN = 2`, …, `NORUINE = 255`) and
+    /// `@Ruinenr: +N` increments the inherited value.
+    pub ruinenr: i32,
     /// All raw properties
     pub properties: HashMap<String, String>,
 }
@@ -58,14 +69,18 @@ impl Default for BuildingDef {
     fn default() -> Self {
         Self {
             nummer: 0,
+            source_id: 0,
             gfx: 0,
             baugfx: -1,
             kind: String::new(),
             size: (1, 1),
             rotate: 0,
+            rand_anz: 1,
+            rand_add: 0,
             anim_anz: 1,
             anim_add: 0,
             anim_time: 0,
+            ruinenr: 255,
             properties: HashMap::new(),
         }
     }
@@ -99,6 +114,7 @@ impl CodFile {
     fn parse_text(text: &str) -> Result<CodFile, CodError> {
         let mut constants: HashMap<String, i32> = HashMap::new();
         let mut buildings: Vec<BuildingDef> = Vec::new();
+        let mut building_by_nummer: HashMap<i32, BuildingDef> = HashMap::new();
         let mut current = BuildingDef::default();
         let mut in_building = false;
         let mut obj_depth = 0i32;
@@ -171,8 +187,16 @@ impl CodFile {
                 }
             }
 
-            // Handle ObjFill (copy from template — we just keep current state)
-            if line.starts_with("ObjFill:") {
+            // Handle ObjFill (copy from a previously emitted template record).
+            if let Some(val_str) = line.strip_prefix("ObjFill:") {
+                let src_expr = val_str.split(',').next().unwrap_or(val_str).trim();
+                let src_nummer = Self::eval(&constants, src_expr);
+                if let Some(template) = building_by_nummer.get(&src_nummer) {
+                    let nummer = current.nummer;
+                    current = template.clone();
+                    current.nummer = nummer;
+                    constants.insert("Nummer".to_string(), current.nummer);
+                }
                 continue;
             }
 
@@ -180,6 +204,7 @@ impl CodFile {
             if let Some(val_str) = line.strip_prefix("@Nummer:") {
                 let val_str = val_str.trim();
                 if in_building {
+                    building_by_nummer.insert(current.nummer, current.clone());
                     buildings.push(current.clone());
                 }
                 if let Some(delta) = val_str.strip_prefix('+') {
@@ -187,6 +212,7 @@ impl CodFile {
                 } else {
                     current.nummer = Self::eval(&constants, val_str);
                 }
+                constants.insert("Nummer".to_string(), current.nummer);
                 in_building = true;
                 continue;
             }
@@ -238,6 +264,24 @@ impl CodFile {
                 continue;
             }
 
+            // Parse RandAnz / RandAdd. The original destruction path reads
+            // these as ushort fields at offsets 0x60 / 0x62 and advances by
+            // `rand() % RandAnz * RandAdd` building-definition records.
+            if let Some(val_str) = line.strip_prefix("RandAnz:") {
+                current.rand_anz = Self::eval_u16(&constants, val_str.trim());
+                current
+                    .properties
+                    .insert("RandAnz".to_string(), current.rand_anz.to_string());
+                continue;
+            }
+            if let Some(val_str) = line.strip_prefix("RandAdd:") {
+                current.rand_add = Self::eval_u16(&constants, val_str.trim());
+                current
+                    .properties
+                    .insert("RandAdd".to_string(), current.rand_add.to_string());
+                continue;
+            }
+
             // Parse AnimAnz
             if let Some(val_str) = line.strip_prefix("AnimAnz:") {
                 current.anim_anz = Self::eval(&constants, val_str.trim());
@@ -256,14 +300,48 @@ impl CodFile {
                 continue;
             }
 
-            // Parse @Id: (incremental) and Id: (absolute)
-            if line.starts_with("@Id:") || line.starts_with("Id:") {
-                // Store as property but don't need special handling
-                if let Some((key, value)) = line.split_once(':') {
-                    current
-                        .properties
-                        .insert(key.trim().to_string(), value.trim().to_string());
+            if let Some(val_str) = line.strip_prefix("@Ruinenr:") {
+                let val_str = val_str.trim();
+                if let Some(delta) = val_str.strip_prefix('+') {
+                    current.ruinenr += Self::eval_ruinenr(&constants, delta.trim());
+                } else if val_str.starts_with('-') {
+                    current.ruinenr += Self::eval_ruinenr(&constants, val_str);
+                } else {
+                    current.ruinenr = Self::eval_ruinenr(&constants, val_str);
                 }
+                current
+                    .properties
+                    .insert("Ruinenr".to_string(), current.ruinenr.to_string());
+                continue;
+            }
+            if let Some(val_str) = line.strip_prefix("Ruinenr:") {
+                current.ruinenr = Self::eval_ruinenr(&constants, val_str.trim());
+                current
+                    .properties
+                    .insert("Ruinenr".to_string(), current.ruinenr.to_string());
+                continue;
+            }
+
+            // Parse @Id: (incremental) and Id: (absolute)
+            if let Some(val_str) = line.strip_prefix("@Id:") {
+                let val_str = val_str.trim();
+                if let Some(delta) = val_str.strip_prefix('+') {
+                    current.source_id += Self::eval(&constants, delta.trim());
+                } else if val_str.starts_with('-') {
+                    current.source_id += Self::eval(&constants, val_str);
+                } else {
+                    current.source_id = Self::eval(&constants, val_str);
+                }
+                current
+                    .properties
+                    .insert("Id".to_string(), current.source_id.to_string());
+                continue;
+            }
+            if let Some(val_str) = line.strip_prefix("Id:") {
+                current.source_id = Self::eval(&constants, val_str.trim());
+                current
+                    .properties
+                    .insert("Id".to_string(), current.source_id.to_string());
                 continue;
             }
 
@@ -299,6 +377,7 @@ impl CodFile {
 
         // Push last building
         if in_building {
+            building_by_nummer.insert(current.nummer, current.clone());
             buildings.push(current);
         }
 
@@ -346,10 +425,101 @@ impl CodFile {
         0
     }
 
+    fn eval_ruinenr(constants: &HashMap<String, i32>, expr: &str) -> i32 {
+        match expr.trim() {
+            "RUINE_HOLZ" => 0,
+            "RUINE_STEIN" => 2,
+            "RUINE_FELD" => 4,
+            "RUINE_ROAD_FELD" => 5,
+            "RUINE_ROAD_STEIN" => 6,
+            "RUINE_MINE" => 7,
+            "RUINE_KONTOR_1" => 8,
+            "RUINE_KONTOR_2" => 9,
+            "RUINE_KONTOR_3" => 10,
+            "RUINE_KONTOR_4" => 11,
+            "RUINE_KONTOR_N1" => 12,
+            "RUINE_KONTOR_N2" => 13,
+            "RUINE_MARKT" => 14,
+            "NORUINE" => 255,
+            other => Self::eval(constants, other),
+        }
+    }
+
+    fn eval_u16(constants: &HashMap<String, i32>, expr: &str) -> u16 {
+        Self::eval(constants, expr).clamp(0, u16::MAX as i32) as u16
+    }
+
     /// Look up a building by its sprite index (Gfx value).
     /// This is what INSELHAUS building_id maps to.
     pub fn building_by_gfx(&self, gfx: i32) -> Option<&BuildingDef> {
         self.buildings.iter().find(|b| b.gfx == gfx)
+    }
+
+    /// Look up a building by its resolved source `Id` field.
+    pub fn building_by_source_id(&self, source_id: i32) -> Option<&BuildingDef> {
+        self.buildings.iter().find(|b| b.source_id == source_id)
+    }
+
+    fn building_index_by_source_id(&self, source_id: i32) -> Option<usize> {
+        self.buildings.iter().position(|b| b.source_id == source_id)
+    }
+
+    /// Resolve an original `Ruinenr` byte to the base ruin building.
+    ///
+    /// The binary builds this table after parsing haeuser.cod
+    /// (`1602_exe.c:68896-68918`) and `FUN_00463f40` indexes it with
+    /// the `Ruinenr` byte. On strand tiles the original uses the same
+    /// table shifted by one entry.
+    pub fn ruin_building(&self, ruinenr: u8, strand: bool) -> Option<&BuildingDef> {
+        let index = self.ruin_building_index(ruinenr, strand)?;
+        self.buildings.get(index)
+    }
+
+    /// Resolve an original `Ruinenr` byte and random draw to the concrete
+    /// random variant definition selected by `FUN_00463f40`.
+    pub fn ruin_variant_building(
+        &self,
+        ruinenr: u8,
+        strand: bool,
+        rand_value: u16,
+    ) -> Option<&BuildingDef> {
+        let base_index = self.ruin_building_index(ruinenr, strand)?;
+        let base = self.buildings.get(base_index)?;
+        let variant_count = base.rand_anz.max(1) as usize;
+        let variant_stride = base.rand_add as usize;
+        let variant = (rand_value as usize % variant_count) * variant_stride;
+        self.buildings.get(base_index + variant).or(Some(base))
+    }
+
+    fn ruin_building_index(&self, ruinenr: u8, strand: bool) -> Option<usize> {
+        let table_index = if strand && ruinenr != 0xff {
+            ruinenr.saturating_add(1)
+        } else {
+            ruinenr
+        };
+        let source_id = self
+            .ruin_source_id(table_index)
+            .or_else(|| self.ruin_source_id(ruinenr))?;
+        self.building_index_by_source_id(source_id)
+    }
+
+    fn ruin_source_id(&self, table_index: u8) -> Option<i32> {
+        let c = |name: &str| self.constants.get(name).copied();
+        match table_index {
+            0 => Some(c("IDRUINE")?),
+            1 => Some(c("IDRUINE")? + 9),
+            2 => Some(c("IDRUINE")? + 10),
+            3 => Some(c("IDRUINE")? + 19),
+            4 => Some(c("IDRUINE")? + 20),
+            5 => Some(c("IDRUINE")? + 30),
+            6 => Some(c("IDRUINE")? + 35),
+            7 => Some(c("IDRUINE")? + 40),
+            8..=11 => Some(c("IDHAFEN")? + 20 + (table_index as i32 - 8)),
+            12 => Some(c("IDNEGER")? + 9),
+            13 => Some(c("IDNEGER")? + 39),
+            14 => Some(c("IDDIVERS")? + 22),
+            _ => None,
+        }
     }
 
     /// Build a lookup table: gfx → building index.
@@ -401,6 +571,7 @@ mod tests {
         assert_eq!(cod.buildings[1].nummer, 0);
         assert_eq!(cod.buildings[1].gfx, 0);
         assert_eq!(cod.buildings[1].kind, "BODEN");
+        assert_eq!(cod.buildings[1].source_id, 0);
 
         // Should have ~500 buildings
         assert!(
@@ -427,6 +598,57 @@ mod tests {
             assert_eq!(b.properties.get("Steuer").map(|s| s.as_str()),
                 Some("2.6"), "Nr={}", b.nummer);
         }
+
+        let ruin_cases = [
+            (270, 8),   // RUINE_KONTOR_1
+            (271, 9),   // ObjFill: BASE, then @Ruinenr: +1
+            (272, 9),   // ObjFill: BASE, then @Ruinenr: +1
+            (273, 9),   // ObjFill: BASE, then @Ruinenr: +1
+            (274, 0),   // RUINE_HOLZ
+            (275, 0),   // RUINE_HOLZ
+            (276, 2),   // RUINE_STEIN
+            (277, 2),   // RUINE_STEIN
+            (359, 255), // NORUINE
+        ];
+        for (nummer, ruinenr) in ruin_cases {
+            let b = cod
+                .buildings
+                .iter()
+                .find(|b| b.nummer == nummer)
+                .unwrap_or_else(|| panic!("missing building Nr={nummer}"));
+            assert_eq!(b.ruinenr, ruinenr, "Nr={nummer} Ruinenr");
+        }
+
+        let idruine = cod.constants["IDRUINE"];
+        assert_eq!(
+            cod.ruin_building(0, false).map(|b| (b.source_id, b.gfx)),
+            Some((idruine, cod.constants["GFXBODEN"] + 400)),
+        );
+        assert_eq!(
+            cod.ruin_building(0, false).map(|b| (b.rand_anz, b.rand_add)),
+            Some((6, 1)),
+        );
+        assert_eq!(
+            cod.ruin_building(0, true).map(|b| (b.source_id, b.gfx)),
+            Some((idruine + 9, cod.constants["GFXBODEN"] + 413)),
+        );
+        assert_eq!(
+            cod.ruin_building(4, false).map(|b| (b.rand_anz, b.rand_add)),
+            Some((2, 1)),
+        );
+        assert_eq!(
+            cod.ruin_variant_building(4, false, 1).map(|b| b.gfx),
+            Some(cod.constants["GFXROHST"] + 89),
+        );
+        assert_eq!(
+            cod.ruin_building(8, false).map(|b| (b.source_id, b.gfx)),
+            Some((cod.constants["IDHAFEN"] + 20, cod.constants["GFXKONTOR"] + 144)),
+        );
+        assert_eq!(
+            cod.ruin_building(14, false).map(|b| (b.source_id, b.gfx)),
+            Some((cod.constants["IDDIVERS"] + 22, cod.constants["GFXMARKT"] + 192)),
+        );
+        assert!(cod.ruin_building(255, false).is_none());
 
         // Print sample buildings
         println!("\nSample buildings:");

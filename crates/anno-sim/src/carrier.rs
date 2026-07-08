@@ -20,10 +20,38 @@ use crate::types::Good;
 use crate::warehouse::{self, Warehouse};
 
 /// Carrier walking speed in sub-tiles per movement tick (100ms).
-/// Matches figuren.cod `Nummer: TRAEGER` `Speed: 220` (and the
-/// alternate TRAEGER2 entry, also 220) once normalised against
-/// our 100 ms step granularity.
+/// Current normalized internal step; `figuren.cod` source speed is
+/// parsed and pinned separately.
 const CARRIER_SPEED: u16 = 4;
+
+/// Fallback TRAEGER cargo capacity per trip, from figuren.cod `Maxtrag: 4`.
+const DEFAULT_CARRIER_MAX_LOAD: u16 = 4;
+
+/// Source-derived carrier constants used by the simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarrierConfig {
+    /// Maximum goods moved by one TRAEGER trip.
+    pub max_load: u16,
+}
+
+impl Default for CarrierConfig {
+    fn default() -> Self {
+        Self {
+            max_load: DEFAULT_CARRIER_MAX_LOAD,
+        }
+    }
+}
+
+impl CarrierConfig {
+    pub fn from_figure_def(def: &anno_formats::figuren::FigureDef) -> Self {
+        let default = Self::default();
+        let max_load = u16::try_from(def.max_load())
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or(default.max_load);
+        Self { max_load }
+    }
+}
 
 /// Try to spawn a carrier for a production building.
 /// Returns Some(figure) if a carrier was created.
@@ -33,6 +61,7 @@ pub fn try_spawn_carrier(
     warehouses: &[Warehouse],
     island_maps: &[IslandMap],
     coverage_maps: &[CoverageMap],
+    config: CarrierConfig,
 ) -> Option<Figure> {
     if def.output_good == Good::None || def.storage_capacity == 0 {
         return None;
@@ -49,7 +78,10 @@ pub fn try_spawn_carrier(
     // island has a coverage map but the building falls outside, the
     // carrier won't spawn — output backs up and efficiency tanks until
     // the player builds a closer warehouse / marketplace.
-    if let Some(cov) = coverage_maps.iter().find(|c| c.island_id == building.island_id) {
+    if let Some(cov) = coverage_maps
+        .iter()
+        .find(|c| c.island_id == building.island_id)
+    {
         let bx = building.tile_x;
         let by = building.tile_y;
         let bw = def.width as u16;
@@ -62,7 +94,9 @@ pub fn try_spawn_carrier(
                     break;
                 }
             }
-            if any { break; }
+            if any {
+                break;
+            }
         }
         if !any {
             return None;
@@ -84,15 +118,22 @@ pub fn try_spawn_carrier(
     let start = (building.tile_x as i32, building.tile_y as i32);
     let goal = (wh.tile_x as i32, wh.tile_y as i32);
 
-    let path = if let Some(map) = island_maps.iter().find(|m| m.island_id == building.island_id) {
-        pathfinding::find_path(map, start, goal).unwrap_or_else(|| direct_path(start, goal))
+    let path = if let Some(map) = island_maps
+        .iter()
+        .find(|m| m.island_id == building.island_id)
+    {
+        pathfinding::find_path_for_carrier(
+            map,
+            start,
+            goal,
+            pathfinding::CarrierLoad::Loaded,
+        )?
     } else {
         direct_path(start, goal)
     };
 
-    // Pick up all output from the building
-    let amount = building.output_stock;
-    building.output_stock = 0;
+    let amount = building.output_stock.min(config.max_load);
+    building.output_stock -= amount;
 
     let mut carrier = Figure::new();
     carrier.action = ActionType::CarryingGoods;
@@ -175,28 +216,18 @@ pub fn handle_arrival(
     warehouses: &mut [Warehouse],
     buildings: &[BuildingInstance],
     island_maps: &[IslandMap],
-    deposit_events: &mut Vec<crate::combat::DamageEvent>,
 ) -> bool {
     match figure.action {
         ActionType::CarryingGoods => {
             // Find the warehouse at the target location
-            if let Some(wh) = warehouses.iter_mut().find(|w| {
-                w.tile_x == figure.target_x as u16 && w.tile_y == figure.target_y as u16
-            }) {
+            if let Some(wh) = warehouses
+                .iter_mut()
+                .find(|w| w.tile_x == figure.target_x as u16 && w.tile_y == figure.target_y as u16)
+            {
                 // Deposit goods
                 let good = good_from_u8(figure.carried_good);
                 let deposited = wh.deposit(good, figure.carried_amount);
                 figure.carried_amount -= deposited;
-                if deposited > 0 {
-                    // Reuse the floating-number system to surface a "+N"
-                    // over the warehouse. target=2 means deposit (positive).
-                    deposit_events.push(crate::combat::DamageEvent {
-                        x: wh.tile_x as i32,
-                        y: wh.tile_y as i32,
-                        amount: deposited,
-                        target: 2,
-                    });
-                }
             }
 
             // Return to source building
@@ -206,8 +237,19 @@ pub fn handle_arrival(
                 let goal = (building.tile_x as i32, building.tile_y as i32);
 
                 // Compute return path
-                let path = if let Some(map) = island_maps.iter().find(|m| m.island_id == building.island_id) {
-                    pathfinding::find_path(map, start, goal).unwrap_or_else(|| direct_path(start, goal))
+                let path = if let Some(map) = island_maps
+                    .iter()
+                    .find(|m| m.island_id == building.island_id)
+                {
+                    match pathfinding::find_path_for_carrier(
+                        map,
+                        start,
+                        goal,
+                        pathfinding::CarrierLoad::Empty,
+                    ) {
+                        Some(path) => path,
+                        None => return true,
+                    }
                 } else {
                     direct_path(start, goal)
                 };
@@ -301,18 +343,30 @@ fn good_from_u8(val: u8) -> Good {
 mod tests {
     use super::*;
     use crate::types::ProductionType;
+    use anno_formats::figuren::FigureDef;
 
     fn def_for_tools() -> BuildingDef {
         BuildingDef {
-            id: 0, category: 0, width: 1, height: 1,
+            id: 0,
+            category: 0,
+            width: 1,
+            height: 1,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
             radius: 0,
-            output_good: Good::Tools, input_good_1: Good::None,
+            output_good: Good::Tools,
+            input_good_1: Good::None,
             input_good_2: Good::None,
-            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 50, cycle_time_ms: 1000,
-            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 50,
+            cycle_time_ms: 1000,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
             min_tier: 0,
@@ -325,6 +379,8 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: None,
         }
     }
@@ -336,7 +392,17 @@ mod tests {
         b.output_stock = 40; // > capacity / 2
         let warehouses = vec![Warehouse::new(0, 0, 1, 1)];
         let cov = CoverageMap::new(0, 60, 60); // empty: nothing covered
-        assert!(try_spawn_carrier(&mut b, &def, &warehouses, &[], &[cov]).is_none());
+        assert!(
+            try_spawn_carrier(
+                &mut b,
+                &def,
+                &warehouses,
+                &[],
+                &[cov],
+                CarrierConfig::default()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -350,8 +416,117 @@ mod tests {
         cov.recompute(&[b.clone()], &[def.clone()], &[(4, 4, 22)]);
         // sanity check
         assert!(cov.is_covered(5, 5));
-        let result = try_spawn_carrier(&mut b, &def, &warehouses, &[], &[cov]);
+        let result = try_spawn_carrier(
+            &mut b,
+            &def,
+            &warehouses,
+            &[],
+            &[cov],
+            CarrierConfig::default(),
+        );
         assert!(result.is_some(), "should dispatch when covered");
+    }
+
+    #[test]
+    fn carrier_not_dispatched_when_island_map_has_no_route() {
+        let def = def_for_tools();
+        let mut b = BuildingInstance::new(0, 0, 2, 5, 0);
+        b.output_stock = 40;
+        let warehouses = vec![Warehouse::new(0, 0, 8, 5)];
+        let mut map = IslandMap::new_open(0, 10, 10);
+        for y in 0..10 {
+            map.set_walkable(5, y, false);
+        }
+
+        let result = try_spawn_carrier(
+            &mut b,
+            &def,
+            &warehouses,
+            &[map],
+            &[],
+            CarrierConfig::default(),
+        );
+
+        assert!(result.is_none());
+        assert_eq!(b.output_stock, 40);
+    }
+
+    #[test]
+    fn returning_carrier_despawns_when_source_route_is_blocked() {
+        let mut figure = Figure::new();
+        figure.action = ActionType::CarryingGoods;
+        figure.tile_x = 8;
+        figure.tile_y = 5;
+        figure.target_x = 8;
+        figure.target_y = 5;
+        figure.building_idx = 0;
+        figure.carried_good = Good::Tools as u8;
+        figure.carried_amount = 4;
+
+        let buildings = vec![BuildingInstance::new(0, 0, 2, 5, 0)];
+        let mut warehouses = vec![Warehouse::new(0, 0, 8, 5)];
+        let mut map = IslandMap::new_open(0, 10, 10);
+        for y in 0..10 {
+            map.set_walkable(5, y, false);
+        }
+
+        assert!(handle_arrival(
+            &mut figure,
+            &mut warehouses,
+            &buildings,
+            &[map],
+        ));
+        assert_eq!(warehouses[0].stock(Good::Tools), 4);
+    }
+
+    #[test]
+    fn carrier_config_uses_figuren_maxtrag() {
+        let mut fig = FigureDef::default();
+        fig.properties.insert("Maxtrag".into(), "7".into());
+
+        assert_eq!(CarrierConfig::from_figure_def(&fig).max_load, 7);
+    }
+
+    #[test]
+    fn carrier_load_clamped_to_traeger_maxtrag() {
+        let def = def_for_tools();
+        let mut b = BuildingInstance::new(0, 0, 5, 5, 0);
+        b.output_stock = 40;
+        let warehouses = vec![Warehouse::new(0, 0, 4, 4)];
+
+        let carrier = try_spawn_carrier(
+            &mut b,
+            &def,
+            &warehouses,
+            &[],
+            &[],
+            CarrierConfig::default(),
+        )
+        .expect("carrier spawned when output is over half capacity");
+
+        assert_eq!(carrier.carried_amount, 4);
+        assert_eq!(b.output_stock, 36);
+    }
+
+    #[test]
+    fn carrier_load_uses_configured_maxtrag() {
+        let def = def_for_tools();
+        let mut b = BuildingInstance::new(0, 0, 5, 5, 0);
+        b.output_stock = 40;
+        let warehouses = vec![Warehouse::new(0, 0, 4, 4)];
+
+        let carrier = try_spawn_carrier(
+            &mut b,
+            &def,
+            &warehouses,
+            &[],
+            &[],
+            CarrierConfig { max_load: 7 },
+        )
+        .expect("carrier spawned when output is over half capacity");
+
+        assert_eq!(carrier.carried_amount, 7);
+        assert_eq!(b.output_stock, 33);
     }
 
     #[test]
@@ -362,6 +537,16 @@ mod tests {
         let mut b = BuildingInstance::new(0, 0, 5, 5, 0);
         b.output_stock = 40;
         let warehouses = vec![Warehouse::new(0, 0, 1, 1)];
-        assert!(try_spawn_carrier(&mut b, &def, &warehouses, &[], &[]).is_some());
+        assert!(
+            try_spawn_carrier(
+                &mut b,
+                &def,
+                &warehouses,
+                &[],
+                &[],
+                CarrierConfig::default()
+            )
+            .is_some()
+        );
     }
 }

@@ -2,16 +2,27 @@
 //!
 //! Ported from FUN_0046c7d0 (core A* pathfinding in original binary).
 //! Uses priority queue with 8-direction neighbor expansion.
-//! Diagonal moves cost ~1.41× orthogonal (approximated as 14 vs 10).
+//! Diagonal moves cost ~1.41× orthogonal. Road tiles use the decoded
+//! haeuser.cod `Wegspeed` carrier-speed quad: empty carriers are faster
+//! on roads, loaded carriers are slower on roads.
 
 use crate::island_map::IslandMap;
 use std::collections::BinaryHeap;
 use std::cmp::Ordering;
 
-/// Cost of orthogonal movement (×10 for integer arithmetic).
-const COST_ORTHO: u32 = 10;
-/// Cost of diagonal movement (≈√2 × 10).
-const COST_DIAG: u32 = 14;
+/// Empty-carrier speed on plain ground from the common haeuser.cod
+/// `Wegspeed` quad `145, 120, 170, 100`.
+const EMPTY_OFFROAD_SPEED: u32 = 145;
+/// Loaded-carrier speed on plain ground from the same quad.
+const LOADED_OFFROAD_SPEED: u32 = 120;
+/// Empty-carrier speed on road tiles from the same `Wegspeed` quad.
+const EMPTY_ROAD_SPEED: u32 = 170;
+/// Loaded-carrier speed on road tiles from the same quad.
+const LOADED_ROAD_SPEED: u32 = 100;
+
+/// Internal travel-time scale. Chosen so road-empty and road-loaded
+/// costs divide cleanly.
+const COST_SCALE: u32 = 17_000;
 
 /// Maximum nodes to explore before giving up.
 const MAX_ITERATIONS: u32 = 10_000;
@@ -27,6 +38,12 @@ const DIRS: [(i32, i32); 8] = [
     (-1, 0),  // W
     (-1, -1), // NW
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CarrierLoad {
+    Empty,
+    Loaded,
+}
 
 /// A* search node.
 #[derive(Clone, Eq, PartialEq)]
@@ -58,6 +75,16 @@ pub fn find_path(
     start: (i32, i32),
     goal: (i32, i32),
 ) -> Option<Vec<(i32, i32)>> {
+    find_path_for_carrier(map, start, goal, CarrierLoad::Empty)
+}
+
+/// Find a path using the decoded loaded/empty carrier road speeds.
+pub fn find_path_for_carrier(
+    map: &IslandMap,
+    start: (i32, i32),
+    goal: (i32, i32),
+    load: CarrierLoad,
+) -> Option<Vec<(i32, i32)>> {
     if start == goal {
         return Some(Vec::new());
     }
@@ -66,18 +93,19 @@ pub fn find_path(
     if !map.is_walkable(goal.0, goal.1) {
         // Try to find nearest walkable tile to goal
         if let Some(alt_goal) = find_nearest_walkable(map, goal) {
-            return find_path_inner(map, start, alt_goal);
+            return find_path_inner(map, start, alt_goal, load);
         }
         return None;
     }
 
-    find_path_inner(map, start, goal)
+    find_path_inner(map, start, goal, load)
 }
 
 fn find_path_inner(
     map: &IslandMap,
     start: (i32, i32),
     goal: (i32, i32),
+    load: CarrierLoad,
 ) -> Option<Vec<(i32, i32)>> {
     let w = map.width as usize;
     let h = map.height as usize;
@@ -95,7 +123,7 @@ fn find_path_inner(
     open.push(Node {
         pos: start,
         g_cost: 0,
-        f_cost: heuristic(start, goal),
+        f_cost: heuristic(start, goal, load),
     });
 
     let mut iterations = 0u32;
@@ -136,15 +164,7 @@ fn find_path_inner(
                 }
             }
 
-            let mut move_cost = if dx != 0 && dy != 0 { COST_DIAG } else { COST_ORTHO };
-            // Road tiles are cheaper. RE: haeuser.cod `Wegspeed`
-            // 145 plain → 170 road = 17/14.5 ≈ ×1.17 speedup; we
-            // approximate by reducing the per-step cost ×0.7 on
-            // road tiles (slightly stronger preference so the A*
-            // routes carriers along roads when one is nearby).
-            if map.is_road(nx, ny) {
-                move_cost = move_cost * 7 / 10;
-            }
+            let move_cost = step_cost(dx != 0 && dy != 0, map.is_road(nx, ny), load);
             let new_g = current.g_cost + move_cost;
 
             let n_idx = ny as usize * w + nx as usize;
@@ -154,7 +174,7 @@ fn find_path_inner(
                 open.push(Node {
                     pos: (nx, ny),
                     g_cost: new_g,
-                    f_cost: new_g + heuristic((nx, ny), goal),
+                    f_cost: new_g + heuristic((nx, ny), goal, load),
                 });
             }
         }
@@ -164,12 +184,42 @@ fn find_path_inner(
 }
 
 /// Octile distance heuristic (admissible for 8-direction movement).
-fn heuristic(a: (i32, i32), b: (i32, i32)) -> u32 {
+fn heuristic(a: (i32, i32), b: (i32, i32), load: CarrierLoad) -> u32 {
     let dx = (a.0 - b.0).unsigned_abs();
     let dy = (a.1 - b.1).unsigned_abs();
     let (min, max) = if dx < dy { (dx, dy) } else { (dy, dx) };
-    // min diagonal moves + (max - min) orthogonal moves
-    min * COST_DIAG + (max - min) * COST_ORTHO
+    let ortho = min_orthogonal_cost(load);
+    let diag = diagonal_cost(ortho);
+    min * diag + (max - min) * ortho
+}
+
+fn step_cost(diagonal: bool, road: bool, load: CarrierLoad) -> u32 {
+    let mut cost = orthogonal_cost(road, load);
+    if diagonal {
+        cost = diagonal_cost(cost);
+    }
+    cost
+}
+
+fn min_orthogonal_cost(load: CarrierLoad) -> u32 {
+    orthogonal_cost(false, load).min(orthogonal_cost(true, load))
+}
+
+fn orthogonal_cost(road: bool, load: CarrierLoad) -> u32 {
+    COST_SCALE / carrier_speed(road, load)
+}
+
+fn diagonal_cost(orthogonal: u32) -> u32 {
+    orthogonal * 14 / 10
+}
+
+const fn carrier_speed(road: bool, load: CarrierLoad) -> u32 {
+    match (road, load) {
+        (false, CarrierLoad::Empty) => EMPTY_OFFROAD_SPEED,
+        (false, CarrierLoad::Loaded) => LOADED_OFFROAD_SPEED,
+        (true, CarrierLoad::Empty) => EMPTY_ROAD_SPEED,
+        (true, CarrierLoad::Loaded) => LOADED_ROAD_SPEED,
+    }
 }
 
 /// Reconstruct path by walking backwards from goal to start using came_from directions.
@@ -290,25 +340,47 @@ mod tests {
     }
 
     #[test]
-    fn pathfinder_prefers_road_when_available() {
-        // A 10x10 grid where the direct diagonal route is open
-        // grass and there's a longer L-shaped road. With road
-        // weighting at 0.7×, the longer-but-on-road route should
-        // win.
+    fn carrier_step_costs_use_decoded_wegspeed_quad() {
+        assert_eq!(carrier_speed(false, CarrierLoad::Empty), 145);
+        assert_eq!(carrier_speed(false, CarrierLoad::Loaded), 120);
+        assert_eq!(carrier_speed(true, CarrierLoad::Empty), 170);
+        assert_eq!(carrier_speed(true, CarrierLoad::Loaded), 100);
+        assert!(
+            orthogonal_cost(true, CarrierLoad::Empty)
+                < orthogonal_cost(false, CarrierLoad::Empty)
+        );
+        assert!(
+            orthogonal_cost(true, CarrierLoad::Loaded)
+                > orthogonal_cost(false, CarrierLoad::Loaded)
+        );
+    }
+
+    #[test]
+    fn empty_carriers_use_short_roads_without_overpreferring_long_detours() {
+        let mut short_road = IslandMap::new_open(0, 10, 10);
+        for x in 1..=8 {
+            short_road.set_road(x, 0, true);
+        }
+        let path =
+            find_path_for_carrier(&short_road, (0, 1), (9, 1), CarrierLoad::Empty).unwrap();
+        assert!(path.iter().any(|&(_, y)| y == 0));
+
+        let mut long_detour = IslandMap::new_open(0, 10, 10);
+        for x in 0..10 {
+            long_detour.set_road(x, 5, true);
+        }
+        let path =
+            find_path_for_carrier(&long_detour, (0, 0), (9, 0), CarrierLoad::Empty).unwrap();
+        assert!(path.iter().all(|&(_, y)| y == 0));
+    }
+
+    #[test]
+    fn loaded_carriers_do_not_detour_onto_slower_roads() {
         let mut map = IslandMap::new_open(0, 10, 10);
-        // Lay a horizontal road row at y=0 from x=0 to x=9.
-        for x in 0..10 { map.set_road(x, 0, true); }
-        let path_road = find_path(&map, (0, 0), (9, 0)).unwrap();
-        // Road row is straight orthogonal — every step weighted.
-        assert_eq!(path_road.len(), 9);
-        // Add a parallel non-road path; the pathfinder still
-        // prefers the road row.
-        let mut map2 = IslandMap::new_open(0, 10, 10);
-        for x in 0..10 { map2.set_road(x, 5, true); }
-        // Path from (0, 0) to (9, 0) should detour through the
-        // road if the cost saving is enough — it isn't here
-        // because the detour is longer than the direct row, but
-        // the test confirms the API works without panicking.
-        let _ = find_path(&map2, (0, 0), (9, 0));
+        for x in 1..=8 {
+            map.set_road(x, 0, true);
+        }
+        let path = find_path_for_carrier(&map, (0, 1), (9, 1), CarrierLoad::Loaded).unwrap();
+        assert!(path.iter().all(|&(_, y)| y == 1));
     }
 }

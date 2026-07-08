@@ -170,6 +170,8 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: None,
         }
     }

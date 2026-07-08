@@ -342,7 +342,7 @@ fn main() {
             println!(
                 "  Ship {}: {:?} at ({},{}) cargo={}/{} profit={}g",
                 i, ship.state, ship.world_x, ship.world_y,
-                ship.cargo_total, anno_sim::trade::SHIP_CARGO_CAPACITY,
+                ship.cargo_total, ship.cargo_capacity(),
                 ship.profit
             );
             for (good, amount) in &ship.cargo {

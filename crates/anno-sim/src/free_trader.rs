@@ -27,13 +27,16 @@
 //!   chance per ship tick** to invoke the target selector. New
 //!   sail-target assigned via `FUN_00445350(&local_3ec, 0x37,
 //!   target_x, target_y)`.
-//! - `figuren.cod` `Nummer: HANDEL1` — the ship sprite/animation set
-//!   the free trader reuses in render.
+//! - `figuren.cod` `Nummer: HANDLER` — the free-trader hull's
+//!   cargo capacity (`Maxware: 6` = 60 t).
 //!
-//! The exact dock-duration, stock-list, and visit-count constants
-//! sit elsewhere (the trader's at-Kontor dialog handler isn't yet
-//! located) and remain SPECULATIVE; values below are conservative
-//! defaults pending that RE.
+//! The exact at-Kontor dwell counter sits elsewhere. The fixed dwell
+//! below remains unpinned, while the ship-count rule follows the
+//! manual: once the active Kontor count calls for another free trader,
+//! the simulator admits it without an extra stochastic gate. New ships
+//! spawn from the loaded ocean-map edge rather than a fixed debug
+//! square; only post-dock target selection is currently tied to the
+//! source `(rand() & 3) == 0` seek gate.
 
 use crate::trade::compass_heading;
 use crate::types::Good;
@@ -58,12 +61,13 @@ pub const NATIVE_SLOT: u8 = 5;
 /// same slot when emitting hideout-spawned ships.
 pub const PIRATE_SLOT: u8 = 6;
 
-// Visit count and dock duration. Anno 1602 manual section 8.1
-// "Free traders" + section 11.4.3 "Placing ships" + binary RE:
+// Port candidate cap, target-seek gate, and dock duration. Anno 1602
+// manual section 8.1 "Free traders" + section 11.4.3 "Placing ships"
+// + binary RE:
 //
 //   - Traders keep circulating between Kontors as long as there are
-//     two or more warehouses in the island chain. They don't pick a
-//     "visits before leaving" — the binary recreates trader ships
+//     two or more warehouses in the island chain. They do not pick a
+//     "visits before leaving" cap — the binary recreates trader ships
 //     dynamically when their target changes (see `1602_exe.c:50289`
 //     returning `&DAT_004cf358 + iVar3 * 0x218` after
 //     `FUN_004488d0` picks a new target).
@@ -79,15 +83,17 @@ pub const PIRATE_SLOT: u8 = 6;
 //     `(supply * 0xa6 >> 7 - other) * qty + (sell - buy) * qty`.
 //     The 0xa6 (= 166) is the base trade multiplier. The trader
 //     picks the highest-scoring port.
+//   - After a trader finishes at a port, `1602_exe.c:57709-57714`
+//     invokes the target selector only when `(rand() & 3) == 0`.
+//     Until that gate hits, the ship remains in the target-seeking
+//     state instead of immediately picking another Kontor.
 //   - Per-good exchange amounts come from the player's buy/sell
 //     sliders (manual 8.1).
 //
-// `VISITS_BEFORE_LEAVING = 12` matches the binary's `local_68 < 0xc`
-// candidate-ports cap. `DOCK_TICKS = 5` is the dwell time in our
-// 10 Hz tick rate (= 0.5 s) — the binary's exact dwell counter
-// hasn't been located but the per-tick `(rand() & 3) == 0`
-// re-target gate at `:57713` already enforces a stochastic dwell.
-const VISITS_BEFORE_LEAVING: u8 = 12;
+// `local_68 < 0xc` is the binary's candidate-port shortlist cap, not
+// a lifetime visit cap. `DOCK_TICKS = 5` is the dwell time in our
+// 10 Hz tick rate (= 0.5 s); the binary's exact at-port dwell counter
+// is still not pinned.
 const DOCK_TICKS: u8 = 5;
 
 /// Initial inventory of a freshly-spawned free trader.
@@ -103,15 +109,40 @@ const DOCK_TICKS: u8 = 5;
 /// > sells them to the Free Traders."
 ///
 /// So the trader's default stock is `Tools` and `Ore` — every other
-/// good is added dynamically when a player sells some to the trader,
-/// which we don't yet model (would require a persistent trader-stock
-/// table tracked across visits). Per-good inventory amounts aren't
-/// quoted in the manual.
+/// good can be added to this ship when a player sells surplus to it.
+/// A global trader-stock table shared across future ships is not
+/// modelled yet. Per-good starting amounts aren't quoted in the
+/// manual. The total is capped by the HANDLER hull's `Maxware × 10`
+/// capacity.
 pub fn default_stock() -> Vec<(Good, u16)> {
-    vec![
-        (Good::Tools, 30),
-        (Good::Ore, 40),
-    ]
+    default_stock_for_capacity(crate::trade::DEFAULT_LARGE_TRADER_CARGO_CAPACITY)
+}
+
+pub fn default_stock_for_capacity(cargo_capacity: u16) -> Vec<(Good, u16)> {
+    let tools = cargo_capacity.min(30);
+    let ore = cargo_capacity.saturating_sub(tools);
+    let mut stock = Vec::new();
+    if tools > 0 {
+        stock.push((Good::Tools, tools));
+    }
+    if ore > 0 {
+        stock.push((Good::Ore, ore));
+    }
+    stock
+}
+
+fn default_free_trader_cargo_capacity() -> u16 {
+    crate::trade::DEFAULT_LARGE_TRADER_CARGO_CAPACITY
+}
+
+pub fn stock_total(stock: &[(Good, u16)]) -> u16 {
+    stock
+        .iter()
+        .fold(0u16, |total, (_, qty)| total.saturating_add(*qty))
+}
+
+pub fn cargo_space(stock: &[(Good, u16)], cargo_capacity: u16) -> u16 {
+    cargo_capacity.saturating_sub(stock_total(stock))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -134,7 +165,9 @@ pub struct FreeTrader {
     pub target_warehouse: Option<usize>,
     pub state: FreeTraderState,
     pub dock_ticks_left: u8,
-    pub visits_remaining: u8,
+    /// HANDLER cargo capacity in tons (`figuren.cod` Maxware × 10).
+    #[serde(default = "default_free_trader_cargo_capacity")]
+    pub cargo_capacity: u16,
     pub stock: Vec<(Good, u16)>,
     /// Once true, the ship is heading off-edge and should be removed
     /// when it reaches its target.
@@ -142,10 +175,23 @@ pub struct FreeTrader {
     pub active: bool,
     pub path: Vec<(i32, i32)>,
     pub path_idx: usize,
+    /// True when `target_x,target_y` came from the loaded ocean map and must
+    /// not fall back to direct grid movement if the route is missing.
+    #[serde(default)]
+    pub path_required: bool,
 }
 
 impl FreeTrader {
     pub fn spawn_at(x: i32, y: i32) -> Self {
+        Self::spawn_at_with_capacity(x, y, crate::trade::DEFAULT_LARGE_TRADER_CARGO_CAPACITY)
+    }
+
+    pub fn spawn_at_with_capacity(x: i32, y: i32, cargo_capacity: u16) -> Self {
+        let capacity = if cargo_capacity == 0 {
+            crate::trade::DEFAULT_LARGE_TRADER_CARGO_CAPACITY
+        } else {
+            cargo_capacity
+        };
         Self {
             world_x: x,
             world_y: y,
@@ -156,17 +202,38 @@ impl FreeTrader {
             target_warehouse: None,
             state: FreeTraderState::Sailing,
             dock_ticks_left: 0,
-            visits_remaining: VISITS_BEFORE_LEAVING,
-            stock: default_stock(),
+            cargo_capacity: capacity,
+            stock: default_stock_for_capacity(capacity),
             leaving: false,
             active: true,
             path: Vec::new(),
             path_idx: 0,
+            path_required: false,
         }
     }
 
+    pub fn cargo_capacity(&self) -> u16 {
+        if self.cargo_capacity == 0 {
+            crate::trade::DEFAULT_LARGE_TRADER_CARGO_CAPACITY
+        } else {
+            self.cargo_capacity
+        }
+    }
+
+    pub fn cargo_total(&self) -> u16 {
+        stock_total(&self.stock)
+    }
+
+    pub fn cargo_space(&self) -> u16 {
+        cargo_space(&self.stock, self.cargo_capacity())
+    }
+
     pub fn stock_amount(&self, good: Good) -> u16 {
-        self.stock.iter().filter(|(g, _)| *g == good).map(|(_, a)| *a).sum()
+        self.stock
+            .iter()
+            .filter(|(g, _)| *g == good)
+            .map(|(_, a)| *a)
+            .sum()
     }
 
     fn withdraw_stock(&mut self, good: Good, amount: u16) -> u16 {
@@ -183,7 +250,13 @@ impl FreeTrader {
     }
 
     fn deposit_stock(&mut self, good: Good, amount: u16) {
-        if amount == 0 { return; }
+        if amount == 0 {
+            return;
+        }
+        let amount = amount.min(self.cargo_space());
+        if amount == 0 {
+            return;
+        }
         if let Some(slot) = self.stock.iter_mut().find(|(g, _)| *g == good) {
             slot.1 = slot.1.saturating_add(amount);
         } else {
@@ -233,14 +306,22 @@ pub fn dock_trade(
     //    not sell to the player below its standard ask.
     let stock_snapshot: Vec<(Good, u16)> = trader.stock.clone();
     for (good, available) in stock_snapshot {
-        if available == 0 { continue; }
+        if available == 0 {
+            continue;
+        }
         let demand = wh.buy_demand(good);
-        if demand == 0 { continue; }
+        if demand == 0 {
+            continue;
+        }
         let standard_buy = crate::prices::price_of(good).buy as i32;
         let offered_price = wh.slider(good).buy_price.unwrap_or(standard_buy);
-        if offered_price < standard_buy { continue; }
+        if offered_price < standard_buy {
+            continue;
+        }
         let price = offered_price;
-        if *player_gold < price { continue; }
+        if *player_gold < price {
+            continue;
+        }
         let max_aff = (*player_gold / price.max(1)) as u16;
         let qty = available.min(demand).min(max_aff);
         let deposited = wh.deposit(good, qty);
@@ -266,9 +347,15 @@ pub fn dock_trade(
         })
         .collect();
     for (good, qty) in offers {
+        let qty = qty.min(trader.cargo_space());
+        if qty == 0 {
+            break;
+        }
         let standard_sell = crate::prices::price_of(good).sell as i32;
         let asked_price = wh.slider(good).sell_price.unwrap_or(standard_sell);
-        if asked_price > standard_sell { continue; }
+        if asked_price > standard_sell {
+            continue;
+        }
         let price = asked_price;
         let withdrawn = wh.withdraw(good, qty);
         if withdrawn > 0 {
@@ -282,9 +369,10 @@ pub fn dock_trade(
 }
 
 /// Step the free trader by one ship-tick: move toward target, dock on
-/// arrival, run dock trades over multiple ticks, pick the next port
-/// when done. Returns `true` if the trader has finished and should be
-/// removed by the caller.
+/// arrival, and run dock trades over multiple ticks. Once docking is
+/// done the caller applies the source `(rand() & 3) == 0` gate before
+/// assigning another port. Returns `true` if the trader has finished
+/// and should be removed by the caller.
 pub fn tick_one(
     trader: &mut FreeTrader,
     warehouses: &mut [Warehouse],
@@ -296,12 +384,18 @@ pub fn tick_one(
 
     match trader.state {
         FreeTraderState::Sailing => {
-            // Direct movement; ocean-A* path overrides if present.
+            if trader.target_warehouse.is_none() && !trader.leaving {
+                return false;
+            }
+            // Direct movement is only for assetless tests / no-ocean fallback.
+            // Loaded-ocean targets require their A* route.
             let prev_x = trader.world_x;
             let prev_y = trader.world_y;
             if !trader.path.is_empty() && trader.path_idx < trader.path.len() {
                 for _ in 0..trader.speed {
-                    if trader.path_idx >= trader.path.len() { break; }
+                    if trader.path_idx >= trader.path.len() {
+                        break;
+                    }
                     let (nx, ny) = trader.path[trader.path_idx];
                     trader.world_x = nx;
                     trader.world_y = ny;
@@ -311,7 +405,9 @@ pub fn tick_one(
                     trader.path.clear();
                     trader.path_idx = 0;
                 }
-            } else {
+            } else if !trader.path_required
+                || (trader.world_x == trader.target_x && trader.world_y == trader.target_y)
+            {
                 let dx = trader.target_x - trader.world_x;
                 let dy = trader.target_y - trader.world_y;
                 let steps = trader.speed as i32;
@@ -329,8 +425,7 @@ pub fn tick_one(
                 trader.heading,
             );
 
-            let arrived = trader.world_x == trader.target_x
-                && trader.world_y == trader.target_y;
+            let arrived = trader.world_x == trader.target_x && trader.world_y == trader.target_y;
             if arrived {
                 if trader.leaving {
                     trader.active = false;
@@ -359,9 +454,6 @@ pub fn tick_one(
                 // Done at this port; caller chooses next destination.
                 trader.target_warehouse = None;
                 trader.state = FreeTraderState::Sailing;
-                if trader.visits_remaining > 0 {
-                    trader.visits_remaining -= 1;
-                }
             }
         }
     }
@@ -374,6 +466,16 @@ mod tests {
 
     fn mk_wh(island: u8, owner: u8, x: u16, y: u16) -> Warehouse {
         Warehouse::new(island, owner, x, y)
+    }
+
+    #[test]
+    fn default_stock_fits_handler_cargo_capacity() {
+        let trader = FreeTrader::spawn_at(5, 5);
+
+        assert_eq!(trader.cargo_capacity(), 60);
+        assert_eq!(trader.cargo_total(), 60);
+        assert_eq!(trader.stock_amount(Good::Tools), 30);
+        assert_eq!(trader.stock_amount(Good::Ore), 30);
     }
 
     #[test]
@@ -414,9 +516,28 @@ mod tests {
         trader.stock.clear();
         let mut gold = 0;
         let _ = dock_trade(&mut trader, &mut whs, &mut gold);
-        assert!(trader.stock_amount(Good::Wool) > 0);
-        assert_eq!(whs[0].stock(Good::Wool), 30);
+        assert_eq!(trader.stock_amount(Good::Wool), 60);
+        assert_eq!(trader.cargo_total(), 60);
+        assert_eq!(whs[0].stock(Good::Wool), 140);
         assert!(gold > 0);
+    }
+
+    #[test]
+    fn dock_trade_buys_surplus_only_until_hold_full() {
+        let mut whs = vec![mk_wh(0, 0, 5, 5)];
+        whs[0].set_capacity(Good::Wool, 200);
+        whs[0].deposit(Good::Wool, 200);
+        whs[0].set_sell_min_keep(Good::Wool, Some(0));
+        let mut trader = FreeTrader::spawn_at_with_capacity(5, 5, 10);
+        trader.target_warehouse = Some(0);
+        trader.stock.clear();
+        let mut gold = 0;
+
+        let _ = dock_trade(&mut trader, &mut whs, &mut gold);
+
+        assert_eq!(trader.cargo_total(), 10);
+        assert_eq!(trader.stock_amount(Good::Wool), 10);
+        assert_eq!(whs[0].stock(Good::Wool), 190);
     }
 
     #[test]
@@ -475,11 +596,65 @@ mod tests {
         let mut gold = vec![5000i32];
         for _ in 0..30 {
             tick_one(&mut trader, &mut whs, &mut gold);
-            if trader.state == FreeTraderState::Docked { break; }
+            if trader.state == FreeTraderState::Docked {
+                break;
+            }
         }
         assert_eq!(trader.state, FreeTraderState::Docked);
         assert_eq!(trader.world_x, 10);
         assert_eq!(trader.world_y, 10);
+    }
+
+    #[test]
+    fn ocean_routed_trader_without_path_does_not_direct_sail() {
+        let mut whs = vec![mk_wh(0, 0, 10, 0)];
+        let mut trader = FreeTrader::spawn_at(0, 0);
+        trader.target_warehouse = Some(0);
+        trader.target_x = 10;
+        trader.target_y = 0;
+        trader.path_required = true;
+        let mut gold = vec![5000i32];
+
+        let removed = tick_one(&mut trader, &mut whs, &mut gold);
+
+        assert!(!removed);
+        assert_eq!((trader.world_x, trader.world_y), (0, 0));
+        assert_eq!(trader.state, FreeTraderState::Sailing);
+    }
+
+    #[test]
+    fn ocean_routed_trader_at_target_still_docks_without_path() {
+        let mut whs = vec![mk_wh(0, 0, 10, 0)];
+        let mut trader = FreeTrader::spawn_at(10, 0);
+        trader.target_warehouse = Some(0);
+        trader.target_x = 10;
+        trader.target_y = 0;
+        trader.path_required = true;
+        let mut gold = vec![5000i32];
+
+        let removed = tick_one(&mut trader, &mut whs, &mut gold);
+
+        assert!(!removed);
+        assert_eq!(trader.state, FreeTraderState::Docked);
+        assert_eq!(trader.dock_ticks_left, DOCK_TICKS);
+    }
+
+    #[test]
+    fn targetless_sailing_trader_waits_for_assignment() {
+        let mut whs = vec![mk_wh(0, 0, 10, 10)];
+        let mut trader = FreeTrader::spawn_at(10, 10);
+        trader.state = FreeTraderState::Sailing;
+        trader.target_warehouse = None;
+        trader.target_x = 10;
+        trader.target_y = 10;
+        let mut gold = vec![5000i32];
+
+        let removed = tick_one(&mut trader, &mut whs, &mut gold);
+
+        assert!(!removed);
+        assert_eq!(trader.state, FreeTraderState::Sailing);
+        assert_eq!(trader.target_warehouse, None);
+        assert_eq!(trader.dock_ticks_left, 0);
     }
 
     #[test]

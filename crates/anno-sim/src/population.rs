@@ -219,21 +219,6 @@ fn demand_slot_for_good(good: Good) -> Option<usize> {
     DEMAND_GOODS.iter().position(|&g| g == good)
 }
 
-/// Return the goods the player is failing to supply at a "severe" level.
-/// A severe shortage is `supply < demand / 2`. Used by the HUD to nudge
-/// the player toward the missing production chain.
-pub fn severe_shortages(player: &crate::player::Player) -> Vec<Good> {
-    let mut out = Vec::new();
-    for (slot_idx, slot) in player.demands.iter().enumerate() {
-        if slot.demand > 0 && slot.supply * 2 < slot.demand {
-            if slot_idx < DEMAND_GOODS.len() {
-                out.push(DEMAND_GOODS[slot_idx]);
-            }
-        }
-    }
-    out
-}
-
 /// Net per-tier population growth per economy tick, expressed in
 /// thousandths of current population, before promotion/demotion.
 ///
@@ -385,20 +370,6 @@ mod tests {
         p.satisfaction[2] = 0;
         update_population_growth(&mut p, 0);
         assert!(p.population[2] < 200, "starving citizens should leave");
-    }
-
-    #[test]
-    fn severe_shortages_lists_only_starved_goods() {
-        let mut p = Player::new_human(0);
-        // Slot 0 (Food): demand 100, supply 30 → severe
-        p.demands[0].demand = 100;
-        p.demands[0].supply = 30;
-        // Slot 1 (Cloth): demand 100, supply 60 → not severe
-        p.demands[1].demand = 100;
-        p.demands[1].supply = 60;
-        // Slot 2 (Alcohol): demand 0, supply 0 → ignored
-        let s = severe_shortages(&p);
-        assert_eq!(s, vec![Good::Food]);
     }
 
     #[test]

@@ -39,7 +39,7 @@ fn main() {
         nummer_to_ware.len());
 
     // Distinct wares produced by PLANTAGE buildings — the
-    // climate-bound subset.
+    // fertility-gated subset.
     let mut plantage_wares: BTreeMap<String, u32> = BTreeMap::new();
     for b in &cod.buildings {
         let pk = b.properties.get("ProdKind").cloned().unwrap_or_default();

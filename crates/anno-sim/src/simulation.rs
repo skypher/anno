@@ -10,13 +10,12 @@ use crate::carrier;
 use crate::civilian;
 use crate::combat::{self, DiplomacyMatrix, MilitaryUnit};
 use crate::coverage::CoverageMap;
-use crate::ocean_map::OceanMap;
 use crate::economy;
 use crate::entity::{ActionType, Figure};
-use crate::history::EconomyHistory;
 use crate::island_map::IslandMap;
-use crate::population;
+use crate::ocean_map::OceanMap;
 use crate::player::Player;
+use crate::population;
 use crate::production;
 use crate::trade::{self, TradeRoute, TradeShip};
 use crate::types::TICKS_PER_MINUTE;
@@ -52,6 +51,20 @@ impl SubsystemTimer {
     }
 }
 
+/// Static-map mutation emitted when a building is destroyed.
+///
+/// `ruin_id` is the source `Ruinenr` byte from haeuser.cod. `0xff`
+/// means the original clears the footprint without placing a ruin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileClear {
+    pub island_id: u8,
+    pub tile_x: u16,
+    pub tile_y: u16,
+    pub width: u8,
+    pub height: u8,
+    pub ruin_id: u8,
+}
+
 /// The main game simulation state.
 pub struct Simulation {
     /// Game clock in centiseconds (600 = 1 displayed minute).
@@ -67,6 +80,7 @@ pub struct Simulation {
 
     // Subsystem cadences (1000-ms tick aligned).
     timer_production: SubsystemTimer, // PRODUCTION_TICK_MS (1000)
+    timer_civilians: SubsystemTimer,  // 4_999
     timer_population: SubsystemTimer, // 10_000
     timer_events: SubsystemTimer,     // 10_000
     timer_ships: SubsystemTimer,      // 1_000
@@ -88,17 +102,22 @@ pub struct Simulation {
     pub trade_ships: Vec<TradeShip>,
     pub coverage_maps: Vec<CoverageMap>,
     pub ocean_map: Option<OceanMap>,
+    /// Source-derived carrier constants. Preserved across save snapshots;
+    /// the game binary reloads them from `figuren.cod` at startup.
+    pub carrier_config: carrier::CarrierConfig,
+    /// Source-derived civilian sprite layout. Preserved across save
+    /// snapshots; the game binary reloads it from `figuren.cod` at startup.
+    pub civilian_config: civilian::CivilianConfig,
+    /// Source-derived trade-ship cargo capacities. Preserved across
+    /// save snapshots; the game binary reloads them from `figuren.cod`.
+    pub ship_cargo_config: trade::ShipCargoConfig,
 
     pub autosave_timer_ms: u32,
 
-    /// Rolling economy/population history for the human player (slot 0).
-    pub history: EconomyHistory,
-
-    /// Footprint cleanup events from buildings destroyed in combat.
-    /// `(island_id, tile_x, tile_y, width, height)`. The renderer drains
-    /// this each frame to clear `Island::tiles` for the destroyed
-    /// footprint and refresh display.
-    pub tile_clears: Vec<(u8, u16, u16, u8, u8)>,
+    /// Footprint cleanup/replacement events from buildings destroyed
+    /// in combat. The game binary drains this each frame to mutate
+    /// `Island::tiles` and refresh display.
+    pub tile_clears: Vec<TileClear>,
 
     /// Active scenario objectives for the human player. Re-evaluated each
     /// economy tick. The renderer reads `progress()` and the per-item
@@ -106,7 +125,7 @@ pub struct Simulation {
     pub objectives: crate::objectives::ObjectiveSet,
 
     /// Indices of objectives that flipped to done since last drain.
-    /// Game binary consumes these to push events into the chat log.
+    /// Game binary consumes these to play the completion cue.
     pub objective_completions: Vec<usize>,
 
     /// `true` once every scenario objective has completed at
@@ -117,19 +136,15 @@ pub struct Simulation {
     /// victory banner when this flips.
     pub scenario_complete: bool,
 
-    /// xorshift RNG state for the event ticker. Persisted as a sim field
-    /// only; not serialized into save files (each load reseeds).
-    rng_state: u64,
+    /// Source-shaped MSVC `rand()` stream. Persisted as a sim field only;
+    /// not serialized into save files (each load reseeds).
+    rng_state: crate::source_rand::SourceRand,
 
     /// Per-island fog-of-war bitmap. Lazily allocated on first sighting.
     pub exploration: Vec<crate::exploration::ExplorationMap>,
 
-    /// Combat damage events from the most recent military tick. Drained
-    /// by the renderer each frame to animate floating "-N" numbers.
-    pub damage_events: Vec<crate::combat::DamageEvent>,
-
     /// Sim-emitted text events (free-trader arrivals, etc.). Drained by
-    /// the game binary into the chat-log overlay each frame.
+    /// the game binary for voice-announcement routing.
     pub event_log: Vec<String>,
 
     /// Roving NPC trade ships. Spawned periodically from the world edge
@@ -166,13 +181,167 @@ pub struct Simulation {
 /// or opponents, have been defeated"):
 /// - Every non-human, non-empty player slot is `Defeated`.
 /// - Or all scenario `objectives` are complete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
-         serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum GameOutcome {
     #[default]
     Pending,
     Victory,
     Defeat,
+}
+
+fn free_trader_port_distance(
+    trader: &crate::free_trader::FreeTrader,
+    warehouse: &Warehouse,
+) -> u32 {
+    let dx = (warehouse.tile_x as i32 - trader.world_x).unsigned_abs();
+    let dy = (warehouse.tile_y as i32 - trader.world_y).unsigned_abs();
+    dx + dy / 4
+}
+
+fn free_trader_port_profit_score(
+    trader: &crate::free_trader::FreeTrader,
+    warehouse: &Warehouse,
+    owner_gold: i32,
+) -> i32 {
+    let mut score = 0i32;
+    let mut gold_left = owner_gold.max(0);
+    let mut cargo_space = trader.cargo_space();
+
+    // First, mirror `dock_trade`: trader stock sold to the port frees
+    // cargo space and earns at least the standard buy price. Score only
+    // accepted trades, using the buy-vs-sell spread as the trader's
+    // positive reason to prefer this port.
+    for &(good, available) in &trader.stock {
+        if crate::prices::original_ware_id(good).is_none() {
+            continue;
+        }
+        if available == 0 {
+            continue;
+        }
+        let demand = warehouse.buy_demand(good);
+        if demand == 0 {
+            continue;
+        }
+        let price = crate::prices::price_of(good);
+        let offered = warehouse.slider(good).buy_price.unwrap_or(price.buy);
+        if offered < price.buy || gold_left < offered {
+            continue;
+        }
+        let affordable = (gold_left / offered.max(1)) as u16;
+        let qty = available.min(demand).min(affordable);
+        if qty == 0 {
+            continue;
+        }
+        gold_left -= qty as i32 * offered;
+        cargo_space = cargo_space.saturating_add(qty);
+        score += qty as i32 * (offered - price.sell).max(0);
+    }
+
+    // Then score surplus this port would sell to the trader. The
+    // trader can resell later at its standard buy price; ports asking
+    // above the standard sell price are rejected by `dock_trade`.
+    for (good, _, _) in warehouse.all_stock() {
+        if crate::prices::original_ware_id(good).is_none() {
+            continue;
+        }
+        let qty = warehouse.sell_offer(good).min(cargo_space);
+        if qty == 0 {
+            continue;
+        }
+        let price = crate::prices::price_of(good);
+        let asked = warehouse.slider(good).sell_price.unwrap_or(price.sell);
+        if asked > price.sell {
+            continue;
+        }
+        cargo_space -= qty;
+        score += qty as i32 * (price.buy - asked).max(0);
+    }
+
+    score
+}
+
+fn free_trader_edge_point_from_bounds(
+    side: u64,
+    offset: u64,
+    max_x: i32,
+    max_y: i32,
+) -> (i32, i32) {
+    let max_x = max_x.max(0);
+    let max_y = max_y.max(0);
+    match side % 4 {
+        0 => ((offset % (max_x as u64 + 1)) as i32, 0),
+        1 => ((offset % (max_x as u64 + 1)) as i32, max_y),
+        2 => (0, (offset % (max_y as u64 + 1)) as i32),
+        _ => (max_x, (offset % (max_y as u64 + 1)) as i32),
+    }
+}
+
+fn free_trader_edge_point_from_ocean(ocean: &OceanMap, side: u64, offset: u64) -> (i32, i32) {
+    let max_x = i32::from(ocean.width.saturating_sub(1));
+    let max_y = i32::from(ocean.height.saturating_sub(1));
+    let edge_len = if side % 4 < 2 {
+        max_x as u64 + 1
+    } else {
+        max_y as u64 + 1
+    };
+
+    for delta in 0..edge_len {
+        let (x, y) = free_trader_edge_point_from_bounds(side, offset + delta, max_x, max_y);
+        if ocean.is_navigable(x, y) {
+            return (x, y);
+        }
+    }
+
+    free_trader_edge_point_from_bounds(side, offset, max_x, max_y)
+}
+
+fn free_trader_departure_point_from_bounds(x: i32, y: i32, max_x: i32, max_y: i32) -> (i32, i32) {
+    let max_x = max_x.max(0);
+    let max_y = max_y.max(0);
+    let cx = x.clamp(0, max_x);
+    let cy = y.clamp(0, max_y);
+    let candidates = [
+        ((cx, 0), cy),
+        ((cx, max_y), (max_y - cy).abs()),
+        ((0, cy), cx),
+        ((max_x, cy), (max_x - cx).abs()),
+    ];
+    candidates
+        .into_iter()
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(point, _)| point)
+        .unwrap_or((cx, cy))
+}
+
+fn free_trader_departure_route_from_ocean(
+    ocean: &OceanMap,
+    x: i32,
+    y: i32,
+) -> Option<((i32, i32), Vec<(i32, i32)>)> {
+    let start = ocean.nearest_navigable(x, y)?;
+    let max_x = i32::from(ocean.width.saturating_sub(1));
+    let max_y = i32::from(ocean.height.saturating_sub(1));
+    let mut candidates = [
+        free_trader_edge_point_from_ocean(ocean, 0, start.0.max(0) as u64),
+        free_trader_edge_point_from_ocean(ocean, 1, start.0.max(0) as u64),
+        free_trader_edge_point_from_ocean(ocean, 2, start.1.max(0) as u64),
+        free_trader_edge_point_from_ocean(ocean, 3, start.1.max(0) as u64),
+    ];
+    candidates.sort_by_key(|&(tx, ty)| (tx - start.0).abs() + (ty - start.1).abs());
+
+    for target in candidates {
+        if target.0 < 0 || target.1 < 0 || target.0 > max_x || target.1 > max_y {
+            continue;
+        }
+        if target == start {
+            return Some((target, Vec::new()));
+        }
+        if let Some(path) = crate::ocean_map::find_ocean_path(ocean, start, target) {
+            return Some((target, path));
+        }
+    }
+
+    None
 }
 
 impl Simulation {
@@ -183,10 +352,12 @@ impl Simulation {
             speed_multiplier: 1,
             paused: false,
 
-            // Subsystem cadences mirror the binary's `-1000` ms
-            // game-tick decrement (1602_exe.c:16110); the off-by-one
-            // values (999 / 9999 / 29999 / 4999) were unjustified.
+            // Main subsystem cadences mirror the binary's `-1000` ms
+            // game-tick decrement (1602_exe.c:16110). The civilian
+            // building dispatcher uses its separate 4999 ms gate from
+            // 1602_exe.c:84620.
             timer_production: SubsystemTimer::new(crate::production::PRODUCTION_TICK_MS),
+            timer_civilians: SubsystemTimer::new(civilian::CIVILIAN_BUILDING_TICK_MS),
             timer_population: SubsystemTimer::new(crate::fidelity::POPULATION_TICK_MS),
             timer_events: SubsystemTimer::new(crate::fidelity::EVENT_TICK_MS),
             timer_ships: SubsystemTimer::new(crate::fidelity::SHIP_TICK_MS),
@@ -207,21 +378,21 @@ impl Simulation {
             trade_ships: Vec::new(),
             coverage_maps: Vec::new(),
             ocean_map: None,
+            carrier_config: carrier::CarrierConfig::default(),
+            civilian_config: civilian::CivilianConfig::default(),
+            ship_cargo_config: trade::ShipCargoConfig::default(),
 
             autosave_timer_ms: 0,
 
-            history: EconomyHistory::new(),
-
             tile_clears: Vec::new(),
 
-            objectives: crate::objectives::ObjectiveSet::default_starter(),
+            objectives: crate::objectives::ObjectiveSet::default(),
             objective_completions: Vec::new(),
             scenario_complete: false,
 
-            rng_state: 0xCBF29CE484222325,
+            rng_state: crate::source_rand::SourceRand::default(),
 
             exploration: Vec::new(),
-            damage_events: Vec::new(),
             event_log: Vec::new(),
             free_traders: Vec::new(),
             free_trader_cooldown: 0,
@@ -241,6 +412,7 @@ impl Simulation {
         use crate::fidelity::Subsystem;
         vec![
             (Subsystem::Production, self.timer_production.interval_ms),
+            (Subsystem::Civilians, self.timer_civilians.interval_ms),
             (Subsystem::Population, self.timer_population.interval_ms),
             (Subsystem::Diplomacy, self.timer_diplomacy.interval_ms),
             (Subsystem::MarketCoverage, self.timer_market.interval_ms),
@@ -250,50 +422,20 @@ impl Simulation {
         ]
     }
 
-    /// Civilization-power score for a player slot. Combines settled
-    /// population, military strength, and treasury into one number that
-    /// the diplomacy AI uses for war / peace / treaty decisions.
-    ///
-    /// SIMPLIFICATION (NOT in the original) — the actual Anno 1602 AI
-    /// (`decompiled/1602_exe.c:31910 FUN_0042adf0` "defending",
-    /// `:32011 FUN_0042b000` "active", `:32078 FUN_0042b160` "allied",
-    /// dispatched by `:32182 FUN_0042b430` and gated by
-    /// `:32223 FUN_0042b4b0`) drives diplomacy off a player-slot state
-    /// machine: it iterates `&DAT_005b7680` (stride 0xA0) testing
-    /// `state == 0xC` / `0xE` and the per-slot 0x4a flag. Cooldown
-    /// fields are recharged from the global tick counter `DAT_005b6040`
-    /// (600 ticks = 1 minute, decoded from `:98053`'s display formula
-    /// `sprintf("%02d:%02d", DAT_005b6040 / 600, (DAT_005b6040 % 600)
-    /// / 10)`):
-    ///   - `+ 0x50` (80 ticks ≈ 8 s) — short-rate retry,
-    ///   - `+ 6000` (10 minutes) — major-action cooldown,
-    ///   - `+ 10000` (~16.6 minutes) — long cooldown.
-    /// There is no scalar strength score in the binary; the original
-    /// used reputation counters and per-action cooldowns, not a
-    /// Lanchester-style number. This power score is a stand-in we use
-    /// until the state-machine port is complete; it keeps the
-    /// diplomacy AI functional but is not RE-faithful.
-    pub fn civilization_power(&self, slot: u8) -> i64 {
-        let pop = self.players.get(slot as usize)
-            .map(|p| p.total_population as i64)
-            .unwrap_or(0);
-        let units = self.military_units.iter()
-            .filter(|u| u.is_alive() && u.owner == slot)
-            .count() as i64 * 25;
-        let gold = self.players.get(slot as usize)
-            .map(|p| (p.gold.max(0) as i64) / 100)
-            .unwrap_or(0);
-        pop + units + gold
+    pub fn seed_source_rand(&mut self, seed: u32) {
+        self.rng_state = crate::source_rand::SourceRand::new(seed);
+    }
+
+    pub fn seed_source_rand_from_get_tick_count(&mut self) {
+        self.rng_state = crate::source_rand::SourceRand::from_get_tick_count();
+    }
+
+    pub fn next_source_rand(&mut self) -> u16 {
+        self.rng_state.next()
     }
 
     fn next_rand(&mut self) -> u64 {
-        if self.rng_state == 0 { self.rng_state = 0xCBF29CE484222325; }
-        let mut x = self.rng_state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng_state = x;
-        x
+        self.next_source_rand() as u64
     }
 
     fn tick_events(&mut self) {
@@ -302,108 +444,21 @@ impl Simulation {
     }
 
     fn tick_pirate_event(&mut self) {
-        // Pirates only spawn when there is an active player trade ship to
-        // hunt — otherwise the world is too empty for it to matter.
-        let target_ship = self.trade_ships.iter()
-            .find(|s| s.active && s.owner == 0);
-        let Some(ship) = target_ship else { return; };
-        let (sx, sy) = (ship.world_x, ship.world_y);
-
-        // 1-in-3 chance per event tick. Tracked in fidelity specs as
-        // speculative until the pirate event scheduler is decoded.
-        let r = self.next_rand();
-        if r % crate::fidelity::PIRATE_EVENT_GATE != 0 { return; }
-
-        // Pirate origin: prefer an active PIRATWOHN hideout building
-        // (manual sec. 7.5 "Pirates and Natives" — pirates have
-        // hideouts on uninhabited islands, not random map edges).
-        // RE: `haeuser.cod` `Kind: PIRATWOHN` defines the hideout
-        // building. If no hideout exists in this scenario, fall back
-        // to the legacy random-edge spawn.
-        let hideout = self.buildings.iter()
-            .filter(|b| b.active && b.is_built() && {
-                let id = b.def_id as usize;
-                id < self.building_defs.len() && {
-                    let def = &self.building_defs[id];
-                    // Either a PIRATWOHN building OR a building
-                    // marked with `Piratflg: 1` (pirate Kontor /
-                    // huts in haeuser.cod).
-                    def.prod_kind == "PIRATWOHN" || def.pirate_owned
-                }
-            })
-            .map(|b| (b.tile_x as i32, b.tile_y as i32))
-            .next();
-        let (px, py) = match hideout {
-            Some((hx, hy)) => (hx, hy),
-            None => {
-                let dx = ((r >> 8) as i32 % 60) - 30;
-                let dy = ((r >> 16) as i32 % 60) - 30;
-                ((sx + dx).max(0), (sy + dy).max(0))
-            }
-        };
-
-        // Slot 6 is the pirate faction. Make them at war with everyone
-        // else (idempotent — set on every spawn).
-        use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
-        use crate::free_trader::PIRATE_SLOT;
-        for j in 0..PIRATE_SLOT {
-            self.diplomacy.set(PIRATE_SLOT, j, Diplomacy::War);
-        }
-        // Pirate spawns use the dedicated PIRAT ship figure
-        // (figuren.cod `Nummer: PIRAT`), not the player-buildable
-        // KRIEG1 hull.
-        let mut pirate = MilitaryUnit::new(UnitType::PirateShip, PIRATE_SLOT, px, py);
-        pirate.target_x = sx;
-        pirate.target_y = sy;
-        self.military_units.push(pirate);
+        // Pirate event spawning needs the decoded source scheduler and target
+        // selection. Scenario-loaded pirate ships and player surrender still
+        // populate the pirate faction; do not fabricate new ships from an
+        // implementation-only random gate.
     }
 
-    /// Random fire / volcano event for the human player. Called from
+    /// Source-anchored disaster scheduler placeholder. Called from
     /// `tick_events`. RE: figuren.cod `Nummer: VULKAN` (figure 0x12)
     /// and `Nummer: BRANDMARKT` (figure 0x08); see `disaster.rs`
     /// module doc-comment.
     fn tick_disaster_event(&mut self) {
-        // Pick a random building owned by the human player.
-        let candidates: Vec<usize> = self.buildings.iter()
-            .enumerate()
-            .filter(|(_, b)| b.active && b.owner == 0 && b.is_built())
-            .map(|(i, _)| i)
-            .collect();
-        if candidates.is_empty() { return; }
-        let r = self.next_rand();
-
-        // Fire: rare ignition this tick (1-in-N gate).
-        if r % crate::disaster::FIRE_IGNITION_GATE == 0 {
-            let pick = (r >> 16) as usize % candidates.len();
-            let bi = candidates[pick];
-            crate::disaster::ignite_building(
-                &mut self.buildings[bi], &mut self.damage_events,
-            );
-            self.event_log.push(format!(
-                "[fire] a building at ({},{}) is on fire",
-                self.buildings[bi].tile_x, self.buildings[bi].tile_y,
-            ));
-        }
-
-        // Volcano: rarer area-of-effect event. We anchor the eruption
-        // on a random player-owned building so the effect lands in a
-        // populated area; the original engine uses fixed VULKAN
-        // tiles on volcanic islands which we don't track yet.
-        let r2 = self.next_rand();
-        if r2 % crate::disaster::VOLCANO_ERUPTION_GATE == 0 {
-            let pick = (r2 >> 16) as usize % candidates.len();
-            let bi = candidates[pick];
-            let cx = self.buildings[bi].tile_x;
-            let cy = self.buildings[bi].tile_y;
-            let island_id = self.buildings[bi].island_id;
-            let hit = crate::disaster::erupt_at(
-                cx, cy, island_id,
-                &mut self.buildings, &mut self.damage_events,
-            );
-            self.event_log.push(format!(
-                "[volcano] eruption at ({cx},{cy}) damaged {hit} building(s)",
-            ));
-        }
+        // Fire and volcano events need decoded source triggers/anchors.
+        // Do not invent an origin from a random player building; the
+        // lower-level effect helpers remain available for source-anchored
+        // call sites.
     }
 
     /// Main simulation tick, called with real-time delta in milliseconds.
@@ -413,10 +468,7 @@ impl Simulation {
         }
 
         // Scale by game speed.
-        let mut remaining = crate::fidelity::scaled_sim_ms(
-            real_dt_ms,
-            self.speed_multiplier,
-        );
+        let mut remaining = crate::fidelity::scaled_sim_ms(real_dt_ms, self.speed_multiplier);
 
         // Process in chunks of MAX_STEP_MS
         while remaining > 0 {
@@ -444,6 +496,11 @@ impl Simulation {
             self.tick_production();
         }
 
+        // 2. Civilian building figure dispatcher
+        if self.timer_civilians.advance(dt_ms) {
+            self.tick_civilians();
+        }
+
         // 3. Population/economy
         if self.timer_population.advance(dt_ms) {
             self.tick_population();
@@ -469,7 +526,7 @@ impl Simulation {
             self.tick_military();
         }
 
-        // 7. Random events (pirates, etc.)
+        // 7. Source-triggered event hooks.
         if self.timer_events.advance(dt_ms) {
             self.tick_events();
         }
@@ -493,44 +550,23 @@ impl Simulation {
                 self.timer_production.interval_ms,
             );
 
-            // Civilian wanderer spawn for residences.
-            // RE: `1602_exe.c:84620-84666` per-building 4999 ms tick
-            // calling FUN_00443a90(0x5a, …) when DAT_005bafc8 != 0.
-            // We piggy-back on the production tick (similar cadence
-            // when the production timer is ~1 s) since the original
-            // dispatcher fires every building tick regardless of
-            // whether the building actually produces a good.
-            if def.prod_kind == "WOHN" {
-                let r = self.next_rand();
-                if let Some(mut fig) = civilian::try_spawn_civilian(
-                    &self.buildings[i], &def, i as u16, r,
-                ) {
-                    fig.building_idx = i as u16;
-                    new_carriers.push(fig);
-                }
-            }
-
             if produced > 0 && production::needs_carrier(&self.buildings[i], &def) {
                 // Check if this building already has an active carrier
                 let has_carrier = self.figures.iter().any(|f| {
                     f.is_active()
                         && f.building_idx == i as u16
-                        && matches!(
-                            f.action,
-                            ActionType::CarryingGoods | ActionType::Returning
-                        )
+                        && matches!(f.action, ActionType::CarryingGoods | ActionType::Returning)
                 });
 
                 if !has_carrier {
-                    if let Some(mut c) =
-                        carrier::try_spawn_carrier(
-                            &mut self.buildings[i],
-                            &def,
-                            &self.warehouses,
-                            &self.island_maps,
-                            &self.coverage_maps,
-                        )
-                    {
+                    if let Some(mut c) = carrier::try_spawn_carrier(
+                        &mut self.buildings[i],
+                        &def,
+                        &self.warehouses,
+                        &self.island_maps,
+                        &self.coverage_maps,
+                        self.carrier_config,
+                    ) {
                         c.building_idx = i as u16;
                         new_carriers.push(c);
                     }
@@ -539,6 +575,34 @@ impl Simulation {
         }
 
         self.figures.extend(new_carriers);
+    }
+
+    fn tick_civilians(&mut self) {
+        let mut new_civilians = Vec::new();
+
+        for i in 0..self.buildings.len() {
+            let def_id = self.buildings[i].def_id as usize;
+            if def_id >= self.building_defs.len() {
+                continue;
+            }
+            let def = self.building_defs[def_id].clone();
+            if def.prod_kind != "WOHN" {
+                continue;
+            }
+            let r = self.next_rand() | (self.next_rand() << 32);
+            if let Some(mut fig) = civilian::try_spawn_civilian_with_config(
+                &self.buildings[i],
+                &def,
+                i as u16,
+                r,
+                self.civilian_config,
+            ) {
+                fig.building_idx = i as u16;
+                new_civilians.push(fig);
+            }
+        }
+
+        self.figures.extend(new_civilians);
     }
 
     pub(crate) fn tick_population(&mut self) {
@@ -556,28 +620,42 @@ impl Simulation {
         // upgrade up. Done before maintenance/cap so the housing cap
         // immediately reflects the new sizes.
         for b in self.buildings.iter_mut() {
-            if !b.active || !b.is_built() { continue; }
+            if !b.active || !b.is_built() {
+                continue;
+            }
             let def_id = b.def_id as usize;
-            if def_id >= self.building_defs.len() { continue; }
+            if def_id >= self.building_defs.len() {
+                continue;
+            }
             let def = &self.building_defs[def_id];
             let is_residence = def.kind == "WOHN" || def.prod_kind == "WOHN";
-            if !is_residence { continue; }
+            if !is_residence {
+                continue;
+            }
             // Manual sec. 6.7.1 + haeuser.cod `Ausbauflg`: only
             // upgradeable residence shells can promote up the tier
             // ladder. Static residences (e.g. construction
             // placeholders, native huts) keep their tier.
-            if !def.upgradeable { continue; }
+            if !def.upgradeable {
+                continue;
+            }
             let owner = b.owner as usize;
-            let Some(p) = self.players.get(owner) else { continue; };
+            let Some(p) = self.players.get(owner) else {
+                continue;
+            };
             let t = b.house_tier as usize;
             if t < 4 && p.satisfaction[t] >= 100 {
                 b.house_tier += 1;
             }
         }
         for b in &self.buildings {
-            if !b.active || !b.is_built() { continue; }
+            if !b.active || !b.is_built() {
+                continue;
+            }
             let owner = b.owner as usize;
-            if owner >= maintenance.len() { continue; }
+            if owner >= maintenance.len() {
+                continue;
+            }
             let def_id = b.def_id as usize;
             if def_id < self.building_defs.len() {
                 let cost = self.building_defs[def_id].maintenance_cost as u32;
@@ -586,8 +664,7 @@ impl Simulation {
                 let pk = self.building_defs[def_id].prod_kind.as_str();
                 if kind == "WOHN" || pk == "WOHN" {
                     let t = (b.house_tier as usize).min(4);
-                    housing[owner] = housing[owner]
-                        .saturating_add(HOUSING_BY_TIER[t]);
+                    housing[owner] = housing[owner].saturating_add(HOUSING_BY_TIER[t]);
                 }
             }
         }
@@ -602,16 +679,17 @@ impl Simulation {
             population::update_population_growth(player, housing[i]);
         }
 
-        // Sample player 0 (the human) into the rolling history (gold,
-        // pop, satisfaction, income/costs, AND per-good warehouse stocks).
         if !self.players.is_empty() {
             // Snapshot to break the borrow with self.objectives.
             let p0 = self.players[0].clone();
-            self.history.record_full(&p0, &self.warehouses, 0);
             // Re-evaluate scenario objectives against the human player.
             let just_done = self.objectives.evaluate(
-                &p0, &self.buildings, &self.building_defs,
-                &self.warehouses, &self.players, 0,
+                &p0,
+                &self.buildings,
+                &self.building_defs,
+                &self.warehouses,
+                &self.players,
+                0,
             );
             let any_just_done = !just_done.is_empty();
             self.objective_completions.extend(just_done);
@@ -621,8 +699,8 @@ impl Simulation {
                 let (done, total) = self.objectives.progress();
                 if total > 0 && done == total {
                     self.scenario_complete = true;
-                    self.event_log.push(
-                        "[victory] Scenario complete!".to_string());
+                    self.event_log
+                        .push("[victory] Scenario complete!".to_string());
                 }
             }
             let p0 = &p0;
@@ -637,9 +715,8 @@ impl Simulation {
             if p0_gold < crate::player::BANKRUPTCY_THRESHOLD
                 && self.last_treasury_warn_gold >= crate::player::BANKRUPTCY_THRESHOLD
             {
-                self.event_log.push(
-                    "[treasury] our treasury is running dangerously low".to_string(),
-                );
+                self.event_log
+                    .push("[treasury] our treasury is running dangerously low".to_string());
             }
             self.last_treasury_warn_gold = p0_gold;
         }
@@ -661,7 +738,8 @@ impl Simulation {
         //    Kontor count to avoid an iterator-borrow conflict.
         let active_kontors_for: Vec<u32> = (0..self.players.len())
             .map(|owner| {
-                self.warehouses.iter()
+                self.warehouses
+                    .iter()
                     .filter(|w| w.active && w.owner as usize == owner)
                     .count() as u32
             })
@@ -671,13 +749,11 @@ impl Simulation {
                 continue;
             }
             let bankrupt_too_long = p.is_game_over();
-            let no_economy = active_kontors_for[i] == 0
-                && p.population.iter().all(|n| *n == 0);
+            let no_economy = active_kontors_for[i] == 0 && p.population.iter().all(|n| *n == 0);
             if bankrupt_too_long || no_economy {
                 p.state = PlayerState::Defeated;
-                self.event_log.push(format!(
-                    "[defeat] player {i} has been defeated",
-                ));
+                self.event_log
+                    .push(format!("[defeat] player {i} has been defeated",));
             }
         }
 
@@ -685,7 +761,9 @@ impl Simulation {
         if self.outcome != GameOutcome::Pending {
             return;
         }
-        let human_defeated = self.players.first()
+        let human_defeated = self
+            .players
+            .first()
             .map(|p| p.state == PlayerState::Defeated)
             .unwrap_or(false);
         if human_defeated {
@@ -697,28 +775,28 @@ impl Simulation {
         // Victory by elimination: at least one rival existed at game
         // start, and all non-human / non-empty / non-pirate slots are
         // now Defeated.
-        let any_rival = self.players.iter().enumerate().any(|(i, p)| {
-            i != 0 && !matches!(p.state, PlayerState::Empty)
-        });
-        let all_rivals_down = self.players.iter().enumerate().all(|(i, p)| {
-            i == 0 || matches!(p.state, PlayerState::Empty | PlayerState::Defeated)
-        });
+        let any_rival = self
+            .players
+            .iter()
+            .enumerate()
+            .any(|(i, p)| i != 0 && !matches!(p.state, PlayerState::Empty));
+        let all_rivals_down =
+            self.players.iter().enumerate().all(|(i, p)| {
+                i == 0 || matches!(p.state, PlayerState::Empty | PlayerState::Defeated)
+            });
         if any_rival && all_rivals_down {
             self.outcome = GameOutcome::Victory;
-            self.event_log.push(
-                "[outcome] VICTORY — all rivals defeated".to_string(),
-            );
+            self.event_log
+                .push("[outcome] VICTORY — all rivals defeated".to_string());
             return;
         }
 
         // Victory by objectives: every scenario objective complete.
-        if !self.objectives.items.is_empty()
-            && self.objectives.items.iter().all(|(_, done)| *done)
+        if !self.objectives.items.is_empty() && self.objectives.items.iter().all(|(_, done)| *done)
         {
             self.outcome = GameOutcome::Victory;
-            self.event_log.push(
-                "[outcome] VICTORY — scenario objectives complete".to_string(),
-            );
+            self.event_log
+                .push("[outcome] VICTORY — scenario objectives complete".to_string());
         }
     }
 
@@ -753,14 +831,15 @@ impl Simulation {
                         let gold = self.players[player_idx].gold;
                         // Fertility gate: gather the set of fertilities
                         // available on islands the AI has a warehouse on.
-                        // A climate-bound plantation can only build if at
+                        // A fertility-bound plantation can only build if at
                         // least one of those islands carries the required
                         // fertility byte.
-                        let mut available_fertilities:
-                            std::collections::HashSet<anno_formats::szs::Fertility> =
-                            std::collections::HashSet::new();
-                        let owner_warehouse_islands:
-                            std::collections::HashSet<u8> = self.warehouses.iter()
+                        let mut available_fertilities: std::collections::HashSet<
+                            anno_formats::szs::Fertility,
+                        > = std::collections::HashSet::new();
+                        let owner_warehouse_islands: std::collections::HashSet<u8> = self
+                            .warehouses
+                            .iter()
                             .filter(|w| w.active && w.owner == owner)
                             .map(|w| w.island_id)
                             .collect();
@@ -778,13 +857,18 @@ impl Simulation {
                                 *counts.entry(b.def_id).or_insert(0) += 1;
                             }
                         }
-                        let pick = self.building_defs.iter().enumerate()
-                            .filter(|(_, d)| d.output_good == good
-                                && d.cost_gold as i32 <= gold
-                                && match d.required_fertility {
-                                    Some(req) => available_fertilities.contains(&req),
-                                    None => true,
-                                })
+                        let pick = self
+                            .building_defs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, d)| {
+                                d.output_good == good
+                                    && d.cost_gold as i32 <= gold
+                                    && match d.required_fertility {
+                                        Some(req) => available_fertilities.contains(&req),
+                                        None => true,
+                                    }
+                            })
                             .min_by_key(|(idx, d)| {
                                 let n = counts.get(&(*idx as u16)).copied().unwrap_or(0);
                                 (n, d.cost_gold)
@@ -794,18 +878,20 @@ impl Simulation {
                         // scenario can see when an AI's plantation
                         // request was blocked by missing fertility.
                         if pick.is_none() {
-                            let any_fertility_blocked = self.building_defs.iter()
-                                .any(|d| d.output_good == good
+                            let any_fertility_blocked = self.building_defs.iter().any(|d| {
+                                d.output_good == good
                                     && d.cost_gold as i32 <= gold
                                     && d.required_fertility.is_some()
                                     && !match d.required_fertility {
                                         Some(req) => available_fertilities.contains(&req),
                                         None => true,
-                                    });
+                                    }
+                            });
                             if any_fertility_blocked {
                                 self.event_log.push(format!(
                                     "AI slot {owner}: cannot build {good:?} — \
-                                     no fertile island in fleet"));
+                                     no fertile island in fleet"
+                                ));
                             }
                         }
                         if let Some((def_id, def)) = pick {
@@ -822,7 +908,9 @@ impl Simulation {
                                 }
                                 match def.required_fertility {
                                     None => true,
-                                    Some(req) => self.island_maps.iter()
+                                    Some(req) => self
+                                        .island_maps
+                                        .iter()
                                         .find(|m| m.island_id == w.island_id)
                                         .map(|m| m.active_fertilities().contains(&req))
                                         .unwrap_or(false),
@@ -837,21 +925,36 @@ impl Simulation {
                                 let cost = def.cost_gold;
                                 let footprint = (w as u32) * (h as u32);
                                 let build_ms = (2_000u32 * footprint).max(2_000);
-                                let map_idx = self.island_maps.iter()
+                                let map_idx = self
+                                    .island_maps
+                                    .iter()
                                     .position(|m| m.island_id == island_id);
                                 if let Some(idx) = map_idx {
-                                    let spot = self.island_maps[idx]
-                                        .find_reachable_spot(cx, cy, w, h, 12, (cx, cy));
+                                    let spot = self.island_maps[idx].find_reachable_spot(
+                                        cx,
+                                        cy,
+                                        w,
+                                        h,
+                                        12,
+                                        (cx, cy),
+                                    );
                                     if let Some((bx, by)) = spot {
                                         // Mark footprint blocked
                                         for dy in 0..h {
                                             for dx in 0..w {
-                                                self.island_maps[idx]
-                                                    .set_walkable(bx + dx, by + dy, false);
+                                                self.island_maps[idx].set_walkable(
+                                                    bx + dx,
+                                                    by + dy,
+                                                    false,
+                                                );
                                             }
                                         }
                                         let mut inst = BuildingInstance::new(
-                                            def_id as u16, island_id, bx, by, owner,
+                                            def_id as u16,
+                                            island_id,
+                                            bx,
+                                            by,
+                                            owner,
                                         );
                                         inst.construction_ms_total = build_ms;
                                         inst.construction_ms_remaining = build_ms;
@@ -881,31 +984,37 @@ impl Simulation {
                                 0..=3 => (UnitType::Infantry, 100),
                                 4..=6 => (UnitType::Musketeer, 150),
                                 7..=8 => (UnitType::Cavalry, 200),
-                                _      => (UnitType::Cannon,    300),
+                                _ => (UnitType::Cannon, 300),
                             }
                         };
-                        let spawn = self.warehouses.iter().find(|w| {
-                            w.active && w.owner == owner
-                        });
+                        let spawn = self
+                            .warehouses
+                            .iter()
+                            .find(|w| w.active && w.owner == owner);
                         if let Some(spawn) = spawn {
                             let (sx, sy) = (spawn.tile_x as i32, spawn.tile_y as i32);
                             let mut spent = 0u32;
                             for k in 0..unit_count {
                                 let (utype, cost) = pick_type(k);
-                                if self.players[player_idx].gold < cost { break; }
+                                if self.players[player_idx].gold < cost {
+                                    break;
+                                }
                                 self.players[player_idx].gold -= cost;
                                 spent += 1;
                                 let kk = k as i32;
                                 let dx = (kk % 3) - 1;
                                 let dy = (kk / 3) % 3 - 1;
                                 self.military_units.push(MilitaryUnit::new(
-                                    utype, owner, sx + dx, sy + dy,
+                                    utype,
+                                    owner,
+                                    sx + dx,
+                                    sy + dy,
                                 ));
                             }
-                            self.players[player_idx].military_maintenance =
-                                self.players[player_idx]
-                                    .military_maintenance
-                                    .saturating_add((spent * 2) as u32);
+                            self.players[player_idx].military_maintenance = self.players
+                                [player_idx]
+                                .military_maintenance
+                                .saturating_add((spent * 2) as u32);
                         }
                     }
                     AiAction::EstablishTradeRoute => {
@@ -916,11 +1025,14 @@ impl Simulation {
                             std::collections::HashMap::new();
                         for wh in &self.warehouses {
                             if wh.active && wh.owner == owner {
-                                by_island.entry(wh.island_id)
+                                by_island
+                                    .entry(wh.island_id)
                                     .or_insert((wh.tile_x, wh.tile_y));
                             }
                         }
-                        if by_island.len() < 2 { continue; }
+                        if by_island.len() < 2 {
+                            continue;
+                        }
                         let mut stops: Vec<(u8, u16, u16)> = by_island
                             .into_iter()
                             .map(|(iid, (x, y))| (iid, x, y))
@@ -939,32 +1051,50 @@ impl Simulation {
                         // moves what's actually there.
                         use crate::trade::{RouteStop, TradeRoute, TradeShip};
                         let all_goods = [
-                            crate::types::Good::Wood, crate::types::Good::Iron,
-                            crate::types::Good::Ore, crate::types::Good::Gold,
-                            crate::types::Good::Wool, crate::types::Good::Sugar,
-                            crate::types::Good::Tobacco, crate::types::Good::Cattle,
-                            crate::types::Good::Grain, crate::types::Good::Flour,
-                            crate::types::Good::Food, crate::types::Good::Alcohol,
-                            crate::types::Good::Cloth, crate::types::Good::Clothing,
-                            crate::types::Good::Jewelry, crate::types::Good::Tools,
-                            crate::types::Good::Bricks, crate::types::Good::Swords,
-                            crate::types::Good::Cannons, crate::types::Good::Muskets,
-                            crate::types::Good::Stone, crate::types::Good::Cocoa,
-                            crate::types::Good::Spices, crate::types::Good::WildGame,
-                            crate::types::Good::Cotton, crate::types::Good::Silk,
-                            crate::types::Good::Fish, crate::types::Good::Grapes,
+                            crate::types::Good::Wood,
+                            crate::types::Good::Iron,
+                            crate::types::Good::Ore,
+                            crate::types::Good::Gold,
+                            crate::types::Good::Wool,
+                            crate::types::Good::Sugar,
+                            crate::types::Good::Tobacco,
+                            crate::types::Good::Cattle,
+                            crate::types::Good::Grain,
+                            crate::types::Good::Flour,
+                            crate::types::Good::Food,
+                            crate::types::Good::Alcohol,
+                            crate::types::Good::Cloth,
+                            crate::types::Good::Clothing,
+                            crate::types::Good::Jewelry,
+                            crate::types::Good::Tools,
+                            crate::types::Good::Bricks,
+                            crate::types::Good::Swords,
+                            crate::types::Good::Cannons,
+                            crate::types::Good::Muskets,
+                            crate::types::Good::Stone,
+                            crate::types::Good::Cocoa,
+                            crate::types::Good::Spices,
+                            crate::types::Good::WildGame,
+                            crate::types::Good::Cotton,
+                            crate::types::Good::Silk,
+                            crate::types::Good::Fish,
+                            crate::types::Good::Grapes,
                             crate::types::Good::TobaccoProducts,
                         ];
-                        let next_id = self.trade_routes.iter()
-                            .map(|r| r.id).max().map(|m| m + 1).unwrap_or(1);
+                        let next_id = self
+                            .trade_routes
+                            .iter()
+                            .map(|r| r.id)
+                            .max()
+                            .map(|m| m + 1)
+                            .unwrap_or(1);
                         let mut route = TradeRoute::new(next_id, owner);
                         for &(iid, wx, wy) in &stops {
                             route.add_stop(RouteStop {
                                 island_id: iid,
                                 warehouse_x: wx,
                                 warehouse_y: wy,
-                                load_goods: all_goods.iter()
-                                    .map(|&g| (g, 50)).collect(),
+                                load_goods: all_goods.iter().map(|&g| (g, 50)).collect(),
                                 unload_goods: all_goods.to_vec(),
                             });
                         }
@@ -972,8 +1102,13 @@ impl Simulation {
                         let route_id = route.id;
                         let (sx, sy) = (stops[0].1 as i32, stops[0].2 as i32);
                         self.trade_routes.push(route);
-                        self.trade_ships.push(TradeShip::new(
-                            owner, route_id, sx, sy,
+                        self.trade_ships.push(TradeShip::new_with_capacity(
+                            owner,
+                            route_id,
+                            sx,
+                            sy,
+                            self.ship_cargo_config
+                                .capacity_for(trade::TradeShipClass::SmallTrader),
                         ));
                     }
                     AiAction::SellExcess => {
@@ -1015,7 +1150,10 @@ impl Simulation {
 
         // Recompute coverage for each island that has a coverage map
         for cov in &mut self.coverage_maps {
-            let whs = wh_by_island.get(&cov.island_id).map(|v| v.as_slice()).unwrap_or(&[]);
+            let whs = wh_by_island
+                .get(&cov.island_id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             cov.recompute(&self.buildings, &self.building_defs, whs);
         }
 
@@ -1028,23 +1166,28 @@ impl Simulation {
         const SIGHT_RADIUS: i32 = 5;
         // Helper: get-or-create the per-island exploration map.
         let ensure = |sim: &mut Simulation, island_id: u8| -> usize {
-            if let Some(idx) = sim.exploration.iter()
+            if let Some(idx) = sim
+                .exploration
+                .iter()
                 .position(|e| e.island_id == island_id)
             {
                 return idx;
             }
             // Pull dimensions from the island map if it exists, else default.
-            let (w, h) = sim.island_maps.iter()
+            let (w, h) = sim
+                .island_maps
+                .iter()
                 .find(|m| m.island_id == island_id)
                 .map(|m| (m.width, m.height))
                 .unwrap_or((128, 128));
-            sim.exploration.push(
-                crate::exploration::ExplorationMap::new(island_id, w, h),
-            );
+            sim.exploration
+                .push(crate::exploration::ExplorationMap::new(island_id, w, h));
             sim.exploration.len() - 1
         };
         // Buildings.
-        let bldg_seeds: Vec<(u8, i32, i32)> = self.buildings.iter()
+        let bldg_seeds: Vec<(u8, i32, i32)> = self
+            .buildings
+            .iter()
             .filter(|b| b.owner == PLAYER && b.active)
             .map(|b| (b.island_id, b.tile_x as i32, b.tile_y as i32))
             .collect();
@@ -1053,7 +1196,9 @@ impl Simulation {
             self.exploration[idx].mark_radius(x, y, SIGHT_RADIUS);
         }
         // Warehouses.
-        let wh_seeds: Vec<(u8, i32, i32)> = self.warehouses.iter()
+        let wh_seeds: Vec<(u8, i32, i32)> = self
+            .warehouses
+            .iter()
             .filter(|w| w.owner == PLAYER && w.active)
             .map(|w| (w.island_id, w.tile_x as i32, w.tile_y as i32))
             .collect();
@@ -1063,14 +1208,18 @@ impl Simulation {
         }
         // Military units (land only — naval roams the world map, no
         // island-tile coords meaningful to per-island bitmap).
-        let unit_seeds: Vec<(u8, i32, i32)> = self.military_units.iter()
-            .filter(|u| u.is_alive() && u.owner == PLAYER
-                && !u.unit_type.stats().is_naval)
+        let unit_seeds: Vec<(u8, i32, i32)> = self
+            .military_units
+            .iter()
+            .filter(|u| u.is_alive() && u.owner == PLAYER && !u.unit_type.stats().is_naval)
             .map(|u| {
                 // Try to find which island this unit is on by walkability map.
-                let island_id = self.island_maps.iter()
+                let island_id = self
+                    .island_maps
+                    .iter()
                     .find(|m| m.is_walkable(u.tile_x, u.tile_y))
-                    .map(|m| m.island_id).unwrap_or(0);
+                    .map(|m| m.island_id)
+                    .unwrap_or(0);
                 (island_id, u.tile_x, u.tile_y)
             })
             .collect();
@@ -1081,67 +1230,12 @@ impl Simulation {
     }
 
     fn tick_diplomacy(&mut self) {
-        // Civilization power per slot, used by AI controllers to decide
-        // war / peace based on relative strength.
-        let scores: Vec<i64> = (0..self.players.len())
-            .map(|i| self.civilization_power(i as u8))
-            .collect();
-
         for ctrl_idx in 0..self.ai_controllers.len() {
             let me = self.ai_controllers[ctrl_idx].player_idx as usize;
-            if me >= scores.len() { continue; }
-            // Only Military and Balanced personalities flip relations.
-            let personality = self.ai_controllers[ctrl_idx].personality;
-            use crate::ai::AiPersonality;
-            use crate::combat::Diplomacy;
-            use crate::player::PlayerState;
-
-            let aggressor = matches!(
-                personality,
-                AiPersonality::Military | AiPersonality::Balanced,
-            );
-            let pacifist = matches!(personality, AiPersonality::Economic);
-
-            let my_score = scores[me];
-            for other in 0..scores.len() {
-                if other == me { continue; }
-                // Ignore empty / defeated slots.
-                if let Some(p) = self.players.get(other) {
-                    if matches!(p.state, PlayerState::Empty | PlayerState::Defeated) {
-                        continue;
-                    }
-                } else { continue; }
-                let other_score = scores[other];
-                let cur = self.diplomacy.get(me as u8, other as u8);
-
-                // Declare war on a clearly weaker neutral neighbor.
-                // SIMPLIFICATION (NOT in original) — the binary's
-                // dispatchers (`1602_exe.c:31910 FUN_0042adf0` and
-                // `:32011 FUN_0042b000`) trigger war from a
-                // state-machine plus per-action cooldown counters
-                // recharged at +0x50/6000/10000 ticks (see
-                // `civilization_power` doc-comment), not from a
-                // numeric strength comparison. We approximate with
-                // a `my_score >= 100` foothold gate and a 2:1 ratio
-                // until the state-machine port is complete.
-                if aggressor
-                    && cur == Diplomacy::Neutral
-                    && my_score >= 100
-                    && other_score * 2 <= my_score
-                {
-                    self.diplomacy.set(me as u8, other as u8, Diplomacy::War);
-                    continue;
-                }
-                // Sue for peace if outmatched (any personality).
-                if cur == Diplomacy::War && other_score >= my_score * 2 {
-                    self.diplomacy.set(me as u8, other as u8, Diplomacy::Neutral);
-                    continue;
-                }
-                // Pacifist AIs back out of any war they aren't winning.
-                if pacifist && cur == Diplomacy::War && other_score >= my_score {
-                    self.diplomacy.set(me as u8, other as u8, Diplomacy::Neutral);
-                }
+            if me >= self.players.len() {
+                continue;
             }
+            use crate::combat::Diplomacy;
 
             // Reactive defense: scan AI warehouses for nearby hostile
             // military and spawn defenders if any are within 8 tiles.
@@ -1149,14 +1243,18 @@ impl Simulation {
             const DEFENDER_RADIUS: i32 = 8;
             const DEFENDERS_PER_THREAT: u32 = 2;
             let owner = me as u8;
-            let warehouse_targets: Vec<(u16, u16, u8)> = self.warehouses.iter()
+            let warehouse_targets: Vec<(u16, u16, u8)> = self
+                .warehouses
+                .iter()
                 .filter(|w| w.active && w.owner == owner)
                 .map(|w| (w.tile_x, w.tile_y, w.island_id))
                 .collect();
             for (wx, wy, _wh_island) in warehouse_targets {
                 // Is there a hostile military unit within radius?
                 let threat = self.military_units.iter().any(|u| {
-                    if !u.is_alive() || u.owner == owner { return false; }
+                    if !u.is_alive() || u.owner == owner {
+                        return false;
+                    }
                     if self.diplomacy.get(owner, u.owner) != Diplomacy::War {
                         return false;
                     }
@@ -1164,18 +1262,31 @@ impl Simulation {
                     let dy = (u.tile_y - wy as i32).abs();
                     dx.max(dy) <= DEFENDER_RADIUS
                 });
-                if !threat { continue; }
+                if !threat {
+                    continue;
+                }
                 // Don't keep spawning if we already have defenders nearby.
-                let existing = self.military_units.iter().filter(|u| {
-                    u.is_alive() && u.owner == owner
-                        && (u.tile_x - wx as i32).abs() <= DEFENDER_RADIUS
-                        && (u.tile_y - wy as i32).abs() <= DEFENDER_RADIUS
-                }).count();
-                if existing >= DEFENDERS_PER_THREAT as usize { continue; }
-                if self.players[me].gold < DEFENDER_COST { continue; }
+                let existing = self
+                    .military_units
+                    .iter()
+                    .filter(|u| {
+                        u.is_alive()
+                            && u.owner == owner
+                            && (u.tile_x - wx as i32).abs() <= DEFENDER_RADIUS
+                            && (u.tile_y - wy as i32).abs() <= DEFENDER_RADIUS
+                    })
+                    .count();
+                if existing >= DEFENDERS_PER_THREAT as usize {
+                    continue;
+                }
+                if self.players[me].gold < DEFENDER_COST {
+                    continue;
+                }
                 let needed = DEFENDERS_PER_THREAT as i32 - existing as i32;
                 for k in 0..needed.max(1) {
-                    if self.players[me].gold < DEFENDER_COST { break; }
+                    if self.players[me].gold < DEFENDER_COST {
+                        break;
+                    }
                     self.players[me].gold -= DEFENDER_COST;
                     let dx = (k % 3) - 1;
                     let dy = (k / 3) - 1;
@@ -1192,12 +1303,11 @@ impl Simulation {
             // when the AI is at war with anyone. If no idle warship is
             // available and the AI has gold, spawn one near the trade ship.
             const ESCORT_COST: i32 = 500;
-            let at_war = (0..scores.len()).any(|j| {
-                j as u8 != owner
-                    && self.diplomacy.get(owner, j as u8) == Diplomacy::War
-            });
+            let at_war = (0..self.players.len())
+                .any(|j| j as u8 != owner && self.diplomacy.get(owner, j as u8) == Diplomacy::War);
             if at_war {
-                let ship_indices: Vec<(usize, i32, i32)> = self.trade_ships
+                let ship_indices: Vec<(usize, i32, i32)> = self
+                    .trade_ships
                     .iter()
                     .enumerate()
                     .filter(|(_, s)| s.active && s.owner == owner)
@@ -1205,13 +1315,15 @@ impl Simulation {
                     .collect();
                 for (ship_idx, sx, sy) in ship_indices {
                     let already_escorted = self.military_units.iter().any(|u| {
-                        u.is_alive() && u.owner == owner
-                            && u.escort_ship == ship_idx as i32
+                        u.is_alive() && u.owner == owner && u.escort_ship == ship_idx as i32
                     });
-                    if already_escorted { continue; }
+                    if already_escorted {
+                        continue;
+                    }
                     // Look for an idle warship to assign.
                     let idle_warship = self.military_units.iter_mut().find(|u| {
-                        u.is_alive() && u.owner == owner
+                        u.is_alive()
+                            && u.owner == owner
                             && u.unit_type.stats().is_naval
                             && u.escort_ship < 0
                     });
@@ -1220,53 +1332,14 @@ impl Simulation {
                         continue;
                     }
                     // Otherwise spawn a fresh SmallWarship beside the ship.
-                    if self.players[me].gold < ESCORT_COST { continue; }
-                    self.players[me].gold -= ESCORT_COST;
-                    let mut unit = MilitaryUnit::new(
-                        crate::combat::UnitType::SmallWarship,
-                        owner,
-                        sx,
-                        sy,
-                    );
-                    unit.escort_ship = ship_idx as i32;
-                    self.military_units.push(unit);
-                }
-            }
-
-            // Offensive raids: aggressors with a clear advantage send half
-            // their idle units toward an enemy warehouse on the same island.
-            if aggressor {
-                for enemy in 0..scores.len() {
-                    if enemy as u8 == owner { continue; }
-                    if self.diplomacy.get(owner, enemy as u8) != Diplomacy::War {
+                    if self.players[me].gold < ESCORT_COST {
                         continue;
                     }
-                    if scores[me] <= scores[enemy] { continue; }
-                    // Pick a target warehouse: the enemy's first active one.
-                    let target = self.warehouses.iter().find(|w| {
-                        w.active && w.owner == enemy as u8
-                    });
-                    let Some(target) = target else { continue; };
-                    let tx = target.tile_x as i32;
-                    let ty = target.tile_y as i32;
-                    // Find this AI's idle units — those whose current
-                    // target is roughly their own tile.
-                    let mut idle_indices: Vec<usize> = Vec::new();
-                    for (i, u) in self.military_units.iter().enumerate() {
-                        if !u.is_alive() || u.owner != owner { continue; }
-                        let stuck = u.target_x == u.tile_x && u.target_y == u.tile_y;
-                        if stuck && u.combat_target < 0 {
-                            idle_indices.push(i);
-                        }
-                    }
-                    let send = (idle_indices.len() / 2).max(1).min(idle_indices.len());
-                    for i in idle_indices.into_iter().take(send) {
-                        self.military_units[i].target_x = tx;
-                        self.military_units[i].target_y = ty;
-                        self.military_units[i].combat_target = -1;
-                        self.military_units[i].move_timer_ms = 0;
-                    }
-                    break; // One front per tick
+                    self.players[me].gold -= ESCORT_COST;
+                    let mut unit =
+                        MilitaryUnit::new(crate::combat::UnitType::SmallWarship, owner, sx, sy);
+                    unit.escort_ship = ship_idx as i32;
+                    self.military_units.push(unit);
                 }
             }
         }
@@ -1311,77 +1384,82 @@ impl Simulation {
         // So the count of free-trader ships scales with the total
         // warehouse count: roughly one ship per two warehouses,
         // counting all colours.
-        let total_active_kontors = self.warehouses.iter()
+        let total_active_kontors = self
+            .warehouses
+            .iter()
             .filter(|w| w.active && w.owner < 4)
             .count();
         let target_traders = (total_active_kontors / 2).min(8);
         let alive_traders = self.free_traders.iter().filter(|t| t.active).count();
-        let need_one_more = alive_traders < target_traders
-            && self.free_trader_cooldown == 0;
+        let need_one_more = alive_traders < target_traders && self.free_trader_cooldown == 0;
 
-        // Per-tick spawn gate: `1602_exe.c:57713 (rand() & 3) == 0`
-        // (1-in-4 chance per ship tick), the same probability the
-        // binary uses for the trader's "seek next target" decision.
         if need_one_more {
-            let r = self.next_rand();
-            if (r & crate::fidelity::FREE_TRADER_TARGET_GATE_MASK) != 0 {
-                return;
-            }
-            // Spawn at a random map edge.
-            let side = (r >> 4) % 4;
-            let off = ((r >> 8) as i32) & 0x7F;
-            let (sx, sy) = match side {
-                0 => (off, 0),
-                1 => (off, 200),
-                2 => (0, off),
-                _ => (200, off),
+            // Spawn at a random edge of the loaded ocean map. Assetless
+            // simulation tests keep the old 200-tile fallback square.
+            let side = self.next_rand();
+            let off = self.next_rand();
+            let (sx, sy) = if let Some(ocean) = self.ocean_map.as_ref() {
+                free_trader_edge_point_from_ocean(ocean, side, off)
+            } else {
+                free_trader_edge_point_from_bounds(side, off, 200, 200)
             };
-            let mut trader = crate::free_trader::FreeTrader::spawn_at(sx, sy);
+            let mut trader = crate::free_trader::FreeTrader::spawn_at_with_capacity(
+                sx,
+                sy,
+                self.ship_cargo_config.free_trader_capacity,
+            );
             self.assign_next_port(&mut trader);
             self.free_traders.push(trader);
-            self.event_log.push(
-                "[trader] free trader sighted at the horizon".to_string(),
-            );
+            self.event_log
+                .push("[trader] free trader sighted at the horizon".to_string());
             self.free_trader_cooldown = 0;
         }
 
         // Step each active trader.
         let mut player_gold: Vec<i32> = self.players.iter().map(|p| p.gold).collect();
         for i in 0..self.free_traders.len() {
-            if !self.free_traders[i].active { continue; }
+            if !self.free_traders[i].active {
+                continue;
+            }
             let removed = crate::free_trader::tick_one(
                 &mut self.free_traders[i],
                 &mut self.warehouses,
                 &mut player_gold,
             );
-            if removed { continue; }
-            // Pick next port if just finished docking.
+            if removed {
+                continue;
+            }
+            // Pick next port if just finished docking. The original
+            // trader state machine only invokes `FUN_004488d0` from
+            // the "seeking next target" state on `(rand() & 3) == 0`
+            // (`1602_exe.c:57709-57714`), so a trader may wait at the
+            // last port for a few ship ticks before choosing again.
             if self.free_traders[i].state == crate::free_trader::FreeTraderState::Sailing
                 && self.free_traders[i].target_warehouse.is_none()
                 && !self.free_traders[i].leaving
             {
-                if self.free_traders[i].visits_remaining == 0 {
-                    self.set_leaving_target(i);
-                } else {
-                    let mut t = std::mem::take(&mut self.free_traders[i]);
-                    self.assign_next_port(&mut t);
-                    self.free_traders[i] = t;
+                let r = self.next_rand();
+                if (r & crate::fidelity::FREE_TRADER_TARGET_GATE_MASK) != 0 {
+                    continue;
                 }
+                let mut t = std::mem::take(&mut self.free_traders[i]);
+                self.assign_next_port(&mut t);
+                self.free_traders[i] = t;
             }
         }
         for (i, g) in player_gold.into_iter().enumerate() {
-            if i < self.players.len() { self.players[i].gold = g; }
+            if i < self.players.len() {
+                self.players[i].gold = g;
+            }
         }
         // Drop departed ships and start the cooldown.
         let before = self.free_traders.len();
         self.free_traders.retain(|t| t.active);
         if self.free_traders.len() < before && self.free_trader_cooldown == 0 {
-            // Respawn delay between trader visits. The 1-in-4 spawn
-            // gate above provides the per-tick stochastic delay
-            // matching the binary's `(rand() & 3) == 0` cadence
-            // (`1602_exe.c:57713`). The fixed minimum gap is 60
-            // ship-ticks (~6 s in our 10 Hz tick rate, decoded from
-            // `:98053` `DAT_005b6040 / 600` minute display).
+            // Respawn delay between trader visits. The fixed minimum
+            // gap is 60 ship-ticks (~6 s in our 10 Hz tick rate,
+            // decoded from `:98053` `DAT_005b6040 / 600` minute
+            // display).
             self.free_trader_cooldown = crate::fidelity::FREE_TRADER_RESPAWN_COOLDOWN_TICKS;
         }
     }
@@ -1401,42 +1479,98 @@ impl Simulation {
         // We approximate the relations score with a sign-flip:
         // human / AI slots (0..=3) are the preferred candidates;
         // the reserved factions (4 = trader itself, 5 = natives,
-        // 6 = pirates) never host trader visits. Without the actual
-        // `FUN_00475c60` formula decoded, all human-/AI-owned
-        // warehouses are scored equally (best) and picked uniformly.
+        // 6 = pirates) never host trader visits. Within that set,
+        // reproduce FUN_004547e0/FUN_004549f0's port choice:
+        // keep the 12 nearest ports by `|dx| + |dy| / 4`, pick the
+        // best positive trade-score port if one exists, otherwise
+        // fall back to a random reachable port inside that shortlist.
         let r = self.next_rand() as usize;
-        let candidates: Vec<usize> = self.warehouses.iter()
+        let mut candidates: Vec<(usize, u32)> = self
+            .warehouses
+            .iter()
             .enumerate()
             .filter(|(_, w)| w.active && w.owner < 4)
-            .map(|(i, _)| i)
+            .map(|(i, w)| (i, free_trader_port_distance(trader, w)))
             .collect();
-        if candidates.is_empty() { return; }
-        let pick = candidates[r % candidates.len()];
+        if candidates.is_empty() {
+            self.send_free_trader_to_edge(trader);
+            return;
+        }
+        candidates.sort_by_key(|(idx, distance)| (*distance, *idx));
+        candidates.truncate(12);
+        let mut best_profit: Option<(usize, i32)> = None;
+        for (idx, _) in &candidates {
+            let wh = &self.warehouses[*idx];
+            let owner_gold = self
+                .players
+                .get(wh.owner as usize)
+                .map(|p| p.gold)
+                .unwrap_or(0);
+            let score = free_trader_port_profit_score(trader, wh, owner_gold);
+            if score <= 0 {
+                continue;
+            }
+            if best_profit.map_or(true, |(_, best)| score > best) {
+                best_profit = Some((*idx, score));
+            }
+        }
+        let pick = best_profit
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| candidates[r % candidates.len()].0);
         let wh = &self.warehouses[pick];
-        trader.target_warehouse = Some(pick);
-        trader.target_x = wh.tile_x as i32;
-        trader.target_y = wh.tile_y as i32;
+        trader.path.clear();
+        trader.path_idx = 0;
+        trader.path_required = false;
+        if let Some(ocean) = self.ocean_map.as_ref() {
+            let start = ocean.nearest_navigable(trader.world_x, trader.world_y);
+            let goal = ocean.nearest_navigable(wh.tile_x as i32, wh.tile_y as i32);
+            let (Some(start), Some(goal)) = (start, goal) else {
+                self.send_free_trader_to_edge(trader);
+                return;
+            };
+            let path = if start == goal {
+                Some(Vec::new())
+            } else {
+                crate::ocean_map::find_ocean_path(ocean, start, goal)
+            };
+            let Some(path) = path else {
+                self.send_free_trader_to_edge(trader);
+                return;
+            };
+            trader.target_warehouse = Some(pick);
+            trader.target_x = goal.0;
+            trader.target_y = goal.1;
+            trader.path = path;
+            trader.path_required = true;
+        } else {
+            trader.target_warehouse = Some(pick);
+            trader.target_x = wh.tile_x as i32;
+            trader.target_y = wh.tile_y as i32;
+        }
     }
 
-    fn set_leaving_target(&mut self, i: usize) {
-        // Pick the closest map edge.
-        let t = &mut self.free_traders[i];
-        let dx_left = t.world_x;
-        let dx_right = 200 - t.world_x;
-        let dy_top = t.world_y;
-        let dy_bot = 200 - t.world_y;
-        let min = dx_left.min(dx_right).min(dy_top).min(dy_bot);
-        if min == dx_left {
-            t.target_x = 0;
-        } else if min == dx_right {
-            t.target_x = 200;
-        } else if min == dy_top {
-            t.target_y = 0;
-        } else {
-            t.target_y = 200;
+    fn send_free_trader_to_edge(&self, trader: &mut crate::free_trader::FreeTrader) {
+        trader.target_warehouse = None;
+        trader.leaving = true;
+        trader.path.clear();
+        trader.path_idx = 0;
+        trader.path_required = false;
+        if let Some(ocean) = self.ocean_map.as_ref() {
+            if let Some(((tx, ty), path)) =
+                free_trader_departure_route_from_ocean(ocean, trader.world_x, trader.world_y)
+            {
+                trader.target_x = tx;
+                trader.target_y = ty;
+                trader.path = path;
+                trader.path_required = true;
+                return;
+            }
         }
-        t.leaving = true;
-        t.target_warehouse = None;
+
+        let (tx, ty) =
+            free_trader_departure_point_from_bounds(trader.world_x, trader.world_y, 200, 200);
+        trader.target_x = tx;
+        trader.target_y = ty;
     }
 
     fn tick_military(&mut self) {
@@ -1448,7 +1582,6 @@ impl Simulation {
             &mut self.military_units,
             &self.diplomacy,
             self.timer_military.interval_ms,
-            &mut self.damage_events,
         );
 
         // Tower / castle defensive cannons fire on hostile units
@@ -1466,7 +1599,6 @@ impl Simulation {
             &mut self.buildings,
             &self.diplomacy,
             &self.building_defs,
-            &mut self.damage_events,
         );
         // Remove destroyed buildings (in reverse) and emit tile-clear events.
         for &bi in destroyed.iter().rev() {
@@ -1477,17 +1609,30 @@ impl Simulation {
             let by = b.tile_y;
             let bw = def.width;
             let bh = def.height;
-            // Free tiles in the island walkability map.
-            if let Some(map) = self.island_maps.iter_mut()
+            // Replace the footprint in the island walkability map.
+            // `NORUINE` clears to terrain; any authored ruin remains a
+            // static obstacle, matching our COD-derived walkability pass
+            // where `RUINE` is not a walkable kind.
+            let walkable_after_destroy = def.ruin_id == crate::building::NO_RUIN_ID;
+            if let Some(map) = self
+                .island_maps
+                .iter_mut()
                 .find(|m| m.island_id == island_id)
             {
                 for dy in 0..bh as u16 {
                     for dx in 0..bw as u16 {
-                        map.set_walkable(bx + dx, by + dy, true);
+                        map.set_walkable(bx + dx, by + dy, walkable_after_destroy);
                     }
                 }
             }
-            self.tile_clears.push((island_id, bx, by, bw, bh));
+            self.tile_clears.push(TileClear {
+                island_id,
+                tile_x: bx,
+                tile_y: by,
+                width: bw,
+                height: bh,
+                ruin_id: def.ruin_id,
+            });
             self.buildings.swap_remove(bi);
         }
 
@@ -1503,16 +1648,19 @@ impl Simulation {
     fn tick_entities(&mut self, dt_ms: u32) {
         // Refresh escort targets so warships stay glued to their assigned
         // trade ship before move orders are stepped.
-        let positions: Vec<(bool, i32, i32)> = self.trade_ships.iter()
+        let positions: Vec<(bool, i32, i32)> = self
+            .trade_ships
+            .iter()
             .map(|s| (s.active, s.world_x, s.world_y))
             .collect();
         combat::tick_escort_targets(&mut self.military_units, &positions);
         // Move military units toward player-issued targets (every step).
         // Naval units are clamped to navigable tiles via the ocean map.
-        combat::tick_unit_orders_with_ocean(
+        combat::tick_unit_orders_with_maps(
             &mut self.military_units,
             dt_ms,
             self.ocean_map.as_ref(),
+            &self.island_maps,
         );
 
         // Trickle construction materials from the player's warehouses,
@@ -1520,22 +1668,21 @@ impl Simulation {
         // for this building are done.
         use crate::types::Good;
         let mut take_one = |island_id: u8, owner: u8, good: Good| -> bool {
-            for w in self.warehouses.iter_mut().filter(|w| {
-                w.active && w.owner == owner && w.island_id == island_id
-            }) {
-                if w.withdraw(good, 1) > 0 { return true; }
+            for w in self
+                .warehouses
+                .iter_mut()
+                .filter(|w| w.active && w.owner == owner && w.island_id == island_id)
+            {
+                if w.withdraw(good, 1) > 0 {
+                    return true;
+                }
             }
             false
         };
-        // Process pending-construction buildings ordered by
-        // `build_priority` descending so high-priority buildings get
-        // first crack at limited warehouse stock. Within a priority
-        // level the natural index order is preserved (stable sort).
-        let mut pending_idx: Vec<usize> = (0..self.buildings.len())
-            .filter(|&i| !self.buildings[i].is_built())
-            .collect();
-        pending_idx.sort_by_key(|&i| std::cmp::Reverse(self.buildings[i].build_priority));
-        for i in pending_idx {
+        for i in 0..self.buildings.len() {
+            if self.buildings[i].is_built() {
+                continue;
+            }
             let b = &mut self.buildings[i];
             // Try to consume one unit of each pending material from a
             // warehouse on the same island. If a line is short, that
@@ -1550,16 +1697,18 @@ impl Simulation {
                 b.bricks_needed -= 1;
             }
             // Construction time only flows once all materials are met.
-            if b.wood_needed == 0 && b.tools_needed == 0 && b.bricks_needed == 0
+            if b.wood_needed == 0
+                && b.tools_needed == 0
+                && b.bricks_needed == 0
                 && b.construction_ms_remaining > 0
             {
-                b.construction_ms_remaining =
-                    b.construction_ms_remaining.saturating_sub(dt_ms);
+                b.construction_ms_remaining = b.construction_ms_remaining.saturating_sub(dt_ms);
             }
         }
 
         let mut despawn_indices = Vec::new();
 
+        let civilian_config = self.civilian_config;
         for (idx, figure) in self.figures.iter_mut().enumerate() {
             if !figure.is_active() {
                 continue;
@@ -1578,14 +1727,13 @@ impl Simulation {
                                 &mut self.warehouses,
                                 &self.buildings,
                                 &self.island_maps,
-                                &mut self.damage_events,
                             );
                             if should_despawn {
                                 despawn_indices.push(idx);
                             }
                         }
                     }
-                    ActionType::Walking if civilian::is_civilian(figure) => {
+                    ActionType::Walking if civilian_config.is_civilian(figure) => {
                         // Step toward target tile, one tile per move
                         // step. When the figure reaches its target or
                         // its TTL (stored in the unused-for-civilians
@@ -1601,8 +1749,7 @@ impl Simulation {
                             } else {
                                 figure.tile_y += dy.signum();
                             }
-                            figure.anim_frame =
-                                figure.anim_frame.wrapping_add(1);
+                            figure.anim_frame = figure.anim_frame.wrapping_add(1);
                             figure.health = figure.health.saturating_sub(1);
                             if figure.health == 0 {
                                 despawn_indices.push(idx);
@@ -1632,8 +1779,7 @@ impl Simulation {
                             } else {
                                 figure.tile_y += dy.signum();
                             }
-                            figure.anim_frame =
-                                figure.anim_frame.wrapping_add(1);
+                            figure.anim_frame = figure.anim_frame.wrapping_add(1);
                         }
                     }
                     _ => {
@@ -1669,7 +1815,8 @@ impl Simulation {
     ) -> bool {
         use crate::types::Good;
         let total = |good: Good| -> u16 {
-            self.warehouses.iter()
+            self.warehouses
+                .iter()
                 .filter(|w| w.active && w.owner == owner && w.island_id == island_id)
                 .map(|w| w.stock(good))
                 .sum::<u16>()
@@ -1681,10 +1828,14 @@ impl Simulation {
             return false;
         }
         let mut take = |good: Good, mut amount: u16| {
-            for w in self.warehouses.iter_mut().filter(|w| {
-                w.active && w.owner == owner && w.island_id == island_id
-            }) {
-                if amount == 0 { break; }
+            for w in self
+                .warehouses
+                .iter_mut()
+                .filter(|w| w.active && w.owner == owner && w.island_id == island_id)
+            {
+                if amount == 0 {
+                    break;
+                }
                 amount -= w.withdraw(good, amount);
             }
         };
@@ -1702,46 +1853,41 @@ impl Simulation {
             Command::SetTaxRate { player, tier, rate } => {
                 let pi = player as usize;
                 let ti = tier as usize;
-                if pi >= self.players.len() || ti >= 5 { return false; }
+                if pi >= self.players.len() || ti >= 5 {
+                    return false;
+                }
                 self.players[pi].tax_rates[ti] = rate;
                 true
             }
             Command::SetDiplomacy { a, b, state } => {
                 use crate::combat::Diplomacy;
                 // Declaring war / breaking treaty is unilateral; nobody
-                // gets to refuse. Asking for alliance or peace, however,
-                // is a proposal — the target's AI evaluates relative
-                // strength and may decline.
-                let unilateral = state == Diplomacy::War;
-                if unilateral {
+                // gets to refuse. Asking for alliance or peace depends on
+                // the original AI relation/cooldown state machine, so this
+                // command must not synthesize acceptance from a score ratio.
+                if state == Diplomacy::War {
                     self.diplomacy.set(a, b, state);
                     return true;
                 }
-                let proposer_score = self.civilization_power(a);
-                let target_score = self.civilization_power(b);
-                // Target accepts when the proposer is at least as strong:
-                // weaklings can't dictate alliance terms to powerhouses.
-                if proposer_score >= target_score {
-                    self.diplomacy.set(a, b, state);
-                    self.event_log.push(format!(
-                        "[diplo] p{b} accepted your {state:?} proposal",
-                    ));
-                    true
-                } else {
-                    self.event_log.push(format!(
-                        "[diplo] p{b} rejected your {state:?} proposal",
-                    ));
-                    false
-                }
+                self.event_log.push(format!(
+                    "[diplo] p{b} {state:?} proposal awaits source diplomacy acceptance"
+                ));
+                false
             }
             Command::Buy { player, good, qty } => {
                 let pi = player as usize;
-                if pi >= self.players.len() { return false; }
+                if pi >= self.players.len() {
+                    return false;
+                }
                 let price = self.current_price(good).buy;
                 let max_aff = (self.players[pi].gold / price).max(0) as u16;
                 let want = qty.min(max_aff);
-                if want == 0 { return false; }
-                if let Some(wh) = self.warehouses.iter_mut()
+                if want == 0 {
+                    return false;
+                }
+                if let Some(wh) = self
+                    .warehouses
+                    .iter_mut()
                     .find(|w| w.active && w.owner == player)
                 {
                     let dep = wh.deposit(good, want);
@@ -1752,9 +1898,13 @@ impl Simulation {
             }
             Command::Sell { player, good, qty } => {
                 let pi = player as usize;
-                if pi >= self.players.len() { return false; }
+                if pi >= self.players.len() {
+                    return false;
+                }
                 let price = self.current_price(good).sell;
-                if let Some(wh) = self.warehouses.iter_mut()
+                if let Some(wh) = self
+                    .warehouses
+                    .iter_mut()
                     .find(|w| w.active && w.owner == player)
                 {
                     let took = wh.withdraw(good, qty);
@@ -1764,37 +1914,51 @@ impl Simulation {
                 false
             }
             Command::GiftGold { from, to, amount } => {
-                if amount <= 0 { return false; }
+                if amount <= 0 {
+                    return false;
+                }
                 let fi = from as usize;
                 let ti = to as usize;
-                if fi >= self.players.len() || ti >= self.players.len()
-                    || fi == ti
-                {
+                if fi >= self.players.len() || ti >= self.players.len() || fi == ti {
                     return false;
                 }
                 let send = amount.min(self.players[fi].gold.max(0));
-                if send <= 0 { return false; }
+                if send <= 0 {
+                    return false;
+                }
                 self.players[fi].gold -= send;
                 self.players[ti].gold += send;
-                self.event_log.push(format!(
-                    "[gift] p{from} sent {send} gold to p{to}",
-                ));
+                self.event_log
+                    .push(format!("[gift] p{from} sent {send} gold to p{to}",));
                 true
             }
-            Command::GiftGoods { from, to, good, qty } => {
-                if qty == 0 || from == to { return false; }
+            Command::GiftGoods {
+                from,
+                to,
+                good,
+                qty,
+            } => {
+                if qty == 0 || from == to {
+                    return false;
+                }
                 // Withdraw from sender's first warehouse with stock.
-                let from_idx = self.warehouses.iter().position(|w| {
-                    w.active && w.owner == from && w.stock(good) > 0
-                });
-                let Some(fi) = from_idx else { return false; };
+                let from_idx = self
+                    .warehouses
+                    .iter()
+                    .position(|w| w.active && w.owner == from && w.stock(good) > 0);
+                let Some(fi) = from_idx else {
+                    return false;
+                };
                 let took = self.warehouses[fi].withdraw(good, qty);
-                if took == 0 { return false; }
+                if took == 0 {
+                    return false;
+                }
                 // Deposit into recipient's first active warehouse with
                 // free space; refund any remainder to the sender.
-                let to_idx = self.warehouses.iter().position(|w| {
-                    w.active && w.owner == to
-                });
+                let to_idx = self
+                    .warehouses
+                    .iter()
+                    .position(|w| w.active && w.owner == to);
                 if let Some(ti) = to_idx {
                     let placed = self.warehouses[ti].deposit(good, took);
                     let leftover = took - placed;
@@ -1802,9 +1966,8 @@ impl Simulation {
                         // Recipient was full — return what didn't fit.
                         self.warehouses[fi].deposit(good, leftover);
                     }
-                    self.event_log.push(format!(
-                        "[gift] p{from} sent {placed} {good:?} to p{to}",
-                    ));
+                    self.event_log
+                        .push(format!("[gift] p{from} sent {placed} {good:?} to p{to}",));
                     placed > 0
                 } else {
                     // No recipient warehouse — refund and fail.
@@ -1812,7 +1975,12 @@ impl Simulation {
                     false
                 }
             }
-            Command::NativeDeliver { player, village_idx, good, qty } => {
+            Command::NativeDeliver {
+                player,
+                village_idx,
+                good,
+                qty,
+            } => {
                 let vi = village_idx as usize;
                 if vi >= self.native_villages.len() || qty == 0 {
                     return false;
@@ -1821,19 +1989,27 @@ impl Simulation {
                 // warehouses. Refund (no-op) if not enough stock.
                 let mut needed = qty;
                 let mut taken = 0u16;
-                for w in self.warehouses.iter_mut()
+                for w in self
+                    .warehouses
+                    .iter_mut()
                     .filter(|w| w.active && w.owner == player)
                 {
-                    if needed == 0 { break; }
+                    if needed == 0 {
+                        break;
+                    }
                     let took = w.withdraw(good, needed);
                     needed -= took;
                     taken += took;
                 }
-                if taken == 0 { return false; }
+                if taken == 0 {
+                    return false;
+                }
                 let outcome = self.native_villages[vi].deliver(player, good, taken);
                 if outcome == crate::native::BarterOutcome::NotWanted {
                     // Refund — natives didn't accept after all.
-                    if let Some(w) = self.warehouses.iter_mut()
+                    if let Some(w) = self
+                        .warehouses
+                        .iter_mut()
                         .find(|w| w.active && w.owner == player)
                     {
                         w.deposit(good, taken);
@@ -1845,7 +2021,12 @@ impl Simulation {
                 ));
                 true
             }
-            Command::NativeWithdraw { player, village_idx, good, qty } => {
+            Command::NativeWithdraw {
+                player,
+                village_idx,
+                good,
+                qty,
+            } => {
                 let vi = village_idx as usize;
                 if vi >= self.native_villages.len() || qty == 0 {
                     return false;
@@ -1854,15 +2035,17 @@ impl Simulation {
                 if outcome != crate::native::BarterOutcome::Withdrawn {
                     return false;
                 }
-                if let Some(w) = self.warehouses.iter_mut()
+                if let Some(w) = self
+                    .warehouses
+                    .iter_mut()
                     .find(|w| w.active && w.owner == player)
                 {
                     let placed = w.deposit(good, qty);
                     if placed < qty {
                         // Warehouse full — refund the credit so the
                         // player can try again with more space.
-                        let refund = (qty - placed) as i32
-                            * crate::prices::price_of(good).sell as i32;
+                        let refund =
+                            (qty - placed) as i32 * crate::prices::price_of(good).sell as i32;
                         let p = player as usize;
                         if p < 7 {
                             self.native_villages[vi].credit[p] += refund;
@@ -1874,8 +2057,7 @@ impl Simulation {
                     placed > 0
                 } else {
                     // No player warehouse — refund all credit and fail.
-                    let refund = qty as i32
-                        * crate::prices::price_of(good).sell as i32;
+                    let refund = qty as i32 * crate::prices::price_of(good).sell as i32;
                     let p = player as usize;
                     if p < 7 {
                         self.native_villages[vi].credit[p] += refund;
@@ -1883,22 +2065,16 @@ impl Simulation {
                     false
                 }
             }
-            Command::SetBuildPriority { player, building_idx, priority } => {
-                let bi = building_idx as usize;
-                if bi >= self.buildings.len() { return false; }
-                if self.buildings[bi].owner != player { return false; }
-                self.buildings[bi].build_priority = priority.min(2);
-                true
-            }
             Command::LoadShip {
-                player, ship_idx, warehouse_idx, good, qty,
+                player,
+                ship_idx,
+                warehouse_idx,
+                good,
+                qty,
             } => {
                 let si = ship_idx as usize;
                 let wi = warehouse_idx as usize;
-                if si >= self.trade_ships.len()
-                    || wi >= self.warehouses.len()
-                    || qty == 0
-                {
+                if si >= self.trade_ships.len() || wi >= self.warehouses.len() || qty == 0 {
                     return false;
                 }
                 if self.trade_ships[si].owner != player
@@ -1913,28 +2089,32 @@ impl Simulation {
                 let wh = &self.warehouses[wi];
                 let dx = (ship.world_x - wh.tile_x as i32).abs();
                 let dy = (ship.world_y - wh.tile_y as i32).abs();
-                if dx > 2 || dy > 2 { return false; }
+                if dx > 2 || dy > 2 {
+                    return false;
+                }
                 let took = self.warehouses[wi].withdraw(good, qty);
-                if took == 0 { return false; }
+                if took == 0 {
+                    return false;
+                }
                 let loaded = self.trade_ships[si].load(good, took);
                 if loaded < took {
                     // Cargo hold full — refund the surplus.
                     self.warehouses[wi].deposit(good, took - loaded);
                 }
-                self.event_log.push(format!(
-                    "[ship] loaded {loaded} {good:?} onto ship #{si}",
-                ));
+                self.event_log
+                    .push(format!("[ship] loaded {loaded} {good:?} onto ship #{si}",));
                 loaded > 0
             }
             Command::UnloadShip {
-                player, ship_idx, warehouse_idx, good, qty,
+                player,
+                ship_idx,
+                warehouse_idx,
+                good,
+                qty,
             } => {
                 let si = ship_idx as usize;
                 let wi = warehouse_idx as usize;
-                if si >= self.trade_ships.len()
-                    || wi >= self.warehouses.len()
-                    || qty == 0
-                {
+                if si >= self.trade_ships.len() || wi >= self.warehouses.len() || qty == 0 {
                     return false;
                 }
                 if self.trade_ships[si].owner != player
@@ -1948,27 +2128,38 @@ impl Simulation {
                 let wh = &self.warehouses[wi];
                 let dx = (ship.world_x - wh.tile_x as i32).abs();
                 let dy = (ship.world_y - wh.tile_y as i32).abs();
-                if dx > 2 || dy > 2 { return false; }
+                if dx > 2 || dy > 2 {
+                    return false;
+                }
                 let unloaded = self.trade_ships[si].unload(good, qty);
-                if unloaded == 0 { return false; }
+                if unloaded == 0 {
+                    return false;
+                }
                 let placed = self.warehouses[wi].deposit(good, unloaded);
                 if placed < unloaded {
                     // Warehouse full — refund the surplus to the ship.
                     self.trade_ships[si].load(good, unloaded - placed);
                 }
-                self.event_log.push(format!(
-                    "[ship] unloaded {placed} {good:?} from ship #{si}",
-                ));
+                self.event_log
+                    .push(format!("[ship] unloaded {placed} {good:?} from ship #{si}",));
                 placed > 0
             }
             Command::SellShip { player, unit_index } => {
                 let pi = player as usize;
-                if pi >= self.players.len() { return false; }
+                if pi >= self.players.len() {
+                    return false;
+                }
                 let ui = unit_index as usize;
-                if ui >= self.military_units.len() { return false; }
+                if ui >= self.military_units.len() {
+                    return false;
+                }
                 let u = &self.military_units[ui];
-                if u.owner != player || !u.is_alive() { return false; }
-                if !u.unit_type.stats().is_naval { return false; }
+                if u.owner != player || !u.is_alive() {
+                    return false;
+                }
+                if !u.unit_type.stats().is_naval {
+                    return false;
+                }
                 let cost = crate::combat::unit_build_cost(u.unit_type);
                 let refund = cost / 2;
                 self.players[pi].gold += refund;
@@ -1976,16 +2167,23 @@ impl Simulation {
                 // already filters dead/inactive units out.
                 self.military_units[ui].active = false;
                 self.military_units[ui].health = 0.0;
-                self.event_log.push(format!(
-                    "[werft] sold ship #{ui} for {refund} gold",
-                ));
+                self.event_log
+                    .push(format!("[werft] sold ship #{ui} for {refund} gold",));
                 true
             }
-            Command::SetPatrol { ref player, ref unit_index, ref waypoints } => {
+            Command::SetPatrol {
+                ref player,
+                ref unit_index,
+                ref waypoints,
+            } => {
                 let ui = *unit_index as usize;
-                if ui >= self.military_units.len() { return false; }
+                if ui >= self.military_units.len() {
+                    return false;
+                }
                 let unit = &mut self.military_units[ui];
-                if unit.owner != *player || !unit.is_alive() { return false; }
+                if unit.owner != *player || !unit.is_alive() {
+                    return false;
+                }
                 if waypoints.is_empty() {
                     unit.patrol.clear();
                     unit.patrol_idx = 0;
@@ -2000,28 +2198,48 @@ impl Simulation {
                 }
                 true
             }
-            Command::ArmShip { player, unit_index, target_cannons } => {
+            Command::ArmShip {
+                player,
+                unit_index,
+                target_cannons,
+            } => {
                 let pi = player as usize;
-                if pi >= self.players.len() { return false; }
+                if pi >= self.players.len() {
+                    return false;
+                }
                 let ui = unit_index as usize;
-                if ui >= self.military_units.len() { return false; }
+                if ui >= self.military_units.len() {
+                    return false;
+                }
                 let unit = &self.military_units[ui];
-                if unit.owner != player || !unit.is_alive() { return false; }
+                if unit.owner != player || !unit.is_alive() {
+                    return false;
+                }
                 let cap = crate::combat::cannon_capacity(unit.unit_type);
-                if cap == 0 { return false; }
+                if cap == 0 {
+                    return false;
+                }
                 let want = target_cannons.min(cap);
                 let have = unit.cannons;
-                if want <= have { return false; }
+                if want <= have {
+                    return false;
+                }
                 let to_install = (want - have) as u32;
                 let cost_gold = to_install as i32 * 200;
-                if self.players[pi].gold < cost_gold { return false; }
+                if self.players[pi].gold < cost_gold {
+                    return false;
+                }
                 // Pull `Cannons` good from any of the player's
                 // warehouses to cover the install.
                 let mut needed = to_install as u16;
-                for w in self.warehouses.iter_mut()
+                for w in self
+                    .warehouses
+                    .iter_mut()
                     .filter(|w| w.active && w.owner == player)
                 {
-                    if needed == 0 { break; }
+                    if needed == 0 {
+                        break;
+                    }
                     let took = w.withdraw(crate::types::Good::Cannons, needed);
                     needed -= took;
                 }
@@ -2031,7 +2249,9 @@ impl Simulation {
                     // walk back what we still owe.
                     let recovered = to_install as u16 - needed;
                     if recovered > 0 {
-                        if let Some(w) = self.warehouses.iter_mut()
+                        if let Some(w) = self
+                            .warehouses
+                            .iter_mut()
                             .find(|w| w.active && w.owner == player)
                         {
                             w.deposit(crate::types::Good::Cannons, recovered);
@@ -2049,23 +2269,25 @@ impl Simulation {
             Command::ProposeTradeAgreement { a, b } => {
                 let ok = self.diplomacy.propose_trade_agreement(a, b);
                 if ok {
-                    self.event_log.push(format!(
-                        "[diplo] trade agreement signed: p{a} ↔ p{b}",
-                    ));
+                    self.event_log
+                        .push(format!("[diplo] trade agreement signed: p{a} ↔ p{b}",));
                 }
                 ok
             }
             Command::BreakTradeAgreement { a, b } => {
                 let ok = self.diplomacy.break_trade_agreement(a, b);
                 if ok {
-                    self.event_log.push(format!(
-                        "[diplo] trade agreement BROKEN: p{a} ↔ p{b}",
-                    ));
+                    self.event_log
+                        .push(format!("[diplo] trade agreement BROKEN: p{a} ↔ p{b}",));
                 }
                 ok
             }
             Command::DispatchCart {
-                player, from_warehouse, to_warehouse, good, qty,
+                player,
+                from_warehouse,
+                to_warehouse,
+                good,
+                qty,
             } => {
                 // KARREN Maxtrag = 6 (figuren.cod `Nummer: KARREN`).
                 let qty = qty.min(6);
@@ -2085,15 +2307,16 @@ impl Simulation {
                     return false;
                 }
                 let took = self.warehouses[fi].withdraw(good, qty);
-                if took == 0 { return false; }
+                if took == 0 {
+                    return false;
+                }
                 let placed = self.warehouses[ti].deposit(good, took);
                 let leftover = took - placed;
                 if leftover > 0 {
                     self.warehouses[fi].deposit(good, leftover);
                 }
-                self.event_log.push(format!(
-                    "[cart] {placed} {good:?} → warehouse #{ti}",
-                ));
+                self.event_log
+                    .push(format!("[cart] {placed} {good:?} → warehouse #{ti}",));
                 placed > 0
             }
         }
@@ -2115,8 +2338,8 @@ mod tests {
     #[test]
     fn ai_request_build_places_building() {
         use crate::ai::AiAction;
-        use crate::types::{Good, ProductionType};
         use crate::building::BuildingDef;
+        use crate::types::{Good, ProductionType};
 
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -2127,15 +2350,26 @@ mod tests {
         sim.warehouses.push(Warehouse::new(0, 1, 15, 15));
         // A single buildable def: a Tools workshop.
         sim.building_defs.push(BuildingDef {
-            id: 0, category: 0, width: 2, height: 2,
+            id: 0,
+            category: 0,
+            width: 2,
+            height: 2,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
             radius: 0,
-            output_good: Good::Tools, input_good_1: Good::Iron,
+            output_good: Good::Tools,
+            input_good_1: Good::Iron,
             input_good_2: Good::None,
-            output_rate: 1, input_1_rate: 1, input_2_rate: 0,
-            storage_capacity: 50, cycle_time_ms: 1000,
-            cost_gold: 500, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 1,
+            input_1_rate: 1,
+            input_2_rate: 0,
+            storage_capacity: 50,
+            cycle_time_ms: 1000,
+            cost_gold: 500,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
             min_tier: 0,
@@ -2148,10 +2382,15 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: None,
         });
         // Drive the build path manually.
-        let action = AiAction::RequestBuild { good: Good::Tools, priority: 0 };
+        let action = AiAction::RequestBuild {
+            good: Good::Tools,
+            priority: 0,
+        };
         // Inline the dispatch loop (tick_ai runs the controller too, which
         // would emit its own actions; we want a focused single-action test).
         let owner = 1u8;
@@ -2159,27 +2398,36 @@ mod tests {
         let gold_before = sim.players[player_idx].gold;
         match action {
             AiAction::RequestBuild { good, .. } => {
-                let pick = sim.building_defs.iter().enumerate()
-                    .filter(|(_, d)| d.output_good == good
-                        && d.cost_gold as i32 <= sim.players[player_idx].gold)
+                let pick = sim
+                    .building_defs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| {
+                        d.output_good == good && d.cost_gold as i32 <= sim.players[player_idx].gold
+                    })
                     .min_by_key(|(_, d)| d.cost_gold);
                 let (def_id, def) = pick.unwrap();
                 let wh = sim.warehouses.iter().find(|w| w.owner == owner).unwrap();
-                let cx = wh.tile_x; let cy = wh.tile_y;
-                let w = def.width as u16; let h = def.height as u16;
+                let cx = wh.tile_x;
+                let cy = wh.tile_y;
+                let w = def.width as u16;
+                let h = def.height as u16;
                 let cost = def.cost_gold;
-                let map_idx = sim.island_maps.iter()
-                    .position(|m| m.island_id == wh.island_id).unwrap();
+                let map_idx = sim
+                    .island_maps
+                    .iter()
+                    .position(|m| m.island_id == wh.island_id)
+                    .unwrap();
                 let spot = sim.island_maps[map_idx]
-                    .find_open_spot(cx, cy, w, h, 12).unwrap();
+                    .find_open_spot(cx, cy, w, h, 12)
+                    .unwrap();
                 for dy in 0..h {
                     for dx in 0..w {
                         sim.island_maps[map_idx].set_walkable(spot.0 + dx, spot.1 + dy, false);
                     }
                 }
-                let mut inst = BuildingInstance::new(
-                    def_id as u16, wh.island_id, spot.0, spot.1, owner,
-                );
+                let mut inst =
+                    BuildingInstance::new(def_id as u16, wh.island_id, spot.0, spot.1, owner);
                 inst.construction_ms_total = 8_000;
                 inst.construction_ms_remaining = 8_000;
                 sim.buildings.push(inst);
@@ -2199,9 +2447,7 @@ mod tests {
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         // Single objective: reach 10 000 gold.
-        sim.objectives = ObjectiveSet::new(vec![
-            Objective::AccumulateGold { amount: 10_000 },
-        ]);
+        sim.objectives = ObjectiveSet::new(vec![Objective::AccumulateGold { amount: 10_000 }]);
 
         // Below threshold — scenario_complete must stay false.
         sim.players[0].gold = 1_000;
@@ -2215,21 +2461,28 @@ mod tests {
         sim.players[0].gold = 12_000;
         sim.tick_population();
         assert!(sim.scenario_complete);
-        let victory_lines: usize = sim.event_log.iter()
-            .filter(|l| l.starts_with("[victory]")).count();
-        assert_eq!(victory_lines, 1,
-            "victory line should fire exactly once on the flip");
+        let victory_lines: usize = sim
+            .event_log
+            .iter()
+            .filter(|l| l.starts_with("[victory]"))
+            .count();
+        assert_eq!(
+            victory_lines, 1,
+            "victory line should fire exactly once on the flip"
+        );
 
         // Tick again — must NOT re-emit (edge-triggered).
         sim.event_log.clear();
         sim.tick_population();
         assert!(sim.scenario_complete);
-        assert!(!sim.event_log.iter().any(|l| l.starts_with("[victory]")),
-            "victory line is edge-triggered");
+        assert!(
+            !sim.event_log.iter().any(|l| l.starts_with("[victory]")),
+            "victory line is edge-triggered"
+        );
     }
 
     #[test]
-    fn ai_picks_fertile_warehouse_for_climate_bound_plantation() {
+    fn ai_picks_fertile_warehouse_for_fertility_bound_plantation() {
         // AI has two warehouses: island 0 (barren, listed
         // first) and island 1 (Cocoa-fertile). When asked to
         // build a Cocoa plantation, the warehouse selector
@@ -2258,24 +2511,42 @@ mod tests {
         sim.warehouses.push(Warehouse::new(0, 1, 15, 15));
         sim.warehouses.push(Warehouse::new(1, 1, 15, 15));
 
-        // Cocoa plantation, climate-bound.
+        // Cocoa plantation, fertility-bound.
         let cocoa_def = BuildingDef {
-            id: 0, category: 0, width: 2, height: 2,
+            id: 0,
+            category: 0,
+            width: 2,
+            height: 2,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "PLANTAGE".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "PLANTAGE".into(),
             radius: 0,
-            output_good: Good::Cocoa, input_good_1: Good::None,
+            output_good: Good::Cocoa,
+            input_good_1: Good::None,
             input_good_2: Good::None,
-            output_rate: 1, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 50, cycle_time_ms: 1000,
-            cost_gold: 200, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 1,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 50,
+            cycle_time_ms: 1000,
+            cost_gold: 200,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
-            native: false, min_tier: 0, max_no_input_ticks: 6,
-            can_dry_up: true, wegspeed: [100; 4],
-            has_door: false, upgradeable: false,
+            native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
+            can_dry_up: true,
+            wegspeed: [100; 4],
+            has_door: false,
+            upgradeable: false,
             max_energy: 0,
             ore_deposit: OreDeposit::None,
-            pirate_owned: false, defensive_cannons: 0,
+            pirate_owned: false,
+            defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: Some(Fertility::Cocoa),
         };
         sim.building_defs.push(cocoa_def);
@@ -2285,22 +2556,28 @@ mod tests {
         let owner = 1u8;
         let def = &sim.building_defs[0];
         let wh = sim.warehouses.iter().find(|w| {
-            if !(w.active && w.owner == owner) { return false; }
+            if !(w.active && w.owner == owner) {
+                return false;
+            }
             match def.required_fertility {
                 None => true,
-                Some(req) => sim.island_maps.iter()
+                Some(req) => sim
+                    .island_maps
+                    .iter()
                     .find(|m| m.island_id == w.island_id)
                     .map(|m| m.active_fertilities().contains(&req))
                     .unwrap_or(false),
             }
         });
         let wh = wh.expect("a fertile warehouse must be found");
-        assert_eq!(wh.island_id, 1,
-            "must pick the Cocoa-fertile island, not the first warehouse");
+        assert_eq!(
+            wh.island_id, 1,
+            "must pick the Cocoa-fertile island, not the first warehouse"
+        );
     }
 
     #[test]
-    fn ai_build_path_blocks_climate_bound_plantation_on_barren_island() {
+    fn ai_build_path_blocks_fertility_bound_plantation_on_barren_island() {
         // Direct exercise of the simulation's RequestBuild
         // handler, bypassing the priority-list early-return so we
         // focus on the fertility filter only. The handler is
@@ -2317,37 +2594,55 @@ mod tests {
         // Barren island — no fertility bytes set.
         sim.island_maps.push(IslandMap::new_open(0, 30, 30));
         sim.warehouses.push(Warehouse::new(0, 1, 15, 15));
-        // Cocoa plantation — climate-bound to Cocoa fertility.
+        // Cocoa plantation — fertility-bound to Cocoa fertility.
         sim.building_defs.push(BuildingDef {
-            id: 0, category: 0, width: 2, height: 2,
+            id: 0,
+            category: 0,
+            width: 2,
+            height: 2,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "PLANTAGE".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "PLANTAGE".into(),
             radius: 0,
-            output_good: Good::Cocoa, input_good_1: Good::None,
+            output_good: Good::Cocoa,
+            input_good_1: Good::None,
             input_good_2: Good::None,
-            output_rate: 1, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 50, cycle_time_ms: 1000,
-            cost_gold: 200, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 1,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 50,
+            cycle_time_ms: 1000,
+            cost_gold: 200,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
-            native: false, min_tier: 0, max_no_input_ticks: 6,
-            can_dry_up: true, wegspeed: [100; 4],
-            has_door: false, upgradeable: false,
+            native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
+            can_dry_up: true,
+            wegspeed: [100; 4],
+            has_door: false,
+            upgradeable: false,
             max_energy: 0,
             ore_deposit: OreDeposit::None,
-            pirate_owned: false, defensive_cannons: 0,
+            pirate_owned: false,
+            defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: Some(Fertility::Cocoa),
         });
 
         // Replay the handler logic: build the
         // available_fertilities set, filter defs, expect None.
         let owner = 1u8;
-        let owner_warehouse_islands: std::collections::HashSet<u8> =
-            sim.warehouses.iter()
-                .filter(|w| w.active && w.owner == owner)
-                .map(|w| w.island_id)
-                .collect();
-        let mut available_fertilities:
-            std::collections::HashSet<Fertility> =
+        let owner_warehouse_islands: std::collections::HashSet<u8> = sim
+            .warehouses
+            .iter()
+            .filter(|w| w.active && w.owner == owner)
+            .map(|w| w.island_id)
+            .collect();
+        let mut available_fertilities: std::collections::HashSet<Fertility> =
             std::collections::HashSet::new();
         for map in &sim.island_maps {
             if owner_warehouse_islands.contains(&map.island_id) {
@@ -2356,22 +2651,30 @@ mod tests {
                 }
             }
         }
-        assert!(available_fertilities.is_empty(),
-            "barren island contributes no fertilities");
-        let pick = sim.building_defs.iter().enumerate()
-            .filter(|(_, d)| d.output_good == Good::Cocoa
-                && match d.required_fertility {
-                    Some(req) => available_fertilities.contains(&req),
-                    None => true,
-                })
+        assert!(
+            available_fertilities.is_empty(),
+            "barren island contributes no fertilities"
+        );
+        let pick = sim
+            .building_defs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                d.output_good == Good::Cocoa
+                    && match d.required_fertility {
+                        Some(req) => available_fertilities.contains(&req),
+                        None => true,
+                    }
+            })
             .next();
-        assert!(pick.is_none(),
-            "fertility filter must reject the Cocoa def on a barren island");
+        assert!(
+            pick.is_none(),
+            "fertility filter must reject the Cocoa def on a barren island"
+        );
 
         // Make the island fertile and re-run.
         sim.island_maps[0].fertilities = [6, 7, 7, 7, 7, 7, 7, 7];
-        let mut available_fertilities:
-            std::collections::HashSet<Fertility> =
+        let mut available_fertilities: std::collections::HashSet<Fertility> =
             std::collections::HashSet::new();
         for map in &sim.island_maps {
             if owner_warehouse_islands.contains(&map.island_id) {
@@ -2381,15 +2684,22 @@ mod tests {
             }
         }
         assert!(available_fertilities.contains(&Fertility::Cocoa));
-        let pick = sim.building_defs.iter().enumerate()
-            .filter(|(_, d)| d.output_good == Good::Cocoa
-                && match d.required_fertility {
-                    Some(req) => available_fertilities.contains(&req),
-                    None => true,
-                })
+        let pick = sim
+            .building_defs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                d.output_good == Good::Cocoa
+                    && match d.required_fertility {
+                        Some(req) => available_fertilities.contains(&req),
+                        None => true,
+                    }
+            })
             .next();
-        assert!(pick.is_some(),
-            "Cocoa-fertile island should accept the Cocoa def");
+        assert!(
+            pick.is_some(),
+            "Cocoa-fertile island should accept the Cocoa def"
+        );
 
         // Construct a mock built building so we can verify
         // BuildingInstance flows through the rest of the sim
@@ -2413,15 +2723,23 @@ mod tests {
         sim.warehouses.push(Warehouse::new(0, 1, 30, 30));
         sim.diplomacy.set(0, 1, Diplomacy::War);
         // Hostile unit within 8 tiles of the AI's warehouse.
-        sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 0, 32, 32));
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::Infantry, 0, 32, 32));
         sim.ai_controllers.push(AiController::new(
-            1, AiPersonality::Military, Difficulty::Hard,
+            1,
+            AiPersonality::Military,
+            Difficulty::Hard,
         ));
         sim.tick_diplomacy();
-        let ai_units: usize = sim.military_units.iter()
+        let ai_units: usize = sim
+            .military_units
+            .iter()
             .filter(|u| u.owner == 1 && u.is_alive())
             .count();
-        assert!(ai_units >= 1, "AI should have spawned at least one defender");
+        assert!(
+            ai_units >= 1,
+            "AI should have spawned at least one defender"
+        );
         assert!(sim.players[1].gold < 5_000);
     }
 
@@ -2432,8 +2750,7 @@ mod tests {
         sim.island_maps.push(IslandMap::new_open(0, 30, 30));
         sim.warehouses.push(Warehouse::new(0, 0, 15, 15));
         sim.tick_exploration();
-        let m = sim.exploration.iter()
-            .find(|e| e.island_id == 0).unwrap();
+        let m = sim.exploration.iter().find(|e| e.island_id == 0).unwrap();
         // Tile right at the warehouse must be revealed.
         assert!(m.is_explored(15, 15));
         // Tile far away must not be (default radius 5).
@@ -2442,20 +2759,31 @@ mod tests {
 
     #[test]
     fn construction_stalls_without_materials() {
-        use crate::types::{Good, ProductionType};
         use crate::building::{BuildingDef, BuildingInstance};
+        use crate::types::{Good, ProductionType};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.building_defs.push(BuildingDef {
-            id: 0, category: 0, width: 1, height: 1,
+            id: 0,
+            category: 0,
+            width: 1,
+            height: 1,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
             radius: 0,
-            output_good: Good::Tools, input_good_1: Good::None,
+            output_good: Good::Tools,
+            input_good_1: Good::None,
             input_good_2: Good::None,
-            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 0, cycle_time_ms: 0,
-            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 0,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
             min_tier: 0,
@@ -2468,6 +2796,8 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: None,
         });
         let mut b = BuildingInstance::new(0, 0, 0, 0, 0);
@@ -2484,8 +2814,8 @@ mod tests {
 
     #[test]
     fn construction_trickles_materials_from_warehouse() {
-        use crate::types::Good;
         use crate::building::BuildingInstance;
+        use crate::types::Good;
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         let mut wh = Warehouse::new(0, 0, 0, 0);
@@ -2548,25 +2878,17 @@ mod tests {
     }
 
     #[test]
-    fn pirates_eventually_spawn_to_attack_player_trade_ships() {
+    fn pirates_do_not_spawn_without_source_hideout() {
         use crate::trade::TradeShip;
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.trade_ships.push(TradeShip::new(0, 0, 100, 100));
-        // Drive event ticks until a pirate appears (1-in-3 odds; cap to
-        // keep the test bounded).
-        let mut spawned = false;
-        for _ in 0..30 {
-            sim.tick_events();
-            if sim.military_units.iter().any(|u| u.owner == 6) {
-                spawned = true;
-                break;
-            }
-        }
-        assert!(spawned, "expected at least one pirate spawn within 30 ticks");
-        // Pirate is at war with player 0.
-        use crate::combat::Diplomacy;
-        assert_eq!(sim.diplomacy.get(6, 0), Diplomacy::War);
+        // Seed 2 satisfied the removed random pirate gate; without a source
+        // trigger, the event must not fabricate an origin near the target ship.
+        sim.seed_source_rand(2);
+        sim.tick_events();
+        assert!(sim.military_units.iter().all(|u| u.owner != 6));
+        assert_eq!(sim.diplomacy.get(6, 0), crate::combat::Diplomacy::Neutral);
     }
 
     #[test]
@@ -2580,10 +2902,184 @@ mod tests {
     }
 
     #[test]
+    fn fire_effect_uses_building_definition_maxbrand_cap() {
+        use crate::building::{BuildingDef, BuildingInstance};
+        use crate::types::{Good, ProductionType};
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.building_defs.push(BuildingDef {
+            id: 0,
+            category: 0,
+            width: 1,
+            height: 1,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::None,
+            input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 1_000,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
+            maintenance_cost: 0,
+            native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
+            has_door: false,
+            upgradeable: false,
+            max_energy: 0,
+            ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
+            max_brand_damage_ticks: 1,
+            ruin_id: crate::building::NO_RUIN_ID,
+            required_fertility: None,
+        });
+        sim.buildings.push(BuildingInstance::new(0, 0, 4, 4, 0));
+
+        assert!(crate::disaster::ignite_building_with_cap(
+            &mut sim.buildings[0],
+            sim.building_defs[0].max_brand_damage_ticks,
+        ));
+        assert_eq!(sim.buildings[0].fire_damage_ticks, 1);
+        let after_first_fire = sim.buildings[0].health;
+
+        assert!(!crate::disaster::ignite_building_with_cap(
+            &mut sim.buildings[0],
+            sim.building_defs[0].max_brand_damage_ticks,
+        ));
+        assert_eq!(sim.buildings[0].fire_damage_ticks, 1);
+        assert_eq!(sim.buildings[0].health, after_first_fire);
+    }
+
+    #[test]
+    fn disaster_event_does_not_fabricate_fire_origin() {
+        use crate::building::{BuildingDef, BuildingInstance, BUILDING_MAX_HEALTH};
+        use crate::types::{Good, ProductionType};
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.building_defs.push(BuildingDef {
+            id: 0,
+            category: 0,
+            width: 1,
+            height: 1,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::None,
+            input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 1_000,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
+            maintenance_cost: 0,
+            native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
+            has_door: false,
+            upgradeable: false,
+            max_energy: 0,
+            ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
+            required_fertility: None,
+        });
+        sim.buildings.push(BuildingInstance::new(0, 0, 4, 4, 0));
+
+        // Seed 8 used to satisfy the removed speculative fire gate.
+        sim.seed_source_rand(8);
+        sim.tick_disaster_event();
+
+        assert_eq!(sim.buildings[0].health, BUILDING_MAX_HEALTH);
+        assert_eq!(sim.buildings[0].fire_damage_ticks, 0);
+        assert!(sim.event_log.iter().all(|line| !line.starts_with("[fire]")));
+    }
+
+    #[test]
+    fn disaster_event_does_not_fabricate_volcano_origin() {
+        use crate::building::{BuildingDef, BuildingInstance, BUILDING_MAX_HEALTH};
+        use crate::types::{Good, ProductionType};
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.building_defs.push(BuildingDef {
+            id: 0,
+            category: 0,
+            width: 1,
+            height: 1,
+            production_type: ProductionType::Craft,
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
+            radius: 0,
+            output_good: Good::None,
+            input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 1_000,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
+            maintenance_cost: 0,
+            native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
+            has_door: false,
+            upgradeable: false,
+            max_energy: 0,
+            ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
+            required_fertility: None,
+        });
+        sim.buildings.push(BuildingInstance::new(0, 0, 4, 4, 0));
+
+        // Seed 2 used to treat 29216 % 32 == 0 as a volcano trigger
+        // centered on this ordinary player building.
+        sim.seed_source_rand(2);
+        sim.tick_disaster_event();
+
+        assert_eq!(sim.buildings[0].health, BUILDING_MAX_HEALTH);
+        assert!(sim
+            .event_log
+            .iter()
+            .all(|line| !line.starts_with("[volcano]")));
+    }
+
+    #[test]
     fn buildings_destroyed_by_adjacent_enemy_units() {
+        use crate::building::{BuildingDef, BuildingInstance};
         use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
         use crate::types::{Good, ProductionType};
-        use crate::building::{BuildingDef, BuildingInstance};
 
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -2591,15 +3087,26 @@ mod tests {
         sim.diplomacy.set(0, 1, Diplomacy::War);
         sim.island_maps.push(IslandMap::new_open(0, 30, 30));
         sim.building_defs.push(BuildingDef {
-            id: 0, category: 0, width: 2, height: 2,
+            id: 0,
+            category: 0,
+            width: 2,
+            height: 2,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
             radius: 0,
-            output_good: Good::Tools, input_good_1: Good::None,
+            output_good: Good::Tools,
+            input_good_1: Good::None,
             input_good_2: Good::None,
-            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 0, cycle_time_ms: 1000,
-            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 1000,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
             min_tier: 0,
@@ -2612,44 +3119,73 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: 5,
             required_fertility: None,
         });
         let b = BuildingInstance::new(0, 0, 10, 10, 0); // player 0 owns
         sim.buildings.push(b);
         // Enemy unit standing right next to the footprint.
-        sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 11, 12));
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::Infantry, 1, 11, 12));
         // Run several military ticks until building dies.
         for _ in 0..30 {
             sim.tick_military();
-            if sim.buildings.is_empty() { break; }
+            if sim.buildings.is_empty() {
+                break;
+            }
         }
-        assert!(sim.buildings.is_empty(), "building should have been destroyed");
+        assert!(
+            sim.buildings.is_empty(),
+            "building should have been destroyed"
+        );
         // Tile-clear event was queued.
-        assert!(!sim.tile_clears.is_empty());
-        // IslandMap walkability restored.
-        assert!(sim.island_maps[0].is_walkable(10, 10));
+        assert_eq!(
+            sim.tile_clears[0],
+            TileClear {
+                island_id: 0,
+                tile_x: 10,
+                tile_y: 10,
+                width: 2,
+                height: 2,
+                ruin_id: 5,
+            }
+        );
+        // Authored ruins remain blocking static map objects.
+        assert!(!sim.island_maps[0].is_walkable(10, 10));
     }
 
     #[test]
     fn buildings_safe_from_neutral_units() {
+        use crate::building::{BuildingDef, BuildingInstance};
         use crate::combat::{MilitaryUnit, UnitType};
         use crate::types::{Good, ProductionType};
-        use crate::building::{BuildingDef, BuildingInstance};
 
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.players.push(Player::new_ai(1, 0));
         sim.island_maps.push(IslandMap::new_open(0, 30, 30));
         sim.building_defs.push(BuildingDef {
-            id: 0, category: 0, width: 2, height: 2,
+            id: 0,
+            category: 0,
+            width: 2,
+            height: 2,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
             radius: 0,
-            output_good: Good::Tools, input_good_1: Good::None,
+            output_good: Good::Tools,
+            input_good_1: Good::None,
             input_good_2: Good::None,
-            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 0, cycle_time_ms: 1000,
-            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 1000,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
             min_tier: 0,
@@ -2662,16 +3198,22 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: None,
         });
         sim.buildings.push(BuildingInstance::new(0, 0, 10, 10, 0));
-        sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 11, 12));
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::Infantry, 1, 11, 12));
         // No diplomacy edit → relation stays Neutral, no damage.
         for _ in 0..30 {
             sim.tick_military();
         }
         assert_eq!(sim.buildings.len(), 1);
-        assert_eq!(sim.buildings[0].health, crate::building::BUILDING_MAX_HEALTH);
+        assert_eq!(
+            sim.buildings[0].health,
+            crate::building::BUILDING_MAX_HEALTH
+        );
     }
 
     #[test]
@@ -2689,11 +3231,16 @@ mod tests {
         // AI has a trade ship.
         sim.trade_ships.push(TradeShip::new(1, 0, 50, 60));
         sim.ai_controllers.push(AiController::new(
-            1, AiPersonality::Military, Difficulty::Hard,
+            1,
+            AiPersonality::Military,
+            Difficulty::Hard,
         ));
         sim.tick_diplomacy();
-        let escorts: Vec<&_> = sim.military_units.iter()
-            .filter(|u| u.owner == 1 && u.escort_ship == 0).collect();
+        let escorts: Vec<&_> = sim
+            .military_units
+            .iter()
+            .filter(|u| u.owner == 1 && u.escort_ship == 0)
+            .collect();
         assert!(!escorts.is_empty(), "expected an escort warship");
         assert!(escorts[0].unit_type.stats().is_naval);
         assert!(sim.players[1].gold < 5_000);
@@ -2732,7 +3279,7 @@ mod tests {
     }
 
     #[test]
-    fn ai_marches_units_at_enemy_warehouse_when_winning() {
+    fn ai_score_does_not_dispatch_offensive_raid() {
         use crate::ai::{AiController, AiPersonality, Difficulty};
         use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
         let mut sim = Simulation::new();
@@ -2752,15 +3299,19 @@ mod tests {
             sim.military_units.push(u);
         }
         sim.ai_controllers.push(AiController::new(
-            1, AiPersonality::Military, Difficulty::Hard,
+            1,
+            AiPersonality::Military,
+            Difficulty::Hard,
         ));
         sim.tick_diplomacy();
-        // At least half of the AI's units should now be marching toward
-        // the enemy warehouse (50,50).
-        let marching = sim.military_units.iter().filter(|u| {
-            u.owner == 1 && u.target_x == 50 && u.target_y == 50
-        }).count();
-        assert!(marching >= 2, "expected ≥2 units marching, got {marching}");
+        // A war state plus score superiority must not synthesize the
+        // original AI offensive order/cooldown state.
+        let marching = sim
+            .military_units
+            .iter()
+            .filter(|u| u.owner == 1 && u.target_x == 50 && u.target_y == 50)
+            .count();
+        assert_eq!(marching, 0, "score-only raid dispatched {marching} units");
     }
 
     #[test]
@@ -2773,12 +3324,17 @@ mod tests {
         sim.players[1].gold = 1_000;
         sim.warehouses.push(Warehouse::new(0, 1, 30, 30));
         // Neutral player walking near the warehouse — not a threat.
-        sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 0, 32, 32));
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::Infantry, 0, 32, 32));
         sim.ai_controllers.push(AiController::new(
-            1, AiPersonality::Military, Difficulty::Hard,
+            1,
+            AiPersonality::Military,
+            Difficulty::Hard,
         ));
         sim.tick_diplomacy();
-        let ai_units: usize = sim.military_units.iter()
+        let ai_units: usize = sim
+            .military_units
+            .iter()
             .filter(|u| u.owner == 1 && u.is_alive())
             .count();
         assert_eq!(ai_units, 0);
@@ -2787,8 +3343,8 @@ mod tests {
     #[test]
     fn ai_request_build_prefers_variety() {
         use crate::ai::{AiController, AiPersonality, Difficulty};
-        use crate::types::{Good, ProductionType};
         use crate::building::BuildingDef;
+        use crate::types::{Good, ProductionType};
 
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -2800,15 +3356,26 @@ mod tests {
         sim.warehouses.push(Warehouse::new(0, 1, 30, 30));
 
         let mk_def = |cost: u32| BuildingDef {
-            id: 0, category: 0, width: 2, height: 2,
+            id: 0,
+            category: 0,
+            width: 2,
+            height: 2,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
             radius: 0,
-            output_good: Good::Food, input_good_1: Good::None,
+            output_good: Good::Food,
+            input_good_1: Good::None,
             input_good_2: Good::None,
-            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 50, cycle_time_ms: 1000,
-            cost_gold: cost, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 50,
+            cycle_time_ms: 1000,
+            cost_gold: cost,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
             min_tier: 0,
@@ -2821,15 +3388,19 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: None,
         };
         // Two defs producing the same Good. Cheaper one would always win
         // under the old logic.
-        sim.building_defs.push(mk_def(500));   // def 0 (cheap)
-        sim.building_defs.push(mk_def(800));   // def 1 (expensive)
+        sim.building_defs.push(mk_def(500)); // def 0 (cheap)
+        sim.building_defs.push(mk_def(800)); // def 1 (expensive)
 
         sim.ai_controllers.push(AiController::new(
-            1, AiPersonality::Economic, Difficulty::Hard,
+            1,
+            AiPersonality::Economic,
+            Difficulty::Hard,
         ));
         // Drive tick_ai twice, resetting cooldowns between so we get
         // back-to-back builds.
@@ -2837,15 +3408,19 @@ mod tests {
         sim.ai_controllers[0].build_cooldown = 0;
         sim.tick_ai();
 
-        let mut def_ids: Vec<u16> = sim.buildings
+        let mut def_ids: Vec<u16> = sim
+            .buildings
             .iter()
             .filter(|b| b.owner == 1)
             .map(|b| b.def_id)
             .collect();
         def_ids.sort();
         assert_eq!(def_ids.len(), 2, "expected two AI builds, got {def_ids:?}");
-        assert_eq!(def_ids, vec![0, 1],
-            "AI should diversify across both defs, got {def_ids:?}");
+        assert_eq!(
+            def_ids,
+            vec![0, 1],
+            "AI should diversify across both defs, got {def_ids:?}"
+        );
     }
 
     #[test]
@@ -2858,11 +3433,16 @@ mod tests {
         sim.warehouses.push(Warehouse::new(0, 1, 10, 10));
         sim.warehouses.push(Warehouse::new(1, 1, 50, 50));
         sim.ai_controllers.push(AiController::new(
-            1, AiPersonality::Economic, Difficulty::Hard,
+            1,
+            AiPersonality::Economic,
+            Difficulty::Hard,
         ));
         // Drive AI tick.
         sim.tick_ai();
-        assert!(!sim.trade_routes.is_empty(), "AI should have created a route");
+        assert!(
+            !sim.trade_routes.is_empty(),
+            "AI should have created a route"
+        );
         assert!(!sim.trade_ships.is_empty(), "AI should have spawned a ship");
         assert_eq!(sim.trade_routes[0].owner, 1);
         assert_eq!(sim.trade_routes[0].stops.len(), 2);
@@ -2879,7 +3459,9 @@ mod tests {
         // Only one island warehouse — not eligible.
         sim.warehouses.push(Warehouse::new(0, 1, 10, 10));
         sim.ai_controllers.push(AiController::new(
-            1, AiPersonality::Economic, Difficulty::Hard,
+            1,
+            AiPersonality::Economic,
+            Difficulty::Hard,
         ));
         sim.tick_ai();
         assert!(sim.trade_routes.is_empty());
@@ -2896,27 +3478,40 @@ mod tests {
         // promoted to Settler tier on the next tick_population.
         sim.players[0].satisfaction[0] = 128;
         sim.building_defs.push(BuildingDef {
-            id: 0, category: 0, width: 1, height: 1,
+            id: 0,
+            category: 0,
+            width: 1,
+            height: 1,
             production_type: ProductionType::Residence,
-            kind: "WOHN".into(), prod_kind: "WOHN".into(),
+            kind: "WOHN".into(),
+            prod_kind: "WOHN".into(),
             radius: 0,
-            output_good: Good::None, input_good_1: Good::None,
+            output_good: Good::None,
+            input_good_1: Good::None,
             input_good_2: Good::None,
-            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 0, cycle_time_ms: 0,
-            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 0,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
             min_tier: 0,
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
-            has_door: true,        // residence has a door
-            upgradeable: true,     // and is upgradeable per Ausbauflg
+            has_door: true,    // residence has a door
+            upgradeable: true, // and is upgradeable per Ausbauflg
             max_energy: 0,
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: None,
         });
         sim.buildings.push(BuildingInstance::new(0, 0, 0, 0, 0));
@@ -2927,21 +3522,32 @@ mod tests {
 
     #[test]
     fn building_maintenance_aggregates_per_player() {
-        use crate::types::{Good, ProductionType};
         use crate::building::{BuildingDef, BuildingInstance};
+        use crate::types::{Good, ProductionType};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.players.push(Player::new_ai(1, 0));
         let mk_def = |maint: u16| BuildingDef {
-            id: 0, category: 0, width: 1, height: 1,
+            id: 0,
+            category: 0,
+            width: 1,
+            height: 1,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
             radius: 0,
-            output_good: Good::Tools, input_good_1: Good::None,
+            output_good: Good::Tools,
+            input_good_1: Good::None,
             input_good_2: Good::None,
-            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 50, cycle_time_ms: 1000,
-            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 50,
+            cycle_time_ms: 1000,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: maint,
             native: false,
             min_tier: 0,
@@ -2954,18 +3560,22 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: None,
         };
         sim.building_defs.push(mk_def(5)); // def 0 cost 5
         sim.building_defs.push(mk_def(8)); // def 1 cost 8
-        // Player 0: 2× def0 + 1× def1 → 5+5+8 = 18
+                                           // Player 0: 2× def0 + 1× def1 → 5+5+8 = 18
         sim.buildings.push(BuildingInstance::new(0, 0, 0, 0, 0));
         sim.buildings.push(BuildingInstance::new(0, 0, 1, 1, 0));
         sim.buildings.push(BuildingInstance::new(1, 0, 2, 2, 0));
         // Player 1: 1× def1 → 8
         sim.buildings.push(BuildingInstance::new(1, 0, 3, 3, 1));
         // Make all "built" so they count.
-        for b in &mut sim.buildings { b.construction_ms_remaining = 0; }
+        for b in &mut sim.buildings {
+            b.construction_ms_remaining = 0;
+        }
         sim.tick_population();
         assert_eq!(sim.players[0].building_maintenance, 18);
         assert_eq!(sim.players[1].building_maintenance, 8);
@@ -2973,20 +3583,31 @@ mod tests {
 
     #[test]
     fn unfinished_buildings_do_not_pay_maintenance() {
-        use crate::types::{Good, ProductionType};
         use crate::building::{BuildingDef, BuildingInstance};
+        use crate::types::{Good, ProductionType};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.building_defs.push(BuildingDef {
-            id: 0, category: 0, width: 1, height: 1,
+            id: 0,
+            category: 0,
+            width: 1,
+            height: 1,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
             radius: 0,
-            output_good: Good::Tools, input_good_1: Good::None,
+            output_good: Good::Tools,
+            input_good_1: Good::None,
             input_good_2: Good::None,
-            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 0, cycle_time_ms: 1000,
-            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 1000,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 7,
             native: false,
             min_tier: 0,
@@ -2999,6 +3620,8 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: None,
         });
         // One under construction, one finished.
@@ -3013,31 +3636,33 @@ mod tests {
     }
 
     #[test]
-    fn ai_declares_war_on_weak_neighbor() {
+    fn ai_score_does_not_create_war() {
         use crate::ai::{AiController, AiPersonality, Difficulty};
         use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.players.push(Player::new_ai(1, 0));
-        // Drain the human player's default starting gold so AI(1) clearly
-        // outscores them on the civilization-power heuristic.
+        // Drain the human player's default starting gold so AI(1) would have
+        // dominated the removed score helper.
         sim.players[0].gold = 0;
         sim.players[1].gold = 5_000;
-        // AI(1) is Military and beefy; player 0 is weak.
+        // AI(1) is Military and beefy; score alone must not synthesize war.
         for _ in 0..10 {
-            sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 0, 0));
+            sim.military_units
+                .push(MilitaryUnit::new(UnitType::Infantry, 1, 0, 0));
         }
         sim.ai_controllers.push(AiController::new(
-            1, AiPersonality::Military, Difficulty::Hard,
+            1,
+            AiPersonality::Military,
+            Difficulty::Hard,
         ));
         sim.tick_diplomacy();
-        assert_eq!(sim.diplomacy.get(1, 0), Diplomacy::War);
-        // Symmetric.
-        assert_eq!(sim.diplomacy.get(0, 1), Diplomacy::War);
+        assert_eq!(sim.diplomacy.get(1, 0), Diplomacy::Neutral);
+        assert_eq!(sim.diplomacy.get(0, 1), Diplomacy::Neutral);
     }
 
     #[test]
-    fn ai_sues_for_peace_when_outmatched() {
+    fn ai_score_does_not_end_war() {
         use crate::ai::{AiController, AiPersonality, Difficulty};
         use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
         let mut sim = Simulation::new();
@@ -3047,13 +3672,17 @@ mod tests {
         sim.diplomacy.set(1, 0, Diplomacy::War);
         // Player 0 vastly outmuscles AI(1).
         for _ in 0..30 {
-            sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 0, 0, 0));
+            sim.military_units
+                .push(MilitaryUnit::new(UnitType::Infantry, 0, 0, 0));
         }
         sim.ai_controllers.push(AiController::new(
-            1, AiPersonality::Military, Difficulty::Hard,
+            1,
+            AiPersonality::Military,
+            Difficulty::Hard,
         ));
         sim.tick_diplomacy();
-        assert_eq!(sim.diplomacy.get(1, 0), Diplomacy::Neutral);
+        assert_eq!(sim.diplomacy.get(1, 0), Diplomacy::War);
+        assert_eq!(sim.diplomacy.get(0, 1), Diplomacy::War);
     }
 
     #[test]
@@ -3066,13 +3695,16 @@ mod tests {
         sim.players[0].gold = 0;
         sim.players[1].gold = 5_000;
         for _ in 0..10 {
-            sim.military_units.push(MilitaryUnit::new(UnitType::Infantry, 1, 0, 0));
+            sim.military_units
+                .push(MilitaryUnit::new(UnitType::Infantry, 1, 0, 0));
         }
         sim.ai_controllers.push(AiController::new(
-            1, AiPersonality::Economic, Difficulty::Hard,
+            1,
+            AiPersonality::Economic,
+            Difficulty::Hard,
         ));
         sim.tick_diplomacy();
-        // Economic AI shouldn't have flipped to war even with the upper hand.
+        // Economic AI must not flip to war even with the upper hand.
         assert_eq!(sim.diplomacy.get(1, 0), Diplomacy::Neutral);
     }
 
@@ -3085,20 +3717,27 @@ mod tests {
         sim.players[1].gold = 5_000;
         sim.players[1].total_population = 200;
         sim.players[1].population[1] = 200; // make calculate_costs etc. sane
-        // AI needs a warehouse to spawn near.
+                                            // AI needs a warehouse to spawn near.
         sim.warehouses.push(Warehouse::new(0, 1, 30, 40));
         // Wire an AI controller bound to slot 1 with the Military personality
         // running on Hard so its target unit count is reasonable.
         sim.ai_controllers.push(AiController::new(
-            1, AiPersonality::Military, Difficulty::Hard,
+            1,
+            AiPersonality::Military,
+            Difficulty::Hard,
         ));
         // Force-trigger the AI tick once.
         sim.tick_ai();
         // Expect at least one swordsman spawned for player 1.
-        let owned: usize = sim.military_units.iter()
+        let owned: usize = sim
+            .military_units
+            .iter()
             .filter(|u| u.owner == 1 && u.is_alive())
             .count();
-        assert!(owned > 0, "AI should have spawned at least one unit, got {owned}");
+        assert!(
+            owned > 0,
+            "AI should have spawned at least one unit, got {owned}"
+        );
         // And paid for them.
         assert!(sim.players[1].gold < 5_000);
     }
@@ -3112,11 +3751,15 @@ mod tests {
         sim.warehouses[0].set_capacity(Good::Cloth, 100);
         sim.warehouses[0].deposit(Good::Cloth, 50);
         sim.warehouses[0].set_capacity(Good::Spices, 100);
-        sim.native_villages.push(crate::native::NativeVillage::new(0, 60, 60));
+        sim.native_villages
+            .push(crate::native::NativeVillage::new(0, 60, 60));
 
         // Deliver Cloth → village credit accumulates.
         let ok = sim.apply_command(&crate::commands::Command::NativeDeliver {
-            player: 0, village_idx: 0, good: Good::Cloth, qty: 30,
+            player: 0,
+            village_idx: 0,
+            good: Good::Cloth,
+            qty: 30,
         });
         assert!(ok);
         assert_eq!(sim.warehouses[0].stock(Good::Cloth), 20);
@@ -3124,7 +3767,10 @@ mod tests {
 
         // Withdraw a small amount of Spices — credit should cover it.
         let ok = sim.apply_command(&crate::commands::Command::NativeWithdraw {
-            player: 0, village_idx: 0, good: Good::Spices, qty: 1,
+            player: 0,
+            village_idx: 0,
+            good: Good::Spices,
+            qty: 1,
         });
         assert!(ok);
         assert_eq!(sim.warehouses[0].stock(Good::Spices), 1);
@@ -3138,10 +3784,14 @@ mod tests {
         sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
         sim.warehouses[0].set_capacity(Good::Wood, 50);
         sim.warehouses[0].deposit(Good::Wood, 50);
-        sim.native_villages.push(crate::native::NativeVillage::new(0, 60, 60));
+        sim.native_villages
+            .push(crate::native::NativeVillage::new(0, 60, 60));
         // Wood is not in the default wants list (Cloth/Tools/Jewelry).
         let ok = sim.apply_command(&crate::commands::Command::NativeDeliver {
-            player: 0, village_idx: 0, good: Good::Wood, qty: 10,
+            player: 0,
+            village_idx: 0,
+            good: Good::Wood,
+            qty: 10,
         });
         assert!(!ok);
         // Refund: warehouse stock unchanged.
@@ -3150,14 +3800,14 @@ mod tests {
 
     #[test]
     fn patrol_cycles_waypoints() {
-        use crate::combat::{MilitaryUnit, UnitType, tick_unit_orders};
+        use crate::combat::{tick_unit_orders, MilitaryUnit, UnitType};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
-        sim.military_units.push(MilitaryUnit::new(
-            UnitType::SmallWarship, 0, 0, 0,
-        ));
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::SmallWarship, 0, 0, 0));
         let ok = sim.apply_command(&crate::commands::Command::SetPatrol {
-            player: 0, unit_index: 0,
+            player: 0,
+            unit_index: 0,
             waypoints: vec![(2, 0), (2, 2), (0, 2)],
         });
         assert!(ok);
@@ -3172,13 +3822,18 @@ mod tests {
         // and the new target_x/y should reflect (2, 2).
         tick_unit_orders(&mut sim.military_units, 200);
         assert_eq!(
-            (sim.military_units[0].target_x, sim.military_units[0].target_y),
+            (
+                sim.military_units[0].target_x,
+                sim.military_units[0].target_y
+            ),
             (2, 2),
         );
 
         // Empty waypoints cancels patrol.
         sim.apply_command(&crate::commands::Command::SetPatrol {
-            player: 0, unit_index: 0, waypoints: vec![],
+            player: 0,
+            unit_index: 0,
+            waypoints: vec![],
         });
         assert!(sim.military_units[0].patrol.is_empty());
     }
@@ -3199,8 +3854,11 @@ mod tests {
 
         // Load 20 Tools.
         let ok = sim.apply_command(&crate::commands::Command::LoadShip {
-            player: 0, ship_idx: 0, warehouse_idx: 0,
-            good: Good::Tools, qty: 20,
+            player: 0,
+            ship_idx: 0,
+            warehouse_idx: 0,
+            good: Good::Tools,
+            qty: 20,
         });
         assert!(ok);
         assert_eq!(sim.warehouses[0].stock(Good::Tools), 30);
@@ -3208,8 +3866,11 @@ mod tests {
 
         // Unload 5 back.
         let ok = sim.apply_command(&crate::commands::Command::UnloadShip {
-            player: 0, ship_idx: 0, warehouse_idx: 0,
-            good: Good::Tools, qty: 5,
+            player: 0,
+            ship_idx: 0,
+            warehouse_idx: 0,
+            good: Good::Tools,
+            qty: 5,
         });
         assert!(ok);
         assert_eq!(sim.warehouses[0].stock(Good::Tools), 35);
@@ -3229,24 +3890,27 @@ mod tests {
         ship.active = true;
         sim.trade_ships.push(ship);
         let ok = sim.apply_command(&crate::commands::Command::LoadShip {
-            player: 0, ship_idx: 0, warehouse_idx: 0,
-            good: Good::Tools, qty: 5,
+            player: 0,
+            ship_idx: 0,
+            warehouse_idx: 0,
+            good: Good::Tools,
+            qty: 5,
         });
         assert!(!ok);
     }
 
     #[test]
     fn sell_ship_refunds_half_cost_and_deactivates() {
-        use crate::combat::{MilitaryUnit, UnitType, unit_build_cost};
+        use crate::combat::{unit_build_cost, MilitaryUnit, UnitType};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.players[0].gold = 100;
-        sim.military_units.push(MilitaryUnit::new(
-            UnitType::SmallWarship, 0, 5, 5,
-        ));
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::SmallWarship, 0, 5, 5));
         let cost = unit_build_cost(UnitType::SmallWarship);
         let ok = sim.apply_command(&crate::commands::Command::SellShip {
-            player: 0, unit_index: 0,
+            player: 0,
+            unit_index: 0,
         });
         assert!(ok);
         assert_eq!(sim.players[0].gold, 100 + cost / 2);
@@ -3258,11 +3922,11 @@ mod tests {
         use crate::combat::{MilitaryUnit, UnitType};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
-        sim.military_units.push(MilitaryUnit::new(
-            UnitType::Infantry, 0, 0, 0,
-        ));
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::Infantry, 0, 0, 0));
         let ok = sim.apply_command(&crate::commands::Command::SellShip {
-            player: 0, unit_index: 0,
+            player: 0,
+            unit_index: 0,
         });
         assert!(!ok);
     }
@@ -3277,11 +3941,12 @@ mod tests {
         sim.warehouses.push(Warehouse::new(0, 0, 30, 40));
         sim.warehouses[0].set_capacity(Good::Cannons, 50);
         sim.warehouses[0].deposit(Good::Cannons, 50);
-        sim.military_units.push(MilitaryUnit::new(
-            UnitType::SmallWarship, 0, 60, 60,
-        ));
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::SmallWarship, 0, 60, 60));
         let ok = sim.apply_command(&crate::commands::Command::ArmShip {
-            player: 0, unit_index: 0, target_cannons: 99, // request beyond cap
+            player: 0,
+            unit_index: 0,
+            target_cannons: 99, // request beyond cap
         });
         assert!(ok);
         let cap = crate::combat::cannon_capacity(UnitType::SmallWarship);
@@ -3295,11 +3960,12 @@ mod tests {
         use crate::combat::{MilitaryUnit, UnitType};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
-        sim.military_units.push(MilitaryUnit::new(
-            UnitType::Infantry, 0, 0, 0,
-        ));
+        sim.military_units
+            .push(MilitaryUnit::new(UnitType::Infantry, 0, 0, 0));
         assert!(!sim.apply_command(&crate::commands::Command::ArmShip {
-            player: 0, unit_index: 0, target_cannons: 1,
+            player: 0,
+            unit_index: 0,
+            target_cannons: 1,
         }));
     }
 
@@ -3310,26 +3976,18 @@ mod tests {
         sim.players.push(Player::new_ai(1, 0));
 
         // Propose & accept.
-        assert!(sim.apply_command(
-            &crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 }
-        ));
+        assert!(sim.apply_command(&crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 }));
         assert!(sim.diplomacy.has_trade_agreement(0, 1));
         assert!(sim.diplomacy.has_trade_agreement(1, 0));
 
         // Break it: penalty flag set, can't re-propose immediately.
-        assert!(sim.apply_command(
-            &crate::commands::Command::BreakTradeAgreement { a: 0, b: 1 }
-        ));
+        assert!(sim.apply_command(&crate::commands::Command::BreakTradeAgreement { a: 0, b: 1 }));
         assert!(!sim.diplomacy.has_trade_agreement(0, 1));
-        assert!(!sim.apply_command(
-            &crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 }
-        ));
+        assert!(!sim.apply_command(&crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 }));
 
         // Clear penalty (e.g. after cooldown), proposal allowed.
         sim.diplomacy.clear_broken_flag(0, 1);
-        assert!(sim.apply_command(
-            &crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 }
-        ));
+        assert!(sim.apply_command(&crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 }));
     }
 
     #[test]
@@ -3345,6 +4003,38 @@ mod tests {
     }
 
     #[test]
+    fn diplomacy_score_does_not_accept_non_war_proposals() {
+        use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
+        use crate::commands::Command;
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.players[0].gold = 50_000;
+        sim.players[0].total_population = 5_000;
+        for _ in 0..20 {
+            sim.military_units
+                .push(MilitaryUnit::new(UnitType::Infantry, 0, 0, 0));
+        }
+
+        assert!(!sim.apply_command(&Command::SetDiplomacy {
+            a: 0,
+            b: 1,
+            state: Diplomacy::Allied,
+        }));
+        assert_eq!(sim.diplomacy.get(0, 1), Diplomacy::Neutral);
+
+        sim.diplomacy.set(0, 1, Diplomacy::War);
+        assert!(!sim.apply_command(&Command::SetDiplomacy {
+            a: 0,
+            b: 1,
+            state: Diplomacy::Neutral,
+        }));
+        assert_eq!(sim.diplomacy.get(0, 1), Diplomacy::War);
+        assert_eq!(sim.diplomacy.get(1, 0), Diplomacy::War);
+        assert_eq!(sim.event_log.len(), 2);
+    }
+
+    #[test]
     fn cart_transfers_clamped_to_six() {
         use crate::types::Good;
         let mut sim = Simulation::new();
@@ -3353,8 +4043,11 @@ mod tests {
         sim.warehouses.push(Warehouse::new(0, 0, 60, 60));
         sim.warehouses[0].deposit(Good::Tools, 25);
         let ok = sim.apply_command(&crate::commands::Command::DispatchCart {
-            player: 0, from_warehouse: 0, to_warehouse: 1,
-            good: Good::Tools, qty: 100,
+            player: 0,
+            from_warehouse: 0,
+            to_warehouse: 1,
+            good: Good::Tools,
+            qty: 100,
         });
         assert!(ok);
         // Capped at Maxtrag = 6.
@@ -3372,31 +4065,44 @@ mod tests {
         sim.warehouses.push(Warehouse::new(1, 1, 60, 60));
         sim.warehouses[0].deposit(Good::Tools, 5);
         let ok = sim.apply_command(&crate::commands::Command::DispatchCart {
-            player: 0, from_warehouse: 0, to_warehouse: 1,
-            good: Good::Tools, qty: 5,
+            player: 0,
+            from_warehouse: 0,
+            to_warehouse: 1,
+            good: Good::Tools,
+            qty: 5,
         });
         assert!(!ok);
         assert_eq!(sim.warehouses[0].stock(Good::Tools), 5);
     }
 
     #[test]
-    fn pirate_spawns_from_hideout_when_present() {
+    fn pirate_event_does_not_spawn_from_hideout_without_source_trigger() {
         use crate::building::BuildingInstance;
         use crate::trade::TradeShip;
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         // Define a single PIRATWOHN building def at index 0.
         sim.building_defs.push(crate::building::BuildingDef {
-            id: 0, category: 0, width: 2, height: 2,
+            id: 0,
+            category: 0,
+            width: 2,
+            height: 2,
             production_type: crate::types::ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "PIRATWOHN".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "PIRATWOHN".into(),
             radius: 4,
             output_good: crate::types::Good::None,
             input_good_1: crate::types::Good::None,
             input_good_2: crate::types::Good::None,
-            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 0, cycle_time_ms: 0,
-            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 0,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
             min_tier: 0,
@@ -3409,6 +4115,8 @@ mod tests {
             ore_deposit: crate::building::OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: None,
         });
         // Place a hideout at a known tile.
@@ -3418,14 +4126,17 @@ mod tests {
         // Need a player trade ship for pirates to want to spawn.
         sim.trade_ships.push(TradeShip::new(0, 0, 50, 50));
 
-        // Force the 1-in-3 random gate to pass.
-        sim.rng_state = 3;
+        // Seed 2 satisfied the removed 1-in-3 random gate. A source hideout
+        // and target ship still must not fabricate a new pirate without the
+        // decoded source event trigger.
+        let mut expected_rng = Simulation::new();
+        expected_rng.seed_source_rand(2);
+        let expected_first_draw = expected_rng.next_source_rand();
+        sim.seed_source_rand(2);
         sim.tick_pirate_event();
-        // Pirate spawn should originate from the hideout tile.
-        let pirate = sim.military_units.iter()
-            .find(|u| u.owner == 6)
-            .expect("pirate should have spawned");
-        assert_eq!((pirate.tile_x, pirate.tile_y), (7, 11));
+        assert!(sim.military_units.iter().all(|u| u.owner != 6));
+        assert_eq!(sim.diplomacy.get(6, 0), crate::combat::Diplomacy::Neutral);
+        assert_eq!(sim.next_source_rand(), expected_first_draw);
     }
 
     #[test]
@@ -3464,14 +4175,18 @@ mod tests {
         sim.players[0].gold = 5_000;
         sim.players[1].gold = 100;
         let ok = sim.apply_command(&crate::commands::Command::GiftGold {
-            from: 0, to: 1, amount: 1_500,
+            from: 0,
+            to: 1,
+            amount: 1_500,
         });
         assert!(ok);
         assert_eq!(sim.players[0].gold, 3_500);
         assert_eq!(sim.players[1].gold, 1_600);
         // Clamp to balance.
         let _ = sim.apply_command(&crate::commands::Command::GiftGold {
-            from: 0, to: 1, amount: 999_999,
+            from: 0,
+            to: 1,
+            amount: 999_999,
         });
         assert_eq!(sim.players[0].gold, 0);
         assert_eq!(sim.players[1].gold, 5_100);
@@ -3487,7 +4202,10 @@ mod tests {
         sim.warehouses.push(Warehouse::new(1, 1, 60, 60));
         sim.warehouses[0].deposit(Good::Tools, 25);
         let ok = sim.apply_command(&crate::commands::Command::GiftGoods {
-            from: 0, to: 1, good: Good::Tools, qty: 20,
+            from: 0,
+            to: 1,
+            good: Good::Tools,
+            qty: 20,
         });
         assert!(ok);
         assert_eq!(sim.warehouses[0].stock(Good::Tools), 5);
@@ -3501,14 +4219,472 @@ mod tests {
         sim.players.push(Player::new_human(0));
         sim.players[0].gold = 5_000;
         assert!(!sim.apply_command(&crate::commands::Command::GiftGold {
-            from: 0, to: 0, amount: 100,
+            from: 0,
+            to: 0,
+            amount: 100,
         }));
         assert!(!sim.apply_command(&crate::commands::Command::GiftGoods {
-            from: 0, to: 0, good: Good::Tools, qty: 1,
+            from: 0,
+            to: 0,
+            good: Good::Tools,
+            qty: 1,
         }));
         assert!(!sim.apply_command(&crate::commands::Command::GiftGold {
-            from: 0, to: 1, amount: 0,
+            from: 0,
+            to: 1,
+            amount: 0,
         }));
+    }
+
+    #[test]
+    fn current_price_uses_fixed_price_table() {
+        use crate::prices::price_of;
+        use crate::types::Good;
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        let mut wh = Warehouse::new(0, 0, 10, 10);
+        wh.deposit(Good::Tools, 1_000);
+        sim.warehouses.push(wh);
+
+        assert_eq!(
+            sim.current_price(Good::Tools).buy,
+            price_of(Good::Tools).buy
+        );
+        assert_eq!(
+            sim.current_price(Good::Tools).sell,
+            price_of(Good::Tools).sell
+        );
+        sim.warehouses[0].withdraw(Good::Tools, 1_000);
+        assert_eq!(
+            sim.current_price(Good::Tools).buy,
+            price_of(Good::Tools).buy
+        );
+        assert_eq!(
+            sim.current_price(Good::Tools).sell,
+            price_of(Good::Tools).sell
+        );
+    }
+
+    #[test]
+    fn civilian_spawns_on_source_building_cadence() {
+        use crate::building::{BuildingDef, BuildingInstance};
+        use crate::types::{Good, ProductionType};
+
+        let mut sim = Simulation::new();
+        sim.building_defs.push(BuildingDef {
+            id: 0,
+            category: 0,
+            width: 2,
+            height: 2,
+            production_type: ProductionType::Residence,
+            kind: "GEBAEUDE".into(),
+            prod_kind: "WOHN".into(),
+            radius: 0,
+            output_good: Good::None,
+            input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 1_000,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
+            maintenance_cost: 0,
+            native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
+            has_door: true,
+            upgradeable: true,
+            max_energy: 0,
+            ore_deposit: crate::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
+            required_fertility: None,
+        });
+        sim.buildings.push(BuildingInstance::new(0, 0, 10, 10, 0));
+        sim.buildings.push(BuildingInstance::new(0, 0, 20, 20, 0));
+
+        for _ in 0..24 {
+            sim.tick(200);
+        }
+        sim.tick(198);
+        assert_eq!(
+            sim.figures
+                .iter()
+                .filter(|fig| civilian::is_civilian(fig))
+                .count(),
+            0
+        );
+
+        sim.tick(1);
+        assert_eq!(
+            sim.figures
+                .iter()
+                .filter(|fig| civilian::is_civilian(fig))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn free_trader_retarget_uses_binary_seek_gate_after_docking() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.warehouses.push(Warehouse::new(0, 0, 10, 10));
+        sim.warehouses.push(Warehouse::new(1, 1, 10, 10));
+
+        let mut trader = crate::free_trader::FreeTrader::spawn_at(10, 10);
+        trader.target_warehouse = Some(0);
+        trader.target_x = 10;
+        trader.target_y = 10;
+        trader.state = crate::free_trader::FreeTraderState::Docked;
+        trader.dock_ticks_left = 1;
+        sim.free_traders.push(trader);
+
+        // Seed 1 produces first MSVC rand() value 41, so
+        // `(rand() & 3) == 0` target gate fails.
+        sim.seed_source_rand(1);
+        sim.tick_free_traders();
+        assert!(sim.free_traders[0].active);
+        assert!(!sim.free_traders[0].leaving);
+        assert_eq!(
+            sim.free_traders[0].state,
+            crate::free_trader::FreeTraderState::Sailing
+        );
+        assert_eq!(sim.free_traders[0].target_warehouse, None);
+
+        // Seed 3 produces first MSVC rand() value 48, so the next
+        // seek tick may pick a new port. This also proves there is no
+        // lifetime visit cap.
+        sim.seed_source_rand(3);
+        sim.tick_free_traders();
+        assert!(sim.free_traders[0].target_warehouse.is_some());
+    }
+
+    #[test]
+    fn free_trader_port_distance_uses_vertical_quarter_metric() {
+        let trader = crate::free_trader::FreeTrader::spawn_at(10, 20);
+        let warehouse = Warehouse::new(0, 0, 14, 32);
+
+        assert_eq!(free_trader_port_distance(&trader, &warehouse), 7);
+    }
+
+    #[test]
+    fn free_trader_edge_point_uses_ocean_map_bounds() {
+        let szs = anno_formats::szs::SzsFile {
+            chunks: Vec::new(),
+            islands: vec![anno_formats::szs::Island {
+                number: 0,
+                width: 100,
+                height: 100,
+                x_pos: 180,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: Vec::new(),
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let ocean = OceanMap::from_scenario(&szs);
+
+        let (x, y) = free_trader_edge_point_from_ocean(&ocean, 1, 9_192);
+
+        assert_eq!(ocean.width, 290);
+        assert_eq!(ocean.height, 110);
+        assert_eq!(x, 9_192 % i32::from(ocean.width));
+        assert_eq!(y, i32::from(ocean.height) - 1);
+        assert!(ocean.is_navigable(x, y));
+    }
+
+    #[test]
+    fn free_trader_spawns_immediately_when_manual_count_requires_ship() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.warehouses.push(Warehouse::new(0, 0, 20, 20));
+        sim.warehouses.push(Warehouse::new(1, 0, 25, 20));
+
+        // Seed 1's first MSVC rand() is 41, which failed the removed
+        // implementation-only `(rand() & 3) == 0` spawn gate.
+        sim.seed_source_rand(1);
+        sim.tick_free_traders();
+
+        assert_eq!(sim.free_traders.len(), 1);
+        assert!(sim.free_traders[0].active);
+        assert_eq!(
+            sim.event_log.last().map(String::as_str),
+            Some("[trader] free trader sighted at the horizon")
+        );
+    }
+
+    #[test]
+    fn free_trader_spawn_uses_loaded_ocean_edge() {
+        let szs = anno_formats::szs::SzsFile {
+            chunks: Vec::new(),
+            islands: vec![anno_formats::szs::Island {
+                number: 0,
+                width: 100,
+                height: 100,
+                x_pos: 180,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: Vec::new(),
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.warehouses.push(Warehouse::new(0, 0, 20, 20));
+        sim.warehouses.push(Warehouse::new(1, 0, 25, 20));
+        sim.ocean_map = Some(OceanMap::from_scenario(&szs));
+
+        // With no spawn-admission rand draw, seed 14 gives side rand
+        // 84 (top edge) and offset rand 27125.
+        sim.seed_source_rand(14);
+        sim.tick_free_traders();
+
+        assert_eq!(sim.free_traders.len(), 1);
+        let ocean = sim.ocean_map.as_ref().unwrap();
+        let trader = &sim.free_traders[0];
+        assert!(trader.world_x >= 0 && trader.world_x < i32::from(ocean.width));
+        assert!(trader.world_y >= 0 && trader.world_y < i32::from(ocean.height));
+        assert_ne!(trader.world_y, 200);
+        assert!(ocean.is_navigable(trader.world_x, trader.world_y));
+    }
+
+    #[test]
+    fn free_trader_assign_next_port_uses_ocean_path_to_docking_tile() {
+        let szs = anno_formats::szs::SzsFile {
+            chunks: Vec::new(),
+            islands: vec![anno_formats::szs::Island {
+                number: 0,
+                width: 5,
+                height: 5,
+                x_pos: 5,
+                y_pos: 5,
+                fertilities: [7; 8],
+                tiles: Vec::new(),
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.warehouses.push(Warehouse::new(0, 0, 7, 7));
+        sim.ocean_map = Some(OceanMap::from_scenario(&szs));
+        let mut trader = crate::free_trader::FreeTrader::spawn_at(2, 7);
+
+        sim.assign_next_port(&mut trader);
+
+        let ocean = sim.ocean_map.as_ref().unwrap();
+        assert_eq!(trader.target_warehouse, Some(0));
+        assert_ne!((trader.target_x, trader.target_y), (7, 7));
+        assert!(ocean.is_navigable(trader.target_x, trader.target_y));
+        assert!(trader.path_required);
+        assert!(!trader.path.is_empty());
+        assert_eq!(
+            trader.path.last().copied(),
+            Some((trader.target_x, trader.target_y))
+        );
+        assert!(
+            trader.path.iter().all(|&(x, y)| ocean.is_navigable(x, y)),
+            "free-trader ocean path must not cross land"
+        );
+    }
+
+    #[test]
+    fn free_trader_without_candidate_ports_leaves_by_ocean_edge() {
+        let szs = anno_formats::szs::SzsFile {
+            chunks: Vec::new(),
+            islands: vec![anno_formats::szs::Island {
+                number: 0,
+                width: 5,
+                height: 5,
+                x_pos: 5,
+                y_pos: 5,
+                fertilities: [7; 8],
+                tiles: Vec::new(),
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let mut sim = Simulation::new();
+        sim.ocean_map = Some(OceanMap::from_scenario(&szs));
+        let mut trader = crate::free_trader::FreeTrader::spawn_at(2, 7);
+
+        sim.assign_next_port(&mut trader);
+
+        assert_eq!(trader.target_warehouse, None);
+        assert!(trader.leaving);
+        assert_eq!((trader.target_x, trader.target_y), (0, 7));
+        assert!(trader.path_required);
+        assert!(!trader.path.is_empty());
+        assert_eq!(
+            trader.path.last().copied(),
+            Some((trader.target_x, trader.target_y))
+        );
+        let mut warehouses = Vec::new();
+        let mut gold = Vec::new();
+        let removed = crate::free_trader::tick_one(&mut trader, &mut warehouses, &mut gold);
+        assert!(removed);
+        assert!(!trader.active);
+    }
+
+    #[test]
+    fn free_trader_unreachable_port_leaves_instead_of_land_cutting() {
+        let szs = anno_formats::szs::SzsFile {
+            chunks: Vec::new(),
+            islands: vec![anno_formats::szs::Island {
+                number: 0,
+                width: 80,
+                height: 80,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: Vec::new(),
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.warehouses.push(Warehouse::new(0, 0, 40, 40));
+        sim.ocean_map = Some(OceanMap::from_scenario(&szs));
+        let mut trader = crate::free_trader::FreeTrader::spawn_at(0, 85);
+
+        sim.assign_next_port(&mut trader);
+
+        assert_eq!(trader.target_warehouse, None);
+        assert!(trader.leaving);
+        assert_eq!((trader.target_x, trader.target_y), (0, 85));
+        assert!(trader.path_required);
+        assert!(trader.path.is_empty());
+        assert!(sim
+            .ocean_map
+            .as_ref()
+            .unwrap()
+            .is_navigable(trader.target_x, trader.target_y));
+    }
+
+    #[test]
+    fn free_trader_port_profit_score_uses_trade_sliders() {
+        let trader = crate::free_trader::FreeTrader::spawn_at(0, 0);
+        let mut buyer = Warehouse::new(0, 0, 1, 0);
+        buyer.set_buy_max_stock(crate::types::Good::Tools, Some(20));
+
+        assert!(free_trader_port_profit_score(&trader, &buyer, 20_000) > 0);
+        assert_eq!(free_trader_port_profit_score(&trader, &buyer, 0), 0);
+
+        let mut empty_trader = crate::free_trader::FreeTrader::spawn_at_with_capacity(0, 0, 60);
+        empty_trader.stock.clear();
+        let mut seller = Warehouse::new(0, 0, 2, 0);
+        seller.deposit(crate::types::Good::Wool, 20);
+        seller.set_sell_min_keep(crate::types::Good::Wool, Some(5));
+
+        assert!(free_trader_port_profit_score(&empty_trader, &seller, 0) > 0);
+        seller.set_sell_price(
+            crate::types::Good::Wool,
+            Some(crate::prices::price_of(crate::types::Good::Wool).sell + 1),
+        );
+        assert_eq!(free_trader_port_profit_score(&empty_trader, &seller, 0), 0);
+    }
+
+    #[test]
+    fn free_trader_port_profit_score_ignores_non_ware_goods() {
+        let mut empty_trader = crate::free_trader::FreeTrader::spawn_at_with_capacity(0, 0, 60);
+        empty_trader.stock.clear();
+        let mut local_only_seller = Warehouse::new(0, 0, 2, 0);
+        local_only_seller.deposit(crate::types::Good::Silk, 20);
+        local_only_seller.set_sell_min_keep(crate::types::Good::Silk, Some(0));
+
+        assert_eq!(
+            crate::prices::original_ware_id(crate::types::Good::Silk),
+            None
+        );
+        assert_eq!(
+            free_trader_port_profit_score(&empty_trader, &local_only_seller, 0),
+            0
+        );
+
+        let mut cargo_trader = crate::free_trader::FreeTrader::spawn_at_with_capacity(0, 0, 60);
+        cargo_trader.stock.clear();
+        cargo_trader.stock.push((crate::types::Good::Fish, 20));
+        let mut local_only_buyer = Warehouse::new(0, 0, 3, 0);
+        local_only_buyer.set_buy_max_stock(crate::types::Good::Fish, Some(20));
+
+        assert_eq!(
+            crate::prices::original_ware_id(crate::types::Good::Fish),
+            None
+        );
+        assert_eq!(
+            free_trader_port_profit_score(&cargo_trader, &local_only_buyer, 20_000),
+            0
+        );
+    }
+
+    #[test]
+    fn free_trader_targeting_uses_twelve_nearest_port_shortlist() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        for x in 1..=12 {
+            sim.warehouses.push(Warehouse::new(0, 0, x, 0));
+        }
+        let mut far = Warehouse::new(0, 0, 190, 190);
+        far.set_buy_max_stock(crate::types::Good::Tools, Some(30));
+        sim.warehouses.push(far);
+
+        let mut trader = crate::free_trader::FreeTrader::spawn_at(0, 0);
+        // With the source-shaped 12-port shortlist, the distant 13th
+        // warehouse is not eligible even though it now has profitable
+        // demand.
+        sim.seed_source_rand(12);
+        sim.assign_next_port(&mut trader);
+
+        assert_ne!(trader.target_warehouse, Some(12));
+        assert!(
+            trader.target_warehouse.is_some_and(|idx| idx < 12),
+            "target should stay inside the 12-nearest shortlist"
+        );
+    }
+
+    #[test]
+    fn free_trader_targeting_prefers_profitable_port_inside_shortlist() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        for x in 1..=12 {
+            sim.warehouses.push(Warehouse::new(0, 0, x, 0));
+        }
+        sim.warehouses[5].set_buy_max_stock(crate::types::Good::Tools, Some(30));
+
+        let mut trader = crate::free_trader::FreeTrader::spawn_at(0, 0);
+        sim.seed_source_rand(0);
+        sim.assign_next_port(&mut trader);
+
+        assert_eq!(trader.target_warehouse, Some(5));
     }
 
     #[test]

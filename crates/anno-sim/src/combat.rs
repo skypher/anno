@@ -66,8 +66,8 @@ impl UnitType {
         // → max_health 1.0). Strength becomes attack_damage / 20.
         match self {
             UnitType::Infantry => UnitStats {
-                max_health: 20.0 / 20.0,    // = 1.0
-                attack_damage: 1.0 / 20.0,  // = 0.05
+                max_health: 20.0 / 20.0,   // = 1.0
+                attack_damage: 1.0 / 20.0, // = 0.05
                 attack_speed_ms: 1000,
                 attack_range: 1,
                 move_speed: 3,
@@ -75,8 +75,8 @@ impl UnitType {
                 is_naval: false,
             },
             UnitType::Musketeer => UnitStats {
-                max_health: 15.0 / 20.0,    // = 0.75
-                attack_damage: 2.4 / 20.0,  // = 0.12
+                max_health: 15.0 / 20.0,   // = 0.75
+                attack_damage: 2.4 / 20.0, // = 0.12
                 attack_speed_ms: 2000,
                 attack_range: 4,
                 move_speed: 2,
@@ -84,8 +84,8 @@ impl UnitType {
                 is_naval: false,
             },
             UnitType::Cavalry => UnitStats {
-                max_health: 18.0 / 20.0,    // = 0.9
-                attack_damage: 1.6 / 20.0,  // = 0.08
+                max_health: 18.0 / 20.0,   // = 0.9
+                attack_damage: 1.6 / 20.0, // = 0.08
                 attack_speed_ms: 800,
                 attack_range: 1,
                 move_speed: 5,
@@ -93,8 +93,8 @@ impl UnitType {
                 is_naval: false,
             },
             UnitType::Cannon => UnitStats {
-                max_health: 12.0 / 20.0,    // = 0.6
-                attack_damage: 7.0 / 20.0,  // = 0.35
+                max_health: 12.0 / 20.0,   // = 0.6
+                attack_damage: 7.0 / 20.0, // = 0.35
                 attack_speed_ms: 3000,
                 attack_range: 8,
                 move_speed: 1,
@@ -108,7 +108,7 @@ impl UnitType {
             // mapped so LargeWarship is slightly faster than
             // SmallWarship (matching the appendix's 120 > 110).
             UnitType::SmallWarship => UnitStats {
-                max_health: 65.0 / 40.0,  // ≈ 1.625
+                max_health: 65.0 / 40.0, // ≈ 1.625
                 attack_damage: 0.10,
                 attack_speed_ms: 2000,
                 attack_range: 5,
@@ -203,7 +203,9 @@ pub struct MilitaryUnit {
     pub patrol_idx: u32,
 }
 
-fn default_escort_ship() -> i32 { -1 }
+fn default_escort_ship() -> i32 {
+    -1
+}
 
 /// Maximum cannons each ship class can mount. Values RE-cited
 /// from `figuren.cod` `Maxkanon:` field on the ship-figure
@@ -259,15 +261,15 @@ pub fn unit_build_cost(t: UnitType) -> i32 {
 pub fn unit_build_resources(t: UnitType) -> (u16, u16, u16, u16, u16, u16, u16) {
     match t {
         // Wood, Bricks, Cloth — naval hulls + sails.
-        UnitType::SmallWarship   => (32, 4, 8,  0, 0, 0, 0),
-        UnitType::LargeWarship   => (60, 7, 14, 0, 0, 0, 0),
+        UnitType::SmallWarship => (32, 4, 8, 0, 0, 0, 0),
+        UnitType::LargeWarship => (60, 7, 14, 0, 0, 0, 0),
         // Pirate ships aren't player-buildable.
-        UnitType::PirateShip     => (0, 0, 0, 0, 0, 0, 0),
+        UnitType::PirateShip => (0, 0, 0, 0, 0, 0, 0),
         // Land units — Tools, Swords/Muskets/Cannons by role.
-        UnitType::Infantry       => (0, 0, 0, 3, 5, 0, 0),
-        UnitType::Cavalry        => (0, 0, 0, 3, 8, 0, 0),
-        UnitType::Musketeer      => (0, 0, 0, 4, 0, 10, 0),
-        UnitType::Cannon         => (0, 0, 0, 2, 0, 0, 14),
+        UnitType::Infantry => (0, 0, 0, 3, 5, 0, 0),
+        UnitType::Cavalry => (0, 0, 0, 3, 8, 0, 0),
+        UnitType::Musketeer => (0, 0, 0, 4, 0, 10, 0),
+        UnitType::Cannon => (0, 0, 0, 2, 0, 0, 14),
     }
 }
 
@@ -298,7 +300,11 @@ impl MilitaryUnit {
     /// Construct a unit and attach an authored name (e.g. for
     /// SHIP4-spawned warships).
     pub fn with_name(
-        unit_type: UnitType, owner: u8, tile_x: i32, tile_y: i32, name: String,
+        unit_type: UnitType,
+        owner: u8,
+        tile_x: i32,
+        tile_y: i32,
+        name: String,
     ) -> Self {
         let mut u = Self::new(unit_type, owner, tile_x, tile_y);
         u.name = name;
@@ -342,7 +348,9 @@ pub struct DiplomacyMatrix {
     trade_agreement_broken: [[bool; 7]; 7],
 }
 
-fn default_trade_matrix() -> [[bool; 7]; 7] { [[false; 7]; 7] }
+fn default_trade_matrix() -> [[bool; 7]; 7] {
+    [[false; 7]; 7]
+}
 
 impl DiplomacyMatrix {
     pub fn new() -> Self {
@@ -392,7 +400,9 @@ impl DiplomacyMatrix {
 
     /// Returns true if `a` and `b` have a concluded trade agreement.
     pub fn has_trade_agreement(&self, a: u8, b: u8) -> bool {
-        if a as usize >= 7 || b as usize >= 7 { return false; }
+        if a as usize >= 7 || b as usize >= 7 {
+            return false;
+        }
         self.trade_agreement[a as usize][b as usize]
     }
 
@@ -401,9 +411,15 @@ impl DiplomacyMatrix {
     /// flag set) OR if the players are at war. Sets the flag
     /// symmetrically. Returns true on success.
     pub fn propose_trade_agreement(&mut self, a: u8, b: u8) -> bool {
-        if a as usize >= 7 || b as usize >= 7 || a == b { return false; }
-        if self.get(a, b) == Diplomacy::War { return false; }
-        if self.trade_agreement_broken[a as usize][b as usize] { return false; }
+        if a as usize >= 7 || b as usize >= 7 || a == b {
+            return false;
+        }
+        if self.get(a, b) == Diplomacy::War {
+            return false;
+        }
+        if self.trade_agreement_broken[a as usize][b as usize] {
+            return false;
+        }
         self.trade_agreement[a as usize][b as usize] = true;
         self.trade_agreement[b as usize][a as usize] = true;
         true
@@ -414,8 +430,12 @@ impl DiplomacyMatrix {
     /// conclude a new trade agreement right after one has been
     /// broken").
     pub fn break_trade_agreement(&mut self, a: u8, b: u8) -> bool {
-        if a as usize >= 7 || b as usize >= 7 || a == b { return false; }
-        if !self.trade_agreement[a as usize][b as usize] { return false; }
+        if a as usize >= 7 || b as usize >= 7 || a == b {
+            return false;
+        }
+        if !self.trade_agreement[a as usize][b as usize] {
+            return false;
+        }
         self.trade_agreement[a as usize][b as usize] = false;
         self.trade_agreement[b as usize][a as usize] = false;
         self.trade_agreement_broken[a as usize][b as usize] = true;
@@ -427,7 +447,9 @@ impl DiplomacyMatrix {
     /// (e.g. after enough cooldown ticks). Restores the ability to
     /// re-propose.
     pub fn clear_broken_flag(&mut self, a: u8, b: u8) {
-        if a as usize >= 7 || b as usize >= 7 { return; }
+        if a as usize >= 7 || b as usize >= 7 {
+            return;
+        }
         self.trade_agreement_broken[a as usize][b as usize] = false;
         self.trade_agreement_broken[b as usize][a as usize] = false;
     }
@@ -446,7 +468,6 @@ pub fn tick_combat(
     units: &mut [MilitaryUnit],
     diplomacy: &DiplomacyMatrix,
     dt_ms: u32,
-    events: &mut Vec<DamageEvent>,
 ) -> Vec<usize> {
     let mut dead = Vec::new();
     let len = units.len();
@@ -483,8 +504,10 @@ pub fn tick_combat(
 
         let stats = units[i].unit_type.stats();
         let dist = distance_sq(
-            units[i].tile_x, units[i].tile_y,
-            units[target_idx].tile_x, units[target_idx].tile_y,
+            units[i].tile_x,
+            units[i].tile_y,
+            units[target_idx].tile_x,
+            units[target_idx].tile_y,
         );
 
         // Check if within attack range
@@ -513,12 +536,6 @@ pub fn tick_combat(
             let cannons = units[i].cannons;
             let damage = stats.attack_damage * (1.0 + cannons as f32 * 0.25);
             units[target_idx].health -= damage;
-            events.push(DamageEvent {
-                x: units[target_idx].tile_x,
-                y: units[target_idx].tile_y,
-                amount: (damage * 100.0) as u16,
-                target: 0,
-            });
 
             // Check if target died
             if !units[target_idx].is_alive() {
@@ -535,17 +552,6 @@ pub fn tick_combat(
     }
 
     dead
-}
-
-/// One-frame combat-damage event for the renderer to animate as a
-/// floating number. Coordinate space depends on `target`.
-#[derive(Debug, Clone, Copy)]
-pub struct DamageEvent {
-    pub x: i32,
-    pub y: i32,
-    pub amount: u16,
-    /// 0 = land unit (tile coords), 1 = building (tile coords).
-    pub target: u8,
 }
 
 /// Damage to enemy buildings from adjacent military units. Called each
@@ -565,20 +571,32 @@ pub fn tick_tower_defense(
     defs: &[crate::building::BuildingDef],
 ) {
     for b in buildings.iter() {
-        if !b.active { continue; }
-        if (b.def_id as usize) >= defs.len() { continue; }
+        if !b.active {
+            continue;
+        }
+        if (b.def_id as usize) >= defs.len() {
+            continue;
+        }
         let def = &defs[b.def_id as usize];
-        if def.defensive_cannons == 0 { continue; }
+        if def.defensive_cannons == 0 {
+            continue;
+        }
         let bx = b.tile_x as i32 + def.width as i32 / 2;
         let by = b.tile_y as i32 + def.height as i32 / 2;
         let range = 4 + def.defensive_cannons as i32;
         let dmg = 0.05 * def.defensive_cannons as f32;
         for u in units.iter_mut() {
-            if !u.is_alive() || u.owner == b.owner { continue; }
-            if diplomacy.get(u.owner, b.owner) != Diplomacy::War { continue; }
+            if !u.is_alive() || u.owner == b.owner {
+                continue;
+            }
+            if diplomacy.get(u.owner, b.owner) != Diplomacy::War {
+                continue;
+            }
             let dx = (u.tile_x - bx).abs();
             let dy = (u.tile_y - by).abs();
-            if dx.max(dy) > range { continue; }
+            if dx.max(dy) > range {
+                continue;
+            }
             u.health -= dmg;
             if !u.is_alive() {
                 u.active = false;
@@ -592,13 +610,16 @@ pub fn tick_building_damage(
     buildings: &mut [crate::building::BuildingInstance],
     diplomacy: &DiplomacyMatrix,
     defs: &[crate::building::BuildingDef],
-    events: &mut Vec<DamageEvent>,
 ) -> Vec<usize> {
     const DMG_PER_ENEMY: u16 = 5;
     let mut destroyed = Vec::new();
     for (bi, b) in buildings.iter_mut().enumerate() {
-        if !b.active { continue; }
-        if (b.def_id as usize) >= defs.len() { continue; }
+        if !b.active {
+            continue;
+        }
+        if (b.def_id as usize) >= defs.len() {
+            continue;
+        }
         let def = &defs[b.def_id as usize];
         let bx = b.tile_x as i32;
         let by = b.tile_y as i32;
@@ -606,28 +627,38 @@ pub fn tick_building_damage(
         let bh = def.height as i32;
         let mut hostile = 0u16;
         for u in units.iter() {
-            if !u.is_alive() || u.owner == b.owner { continue; }
-            if u.unit_type.stats().is_naval { continue; }
-            if diplomacy.get(u.owner, b.owner) != Diplomacy::War { continue; }
+            if !u.is_alive() || u.owner == b.owner {
+                continue;
+            }
+            if u.unit_type.stats().is_naval {
+                continue;
+            }
+            if diplomacy.get(u.owner, b.owner) != Diplomacy::War {
+                continue;
+            }
             // Adjacent if within 2 tiles of the footprint.
-            let dx = if u.tile_x < bx { bx - u.tile_x }
-                     else if u.tile_x >= bx + bw { u.tile_x - (bx + bw - 1) }
-                     else { 0 };
-            let dy = if u.tile_y < by { by - u.tile_y }
-                     else if u.tile_y >= by + bh { u.tile_y - (by + bh - 1) }
-                     else { 0 };
+            let dx = if u.tile_x < bx {
+                bx - u.tile_x
+            } else if u.tile_x >= bx + bw {
+                u.tile_x - (bx + bw - 1)
+            } else {
+                0
+            };
+            let dy = if u.tile_y < by {
+                by - u.tile_y
+            } else if u.tile_y >= by + bh {
+                u.tile_y - (by + bh - 1)
+            } else {
+                0
+            };
             if dx.max(dy) <= 2 {
                 hostile = hostile.saturating_add(1);
             }
         }
-        if hostile == 0 { continue; }
+        if hostile == 0 {
+            continue;
+        }
         let total = DMG_PER_ENEMY.saturating_mul(hostile);
-        events.push(DamageEvent {
-            x: b.tile_x as i32,
-            y: b.tile_y as i32,
-            amount: total,
-            target: 1,
-        });
         if b.health <= total {
             b.health = 0;
             b.active = false;
@@ -647,7 +678,9 @@ pub fn tick_escort_targets(
     ship_positions: &[(bool, i32, i32)], // (active, world_x, world_y)
 ) {
     for u in units.iter_mut() {
-        if u.escort_ship < 0 { continue; }
+        if u.escort_ship < 0 {
+            continue;
+        }
         let idx = u.escort_ship as usize;
         match ship_positions.get(idx) {
             Some(&(true, sx, sy)) => {
@@ -670,6 +703,21 @@ pub fn tick_unit_orders_with_ocean(
     dt_ms: u32,
     ocean_map: Option<&crate::ocean_map::OceanMap>,
 ) {
+    tick_unit_orders_with_maps(units, dt_ms, ocean_map, &[]);
+}
+
+/// Move units using world/island map constraints when available.
+///
+/// Naval units are clamped against the ocean map. Land units whose
+/// current tile belongs to an island map take the first step of an A*
+/// route on that map; if no route exists, they hold position instead of
+/// walking through blocked terrain.
+pub fn tick_unit_orders_with_maps(
+    units: &mut [MilitaryUnit],
+    dt_ms: u32,
+    ocean_map: Option<&crate::ocean_map::OceanMap>,
+    island_maps: &[crate::island_map::IslandMap],
+) {
     for u in units.iter_mut() {
         if !u.is_alive() || u.combat_target >= 0 {
             continue;
@@ -691,77 +739,15 @@ pub fn tick_unit_orders_with_ocean(
         let speed = u.unit_type.stats().move_speed.max(1) as u32;
         let step_ms = (1000 / speed).max(100);
         u.move_timer_ms = u.move_timer_ms.saturating_add(dt_ms);
-        let is_naval = u.unit_type.stats().is_naval;
         while u.move_timer_ms >= step_ms {
             u.move_timer_ms -= step_ms;
-            let dx = u.target_x - u.tile_x;
-            let dy = u.target_y - u.tile_y;
-            if dx == 0 && dy == 0 { break; }
-            let sx = dx.signum();
-            let sy = dy.signum();
-            let (nx, ny) = if dx.abs() > 0 && dy.abs() > 0 {
-                (u.tile_x + sx, u.tile_y + sy)
-            } else if dx.abs() > 0 {
-                (u.tile_x + sx, u.tile_y)
-            } else {
-                (u.tile_x, u.tile_y + sy)
+            let Some((nx, ny)) = next_order_step(u, ocean_map, island_maps) else {
+                break;
             };
-            // Naval clamp: refuse moves onto land.
-            if is_naval {
-                if let Some(om) = ocean_map {
-                    if !om.is_navigable(nx, ny) { break; }
-                }
-            }
+            let sx = (nx - u.tile_x).signum();
+            let sy = (ny - u.tile_y).signum();
             u.tile_x = nx;
             u.tile_y = ny;
-            u.direction = match (sx, sy) {
-                (0, -1) => 0, (1, -1) => 1, (1, 0) => 2, (1, 1) => 3,
-                (0, 1) => 4, (-1, 1) => 5, (-1, 0) => 6, (-1, -1) => 7,
-                _ => u.direction,
-            };
-        }
-    }
-}
-
-pub fn tick_unit_orders(units: &mut [MilitaryUnit], dt_ms: u32) {
-    for u in units.iter_mut() {
-        if !u.is_alive() || u.combat_target >= 0 {
-            continue;
-        }
-        if u.tile_x == u.target_x && u.tile_y == u.target_y {
-            u.move_timer_ms = 0;
-            // Patrol advance — same logic as the ocean-aware variant.
-            if !u.patrol.is_empty() {
-                u.patrol_idx = (u.patrol_idx + 1) % u.patrol.len() as u32;
-                let (nx, ny) = u.patrol[u.patrol_idx as usize];
-                u.target_x = nx;
-                u.target_y = ny;
-            } else {
-                continue;
-            }
-        }
-        let speed = u.unit_type.stats().move_speed.max(1) as u32;
-        let step_ms = (1000 / speed).max(100);
-        u.move_timer_ms = u.move_timer_ms.saturating_add(dt_ms);
-        while u.move_timer_ms >= step_ms {
-            u.move_timer_ms -= step_ms;
-            let dx = u.target_x - u.tile_x;
-            let dy = u.target_y - u.tile_y;
-            if dx == 0 && dy == 0 {
-                break;
-            }
-            // 8-direction step: prefer the larger axis but allow diagonals
-            let sx = dx.signum();
-            let sy = dy.signum();
-            if dx.abs() > 0 && dy.abs() > 0 {
-                u.tile_x += sx;
-                u.tile_y += sy;
-            } else if dx.abs() > 0 {
-                u.tile_x += sx;
-            } else {
-                u.tile_y += sy;
-            }
-            // Update direction (0=N, 1=NE, 2=E, ... 7=NW). Use sx,sy.
             u.direction = match (sx, sy) {
                 (0, -1) => 0,
                 (1, -1) => 1,
@@ -774,6 +760,61 @@ pub fn tick_unit_orders(units: &mut [MilitaryUnit], dt_ms: u32) {
                 _ => u.direction,
             };
         }
+    }
+}
+
+pub fn tick_unit_orders(units: &mut [MilitaryUnit], dt_ms: u32) {
+    tick_unit_orders_with_maps(units, dt_ms, None, &[]);
+}
+
+fn next_order_step(
+    unit: &MilitaryUnit,
+    ocean_map: Option<&crate::ocean_map::OceanMap>,
+    island_maps: &[crate::island_map::IslandMap],
+) -> Option<(i32, i32)> {
+    if unit.tile_x == unit.target_x && unit.tile_y == unit.target_y {
+        return None;
+    }
+
+    if unit.unit_type.stats().is_naval {
+        let next = direct_order_step(unit)?;
+        if let Some(om) = ocean_map {
+            if !om.is_navigable(next.0, next.1) {
+                return None;
+            }
+        }
+        return Some(next);
+    }
+
+    if let Some(map) = island_maps
+        .iter()
+        .find(|m| m.is_walkable(unit.tile_x, unit.tile_y))
+    {
+        return crate::pathfinding::find_path(
+            map,
+            (unit.tile_x, unit.tile_y),
+            (unit.target_x, unit.target_y),
+        )
+        .and_then(|path| path.first().copied());
+    }
+
+    direct_order_step(unit)
+}
+
+fn direct_order_step(unit: &MilitaryUnit) -> Option<(i32, i32)> {
+    let dx = unit.target_x - unit.tile_x;
+    let dy = unit.target_y - unit.tile_y;
+    if dx == 0 && dy == 0 {
+        return None;
+    }
+    let sx = dx.signum();
+    let sy = dy.signum();
+    if dx.abs() > 0 && dy.abs() > 0 {
+        Some((unit.tile_x + sx, unit.tile_y + sy))
+    } else if dx.abs() > 0 {
+        Some((unit.tile_x + sx, unit.tile_y))
+    } else {
+        Some((unit.tile_x, unit.tile_y + sy))
     }
 }
 
@@ -905,7 +946,7 @@ mod tests {
         let diplomacy = DiplomacyMatrix::new_all_war();
 
         for _ in 0..400 {
-            tick_combat(&mut units, &diplomacy, 100, &mut Vec::new());
+            tick_combat(&mut units, &diplomacy, 100);
         }
 
         // At least one should be dead
@@ -929,6 +970,49 @@ mod tests {
     }
 
     #[test]
+    fn tick_unit_orders_with_maps_routes_land_unit_around_wall() {
+        let mut map = crate::island_map::IslandMap::new_open(0, 10, 10);
+        for y in 0..9 {
+            map.set_walkable(2, y, false);
+        }
+        let mut units = vec![MilitaryUnit::new(UnitType::Infantry, 0, 0, 4)];
+        units[0].target_x = 4;
+        units[0].target_y = 4;
+
+        for _ in 0..120 {
+            tick_unit_orders_with_maps(&mut units, 100, None, std::slice::from_ref(&map));
+            assert!(
+                !(units[0].tile_x == 2 && units[0].tile_y < 9),
+                "land unit stepped into blocked wall at ({}, {})",
+                units[0].tile_x,
+                units[0].tile_y
+            );
+            if units[0].tile_x == 4 && units[0].tile_y == 4 {
+                break;
+            }
+        }
+
+        assert_eq!((units[0].tile_x, units[0].tile_y), (4, 4));
+    }
+
+    #[test]
+    fn tick_unit_orders_with_maps_holds_land_unit_when_no_route_exists() {
+        let mut map = crate::island_map::IslandMap::new_open(0, 6, 6);
+        for y in 0..6 {
+            map.set_walkable(2, y, false);
+        }
+        let mut units = vec![MilitaryUnit::new(UnitType::Infantry, 0, 0, 3)];
+        units[0].target_x = 5;
+        units[0].target_y = 3;
+
+        for _ in 0..30 {
+            tick_unit_orders_with_maps(&mut units, 100, None, std::slice::from_ref(&map));
+        }
+
+        assert_eq!((units[0].tile_x, units[0].tile_y), (0, 3));
+    }
+
+    #[test]
     fn tick_unit_orders_skipped_during_combat() {
         let mut units = vec![MilitaryUnit::new(UnitType::Infantry, 0, 0, 0)];
         units[0].target_x = 5;
@@ -949,7 +1033,7 @@ mod tests {
         let diplomacy = DiplomacyMatrix::new();
 
         for _ in 0..100 {
-            tick_combat(&mut units, &diplomacy, 100, &mut Vec::new());
+            tick_combat(&mut units, &diplomacy, 100);
         }
 
         // Both should be alive (no combat between allies)
@@ -969,11 +1053,14 @@ mod tests {
 
         // Run combat
         for _ in 0..200 {
-            tick_combat(&mut units, &diplomacy, 100, &mut Vec::new());
+            tick_combat(&mut units, &diplomacy, 100);
         }
 
         // At least one cannon should survive, pikeman should die
-        let cannons_alive = units.iter().filter(|u| u.owner == 0 && u.is_alive()).count();
+        let cannons_alive = units
+            .iter()
+            .filter(|u| u.owner == 0 && u.is_alive())
+            .count();
         assert!(cannons_alive > 0, "At least one cannon should survive");
         assert!(!units[2].is_alive(), "Infantry should die to cannon fire");
     }
@@ -983,24 +1070,40 @@ mod tests {
         use crate::building::{BuildingDef, BuildingInstance, OreDeposit};
         use crate::types::ProductionType;
         let mk_tower = |cannons: u8| BuildingDef {
-            id: 0, category: 5, width: 2, height: 2,
+            id: 0,
+            category: 5,
+            width: 2,
+            height: 2,
             production_type: ProductionType::Craft,
-            kind: "TURM".into(), prod_kind: "TURM".into(),
+            kind: "TURM".into(),
+            prod_kind: "TURM".into(),
             radius: 0,
             output_good: crate::types::Good::None,
             input_good_1: crate::types::Good::None,
             input_good_2: crate::types::Good::None,
-            output_rate: 0, input_1_rate: 0, input_2_rate: 0,
-            storage_capacity: 0, cycle_time_ms: 0,
-            cost_gold: 0, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 0,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
-            native: false, min_tier: 0, max_no_input_ticks: 6,
-            can_dry_up: false, wegspeed: [100; 4],
-            has_door: false, upgradeable: false,
+            native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
+            has_door: false,
+            upgradeable: false,
             max_energy: 0,
             ore_deposit: OreDeposit::None,
             pirate_owned: false,
             defensive_cannons: cannons,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
             required_fertility: None,
         };
         let defs = vec![mk_tower(2)];
@@ -1025,10 +1128,8 @@ mod tests {
         // (Strength 1.0) — cannon DPS ≈ 0.117 vs infantry 0.05
         // and the HP-pool ratio still favours cannons in this
         // simple Lanchester model.
-        let (att_ratio, def_ratio) = simulate_battle_outcome(
-            &[(UnitType::Cannon, 10)],
-            &[(UnitType::Infantry, 10)],
-        );
+        let (att_ratio, def_ratio) =
+            simulate_battle_outcome(&[(UnitType::Cannon, 10)], &[(UnitType::Infantry, 10)]);
         assert!(att_ratio > def_ratio);
     }
 
@@ -1041,7 +1142,7 @@ mod tests {
         let diplomacy = DiplomacyMatrix::new_all_war();
 
         for _ in 0..100 {
-            tick_combat(&mut units, &diplomacy, 100, &mut Vec::new());
+            tick_combat(&mut units, &diplomacy, 100);
         }
 
         // Both should be alive — naval and land can't fight each other

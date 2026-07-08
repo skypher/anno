@@ -19,7 +19,6 @@ pub const MARKET_TICK_MS: u32 = 1_000;
 pub const MILITARY_TICK_MS: u32 = 10_000;
 pub const DIPLOMACY_TICK_MS: u32 = 5_000;
 
-pub const PIRATE_EVENT_GATE: u64 = 3;
 pub const FREE_TRADER_TARGET_GATE_MASK: u64 = 3;
 pub const FREE_TRADER_TARGET_GATE_DENOMINATOR: u64 = 4;
 pub const FREE_TRADER_RESPAWN_COOLDOWN_TICKS: u32 = 60;
@@ -54,6 +53,7 @@ pub struct SourceRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Subsystem {
     Production,
+    Civilians,
     Population,
     Diplomacy,
     MarketCoverage,
@@ -66,6 +66,7 @@ impl Subsystem {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Production => "production",
+            Self::Civilians => "civilians",
             Self::Population => "population",
             Self::Diplomacy => "diplomacy",
             Self::MarketCoverage => "market_coverage",
@@ -84,7 +85,7 @@ pub struct TimingSpec {
     pub source: SourceRef,
 }
 
-pub const TIMING_SPECS: [TimingSpec; 7] = [
+pub const TIMING_SPECS: [TimingSpec; 8] = [
     TimingSpec {
         subsystem: Subsystem::Production,
         interval_ms: crate::production::PRODUCTION_TICK_MS,
@@ -93,6 +94,16 @@ pub const TIMING_SPECS: [TimingSpec; 7] = [
             source: "decompiled/1602_exe.c",
             location: "16110",
             note: "production accumulator decremented by 1000 ms",
+        },
+    },
+    TimingSpec {
+        subsystem: Subsystem::Civilians,
+        interval_ms: crate::civilian::CIVILIAN_BUILDING_TICK_MS,
+        status: FidelityStatus::BinaryVerified,
+        source: SourceRef {
+            source: "decompiled/1602_exe.c",
+            location: "84620-84666",
+            note: "building accumulator dispatches civilian figure spawns after 4999 ms",
         },
     },
     TimingSpec {
@@ -165,58 +176,16 @@ pub struct ProbabilitySpec {
     pub source: SourceRef,
 }
 
-pub const PROBABILITY_SPECS: [ProbabilitySpec; 5] = [
-    ProbabilitySpec {
-        name: "pirate_event_spawn",
-        denominator: PIRATE_EVENT_GATE,
-        status: FidelityStatus::Speculative,
-        source: SourceRef {
-            source: "implementation",
-            location: "Simulation::tick_pirate_event",
-            note: "active player trade ship gate is known; spawn odds still need binary pinning",
-        },
+pub const PROBABILITY_SPECS: [ProbabilitySpec; 1] = [ProbabilitySpec {
+    name: "free_trader_target_gate",
+    denominator: FREE_TRADER_TARGET_GATE_DENOMINATOR,
+    status: FidelityStatus::BinaryVerified,
+    source: SourceRef {
+        source: "decompiled/1602_exe.c",
+        location: "57713",
+        note: "(rand() & 3) == 0 while seeking a trader target",
     },
-    ProbabilitySpec {
-        name: "free_trader_target_gate",
-        denominator: FREE_TRADER_TARGET_GATE_DENOMINATOR,
-        status: FidelityStatus::BinaryVerified,
-        source: SourceRef {
-            source: "decompiled/1602_exe.c",
-            location: "57713",
-            note: "(rand() & 3) == 0 while seeking a trader target",
-        },
-    },
-    ProbabilitySpec {
-        name: "fire_ignition",
-        denominator: crate::disaster::FIRE_IGNITION_GATE,
-        status: FidelityStatus::Speculative,
-        source: SourceRef {
-            source: "implementation",
-            location: "disaster.rs",
-            note: "fire existence is RE-cited; ignition odds are not decoded",
-        },
-    },
-    ProbabilitySpec {
-        name: "fire_extinguish",
-        denominator: crate::disaster::FIRE_EXTINGUISH_GATE,
-        status: FidelityStatus::Speculative,
-        source: SourceRef {
-            source: "implementation",
-            location: "disaster.rs",
-            note: "extinguish odds are not decoded",
-        },
-    },
-    ProbabilitySpec {
-        name: "volcano_eruption",
-        denominator: crate::disaster::VOLCANO_ERUPTION_GATE,
-        status: FidelityStatus::Speculative,
-        source: SourceRef {
-            source: "implementation",
-            location: "disaster.rs",
-            note: "volcano visuals are RE-cited; eruption cadence is not decoded",
-        },
-    },
-];
+}];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceEvent {
@@ -355,6 +324,7 @@ mod tests {
         }
 
         assert_eq!(count(&events, Subsystem::Production), 10);
+        assert_eq!(count(&events, Subsystem::Civilians), 2);
         assert_eq!(count(&events, Subsystem::MarketCoverage), 10);
         assert_eq!(count(&events, Subsystem::Ships), 10);
         assert_eq!(count(&events, Subsystem::Diplomacy), 2);
@@ -367,11 +337,15 @@ mod tests {
             subsystem: Subsystem::Diplomacy,
         }));
         assert_eq!(
-            events[events.len() - 7..],
+            events[events.len() - 8..],
             [
                 TraceEvent {
                     at_ms: 10_000,
                     subsystem: Subsystem::Production
+                },
+                TraceEvent {
+                    at_ms: 10_000,
+                    subsystem: Subsystem::Civilians
                 },
                 TraceEvent {
                     at_ms: 10_000,
@@ -451,9 +425,30 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name)
             .collect();
-        assert!(probability.contains(&"pirate_event_spawn"));
-        assert!(probability.contains(&"fire_ignition"));
-        assert!(probability.contains(&"volcano_eruption"));
+        assert!(probability.is_empty());
+        assert!(!probability.contains(&"pirate_event_spawn"));
+        assert!(!probability.contains(&"free_trader_spawn_gate"));
+        assert!(!probability.contains(&"free_trader_target_gate"));
+        assert!(!probability.contains(&"fire_ignition"));
+        assert!(!probability.contains(&"fire_extinguish"));
+        assert!(!probability.contains(&"volcano_eruption"));
+    }
+
+    #[test]
+    fn free_trader_target_gate_is_binary_verified() {
+        let target = PROBABILITY_SPECS
+            .iter()
+            .find(|spec| spec.name == "free_trader_target_gate")
+            .unwrap();
+
+        assert_eq!(target.status, FidelityStatus::BinaryVerified);
+        assert_eq!(target.source.source, "decompiled/1602_exe.c");
+        assert!(PROBABILITY_SPECS
+            .iter()
+            .all(|spec| spec.name != "free_trader_spawn_gate"));
+        assert!(PROBABILITY_SPECS
+            .iter()
+            .all(|spec| spec.name != "pirate_event_spawn"));
     }
 
     #[test]

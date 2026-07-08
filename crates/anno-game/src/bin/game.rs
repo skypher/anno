@@ -1,71 +1,53 @@
 //! Anno 1602 — Live game viewer with integrated simulation.
 //!
 //! Renders the isometric map while running the full simulation loop.
-//! Carriers, trade ships, and military units are shown as colored markers.
+//! Carriers, civilians, trade ships, and military units are drawn from
+//! source sprites with marker fallbacks.
 //!
 //! Controls:
 //!   Arrow keys / mouse drag: scroll the map
-//!   +/-/scroll: zoom in/out
+//!   F2/F3/F4: bird-eye/normal/detailed zoom level
 //!   Tab: cycle through islands
-//!   W: toggle world map vs single island
-//!   Space: pause/unpause simulation
-//!   F/G: decrease/increase game speed (1x-8x)
+//!   W: selected ship hoists white flag and surrenders to pirates
+//!   Pause: pause simulation (Esc/right-click resumes)
+//!   J: jump to the active object
+//!   O: options menu
+//!   F5/F6/F7: normal/double/quadruple game speed
 //!   B: toggle build mode (then 1-9 to select building, click to place;
-//!      [/] cycle category, PgUp/PgDn flip page, Z cycles orientation)
-//!   M: toggle music on/off
-//!   N: next music track
-//!   V: cycle music volume
-//!   S: save screenshot
-//!   D: toggle demolish mode (click to remove building, refunds 50% cost)
-//!   T: toggle tax panel (Up/Down=select tier, Left/Right=adjust rate)
-//!   Y: toggle diplomacy panel (Up/Down=select player, Left/Right=cycle relation)
-//!   R: toggle trade-route mode (click warehouses, Enter=commit, Esc=cancel)
-//!   H: toggle economy HUD overlay
-//!   C: toggle service coverage overlay (green=covered, red=uncovered)
-//!   K: toggle economy history graphs (gold / population / satisfaction)
-//!   P: toggle production overview (per-good producer count / efficiency / stock)
-//!   O: toggle player roster (state / gold / pop / units / diplomacy)
-//!   A: open market (buy/sell goods at first warehouse — Left/Right by 10)
-//!   U: open warehouse table (per-warehouse stock columns for current island)
-//!   J: open fleet panel (active ships' route, state, cargo, profit)
-//!   Q: open build queue panel (in-progress buildings + outstanding materials)
-//!   Shift+R: open active-routes panel (Up/Down + Bksp to delete)
-//!   ?: open scenario objectives panel
+//!      [/] cycle category, PgUp/PgDn flip page, Z/X rotate)
+//!   F: video sequences and speech menu
+//!   D: toggle diplomacy panel (Up/Down=select player, Left/Right=cycle relation)
+//!   I: toggle info/status mode (click buildings for object info)
+//!   K: toggle combat mode (click own units, right-click to move)
+//!   H: cycle between own warehouses
+//!   C: list own and trade-agreement cities
+//!   S: list own ships
+//!   Ctrl+1-9: store selected troop assembly; 1-9 recalls it
 //!   Enter: open chat input (multiplayer); type then Enter to send, Esc cancels
-//!   F2: open scenario picker (Up/Down, Enter to relaunch with chosen .szs)
-//!   F3: open save-slot picker (Up/Down, S to save, L to load)
-//!   F4: build a TradeShip at the first warehouse (1000 gold)
-//!   F6: toggle path-debug overlay (carrier A* paths + ship ocean paths)
-//!   F7: found a colony (drop a Kontor) on the current island (500 gold)
-//!   F8: export current islands as `.szs` to saves/<scenario>.export.szs
-//!   F10: open settings panel (volumes, default zoom)
-//!   F12: toggle perf overlay (sim/render/frame microseconds + FPS)
-//!   F5: quicksave (writes saves/<scenario>.quicksave.bin)
-//!   F9: quickload
+//!   L: open save-slot picker (Up/Down, S to save, L to load)
 //!
 //! Multiplayer flags:
 //!   --host PORT          run as host, broadcast snapshots every 1s
 //!   --join HOST:PORT     run as client, replace local sim with received snapshots
-//!   Left-click on military unit: select (Shift+click adds to selection)
+//!   Left-click on own ship/unit in combat mode: select (Shift+click adds units)
 //!   Right-click (with units selected): move-to order
-//!   Right-click (no selection): inspect building/tile
-//!   Shift+Right-click: open context menu (Inspect / Move / Demolish)
-//!   Escape: quit (or close inspection / cancel build or demolish mode)
+//!   Right-click (no selection): inspect building/tile, or resume if paused
+//!   Escape: quit (or close panels / cancel modes / resume pause)
 
 use anno_audio::engine::AudioEngine;
 use anno_formats::cod::CodFile;
 use anno_formats::col::parse_col;
 use anno_formats::szs::{Island, IslandTile, SzsFile};
 use anno_render::sprite::{SpriteCategory, SpriteManager};
-use anno_sim::ai::{AiController, AiPersonality, Difficulty};
+use anno_sim::ai::AiController;
 use anno_sim::building::BuildingInstance;
-use anno_sim::combat::{Diplomacy, MilitaryUnit, UnitType};
+use anno_sim::combat::{Diplomacy, UnitType};
 use anno_sim::data_bridge;
 use anno_sim::entity::ActionType;
 use anno_sim::island_map::IslandMap;
 use anno_sim::player::Player;
-use anno_sim::simulation::Simulation;
-use anno_sim::trade::{RouteStop, TradeRoute, TradeShip};
+use anno_sim::simulation::{Simulation, TileClear};
+use anno_sim::trade::TradeShipClass;
 use anno_sim::types::Good;
 use anno_sim::warehouse::Warehouse;
 use sdl2::event::Event;
@@ -77,6 +59,7 @@ use sdl2::rect::Rect;
 const WINDOW_W: u32 = 1280;
 const WINDOW_H: u32 = 800;
 const BG_COLOR: (u8, u8, u8) = (0x10, 0x20, 0x40);
+const DIPLOMACY_PANEL_HELP: &str = "Up/Dn pick  Lt/Rt cycle";
 
 const ZOOM_TILE_W: [i32; 3] = [64, 32, 16];
 const ZOOM_TILE_H: [i32; 3] = [31, 15, 7];
@@ -170,7 +153,11 @@ enum NetRole {
 }
 
 fn net_role_port(role: &NetRole) -> u16 {
-    if let NetRole::Host { port } = role { *port } else { 0 }
+    if let NetRole::Host { port } = role {
+        *port
+    } else {
+        0
+    }
 }
 
 /// Tiny 4x5 bitmap font for HUD rendering (ASCII 32-127).
@@ -182,21 +169,60 @@ mod tiny_font {
     /// Bitmap glyphs for ASCII 32-90 (space through Z). Others fallback to '?'.
     const GLYPHS: &[(u8, u32)] = &[
         (b' ', 0x00000),
-        (b'0', 0x69BD6), (b'1', 0x46224), (b'2', 0x69246), (b'3', 0x69496),
-        (b'4', 0x99F11), (b'5', 0xF8E1E), (b'6', 0x68E96), (b'7', 0xF1244),
-        (b'8', 0x69696), (b'9', 0x69716), (b':', 0x04040),
-        (b'A', 0x69F99), (b'B', 0xE9E9E), (b'C', 0x78867), (b'D', 0xE9996 + 1 - 1),
-        (b'E', 0xF8E8F), (b'F', 0xF8E88), (b'G', 0x78B97), (b'H', 0x99F99),
-        (b'I', 0xE444E), (b'J', 0x11196), (b'K', 0x9ACA9), (b'L', 0x8888F),
-        (b'M', 0x9F999), (b'N', 0x9DB99), (b'O', 0x69996), (b'P', 0xE9E88),
-        (b'Q', 0x699A7), (b'R', 0xE9EA9), (b'S', 0x78617), (b'T', 0xF4444),
-        (b'U', 0x99996), (b'V', 0x9996A + 1 - 1), (b'W', 0x999F9), (b'X', 0x96699),
-        (b'Y', 0x99644), (b'Z', 0xF1248 + 7),
-        (b'a', 0x06996), (b'b', 0x8E996 + 1 - 1), (b'c', 0x07896 + 1 - 1),
-        (b'd', 0x17996 + 1 - 1), (b'e', 0x06F87),
-        (b'%', 0x91249), (b'+', 0x04E40), (b'-', 0x00E00), (b'/', 0x11248),
-        (b'.', 0x00004), (b',', 0x00024), (b'=', 0x0E0E0), (b'?', 0x69240),
-        (b'(', 0x24842), (b')', 0x42124), (b'|', 0x44444), (b'x', 0x09690),
+        (b'0', 0x69BD6),
+        (b'1', 0x46224),
+        (b'2', 0x69246),
+        (b'3', 0x69496),
+        (b'4', 0x99F11),
+        (b'5', 0xF8E1E),
+        (b'6', 0x68E96),
+        (b'7', 0xF1244),
+        (b'8', 0x69696),
+        (b'9', 0x69716),
+        (b':', 0x04040),
+        (b'A', 0x69F99),
+        (b'B', 0xE9E9E),
+        (b'C', 0x78867),
+        (b'D', 0xE9996 + 1 - 1),
+        (b'E', 0xF8E8F),
+        (b'F', 0xF8E88),
+        (b'G', 0x78B97),
+        (b'H', 0x99F99),
+        (b'I', 0xE444E),
+        (b'J', 0x11196),
+        (b'K', 0x9ACA9),
+        (b'L', 0x8888F),
+        (b'M', 0x9F999),
+        (b'N', 0x9DB99),
+        (b'O', 0x69996),
+        (b'P', 0xE9E88),
+        (b'Q', 0x699A7),
+        (b'R', 0xE9EA9),
+        (b'S', 0x78617),
+        (b'T', 0xF4444),
+        (b'U', 0x99996),
+        (b'V', 0x9996A + 1 - 1),
+        (b'W', 0x999F9),
+        (b'X', 0x96699),
+        (b'Y', 0x99644),
+        (b'Z', 0xF1248 + 7),
+        (b'a', 0x06996),
+        (b'b', 0x8E996 + 1 - 1),
+        (b'c', 0x07896 + 1 - 1),
+        (b'd', 0x17996 + 1 - 1),
+        (b'e', 0x06F87),
+        (b'%', 0x91249),
+        (b'+', 0x04E40),
+        (b'-', 0x00E00),
+        (b'/', 0x11248),
+        (b'.', 0x00004),
+        (b',', 0x00024),
+        (b'=', 0x0E0E0),
+        (b'?', 0x69240),
+        (b'(', 0x24842),
+        (b')', 0x42124),
+        (b'|', 0x44444),
+        (b'x', 0x09690),
     ];
 
     fn glyph(ch: u8) -> u32 {
@@ -219,9 +245,14 @@ mod tiny_font {
 
     /// Draw a string onto an RGBA buffer. Returns width in pixels consumed.
     pub fn draw_str(
-        buf: &mut [u8], buf_w: u32, buf_h: u32,
-        x: i32, y: i32, text: &str,
-        color: [u8; 4], scale: u32,
+        buf: &mut [u8],
+        buf_w: u32,
+        buf_h: u32,
+        x: i32,
+        y: i32,
+        text: &str,
+        color: [u8; 4],
+        scale: u32,
     ) {
         let mut cx = x;
         for &ch in text.as_bytes() {
@@ -234,18 +265,24 @@ mod tiny_font {
                             for sx in 0..scale {
                                 let px = cx + (col * scale + sx) as i32;
                                 let py = y + (row * scale + sy) as i32;
-                                if px >= 0 && py >= 0
-                                    && (px as u32) < buf_w
-                                    && (py as u32) < buf_h
+                                if px >= 0 && py >= 0 && (px as u32) < buf_w && (py as u32) < buf_h
                                 {
                                     let off = ((py as u32 * buf_w + px as u32) * 4) as usize;
                                     if off + 3 < buf.len() {
                                         let a = color[3] as u16;
                                         let inv_a = 255 - a;
-                                        buf[off] = ((color[0] as u16 * a + buf[off] as u16 * inv_a) / 255) as u8;
-                                        buf[off+1] = ((color[1] as u16 * a + buf[off+1] as u16 * inv_a) / 255) as u8;
-                                        buf[off+2] = ((color[2] as u16 * a + buf[off+2] as u16 * inv_a) / 255) as u8;
-                                        buf[off+3] = 255;
+                                        buf[off] = ((color[0] as u16 * a + buf[off] as u16 * inv_a)
+                                            / 255)
+                                            as u8;
+                                        buf[off + 1] = ((color[1] as u16 * a
+                                            + buf[off + 1] as u16 * inv_a)
+                                            / 255)
+                                            as u8;
+                                        buf[off + 2] = ((color[2] as u16 * a
+                                            + buf[off + 2] as u16 * inv_a)
+                                            / 255)
+                                            as u8;
+                                        buf[off + 3] = 255;
                                     }
                                 }
                             }
@@ -260,7 +297,9 @@ mod tiny_font {
 
     /// Measure text width in pixels.
     pub fn measure(text: &str, scale: u32) -> u32 {
-        if text.is_empty() { return 0; }
+        if text.is_empty() {
+            return 0;
+        }
         let chars = text.len() as u32;
         chars * (CHAR_W * scale + scale) - scale
     }
@@ -282,10 +321,10 @@ struct BuildableBuilding {
 #[repr(u8)]
 enum BuildCategory {
     Production = 0,
-    Residence  = 1,
-    Service    = 2,
-    Military   = 3,
-    Special    = 4,
+    Residence = 1,
+    Service = 2,
+    Military = 3,
+    Special = 4,
 }
 
 impl BuildCategory {
@@ -300,26 +339,35 @@ impl BuildCategory {
     fn label(self) -> &'static str {
         match self {
             BuildCategory::Production => "PROD",
-            BuildCategory::Residence  => "RES",
-            BuildCategory::Service    => "SVC",
-            BuildCategory::Military   => "MIL",
-            BuildCategory::Special    => "SPC",
+            BuildCategory::Residence => "RES",
+            BuildCategory::Service => "SVC",
+            BuildCategory::Military => "MIL",
+            BuildCategory::Special => "SPC",
         }
     }
 
     fn from_def(def: &anno_sim::building::BuildingDef) -> Self {
         let pk = def.prod_kind.as_str();
-        if matches!(pk, "MARKT" | "KIRCHE" | "KAPELLE" | "SCHULE" | "HOCHSCHULE"
-            | "WIRT" | "THEATER" | "ARZT" | "BADEHAUS" | "GALGEN" | "KLINIK")
-        {
+        if matches!(
+            pk,
+            "MARKT"
+                | "KIRCHE"
+                | "KAPELLE"
+                | "SCHULE"
+                | "HOCHSCHULE"
+                | "WIRT"
+                | "THEATER"
+                | "ARZT"
+                | "BADEHAUS"
+                | "GALGEN"
+                | "KLINIK"
+        ) {
             return BuildCategory::Service;
         }
         if matches!(pk, "MILITAR") {
             return BuildCategory::Military;
         }
-        if matches!(pk, "KONTOR") || def.kind.as_str() == "KONTOR"
-            || def.kind.as_str() == "HQ"
-        {
+        if matches!(pk, "KONTOR") || def.kind.as_str() == "KONTOR" || def.kind.as_str() == "HQ" {
             return BuildCategory::Special;
         }
         if def.kind.as_str() == "WOHN" || matches!(pk, "WOHN") {
@@ -364,8 +412,15 @@ impl BuildingPlacer {
             let has_production = def.output_good != Good::None;
             let is_service = matches!(
                 def.prod_kind.as_str(),
-                "MARKT" | "KIRCHE" | "KAPELLE" | "SCHULE" | "WIRT" | "THEATER" | "ARZT"
-                    | "BADEHAUS" | "GALGEN"
+                "MARKT"
+                    | "KIRCHE"
+                    | "KAPELLE"
+                    | "SCHULE"
+                    | "WIRT"
+                    | "THEATER"
+                    | "ARZT"
+                    | "BADEHAUS"
+                    | "GALGEN"
             );
             let is_military = matches!(def.prod_kind.as_str(), "MILITAR");
             let is_kontor = def.kind.as_str() == "KONTOR" || def.prod_kind.as_str() == "KONTOR";
@@ -414,7 +469,9 @@ impl BuildingPlacer {
     }
 
     fn category_indices(&self) -> Vec<usize> {
-        self.buildable.iter().enumerate()
+        self.buildable
+            .iter()
+            .enumerate()
             .filter(|(_, b)| b.category == self.category)
             .map(|(i, _)| i)
             .collect()
@@ -459,7 +516,11 @@ impl BuildingPlacer {
         let cat = self.category_indices();
         let start = self.page * 9;
         let end = (start + 9).min(cat.len());
-        if start >= cat.len() { Vec::new() } else { cat[start..end].to_vec() }
+        if start >= cat.len() {
+            Vec::new()
+        } else {
+            cat[start..end].to_vec()
+        }
     }
 
     fn select_on_page(&mut self, slot: usize) {
@@ -475,7 +536,11 @@ impl BuildingPlacer {
 
     fn page_count(&self) -> usize {
         let n = self.category_indices().len();
-        if n == 0 { 0 } else { (n - 1) / 9 + 1 }
+        if n == 0 {
+            0
+        } else {
+            (n - 1) / 9 + 1
+        }
     }
 
     fn next_page(&mut self) {
@@ -490,32 +555,6 @@ impl BuildingPlacer {
 
 /// Convert screen pixel coordinates to isometric tile coordinates.
 /// Returns (tile_x, tile_y) relative to the island origin.
-/// Apply a `figuren.cod` formation to the selected military units,
-/// anchored at the formation leader's current tile (offset 0). Each
-/// unit's `target_x/y` is set to its slot in the formation; the
-/// existing `combat::tick_unit_orders_with_ocean` then walks them
-/// into shape.
-fn apply_formation(
-    units: &mut [anno_sim::combat::MilitaryUnit],
-    selected: &[usize],
-    formation: anno_sim::formation::Formation,
-) {
-    let anchor = match selected.first().and_then(|&i| units.get(i)) {
-        Some(u) => (u.tile_x, u.tile_y),
-        None => return,
-    };
-    for (slot, &i) in selected.iter().enumerate() {
-        if let Some(u) = units.get_mut(i) {
-            if !u.is_alive() { continue; }
-            let (tx, ty) = formation.place(slot, anchor.0, anchor.1);
-            u.target_x = tx;
-            u.target_y = ty;
-            u.combat_target = -1;
-            u.move_timer_ms = 0;
-        }
-    }
-}
-
 fn screen_to_tile(
     screen_x: i32,
     screen_y: i32,
@@ -561,6 +600,44 @@ fn screen_to_tile(
     (tx, ty)
 }
 
+fn scroll_for_island_tile(
+    island: &Island,
+    sprite_zoom: usize,
+    display_zoom: i32,
+    tile_x: i32,
+    tile_y: i32,
+) -> (i32, i32) {
+    let tile_w = ZOOM_TILE_W[sprite_zoom];
+    let tile_h = ZOOM_TILE_H[sprite_zoom];
+    let half_tw = tile_w / 2;
+    let half_th = tile_h / 2;
+    let img_w = ((island.width as i32 + island.height as i32) * half_tw) + tile_w;
+    let img_h = ((island.width as i32 + island.height as i32) * half_th) + tile_h + 500;
+    let origin_x = island.height as i32 * half_tw;
+    let origin_y = 300;
+    let tex_x = origin_x + (tile_x - tile_y) * half_tw + half_tw;
+    let tex_y = origin_y + (tile_x + tile_y) * half_th + half_th;
+    (
+        img_w * display_zoom / 2 - tex_x * display_zoom,
+        img_h * display_zoom / 2 - tex_y * display_zoom,
+    )
+}
+
+fn troop_assembly_slot(key: Keycode) -> Option<usize> {
+    match key {
+        Keycode::Num1 => Some(0),
+        Keycode::Num2 => Some(1),
+        Keycode::Num3 => Some(2),
+        Keycode::Num4 => Some(3),
+        Keycode::Num5 => Some(4),
+        Keycode::Num6 => Some(5),
+        Keycode::Num7 => Some(6),
+        Keycode::Num8 => Some(7),
+        Keycode::Num9 => Some(8),
+        _ => None,
+    }
+}
+
 /// Check if a building can be placed at the given tile position on an island.
 fn can_place_building(
     island: &Island,
@@ -594,21 +671,192 @@ fn can_place_building(
 /// off these so the placement helper stays free of UI dependencies.
 enum PlaceOutcome {
     Placed,
-    NotEnoughGold { need: u32, have: i32 },
+    NotEnoughGold {
+        need: u32,
+        have: i32,
+    },
     BlockedByTerrain,
-    WrongClimate { needs: anno_sim::climate::Climate,
-                   actual: anno_sim::climate::Climate },
+    MissingFertility {
+        required: anno_formats::szs::Fertility,
+    },
     NotCoastal,
     NoIslandMap,
     NoBuildingSelected,
     /// Bauinfra gate: player's highest-populated tier is below the
     /// building's `min_tier` (manual sec. 6.7.1).
-    WrongTier { needed: u8, have: u8 },
+    WrongTier {
+        needed: u8,
+        have: u8,
+    },
+}
+
+fn fertility_label(fertility: anno_formats::szs::Fertility) -> &'static str {
+    use anno_formats::szs::Fertility;
+    match fertility {
+        Fertility::Grain => "Grain",
+        Fertility::Tobacco => "Tobacco",
+        Fertility::Spices => "Spices",
+        Fertility::Sugarcane => "Sugarcane",
+        Fertility::Cotton => "Cotton",
+        Fertility::Vines => "Vines",
+        Fertility::Cocoa => "Cocoa",
+    }
+}
+
+fn fertility_list_label(island: &Island) -> String {
+    let fertilities = island.active_fertilities();
+    if fertilities.is_empty() {
+        "none".into()
+    } else {
+        fertilities
+            .into_iter()
+            .map(fertility_label)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn missing_required_fertility(
+    def: &anno_sim::building::BuildingDef,
+    island: &Island,
+) -> Option<anno_formats::szs::Fertility> {
+    let required = def.required_fertility?;
+    (!data_bridge::island_can_host_building(def, island)).then_some(required)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CityListRow {
+    name: String,
+    owner: u8,
+    island_number: u8,
+    population: u32,
+}
+
+fn visible_city_list_rows(
+    islands: &[Island],
+    diplomacy: &anno_sim::combat::DiplomacyMatrix,
+) -> Vec<CityListRow> {
+    islands
+        .iter()
+        .filter_map(|island| {
+            let city = island.city.as_ref()?;
+            if city.name.trim().is_empty() {
+                return None;
+            }
+            if city.owner_slot != 0 && !diplomacy.has_trade_agreement(0, city.owner_slot) {
+                return None;
+            }
+            Some(CityListRow {
+                name: city.name.clone(),
+                owner: city.owner_slot,
+                island_number: island.number,
+                population: city.tier_population.iter().sum(),
+            })
+        })
+        .collect()
+}
+
+fn truncate_city_name(name: &str, max_chars: usize) -> String {
+    let mut out: String = name.chars().take(max_chars).collect();
+    if name.chars().count() > max_chars && max_chars > 0 {
+        out.pop();
+        out.push('~');
+    }
+    out
+}
+
+fn city_list_line(row: &CityListRow) -> String {
+    let name = truncate_city_name(&row.name, 20);
+    format!(
+        "{:<20} p{} {:>5} i{}",
+        name, row.owner, row.population, row.island_number
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShipListRow {
+    name: String,
+    kind: &'static str,
+    status: &'static str,
+    warship: bool,
+}
+
+fn trade_ship_class_label(class: TradeShipClass) -> &'static str {
+    match class {
+        TradeShipClass::SmallTrader => "small trader",
+        TradeShipClass::LargeTrader => "large trader",
+    }
+}
+
+fn trade_ship_state_label(state: anno_sim::trade::ShipState) -> &'static str {
+    match state {
+        anno_sim::trade::ShipState::Sailing => "sailing",
+        anno_sim::trade::ShipState::Trading => "trading",
+        anno_sim::trade::ShipState::Waiting => "waiting",
+        anno_sim::trade::ShipState::Idle => "idle",
+    }
+}
+
+fn naval_unit_label(unit_type: UnitType) -> &'static str {
+    match unit_type {
+        UnitType::SmallWarship => "small warship",
+        UnitType::LargeWarship => "large warship",
+        UnitType::PirateShip => "pirate ship",
+        _ => "ship",
+    }
+}
+
+fn visible_ship_list_rows(
+    trade_ships: &[anno_sim::trade::TradeShip],
+    military_units: &[anno_sim::combat::MilitaryUnit],
+) -> Vec<ShipListRow> {
+    let mut rows = Vec::new();
+    for (idx, ship) in trade_ships
+        .iter()
+        .enumerate()
+        .filter(|(_, ship)| ship.active && ship.owner == 0)
+    {
+        let name = if ship.name.trim().is_empty() {
+            format!("Ship {}", idx + 1)
+        } else {
+            ship.name.clone()
+        };
+        rows.push(ShipListRow {
+            name,
+            kind: trade_ship_class_label(ship.class),
+            status: trade_ship_state_label(ship.state),
+            warship: false,
+        });
+    }
+    for (idx, unit) in military_units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| unit.owner == 0 && unit.is_alive() && unit.unit_type.stats().is_naval)
+    {
+        let kind = naval_unit_label(unit.unit_type);
+        let name = if unit.name.trim().is_empty() {
+            format!("Ship {}", idx + 1)
+        } else {
+            unit.name.clone()
+        };
+        rows.push(ShipListRow {
+            name,
+            kind,
+            status: "ready",
+            warship: true,
+        });
+    }
+    rows
+}
+
+fn ship_list_line(row: &ShipListRow) -> String {
+    let name = truncate_city_name(&row.name, 22);
+    format!("{:<22} {:<13} {}", name, row.kind, row.status)
 }
 
 /// Attempt to place the placer's currently-selected building at
 /// `(tile_x, tile_y)` on `current_island`. Mirrors the original
-/// click-place flow: climate gate, fishery coast gate, walkability,
+/// click-place flow: fertility gate, fishery coast gate, walkability,
 /// gold cost, materials trickle. Side-effecting helper used by both
 /// the click handler and the drag-place loop.
 fn try_place_building(
@@ -620,8 +868,6 @@ fn try_place_building(
     placer: &BuildingPlacer,
     tile_x: i32,
     tile_y: i32,
-    owner: u8,
-    free_build: bool,
 ) -> PlaceOutcome {
     let bb = match placer.selected_building() {
         Some(b) => b,
@@ -634,32 +880,29 @@ fn try_place_building(
     let bld_w = def.width;
     let bld_h = def.height;
     let cost = def.cost_gold;
-    let input1 = def.input_good_1;
-    let input2 = def.input_good_2;
-    let storage = def.storage_capacity;
 
-    let island_map_idx = sim.island_maps.iter()
+    let island_map_idx = sim
+        .island_maps
+        .iter()
         .position(|m| m.island_id == island_number);
 
-    // Climate gate.
     let isl = &islands[current_island];
-    let climate = anno_sim::climate::climate_for_y(isl.y_pos as u32, 512);
-    if !anno_sim::climate::allows_production(climate, def.output_good) {
-        let needs = match climate {
-            anno_sim::climate::Climate::North => anno_sim::climate::Climate::South,
-            anno_sim::climate::Climate::South => anno_sim::climate::Climate::North,
-        };
-        return PlaceOutcome::WrongClimate { needs, actual: climate };
+    if let Some(required) = missing_required_fertility(def, isl) {
+        return PlaceOutcome::MissingFertility { required };
     }
 
     // Fishery coast gate.
     if def.output_good == Good::Fish {
         let coast_ok = if let Some(idx) = island_map_idx {
             let map = &sim.island_maps[idx];
-            (0..bld_h as i32).any(|dy| (0..bld_w as i32)
-                .any(|dx| map.is_coastal(tile_x + dx, tile_y + dy)))
-        } else { false };
-        if !coast_ok { return PlaceOutcome::NotCoastal; }
+            (0..bld_h as i32)
+                .any(|dy| (0..bld_w as i32).any(|dx| map.is_coastal(tile_x + dx, tile_y + dy)))
+        } else {
+            false
+        };
+        if !coast_ok {
+            return PlaceOutcome::NotCoastal;
+        }
     }
 
     let map_idx = match island_map_idx {
@@ -667,42 +910,43 @@ fn try_place_building(
         None => return PlaceOutcome::NoIslandMap,
     };
     if !can_place_building(
-        &islands[current_island], &sim.island_maps[map_idx],
-        tile_x, tile_y, bld_w, bld_h,
+        &islands[current_island],
+        &sim.island_maps[map_idx],
+        tile_x,
+        tile_y,
+        bld_w,
+        bld_h,
     ) {
         return PlaceOutcome::BlockedByTerrain;
     }
+    let owner = 0u8;
     let owner_idx = owner as usize;
-    if !free_build {
-        if owner_idx >= sim.players.len()
-            || sim.players[owner_idx].gold < cost as i32
-        {
-            return PlaceOutcome::NotEnoughGold {
-                need: cost,
-                have: sim.players.get(owner_idx).map(|p| p.gold).unwrap_or(0),
+    if owner_idx >= sim.players.len() || sim.players[owner_idx].gold < cost as i32 {
+        return PlaceOutcome::NotEnoughGold {
+            need: cost,
+            have: sim.players.get(owner_idx).map(|p| p.gold).unwrap_or(0),
+        };
+    }
+    // Bauinfra gate: building requires the player to have at
+    // least `min_tier` population in the matching tier or
+    // higher. Manual sec. 6.7.1: civilization-level governs
+    // which buildings unlock.
+    if def.min_tier > 0 && owner_idx < sim.players.len() {
+        let p = &sim.players[owner_idx];
+        let highest = (0..p.population.len() as u8)
+            .filter(|&t| p.population[t as usize] > 0)
+            .max()
+            .unwrap_or(0);
+        if highest < def.min_tier {
+            return PlaceOutcome::WrongTier {
+                needed: def.min_tier,
+                have: highest,
             };
-        }
-        // Bauinfra gate: building requires the player to have at
-        // least `min_tier` population in the matching tier or
-        // higher. Manual sec. 6.7.1: civilization-level governs
-        // which buildings unlock.
-        if def.min_tier > 0 && owner_idx < sim.players.len() {
-            let p = &sim.players[owner_idx];
-            let highest = (0..p.population.len() as u8)
-                .filter(|&t| p.population[t as usize] > 0)
-                .max()
-                .unwrap_or(0);
-            if highest < def.min_tier {
-                return PlaceOutcome::WrongTier {
-                    needed: def.min_tier,
-                    have: highest,
-                };
-            }
         }
     }
 
     // All gates passed — apply the placement.
-    if !free_build && owner_idx < sim.players.len() {
+    if owner_idx < sim.players.len() {
         sim.players[owner_idx].gold -= cost as i32;
     }
     let cod_b = &cod.buildings[def_idx];
@@ -715,10 +959,7 @@ fn try_place_building(
         for dx in 0..bld_w as u8 {
             let tx = tile_x as u8 + dx;
             let ty = tile_y as u8 + dy;
-            let tile_sprite = sprite_idx
-                + rot_offset
-                + dy as usize * bld_w as usize
-                + dx as usize;
+            let tile_sprite = sprite_idx + rot_offset + dy as usize * bld_w as usize + dx as usize;
             islands[current_island].tiles.push(IslandTile {
                 x: tx,
                 y: ty,
@@ -738,8 +979,6 @@ fn try_place_building(
         tile_y as u16,
         owner,
     );
-    if input1 != Good::None { instance.input_1_stock = storage; }
-    if input2 != Good::None { instance.input_2_stock = storage; }
     // Mines tap a finite ore deposit (RE: haeuser.cod Erzbergnr).
     // Non-mine buildings keep the u16::MAX uncapped default.
     let cap = def.ore_deposit.capacity();
@@ -748,24 +987,116 @@ fn try_place_building(
     }
     let footprint = (def.width as u32) * (def.height as u32);
     let build_ms = (2_000u32 * footprint).max(2_000);
-    if free_build {
-        // Editor mode: building is finished immediately and needs no
-        // materials. Lets the editor lay out a scenario at full
-        // detail without spending the player's resources.
-        instance.construction_ms_total = 0;
-        instance.construction_ms_remaining = 0;
-        instance.wood_needed = 0;
-        instance.tools_needed = 0;
-        instance.bricks_needed = 0;
-    } else {
-        instance.construction_ms_total = build_ms;
-        instance.construction_ms_remaining = build_ms;
-        instance.wood_needed = def.cost_wood;
-        instance.tools_needed = def.cost_tools;
-        instance.bricks_needed = def.cost_bricks;
-    }
+    instance.construction_ms_total = build_ms;
+    instance.construction_ms_remaining = build_ms;
+    instance.wood_needed = def.cost_wood;
+    instance.tools_needed = def.cost_tools;
+    instance.bricks_needed = def.cost_bricks;
     sim.buildings.push(instance);
     PlaceOutcome::Placed
+}
+
+fn is_strand_ruin_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "STRAND" | "STRANDMUND" | "STRANDECKA" | "STRANDECKI" | "STRANDVARI"
+    )
+}
+
+fn removed_tile_was_strand(cod: &CodFile, removed: &[IslandTile], x: u16, y: u16) -> bool {
+    removed.iter().any(|tile| {
+        tile.x as u16 == x
+            && tile.y as u16 == y
+            && cod
+                .building_by_gfx(tile.building_id as i32)
+                .map(|b| is_strand_ruin_kind(&b.kind))
+                .unwrap_or(false)
+    })
+}
+
+fn push_ruin_tiles<F: FnMut() -> u16>(
+    island: &mut Island,
+    cod: &CodFile,
+    clear: TileClear,
+    removed: &[IslandTile],
+    next_rand: &mut F,
+) {
+    if clear.ruin_id == anno_sim::building::NO_RUIN_ID {
+        return;
+    }
+
+    let base_strand = removed_tile_was_strand(cod, removed, clear.tile_x, clear.tile_y);
+    let Some(base_ruin) = cod.ruin_building(clear.ruin_id, base_strand) else {
+        return;
+    };
+
+    if base_ruin.size == (clear.width as i32, clear.height as i32) {
+        let rand_value = next_rand();
+        let Some(ruin) = cod.ruin_variant_building(clear.ruin_id, base_strand, rand_value) else {
+            return;
+        };
+        let base_gfx = ruin.gfx as u16;
+        for dy in 0..clear.height {
+            for dx in 0..clear.width {
+                island.tiles.push(IslandTile {
+                    building_id: base_gfx + dy as u16 * clear.width as u16 + dx as u16,
+                    x: clear.tile_x as u8 + dx,
+                    y: clear.tile_y as u8 + dy,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                });
+            }
+        }
+        return;
+    }
+
+    for dy in 0..clear.height {
+        for dx in (0..clear.width).rev() {
+            let x = clear.tile_x + dx as u16;
+            let y = clear.tile_y + dy as u16;
+            let strand = removed_tile_was_strand(cod, removed, x, y);
+            let rand_value = next_rand();
+            let Some(ruin) = cod.ruin_variant_building(clear.ruin_id, strand, rand_value) else {
+                continue;
+            };
+            island.tiles.push(IslandTile {
+                building_id: ruin.gfx as u16,
+                x: x as u8,
+                y: y as u8,
+                orientation: 0,
+                anim_count: 0,
+                flags: 0,
+            });
+        }
+    }
+}
+
+fn apply_tile_clear_event<F: FnMut() -> u16>(
+    islands: &mut [Island],
+    cod: &CodFile,
+    clear: TileClear,
+    next_rand: &mut F,
+) {
+    let Some(island) = islands.iter_mut().find(|i| i.number == clear.island_id) else {
+        return;
+    };
+
+    let right = clear.tile_x + clear.width as u16;
+    let bottom = clear.tile_y + clear.height as u16;
+    let mut removed = Vec::new();
+    island.tiles.retain(|tile| {
+        let in_footprint = tile.x as u16 >= clear.tile_x
+            && (tile.x as u16) < right
+            && tile.y as u16 >= clear.tile_y
+            && (tile.y as u16) < bottom;
+        if in_footprint {
+            removed.push(*tile);
+        }
+        !in_footprint
+    });
+
+    push_ruin_tiles(island, cod, clear, &removed, next_rand);
 }
 
 fn main() {
@@ -805,8 +1136,7 @@ fn main() {
     );
 
     // Load building definitions
-    let cod_data =
-        std::fs::read(base_dir.join("haeuser.cod")).expect("Failed to read haeuser.cod");
+    let cod_data = std::fs::read(base_dir.join("haeuser.cod")).expect("Failed to read haeuser.cod");
     let cod = CodFile::parse(&cod_data).expect("Failed to parse COD");
     let defs = data_bridge::load_building_defs(&cod);
     println!("Loaded {} building definitions", defs.len());
@@ -837,16 +1167,38 @@ fn main() {
     // heuristic values if the figure can't be found.
     let traeger_def = figures.find("TRAEGER").cloned();
     let handel1_def = figures.find("HANDEL1").cloned();
+    let handel2_def = figures.find("HANDEL2").cloned();
+    let handler_def = figures.find("HANDLER").cloned();
+    let krieg1_def = figures.find("KRIEG1").cloned();
+    let krieg2_def = figures.find("KRIEG2").cloned();
+    let pirat_def = figures.find("PIRAT").cloned();
+    let ship_cargo_config = anno_sim::trade::ShipCargoConfig::from_figures(&figures);
+    let ship_sprite_layout = ShipSpriteLayout::from_figure_defs(
+        handel1_def.as_ref(),
+        handel2_def.as_ref(),
+        handler_def.as_ref(),
+        krieg1_def.as_ref(),
+        krieg2_def.as_ref(),
+        pirat_def.as_ref(),
+    );
+    let soldier_sprite_layout = SoldierSpriteLayout::from_figures(&figures);
     let carrier_walk_anz = traeger_def
         .as_ref()
         .and_then(|f| f.walk_anim())
         .map(|a| a.anim_anz as usize)
         .unwrap_or(8);
-    let ship_walk_anz = handel1_def
+    let carrier_empty_anim_offs = traeger_def
         .as_ref()
         .and_then(|f| f.walk_anim())
-        .map(|a| a.anim_anz as usize)
-        .unwrap_or(40);
+        .and_then(|a| usize::try_from(a.anim_offs).ok())
+        .unwrap_or(0);
+    let carrier_loaded_anim_offs = traeger_def
+        .as_ref()
+        .and_then(|f| f.anim(1))
+        .and_then(|a| usize::try_from(a.anim_offs).ok())
+        .unwrap_or(carrier_walk_anz * 8);
+    let civilian_config = anno_sim::civilian::CivilianConfig::from_figures(&figures);
+    let civilian_walk_anz = civilian_frames_per_dir_from_figures(&figures);
     let _ = &figures;
 
     // Parse CLI: positional scenario path + optional --host PORT / --join HOST:PORT
@@ -858,15 +1210,14 @@ fn main() {
         let a = &raw_args[i];
         if a == "--host" {
             i += 1;
-            let port: u16 = raw_args.get(i)
+            let port: u16 = raw_args
+                .get(i)
                 .and_then(|p| p.parse().ok())
                 .expect("--host needs a port number");
             net_role = NetRole::Host { port };
         } else if a == "--join" {
             i += 1;
-            let addr = raw_args.get(i)
-                .cloned()
-                .expect("--join needs HOST:PORT");
+            let addr = raw_args.get(i).cloned().expect("--join needs HOST:PORT");
             net_role = NetRole::Client { addr };
         } else {
             positional.push(a.clone());
@@ -914,10 +1265,18 @@ fn main() {
         if m.mission_nr.is_some() || m.ranking.is_some() {
             println!(
                 "Scenario meta: mission #{} players {}-{} ranking {}",
-                m.mission_nr.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-                m.player_min.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-                m.player_max.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-                m.ranking.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                m.mission_nr
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                m.player_min
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                m.player_max
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                m.ranking
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".into()),
             );
         }
     }
@@ -925,9 +1284,7 @@ fn main() {
         // Print every island with at least one fertility OR a
         // settled city — surfaces the new INSEL5 fertility map.
         let active = island.active_fertilities();
-        let fert_names: Vec<String> = active.iter()
-            .map(|f| format!("{f:?}"))
-            .collect();
+        let fert_names: Vec<String> = active.iter().map(|f| format!("{f:?}")).collect();
         if let Some(city) = island.city.as_ref() {
             if !city.name.is_empty() {
                 let fert_tag = if fert_names.is_empty() {
@@ -935,12 +1292,17 @@ fn main() {
                 } else {
                     format!("  fertilities=[{}]", fert_names.join(", "))
                 };
-                println!("  Island {}: city '{}' (owner_slot {}, island_index {}){fert_tag}",
-                    island.number, city.name, city.owner_slot, city.island_index);
+                println!(
+                    "  Island {}: city '{}' (owner_slot {}, island_index {}){fert_tag}",
+                    island.number, city.name, city.owner_slot, city.island_index
+                );
             }
         } else if !fert_names.is_empty() {
-            println!("  Island {} (uninhabited): fertilities=[{}]",
-                island.number, fert_names.join(", "));
+            println!(
+                "  Island {} (uninhabited): fertilities=[{}]",
+                island.number,
+                fert_names.join(", ")
+            );
         }
     }
     if !szs.ships.is_empty() {
@@ -954,43 +1316,61 @@ fn main() {
                 *tally.entry(c).or_default() += 1;
             }
         }
-        let named: Vec<&str> = szs.ships.iter()
+        let named: Vec<&str> = szs
+            .ships
+            .iter()
             .filter(|s| !s.name.is_empty())
             .map(|s| s.name.as_str())
             .collect();
         if !named.is_empty() {
-            let class_summary: Vec<String> = tally.iter()
-                .map(|(c, n)| format!("{n}× {c:?}"))
-                .collect();
-            println!("Starting ships ({}): {} [{}]",
-                named.len(), named.join(", "),
-                class_summary.join(", "));
+            let class_summary: Vec<String> =
+                tally.iter().map(|(c, n)| format!("{n}× {c:?}")).collect();
+            println!(
+                "Starting ships ({}): {} [{}]",
+                named.len(),
+                named.join(", "),
+                class_summary.join(", ")
+            );
         }
     }
     if let Some(mission) = szs.mission.as_ref() {
         if !mission.briefing.is_empty() {
             use anno_formats::szs::{
-                MISSION_FLAG_POPULATION, MISSION_FLAG_POPULATION2,
-                MISSION_FLAG_POPULATION3, MISSION_FLAG_COOPERATIVE,
-                MISSION_FLAG_RANKING, MISSION_FLAG_PIRATE,
+                MISSION_FLAG_COOPERATIVE, MISSION_FLAG_PIRATE, MISSION_FLAG_POPULATION,
+                MISSION_FLAG_POPULATION2, MISSION_FLAG_POPULATION3, MISSION_FLAG_RANKING,
             };
             // Enumerate every set bit and label the known ones —
             // unrecognised bits print as `unknown(0x...)` so a new
             // scenario flips them into view at run time.
             let mut tags: Vec<String> = Vec::new();
             let mut seen = 0u32;
-            let mut tag = |bit: u32, name: &str, seen: &mut u32, tags: &mut Vec<String>| {
+            let tag = |bit: u32, name: &str, seen: &mut u32, tags: &mut Vec<String>| {
                 if mission.flags & bit != 0 {
                     tags.push(name.to_string());
                     *seen |= bit;
                 }
             };
-            tag(MISSION_FLAG_POPULATION,  "population",     &mut seen, &mut tags);
-            tag(MISSION_FLAG_POPULATION2, "population2",    &mut seen, &mut tags);
-            tag(MISSION_FLAG_POPULATION3, "population3",    &mut seen, &mut tags);
-            tag(MISSION_FLAG_COOPERATIVE, "cooperative",    &mut seen, &mut tags);
-            tag(MISSION_FLAG_RANKING,     "ranking",        &mut seen, &mut tags);
-            tag(MISSION_FLAG_PIRATE,      "pirate-combat",  &mut seen, &mut tags);
+            tag(MISSION_FLAG_POPULATION, "population", &mut seen, &mut tags);
+            tag(
+                MISSION_FLAG_POPULATION2,
+                "population2",
+                &mut seen,
+                &mut tags,
+            );
+            tag(
+                MISSION_FLAG_POPULATION3,
+                "population3",
+                &mut seen,
+                &mut tags,
+            );
+            tag(
+                MISSION_FLAG_COOPERATIVE,
+                "cooperative",
+                &mut seen,
+                &mut tags,
+            );
+            tag(MISSION_FLAG_RANKING, "ranking", &mut seen, &mut tags);
+            tag(MISSION_FLAG_PIRATE, "pirate-combat", &mut seen, &mut tags);
             let leftover = mission.flags & !seen;
             for bit in 0..32 {
                 let mask = 1u32 << bit;
@@ -998,7 +1378,11 @@ fn main() {
                     tags.push(format!("unknown(0x{mask:X})"));
                 }
             }
-            let tag_str = if tags.is_empty() { String::new() } else { format!("  [{}]", tags.join(", ")) };
+            let tag_str = if tags.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", tags.join(", "))
+            };
             println!("Mission flags 0x{:04x}{}", mission.flags, tag_str);
             let goals = mission.goals();
             if let Some(pop) = goals.primary_population() {
@@ -1030,7 +1414,12 @@ fn main() {
     }
 
     // Initialize simulation
-    let mut sim = init_simulation(&szs, &cod, &defs);
+    let mut sim = init_simulation(&szs, &cod, &defs, ship_cargo_config);
+    sim.seed_source_rand_from_get_tick_count();
+    if let Some(traeger) = traeger_def.as_ref() {
+        sim.carrier_config = anno_sim::carrier::CarrierConfig::from_figure_def(traeger);
+    }
+    sim.civilian_config = civilian_config;
     println!(
         "Simulation initialized: {} buildings, {} warehouses, {} island maps",
         sim.buildings.len(),
@@ -1038,21 +1427,20 @@ fn main() {
         sim.island_maps.len()
     );
 
-    // Replace dev-default objectives with the scenario's actual
-    // AUFTRAG4 goals when the briefing's flag bits are set. Falls
-    // back to the dev defaults when the scenario carries no
-    // flagged goals (Tutorials, Continous-Play templates).
+    // Load scenario objectives from AUFTRAG4. Scenarios with no
+    // flagged goals stay objective-free instead of receiving a
+    // generated tutorial checklist.
     if let Some(mission) = szs.mission.as_ref() {
         let g = mission.goals();
-        let scenario_set = anno_sim::objectives::ObjectiveSet::from_mission_goals(&g);
-        if !scenario_set.items.is_empty() {
-            sim.objectives = scenario_set;
-        }
+        sim.objectives = anno_sim::objectives::ObjectiveSet::from_mission_goals(&g);
     }
 
     // Initialize building placer
     let mut placer = BuildingPlacer::new(&cod, &defs);
-    println!("Building placer: {} buildable types", placer.buildable.len());
+    println!(
+        "Building placer: {} buildable types",
+        placer.buildable.len()
+    );
 
     // Initialize animation state
     let mut anim_state = AnimationState::new(&cod);
@@ -1101,16 +1489,19 @@ fn main() {
     }
 
     // Load sound effects. Slots are reused from SPEECH8/MUSIC8 pools.
-    let place_sound_slot = audio.waves.load("SPEECH8/1000.WAV")
+    let place_sound_slot = audio
+        .waves
+        .load("SPEECH8/1000.WAV")
         .or_else(|| audio.waves.load("1000.WAV"));
-    let event_destroy_slot = audio.waves.load("SPEECH8/1010.WAV")
+    let event_destroy_slot = audio
+        .waves
+        .load("SPEECH8/1010.WAV")
         .or_else(|| audio.waves.load("1010.WAV"))
         .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
-    let event_obj_done_slot = audio.waves.load("SPEECH8/1020.WAV")
+    let event_obj_done_slot = audio
+        .waves
+        .load("SPEECH8/1020.WAV")
         .or_else(|| audio.waves.load("1020.WAV"))
-        .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
-    let event_war_slot = audio.waves.load("SPEECH8/1030.WAV")
-        .or_else(|| audio.waves.load("1030.WAV"))
         .or_else(|| audio.waves.load("SPEECH8/1000.WAV"));
     // Per-event sample slots. The original loads named WAV files from
     // `SAMPLES/` via `_MaxwaveLoad@4` at startup
@@ -1121,13 +1512,19 @@ fn main() {
     // These are the actual event audio cues the original used.
     // The numbered SPEECH8 WAVs are voice-line speech (e.g. citizens
     // demanding new goods); the per-event playback uses SAMPLES/*.wav.
-    let voice_stockpile_slot = audio.waves.load("SAMPLES/event.wav")
+    let voice_stockpile_slot = audio
+        .waves
+        .load("SAMPLES/event.wav")
         .or_else(|| audio.waves.load("SAMPLES/Event.wav"));
     let voice_treasury_slot = voice_stockpile_slot;
-    let voice_trader_slot = audio.waves.load("SAMPLES/triumph.wav")
+    let voice_trader_slot = audio
+        .waves
+        .load("SAMPLES/triumph.wav")
         .or_else(|| audio.waves.load("SAMPLES/Triumph.wav"))
         .or_else(|| voice_stockpile_slot);
-    let voice_attack_slot = audio.waves.load("SAMPLES/piraten.wav")
+    let voice_attack_slot = audio
+        .waves
+        .load("SAMPLES/piraten.wav")
         .or_else(|| audio.waves.load("SAMPLES/Piraten.wav"))
         .or_else(|| voice_stockpile_slot);
     // Volcano eruption — RE: `1602_exe.c:106445-447` loads
@@ -1135,7 +1532,9 @@ fn main() {
     // figuren.cod VULKAN figure plays one of them via `WAV_VULKAN1, 3`
     // (the `, 3` is the random-pick range). We pick #1 deterministically
     // since our event_log doesn't yet propagate the per-event RNG.
-    let voice_volcano_slot = audio.waves.load("SAMPLES/vulkan1.wav")
+    let voice_volcano_slot = audio
+        .waves
+        .load("SAMPLES/vulkan1.wav")
         .or_else(|| audio.waves.load("SAMPLES/Vulkan1.wav"))
         .or_else(|| audio.waves.load("SAMPLES/vulkan2.wav"))
         .or_else(|| voice_stockpile_slot);
@@ -1166,7 +1565,8 @@ fn main() {
     // Pin the logical drawing surface to WINDOW_W × WINDOW_H so panels
     // and HUD positions remain stable even when the user resizes the OS
     // window. SDL letterboxes / scales for us.
-    canvas.set_logical_size(WINDOW_W, WINDOW_H)
+    canvas
+        .set_logical_size(WINDOW_W, WINDOW_H)
         .expect("set_logical_size failed");
 
     let texture_creator = canvas.texture_creator();
@@ -1195,8 +1595,7 @@ fn main() {
     let broadcast_interval_ms: u32 = 1000;
     match net_role {
         NetRole::Host { port } => {
-            let addr: std::net::SocketAddr =
-                format!("0.0.0.0:{port}").parse().unwrap();
+            let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
             match anno_net::transport::NetHost::bind(addr, "anno-game") {
                 Ok(h) => {
                     net_host = Some(h);
@@ -1262,112 +1661,34 @@ fn main() {
         info: String,
     }
     let mut inspection: Option<Inspection> = None;
-    let mut show_hud = true;
     let mut demolish_mode = false;
     let mut demolish_hover: Option<usize> = None; // building index under cursor
-    let mut tax_panel = false;
-    let mut tax_tier: usize = 0; // selected tier for tax adjustment
     let mut diplomacy_panel = false;
     let mut diplomacy_target: u8 = 1; // selected counterpart (1..6) for player 0
-    let mut market_panel = false;
-    let mut market_sel: usize = 0;
-    let mut show_paths = false;
-    let mut route_list_panel = false;
-    let mut route_list_sel: usize = 0;
-    let mut help_panel = false;
-    let mut eval_panel = false;
+    let mut info_mode = false;
+    let mut combat_mode = false;
     let mut cities_panel = false;
-    let mut music_panel = false;
-    let mut music_sel: usize = 0;
     let mut ship_panel = false;
-    let mut obj_panel = false;
-    let mut settings = anno_sim::settings::Settings::load_default();
-    let mut settings_panel = false;
-    let mut settings_sel: usize = 0;
-    let mut show_perf = false;
-    let mut perf_history: std::collections::VecDeque<(u32, u32, u32)>
-        = std::collections::VecDeque::with_capacity(60);
-    let mut frame_started = std::time::Instant::now();
-    // Auto-pause-while-menu-open: when any modal panel is opened we
-    // pause the sim so the player can read it; we only unpause on close
-    // if we were the ones who paused (i.e. the player didn't manually
-    // unpause via Space while reading).
-    let mut scenario_picker = false;
-    let mut scenario_sel: usize = 0;
-    // Scan Szenes/ once at startup so the picker is populated.
-    let scenario_files: Vec<std::path::PathBuf> = {
-        let szenes = base_dir.join("Szenes");
-        let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(&szenes)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .ends_with(".szs")
-            })
-            .map(|e| e.path())
-            .collect();
-        v.sort();
-        v
-    };
-    if let Some(idx) = scenario_files
-        .iter()
-        .position(|p| p.to_string_lossy() == scenario_path)
-    {
-        scenario_sel = idx;
-    }
+    let mut video_speech_panel = false;
+    let mut video_speech_sel: usize = 0;
+    let mut video_sequences_enabled = true;
+    let mut speech_enabled = true;
+    let mut options_panel = false;
+    let mut options_sel: usize = 0;
     let mut chat_active = false;
     let mut chat_input = String::new();
     // Recently received chat lines (oldest first) with timestamp for TTL.
     let mut chat_log: std::collections::VecDeque<(String, std::time::Instant)> =
         std::collections::VecDeque::new();
 
-    // Snapshots used to derive in-game event notifications (diplomacy
-    // flips, AI building completions). First-tick deltas are absorbed by
-    // initialising from the live state below.
-    use anno_sim::combat::Diplomacy;
-    let mut prev_diplomacy: [[Diplomacy; 7]; 7] = [[Diplomacy::Neutral; 7]; 7];
-    for i in 0..7u8 {
-        for j in 0..7u8 {
-            prev_diplomacy[i as usize][j as usize] = sim.diplomacy.get(i, j);
-        }
-    }
-    let mut prev_building_counts: [usize; 7] = [0; 7];
-    for b in &sim.buildings {
-        let o = b.owner as usize;
-        if o < prev_building_counts.len() {
-            prev_building_counts[o] += 1;
-        }
-    }
-    // Trade route editor: while in this mode, LMB on a warehouse adds it
-    // as a stop in the draft route; Enter commits, Esc cancels.
-    let mut trade_route_mode = false;
-    /// (island_id, x, y, mode) where mode: 0=LOAD only, 1=UNLOAD only, 2=BOTH.
-    let mut draft_route_stops: Vec<(u8, u16, u16, u8)> = Vec::new();
-    let mut next_route_id: u16 = sim
-        .trade_routes
-        .iter()
-        .map(|r| r.id)
-        .max()
-        .map(|m| m + 1)
-        .unwrap_or(1);
-    let mut show_coverage = false;
     let mut selected_units: Vec<usize> = Vec::new();
+    let mut selected_trade_ship_idx: Option<usize> = None;
+    let mut troop_assemblies: [Vec<usize>; 9] = std::array::from_fn(|_| Vec::new());
+    let mut warehouse_cycle_idx: Option<usize> = None;
     let mut shift_held = false;
-    // Scenario editor mode: pauses the sim and lets the player
-    // place buildings as any of the 4 player slots (0..3) instead
-    // of always slot 0. Manual chapter 11 covers a full editor
-    // (place/edit goals/define computer attitudes); this is a
-    // minimal in-game version — design islands by placing per-slot
-    // buildings, then F8 to export the .szs.
-    let mut editor_mode = false;
-    let mut editor_owner: u8 = 0;
+    let mut ctrl_held = false;
     let mut save_banner: Option<(String, std::time::Instant)> = None;
     let save_dir = std::path::PathBuf::from("saves");
-    let quicksave_path = save_dir.join(format!("{}.quicksave.bin", scenario_name));
     let mut save_panel = false;
     let mut save_sel: usize = 0;
     let slot_path = |slot: usize| -> std::path::PathBuf {
@@ -1386,41 +1707,36 @@ fn main() {
                     if chat_active {
                         chat_active = false;
                         chat_input.clear();
-                    } else if route_list_panel {
-                        route_list_panel = false;
-                    } else if scenario_picker {
-                        scenario_picker = false;
                     } else if save_panel {
                         save_panel = false;
-                    } else if settings_panel {
-                        settings_panel = false;
-                    } else if market_panel {
-                        market_panel = false;
+                    } else if options_panel {
+                        options_panel = false;
+                    } else if video_speech_panel {
+                        video_speech_panel = false;
                     } else if ship_panel {
                         ship_panel = false;
-                    } else if help_panel {
-                        help_panel = false;
-                    } else if obj_panel {
-                        obj_panel = false;
                     } else if placer.active {
                         placer.active = false;
                     } else if demolish_mode {
                         demolish_mode = false;
-                    } else if trade_route_mode {
-                        trade_route_mode = false;
-                        draft_route_stops.clear();
-                    } else if eval_panel {
-                        eval_panel = false;
                     } else if cities_panel {
                         cities_panel = false;
-                    } else if music_panel {
-                        music_panel = false;
-                    } else if !selected_units.is_empty() {
+                    } else if info_mode {
+                        info_mode = false;
+                        selected_building_idx = None;
+                    } else if combat_mode {
+                        combat_mode = false;
                         selected_units.clear();
+                        selected_trade_ship_idx = None;
+                    } else if !selected_units.is_empty() || selected_trade_ship_idx.is_some() {
+                        selected_units.clear();
+                        selected_trade_ship_idx = None;
                     } else if selected_building_idx.is_some() {
                         selected_building_idx = None;
                     } else if inspection.is_some() {
                         inspection = None;
+                    } else if sim.paused {
+                        sim.paused = false;
                     } else {
                         break 'main;
                     }
@@ -1432,75 +1748,28 @@ fn main() {
                     if matches!(key, Keycode::LShift | Keycode::RShift) {
                         shift_held = true;
                     }
-                    if route_list_panel {
-                        let routes: Vec<u16> = sim.trade_routes.iter()
-                            .filter(|r| r.owner == 0)
-                            .map(|r| r.id)
-                            .collect();
-                        match key {
-                            Keycode::Up => {
-                                if route_list_sel > 0 { route_list_sel -= 1; }
-                            }
-                            Keycode::Down => {
-                                if route_list_sel + 1 < routes.len() {
-                                    route_list_sel += 1;
-                                }
-                            }
-                            Keycode::Backspace | Keycode::Delete => {
-                                if let Some(&rid) = routes.get(route_list_sel) {
-                                    sim.trade_routes.retain(|r| r.id != rid);
-                                    sim.trade_ships.retain(|s| s.route_id != rid);
-                                    if route_list_sel > 0 { route_list_sel -= 1; }
-                                }
-                            }
-                            Keycode::R if shift_held => { route_list_panel = false; }
-                            Keycode::Escape => { route_list_panel = false; }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    if settings_panel {
-                        match key {
-                            Keycode::Up => {
-                                if settings_sel > 0 { settings_sel -= 1; }
-                            }
-                            Keycode::Down => {
-                                if settings_sel + 1 < anno_sim::settings::Settings::COUNT {
-                                    settings_sel += 1;
-                                }
-                            }
-                            Keycode::Left => {
-                                settings.adjust(settings_sel, -5);
-                                let _ = settings.save_default();
-                            }
-                            Keycode::Right => {
-                                settings.adjust(settings_sel, 5);
-                                let _ = settings.save_default();
-                            }
-                            Keycode::F10 | Keycode::Escape => {
-                                settings_panel = false;
-                            }
-                            _ => {}
-                        }
-                        continue;
+                    if matches!(key, Keycode::LCtrl | Keycode::RCtrl) {
+                        ctrl_held = true;
                     }
                     if save_panel {
                         match key {
                             Keycode::Up => {
-                                if save_sel > 0 { save_sel -= 1; }
+                                if save_sel > 0 {
+                                    save_sel -= 1;
+                                }
                             }
                             Keycode::Down => {
-                                if save_sel + 1 < 10 { save_sel += 1; }
+                                if save_sel + 1 < 10 {
+                                    save_sel += 1;
+                                }
                             }
                             Keycode::S => {
                                 let path = slot_path(save_sel);
                                 let snap = sim.snapshot();
                                 let msg = match anno_sim::save::save_to_file(&path, &snap) {
-                                    Ok(()) => format!(
-                                        "saved slot {} → {}",
-                                        save_sel,
-                                        path.display(),
-                                    ),
+                                    Ok(()) => {
+                                        format!("saved slot {} → {}", save_sel, path.display(),)
+                                    }
                                     Err(e) => format!("save FAILED: {e}"),
                                 };
                                 println!("{msg}");
@@ -1511,8 +1780,8 @@ fn main() {
                                 let msg = match anno_sim::save::load_from_file(&path) {
                                     Ok(state) => {
                                         let bldgs = state.buildings.len();
-                                        let gold = state.players.first()
-                                            .map(|p| p.gold).unwrap_or(0);
+                                        let gold =
+                                            state.players.first().map(|p| p.gold).unwrap_or(0);
                                         sim.apply_snapshot(state);
                                         needs_redraw = true;
                                         format!(
@@ -1526,173 +1795,99 @@ fn main() {
                                 save_banner = Some((msg, std::time::Instant::now()));
                                 save_panel = false;
                             }
-                            Keycode::F3 | Keycode::Escape => {
+                            Keycode::Escape => {
                                 save_panel = false;
                             }
-                            Keycode::Space => {
-                                sim.paused = !sim.paused;
+                            Keycode::Pause => {
+                                sim.paused = true;
                             }
                             _ => {}
                         }
                         continue;
                     }
-                    if market_panel {
-                        const GOODS: &[Good] = &[
-                            Good::Wood, Good::Iron, Good::Ore, Good::Gold,
-                            Good::Wool, Good::Sugar, Good::Tobacco, Good::Cattle,
-                            Good::Grain, Good::Flour, Good::Food, Good::Alcohol,
-                            Good::Cloth, Good::Clothing, Good::Jewelry, Good::Tools,
-                            Good::Bricks, Good::Swords, Good::Cannons, Good::Muskets,
-                            Good::Stone, Good::Cocoa, Good::Spices, Good::WildGame,
-                            Good::Cotton, Good::Silk, Good::Fish, Good::Grapes,
-                            Good::TobaccoProducts,
-                        ];
+                    if options_panel {
                         match key {
                             Keycode::Up => {
-                                if market_sel > 0 { market_sel -= 1; }
+                                if options_sel > 0 {
+                                    options_sel -= 1;
+                                }
                             }
                             Keycode::Down => {
-                                if market_sel + 1 < GOODS.len() {
-                                    market_sel += 1;
+                                if options_sel < 3 {
+                                    options_sel += 1;
                                 }
                             }
-                            Keycode::Right => {
-                                // Sell selected good. Plain Right=10,
-                                // Shift+Right=100. Routed through
-                                // apply_command so it uses live market
-                                // prices and works in multiplayer.
-                                if let Some(g) = GOODS.get(market_sel).copied() {
-                                    let qty = if shift_held { 100 } else { 10 };
-                                    sim.apply_command(
-                                        &anno_sim::commands::Command::Sell {
-                                            player: 0, good: g, qty,
-                                        },
-                                    );
-                                }
-                            }
-                            Keycode::Left => {
-                                if let Some(g) = GOODS.get(market_sel).copied() {
-                                    let qty = if shift_held { 100 } else { 10 };
-                                    sim.apply_command(
-                                        &anno_sim::commands::Command::Buy {
-                                            player: 0, good: g, qty,
-                                        },
-                                    );
-                                }
-                            }
-                            Keycode::A | Keycode::Escape => {
-                                market_panel = false;
-                            }
-                            Keycode::B => {
-                                // Cycle the free-trader BUY-MAX slider
-                                // for the selected good on the player's
-                                // first warehouse: None → 25 → 50 → 100
-                                // → None. Manual 8.1: "the free traders
-                                // will keep selling you the chosen
-                                // product, up to the desired amount."
-                                if let Some(g) = GOODS.get(market_sel).copied() {
-                                    if let Some(wh) = sim.warehouses.iter_mut()
-                                        .find(|w| w.active && w.owner == 0)
-                                    {
-                                        let next = match wh.slider(g).buy_max_stock {
-                                            None => Some(25),
-                                            Some(25) => Some(50),
-                                            Some(50) => Some(100),
-                                            _ => None,
+                            Keycode::Left | Keycode::Right | Keycode::Return | Keycode::KpEnter => {
+                                match options_sel {
+                                    0 => {
+                                        music_enabled = !music_enabled;
+                                        if music_enabled {
+                                            if let Some(slot) = music_slot {
+                                                audio.streams.resume(slot);
+                                            }
+                                            println!("Music ON");
+                                        } else {
+                                            if let Some(slot) = music_slot {
+                                                audio.streams.stop(slot);
+                                            }
+                                            println!("Music OFF");
+                                        }
+                                    }
+                                    1 => {
+                                        music_volume = match key {
+                                            Keycode::Left => (music_volume - 0.2).max(0.0),
+                                            Keycode::Right => (music_volume + 0.2).min(1.0),
+                                            _ if music_volume >= 0.95 => 0.0,
+                                            _ => (music_volume + 0.2).min(1.0),
                                         };
-                                        wh.set_buy_max_stock(g, next);
+                                        if let Some(slot) = music_slot {
+                                            audio.streams.set_volume(slot, music_volume);
+                                        }
+                                        println!("Music volume: {:.0}%", music_volume * 100.0);
                                     }
+                                    2 => {
+                                        video_sequences_enabled = !video_sequences_enabled;
+                                    }
+                                    3 => {
+                                        speech_enabled = !speech_enabled;
+                                    }
+                                    _ => {}
                                 }
                             }
-                            Keycode::N => {
-                                // Cycle the free-trader SELL-MIN-KEEP
-                                // slider: None → 0 → 30 → 60 → None.
-                                // Manual 8.1: "everything left of the
-                                // mark you set with the slider will
-                                // remain in the warehouse, while
-                                // everything to the right of it will
-                                // be sold."
-                                if let Some(g) = GOODS.get(market_sel).copied() {
-                                    if let Some(wh) = sim.warehouses.iter_mut()
-                                        .find(|w| w.active && w.owner == 0)
-                                    {
-                                        let next = match wh.slider(g).sell_min_keep {
-                                            None => Some(0),
-                                            Some(0) => Some(30),
-                                            Some(30) => Some(60),
-                                            _ => None,
-                                        };
-                                        wh.set_sell_min_keep(g, next);
-                                    }
-                                }
+                            Keycode::O | Keycode::Escape => {
+                                options_panel = false;
                             }
-                            Keycode::Space => {
-                                sim.paused = !sim.paused;
+                            Keycode::Pause => {
+                                sim.paused = true;
                             }
                             _ => {}
                         }
                         continue;
                     }
-                    if music_panel {
+                    if video_speech_panel {
                         match key {
                             Keycode::Up => {
-                                if music_sel > 0 { music_sel -= 1; }
+                                if video_speech_sel > 0 {
+                                    video_speech_sel -= 1;
+                                }
                             }
                             Keycode::Down => {
-                                if music_sel + 1 < music_files.len() {
-                                    music_sel += 1;
+                                if video_speech_sel < 1 {
+                                    video_speech_sel += 1;
                                 }
                             }
-                            Keycode::Return | Keycode::KpEnter => {
-                                if let Some(track) = music_files.get(music_sel) {
-                                    if let Some(slot) = music_slot {
-                                        audio.streams.stop(slot);
-                                        audio.streams.destroy(slot);
-                                    }
-                                    music_slot = audio.streams.create(track, 0);
-                                    if let (Some(slot), Some(handle)) =
-                                        (music_slot, audio.stream_handle.as_ref())
-                                    {
-                                        audio.streams.play(slot, music_volume, handle);
-                                        save_banner = Some((
-                                            format!("playing: {}", track),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
+                            Keycode::Left | Keycode::Right | Keycode::Return | Keycode::KpEnter => {
+                                if video_speech_sel == 0 {
+                                    video_sequences_enabled = !video_sequences_enabled;
+                                } else {
+                                    speech_enabled = !speech_enabled;
                                 }
                             }
-                            Keycode::Escape | Keycode::J => {
-                                music_panel = false;
+                            Keycode::F | Keycode::Escape => {
+                                video_speech_panel = false;
                             }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    if scenario_picker {
-                        match key {
-                            Keycode::Up => {
-                                if scenario_sel > 0 { scenario_sel -= 1; }
-                            }
-                            Keycode::Down => {
-                                if scenario_sel + 1 < scenario_files.len() {
-                                    scenario_sel += 1;
-                                }
-                            }
-                            Keycode::Return | Keycode::KpEnter => {
-                                if let Some(path) = scenario_files.get(scenario_sel) {
-                                    // Re-exec ourselves with the chosen scenario.
-                                    if let Ok(exe) = std::env::current_exe() {
-                                        let _ = std::process::Command::new(exe)
-                                            .arg(path)
-                                            .spawn();
-                                        println!("Launching {}", path.display());
-                                        std::process::exit(0);
-                                    }
-                                }
-                                scenario_picker = false;
-                            }
-                            Keycode::F2 | Keycode::Escape => {
-                                scenario_picker = false;
+                            Keycode::Pause => {
+                                sim.paused = true;
                             }
                             _ => {}
                         }
@@ -1703,13 +1898,17 @@ fn main() {
                         // care about and drop the rest (the typed text
                         // arrives via TextInput events).
                         match key {
-                            Keycode::Backspace => { chat_input.pop(); }
+                            Keycode::Backspace => {
+                                chat_input.pop();
+                            }
                             Keycode::Return | Keycode::KpEnter => {
                                 let text = chat_input.trim().to_string();
                                 if !text.is_empty() {
                                     let local_line = format!("you: {text}");
                                     chat_log.push_back((local_line, std::time::Instant::now()));
-                                    if chat_log.len() > 8 { chat_log.pop_front(); }
+                                    if chat_log.len() > 8 {
+                                        chat_log.pop_front();
+                                    }
                                     let msg = anno_net::protocol::NetMessage::chat(&text);
                                     if let Some(host) = net_host.as_mut() {
                                         host.send_to_all(&msg);
@@ -1740,12 +1939,14 @@ fn main() {
                             Keycode::PageDown => placer.next_page(),
                             Keycode::LeftBracket => placer.prev_category(),
                             Keycode::RightBracket => placer.next_category(),
-                            Keycode::Z => {
-                                // Cycle rotation through the selected
-                                // building's configured Rotate count.
+                            Keycode::Z | Keycode::X => {
                                 if let Some(b) = placer.selected_building() {
                                     let rot = cod.buildings[b.def_idx].rotate.max(1) as u8;
-                                    placer.orientation = (placer.orientation + 1) % rot;
+                                    if matches!(key, Keycode::Z) {
+                                        placer.orientation = (placer.orientation + 1) % rot;
+                                    } else {
+                                        placer.orientation = (placer.orientation + rot - 1) % rot;
+                                    }
                                 }
                             }
                             Keycode::B => placer.toggle(),
@@ -1756,54 +1957,18 @@ fn main() {
                             Keycode::Down => scroll_y -= 48,
                             _ => {}
                         }
-                    } else if tax_panel {
-                        // Tax panel keys
-                        match key {
-                            Keycode::Up => {
-                                if tax_tier > 0 { tax_tier -= 1; }
-                            }
-                            Keycode::Down => {
-                                if tax_tier < 4 { tax_tier += 1; }
-                            }
-                            Keycode::Left | Keycode::Right => {
-                                let new_rate = sim.players.first()
-                                    .map(|p| {
-                                        let r = p.tax_rates[tax_tier];
-                                        if matches!(key, Keycode::Right) {
-                                            r.saturating_add(8).min(128)
-                                        } else {
-                                            r.saturating_sub(8)
-                                        }
-                                    })
-                                    .unwrap_or(64);
-                                let cmd = anno_sim::commands::Command::SetTaxRate {
-                                    player: 0, tier: tax_tier as u8, rate: new_rate,
-                                };
-                                if let Some(client) = net_client.as_mut() {
-                                    let payload = cmd.encode();
-                                    let msg = anno_net::protocol::NetMessage
-                                        ::game_data(payload);
-                                    let _ = client.send(&msg);
-                                } else {
-                                    sim.apply_command(&cmd);
-                                }
-                            }
-                            Keycode::T | Keycode::Escape => {
-                                tax_panel = false;
-                            }
-                            Keycode::Space => {
-                                sim.paused = !sim.paused;
-                            }
-                            _ => {}
-                        }
                     } else if diplomacy_panel {
                         // Diplomacy panel keys
                         match key {
                             Keycode::Up => {
-                                if diplomacy_target > 1 { diplomacy_target -= 1; }
+                                if diplomacy_target > 1 {
+                                    diplomacy_target -= 1;
+                                }
                             }
                             Keycode::Down => {
-                                if diplomacy_target < 6 { diplomacy_target += 1; }
+                                if diplomacy_target < 6 {
+                                    diplomacy_target += 1;
+                                }
                             }
                             Keycode::Left | Keycode::Right => {
                                 use anno_sim::combat::Diplomacy;
@@ -1821,51 +1986,20 @@ fn main() {
                                         Diplomacy::War => Diplomacy::Neutral,
                                     }
                                 };
-                                // Route through apply_command so peace /
-                                // alliance proposals can be rejected; war
-                                // declarations remain unilateral.
-                                sim.apply_command(
-                                    &anno_sim::commands::Command::SetDiplomacy {
-                                        a: 0,
-                                        b: diplomacy_target,
-                                        state: next,
-                                    },
-                                );
+                                // Route through apply_command so war stays
+                                // unilateral while peace/alliance wait for the
+                                // source diplomacy acceptance path.
+                                sim.apply_command(&anno_sim::commands::Command::SetDiplomacy {
+                                    a: 0,
+                                    b: diplomacy_target,
+                                    state: next,
+                                });
                             }
-                            Keycode::G => {
-                                // "Pay tribute" — gift 500 gold to
-                                // the selected target. Manual section
-                                // on diplomacy: tribute is a per-
-                                // diplomacy-panel action, not a
-                                // separate menu.
-                                let amount = if shift_held { 5_000 } else { 500 };
-                                sim.apply_command(
-                                    &anno_sim::commands::Command::GiftGold {
-                                        from: 0,
-                                        to: diplomacy_target,
-                                        amount,
-                                    },
-                                );
-                            }
-                            Keycode::T => {
-                                // Gift 25 Tools (or 100 with Shift)
-                                // to the selected target — convenient
-                                // for early-game alliance support.
-                                let qty = if shift_held { 100 } else { 25 };
-                                sim.apply_command(
-                                    &anno_sim::commands::Command::GiftGoods {
-                                        from: 0,
-                                        to: diplomacy_target,
-                                        good: Good::Tools,
-                                        qty,
-                                    },
-                                );
-                            }
-                            Keycode::Y | Keycode::Escape => {
+                            Keycode::D | Keycode::Escape => {
                                 diplomacy_panel = false;
                             }
-                            Keycode::Space => {
-                                sim.paused = !sim.paused;
+                            Keycode::Pause => {
+                                sim.paused = true;
                             }
                             _ => {}
                         }
@@ -1881,8 +2015,7 @@ fn main() {
                                 if !world_mode && !islands.is_empty() {
                                     let start = current_island;
                                     loop {
-                                        current_island =
-                                            (current_island + 1) % islands.len();
+                                        current_island = (current_island + 1) % islands.len();
                                         if !islands[current_island].tiles.is_empty()
                                             || current_island == start
                                         {
@@ -1895,560 +2028,395 @@ fn main() {
                                 }
                             }
                             Keycode::W => {
-                                world_mode = !world_mode;
-                                needs_redraw = true;
-                                scroll_x = 0;
-                                scroll_y = 0;
+                                let pirate_slot = anno_sim::free_trader::PIRATE_SLOT;
+                                let mut surrendered = 0usize;
+
+                                for &ui in &selected_units {
+                                    if let Some(unit) = sim.military_units.get_mut(ui) {
+                                        if unit.owner == 0
+                                            && unit.is_alive()
+                                            && unit.unit_type.stats().is_naval
+                                        {
+                                            unit.owner = pirate_slot;
+                                            unit.target_x = unit.tile_x;
+                                            unit.target_y = unit.tile_y;
+                                            unit.combat_target = -1;
+                                            unit.escort_ship = -1;
+                                            unit.patrol.clear();
+                                            surrendered += 1;
+                                        }
+                                    }
+                                }
+                                selected_units.retain(|&ui| {
+                                    sim.military_units
+                                        .get(ui)
+                                        .map(|u| u.owner == 0 && u.is_alive())
+                                        .unwrap_or(false)
+                                });
+
+                                if let Some(si) = selected_trade_ship_idx.take() {
+                                    if let Some(ship) = sim.trade_ships.get_mut(si) {
+                                        if ship.owner == 0 && ship.active {
+                                            ship.owner = pirate_slot;
+                                            ship.route_id = u16::MAX;
+                                            ship.state = anno_sim::trade::ShipState::Idle;
+                                            ship.path.clear();
+                                            ship.path_idx = 0;
+                                            surrendered += 1;
+                                        }
+                                    }
+                                }
+
+                                if surrendered > 0 {
+                                    sim.diplomacy.set(pirate_slot, 0, Diplomacy::War);
+                                    println!(
+                                        "{surrendered} selected ship(s) surrendered to pirates",
+                                    );
+                                }
                             }
-                            Keycode::Space => {
-                                sim.paused = !sim.paused;
+                            Keycode::Pause => {
+                                sim.paused = true;
+                            }
+                            Keycode::F2 => {
+                                if sprite_zoom != 2 && !sprites_by_zoom[2].is_empty() {
+                                    sprite_zoom = 2;
+                                    needs_redraw = true;
+                                }
+                                display_zoom = 1;
+                            }
+                            Keycode::F3 => {
+                                if sprite_zoom != 1 && !sprites_by_zoom[1].is_empty() {
+                                    sprite_zoom = 1;
+                                    needs_redraw = true;
+                                }
+                                display_zoom = 1;
+                            }
+                            Keycode::F4 => {
+                                if sprite_zoom != 0 {
+                                    sprite_zoom = 0;
+                                    needs_redraw = true;
+                                }
+                                display_zoom = 1;
+                            }
+                            Keycode::F5 => {
+                                sim.speed_multiplier = 1;
+                            }
+                            Keycode::F6 => {
+                                sim.speed_multiplier = 2;
+                            }
+                            Keycode::F7 => {
+                                sim.speed_multiplier = 4;
                             }
                             Keycode::F => {
-                                if sim.speed_multiplier > 1 {
-                                    sim.speed_multiplier -= 1;
+                                video_speech_panel = !video_speech_panel;
+                                if video_speech_panel {
+                                    placer.active = false;
+                                    demolish_mode = false;
+                                    diplomacy_panel = false;
+                                    info_mode = false;
+                                    combat_mode = false;
+                                    ship_panel = false;
+                                    cities_panel = false;
+                                    save_panel = false;
+                                    selected_building_idx = None;
+                                    selected_units.clear();
+                                    selected_trade_ship_idx = None;
                                 }
                             }
-                            Keycode::G if editor_mode => {
-                                // In editor mode: append a sample
-                                // gold-target objective. Cycles
-                                // the threshold 5k/10k/20k/50k.
-                                use anno_sim::objectives::Objective;
-                                let amounts = [5_000, 10_000, 20_000, 50_000];
-                                let cur = sim.objectives.items.iter()
-                                    .filter_map(|(o, _)| match o {
-                                        Objective::AccumulateGold { amount } => Some(*amount),
-                                        _ => None,
-                                    })
-                                    .last()
-                                    .unwrap_or(0);
-                                let next = amounts.iter()
-                                    .find(|&&a| a > cur)
-                                    .copied()
-                                    .unwrap_or(amounts[0]);
-                                sim.objectives.items.push((
-                                    Objective::AccumulateGold { amount: next }, false,
-                                ));
-                                save_banner = Some((
-                                    format!("editor: added gold target {next}"),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                            Keycode::G => {
-                                if sim.speed_multiplier < 8 {
-                                    sim.speed_multiplier += 1;
+                            Keycode::J => {
+                                let mut target: Option<(usize, i32, i32, &'static str)> = None;
+
+                                if let Some(si) = selected_trade_ship_idx {
+                                    if let Some(ship) = sim.trade_ships.get(si) {
+                                        if ship.active {
+                                            target = Some((
+                                                current_island,
+                                                ship.world_x,
+                                                ship.world_y,
+                                                "trade ship",
+                                            ));
+                                        }
+                                    }
                                 }
-                            }
-                            Keycode::L if trade_route_mode => {
-                                if let Some(last) = draft_route_stops.last_mut() {
-                                    last.3 = 0; // LOAD only
+
+                                if target.is_none() {
+                                    if let Some(&ui) = selected_units.iter().find(|&&ui| {
+                                        sim.military_units
+                                            .get(ui)
+                                            .map(|u| u.is_alive())
+                                            .unwrap_or(false)
+                                    }) {
+                                        if let Some(unit) = sim.military_units.get(ui) {
+                                            target = Some((
+                                                current_island,
+                                                unit.tile_x,
+                                                unit.tile_y,
+                                                "unit",
+                                            ));
+                                        }
+                                    }
                                 }
-                            }
-                            Keycode::U if trade_route_mode => {
-                                if let Some(last) = draft_route_stops.last_mut() {
-                                    last.3 = 1; // UNLOAD only
+
+                                if target.is_none() {
+                                    if let Some(bi) = selected_building_idx {
+                                        if let Some(b) = sim.buildings.get(bi) {
+                                            if b.active {
+                                                let def = &defs[b.def_id as usize];
+                                                if let Some(island_idx) = islands
+                                                    .iter()
+                                                    .position(|i| i.number == b.island_id)
+                                                {
+                                                    target = Some((
+                                                        island_idx,
+                                                        b.tile_x as i32 + def.width as i32 / 2,
+                                                        b.tile_y as i32 + def.height as i32 / 2,
+                                                        "building",
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                            Keycode::B if trade_route_mode => {
-                                if let Some(last) = draft_route_stops.last_mut() {
-                                    last.3 = 2; // BOTH
+
+                                if target.is_none() {
+                                    if let Some(ref insp) = inspection {
+                                        if let Some(bi) = insp.building_idx {
+                                            if let Some(b) = sim.buildings.get(bi) {
+                                                if b.active {
+                                                    let def = &defs[b.def_id as usize];
+                                                    if let Some(island_idx) = islands
+                                                        .iter()
+                                                        .position(|i| i.number == b.island_id)
+                                                    {
+                                                        target = Some((
+                                                            island_idx,
+                                                            b.tile_x as i32 + def.width as i32 / 2,
+                                                            b.tile_y as i32 + def.height as i32 / 2,
+                                                            "building",
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(wi) = insp.warehouse_idx {
+                                            if let Some(wh) = sim.warehouses.get(wi) {
+                                                if wh.active {
+                                                    if let Some(island_idx) = islands
+                                                        .iter()
+                                                        .position(|i| i.number == wh.island_id)
+                                                    {
+                                                        target = Some((
+                                                            island_idx,
+                                                            wh.tile_x as i32,
+                                                            wh.tile_y as i32,
+                                                            "warehouse",
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            target = Some((
+                                                current_island,
+                                                insp.tile_x,
+                                                insp.tile_y,
+                                                "tile",
+                                            ));
+                                        }
+                                    }
+                                }
+
+                                if let Some((island_idx, tile_x, tile_y, label)) = target {
+                                    current_island = island_idx;
+                                    world_mode = false;
+                                    needs_redraw = true;
+                                    let (sx, sy) = scroll_for_island_tile(
+                                        &islands[current_island],
+                                        sprite_zoom,
+                                        display_zoom,
+                                        tile_x,
+                                        tile_y,
+                                    );
+                                    scroll_x = sx;
+                                    scroll_y = sy;
+                                    println!(
+                                        "Jumped to active {label}: island {} ({tile_x},{tile_y})",
+                                        islands[current_island].number,
+                                    );
                                 }
                             }
                             Keycode::B => {
                                 if !world_mode {
                                     demolish_mode = false;
-                                    tax_panel = false;
+                                    info_mode = false;
+                                    combat_mode = false;
+                                    selected_building_idx = None;
+                                    selected_units.clear();
+                                    selected_trade_ship_idx = None;
                                     placer.toggle();
                                 }
                             }
                             Keycode::D => {
-                                if !world_mode {
-                                    placer.active = false;
-                                    demolish_mode = !demolish_mode;
-                                    tax_panel = false;
-                                }
-                            }
-                            Keycode::T => {
-                                tax_panel = !tax_panel;
-                                if tax_panel {
-                                    placer.active = false;
-                                    demolish_mode = false;
-                                    diplomacy_panel = false;
-                                }
-                            }
-                            Keycode::Y => {
                                 diplomacy_panel = !diplomacy_panel;
                                 if diplomacy_panel {
                                     placer.active = false;
                                     demolish_mode = false;
-                                    tax_panel = false;
+                                    info_mode = false;
+                                    combat_mode = false;
+                                    selected_units.clear();
+                                    selected_trade_ship_idx = None;
                                 }
                             }
-                            Keycode::R if shift_held => {
-                                route_list_panel = !route_list_panel;
-                            }
-                            Keycode::R => {
-                                trade_route_mode = !trade_route_mode;
-                                if trade_route_mode {
+                            Keycode::I => {
+                                info_mode = !info_mode;
+                                if info_mode {
                                     placer.active = false;
                                     demolish_mode = false;
-                                    tax_panel = false;
                                     diplomacy_panel = false;
-                                    draft_route_stops.clear();
+                                    combat_mode = false;
+                                    selected_units.clear();
+                                    selected_trade_ship_idx = None;
                                 } else {
-                                    draft_route_stops.clear();
+                                    selected_building_idx = None;
+                                }
+                            }
+                            Keycode::K => {
+                                combat_mode = !combat_mode;
+                                if combat_mode {
+                                    placer.active = false;
+                                    demolish_mode = false;
+                                    diplomacy_panel = false;
+                                    info_mode = false;
+                                    selected_building_idx = None;
+                                } else {
+                                    selected_units.clear();
+                                    selected_trade_ship_idx = None;
                                 }
                             }
                             Keycode::Return | Keycode::KpEnter => {
-                                if trade_route_mode && draft_route_stops.len() >= 2 {
-                                    use anno_sim::trade::{
-                                        RouteStop, TradeRoute, TradeShip,
-                                    };
-                                    use anno_sim::types::Good;
-                                    let all_goods = [
-                                        Good::Wood, Good::Iron, Good::Ore, Good::Gold,
-                                        Good::Wool, Good::Sugar, Good::Tobacco,
-                                        Good::Cattle, Good::Grain, Good::Flour,
-                                        Good::Food, Good::Alcohol, Good::Cloth,
-                                        Good::Clothing, Good::Jewelry, Good::Tools,
-                                        Good::Bricks, Good::Swords, Good::Cannons,
-                                        Good::Muskets, Good::Stone, Good::Cocoa,
-                                        Good::Spices, Good::WildGame, Good::Cotton,
-                                        Good::Silk, Good::Fish, Good::Grapes,
-                                        Good::TobaccoProducts,
-                                    ];
-                                    let mut route = TradeRoute::new(next_route_id, 0);
-                                    for &(island_id, wx, wy, mode) in &draft_route_stops {
-                                        let (load, unload): (Vec<(Good, u16)>, Vec<Good>) =
-                                            match mode {
-                                                0 => (
-                                                    all_goods.iter().map(|&g| (g, 50)).collect(),
-                                                    Vec::new(),
-                                                ),
-                                                1 => (Vec::new(), all_goods.to_vec()),
-                                                _ => (
-                                                    all_goods.iter().map(|&g| (g, 50)).collect(),
-                                                    all_goods.to_vec(),
-                                                ),
-                                            };
-                                        route.add_stop(RouteStop {
-                                            island_id,
-                                            warehouse_x: wx,
-                                            warehouse_y: wy,
-                                            load_goods: load,
-                                            unload_goods: unload,
-                                        });
-                                    }
-                                    route.activate();
-                                    let route_id = route.id;
-                                    let (sx, sy) = (
-                                        draft_route_stops[0].1 as i32,
-                                        draft_route_stops[0].2 as i32,
-                                    );
-                                    sim.trade_routes.push(route);
-                                    sim.trade_ships.push(TradeShip::new(
-                                        0, route_id, sx, sy,
-                                    ));
-                                    next_route_id += 1;
-                                    println!(
-                                        "Created trade route {} ({} stops) + 1 ship",
-                                        route_id,
-                                        draft_route_stops.len(),
-                                    );
-                                    draft_route_stops.clear();
-                                    trade_route_mode = false;
-                                } else if !trade_route_mode && !chat_active {
+                                if !chat_active {
                                     chat_active = true;
                                     chat_input.clear();
                                 }
                             }
-                            Keycode::M => {
-                                // Toggle music
-                                music_enabled = !music_enabled;
-                                if music_enabled {
-                                    // Resume or start next track
-                                    if let Some(slot) = music_slot {
-                                        audio.streams.resume(slot);
-                                    }
-                                    println!("Music ON");
-                                } else {
-                                    if let Some(slot) = music_slot {
-                                        audio.streams.stop(slot);
-                                    }
-                                    println!("Music OFF");
-                                }
-                            }
-                            Keycode::N => {
-                                // Next track
-                                if !music_files.is_empty() {
-                                    if let Some(slot) = music_slot {
-                                        audio.streams.destroy(slot);
-                                    }
-                                    current_track = (current_track + 1) % music_files.len();
-                                    if let Some(slot) =
-                                        audio.streams.create(&music_files[current_track], 0)
-                                    {
-                                        if music_enabled {
-                                            if let Some(ref handle) = audio.stream_handle {
-                                                audio.streams.play(slot, music_volume, handle);
-                                            }
-                                        }
-                                        println!("Track: {}", music_files[current_track]);
-                                        music_slot = Some(slot);
-                                    }
-                                }
-                            }
-                            Keycode::V if shift_held => {
-                                eval_panel = !eval_panel;
-                            }
-                            Keycode::V => {
-                                // Cycle volume: 0.2 → 0.4 → 0.6 → 0.8 → 1.0 → 0.0 → 0.2...
-                                music_volume = if music_volume >= 0.95 {
-                                    0.0
-                                } else {
-                                    music_volume + 0.2
-                                };
-                                if let Some(slot) = music_slot {
-                                    audio.streams.set_volume(slot, music_volume);
-                                }
-                                println!("Volume: {:.0}%", music_volume * 100.0);
-                            }
-                            Keycode::S => {
-                                if let Some(ref rs) = rendered {
-                                    save_ppm(&rs.rgba, rs.width, rs.height, &scenario_name);
-                                }
-                            }
                             Keycode::H => {
-                                show_hud = !show_hud;
-                            }
-                            Keycode::C if shift_held => {
-                                cities_panel = !cities_panel;
+                                let owned: Vec<usize> = sim
+                                    .warehouses
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, w)| w.active && w.owner == 0)
+                                    .map(|(idx, _)| idx)
+                                    .collect();
+                                if !owned.is_empty() {
+                                    let current_island_number =
+                                        islands.get(current_island).map(|i| i.number).unwrap_or(0);
+                                    let current_pos = warehouse_cycle_idx
+                                        .and_then(|idx| owned.iter().position(|&i| i == idx))
+                                        .or_else(|| {
+                                            owned.iter().position(|&idx| {
+                                                sim.warehouses[idx].island_id
+                                                    == current_island_number
+                                            })
+                                        });
+                                    let next_pos =
+                                        current_pos.map_or(0, |pos| (pos + 1) % owned.len());
+                                    let target_idx = owned[next_pos];
+                                    warehouse_cycle_idx = Some(target_idx);
+                                    let wh = &sim.warehouses[target_idx];
+                                    if let Some(island_idx) =
+                                        islands.iter().position(|i| i.number == wh.island_id)
+                                    {
+                                        current_island = island_idx;
+                                        world_mode = false;
+                                        needs_redraw = true;
+                                        let (sx, sy) = scroll_for_island_tile(
+                                            &islands[current_island],
+                                            sprite_zoom,
+                                            display_zoom,
+                                            wh.tile_x as i32,
+                                            wh.tile_y as i32,
+                                        );
+                                        scroll_x = sx;
+                                        scroll_y = sy;
+                                    }
+                                }
                             }
                             Keycode::C => {
-                                show_coverage = !show_coverage;
+                                cities_panel = !cities_panel;
                             }
-                            Keycode::A => {
-                                market_panel = !market_panel;
-                            }
-                            Keycode::J if shift_held => {
-                                music_panel = !music_panel;
-                            }
-                            Keycode::J => {
+                            Keycode::S => {
                                 ship_panel = !ship_panel;
                             }
-                            Keycode::Question | Keycode::Slash => {
-                                obj_panel = !obj_panel;
-                            }
-                            Keycode::F2 => {
-                                scenario_picker = !scenario_picker;
-                            }
-                            Keycode::F3 => {
-                                save_panel = !save_panel;
-                            }
-                            Keycode::F10 => {
-                                settings_panel = !settings_panel;
-                            }
-                            Keycode::F11 => {
-                                help_panel = !help_panel;
-                            }
-                            Keycode::F12 => {
-                                show_perf = !show_perf;
-                            }
-                            Keycode::P if editor_mode => {
-                                // Append a population objective:
-                                // Settlers 50 / Citizens 100 /
-                                // Merchants 200 / Aristocrats 400.
-                                use anno_sim::objectives::Objective;
-                                let goal = match sim.objectives.items.iter()
-                                    .filter_map(|(o, _)| match o {
-                                        Objective::ReachPopulation { tier, count } =>
-                                            Some((*tier, *count)),
-                                        _ => None,
-                                    })
-                                    .last()
-                                {
-                                    None => (1u8, 50u32),         // Settlers 50
-                                    Some((1, _)) => (2, 100),     // Citizens 100
-                                    Some((2, _)) => (3, 200),     // Merchants 200
-                                    Some((3, _)) => (4, 400),     // Aristocrats 400
-                                    _ => (1, 50),
-                                };
-                                sim.objectives.items.push((
-                                    Objective::ReachPopulation {
-                                        tier: goal.0, count: goal.1,
-                                    }, false,
-                                ));
-                                save_banner = Some((
-                                    format!(
-                                        "editor: added population target tier{} = {}",
-                                        goal.0, goal.1,
-                                    ),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                            Keycode::Backspace if editor_mode => {
-                                // Pop the most-recent objective.
-                                if let Some((o, _)) = sim.objectives.items.pop() {
-                                    save_banner = Some((
-                                        format!("editor: removed {}", o.label()),
-                                        std::time::Instant::now(),
-                                    ));
+                            Keycode::O => {
+                                options_panel = !options_panel;
+                                if options_panel {
+                                    placer.active = false;
+                                    demolish_mode = false;
+                                    diplomacy_panel = false;
+                                    info_mode = false;
+                                    combat_mode = false;
+                                    ship_panel = false;
+                                    cities_panel = false;
+                                    save_panel = false;
+                                    video_speech_panel = false;
+                                    selected_building_idx = None;
+                                    selected_units.clear();
+                                    selected_trade_ship_idx = None;
                                 }
                             }
-                            Keycode::E if shift_held => {
-                                // Toggle scenario editor (Shift+E).
-                                // Pauses the sim so buildings placed
-                                // here are scenario-state, not live.
-                                editor_mode = !editor_mode;
-                                sim.paused = editor_mode;
-                                if editor_mode {
-                                    // Ensure slots 1..3 exist so the
-                                    // player can place AI-owned
-                                    // buildings without bounds checks
-                                    // failing.
-                                    while sim.players.len() < 4 {
-                                        let idx = sim.players.len() as u8;
-                                        sim.players.push(
-                                            anno_sim::player::Player::new_ai(idx, 0),
+                            Keycode::Num1
+                            | Keycode::Num2
+                            | Keycode::Num3
+                            | Keycode::Num4
+                            | Keycode::Num5
+                            | Keycode::Num6
+                            | Keycode::Num7
+                            | Keycode::Num8
+                            | Keycode::Num9 => {
+                                if let Some(slot) = troop_assembly_slot(key) {
+                                    if ctrl_held {
+                                        let stored: Vec<usize> = selected_units
+                                            .iter()
+                                            .copied()
+                                            .filter(|&ui| {
+                                                sim.military_units
+                                                    .get(ui)
+                                                    .map(|u| u.owner == 0 && u.is_alive())
+                                                    .unwrap_or(false)
+                                            })
+                                            .collect();
+                                        troop_assemblies[slot] = stored;
+                                        println!(
+                                            "Stored {} unit(s) in troop assembly {}",
+                                            troop_assemblies[slot].len(),
+                                            slot + 1,
                                         );
-                                    }
-                                }
-                                let msg = if editor_mode {
-                                    format!(
-                                        "EDITOR mode ON — placing as player {} ([/] cycle)",
-                                        editor_owner,
-                                    )
-                                } else {
-                                    "EDITOR mode OFF".to_string()
-                                };
-                                save_banner = Some((msg, std::time::Instant::now()));
-                            }
-                            Keycode::LeftBracket if editor_mode => {
-                                editor_owner = (editor_owner + 3) % 4;
-                                save_banner = Some((
-                                    format!("editor owner = player {editor_owner}"),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                            Keycode::RightBracket if editor_mode => {
-                                editor_owner = (editor_owner + 1) % 4;
-                                save_banner = Some((
-                                    format!("editor owner = player {editor_owner}"),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                            Keycode::F8 => {
-                                // Export the current island layout to an
-                                // .szs file. Useful for scenario authoring
-                                // — modify in-game, then F8 to persist.
-                                let path = save_dir.join(format!("{scenario_name}.export.szs"));
-                                let bytes = anno_formats::szs::SzsFile::encode_islands(&islands);
-                                if let Some(parent) = path.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                let msg = match std::fs::write(&path, &bytes) {
-                                    Ok(()) => format!(
-                                        "exported {} islands → {}",
-                                        islands.len(), path.display(),
-                                    ),
-                                    Err(e) => format!("export FAILED: {e}"),
-                                };
-                                println!("{msg}");
-                                save_banner = Some((msg, std::time::Instant::now()));
-                            }
-                            Keycode::F7 => {
-                                // Found a colony: drop a Kontor on the
-                                // active island if the player has none
-                                // there yet. Costs 500 gold.
-                                if !world_mode {
-                                    let island = &islands[current_island];
-                                    let island_id = island.number;
-                                    const COLONY_COST: i32 = 500;
-                                    let already = sim.warehouses.iter().any(|w| {
-                                        w.active && w.owner == 0
-                                            && w.island_id == island_id
-                                    });
-                                    if already {
-                                        save_banner = Some((
-                                            "colony FAILED: already have a Kontor here"
-                                                .to_string(),
-                                            std::time::Instant::now(),
-                                        ));
-                                    } else if sim.players[0].gold < COLONY_COST {
-                                        save_banner = Some((
-                                            "colony FAILED: need 500 gold"
-                                                .to_string(),
-                                            std::time::Instant::now(),
-                                        ));
                                     } else {
-                                        // Find a walkable spot near the
-                                        // island center for the new Kontor.
-                                        let map_idx = sim.island_maps.iter()
-                                            .position(|m| m.island_id == island_id);
-                                        if let Some(idx) = map_idx {
-                                            let cx = (island.width / 2) as u16;
-                                            let cy = (island.height / 2) as u16;
-                                            let spot = sim.island_maps[idx]
-                                                .find_open_spot(cx, cy, 2, 2, 20);
-                                            if let Some((bx, by)) = spot {
-                                                sim.players[0].gold -= COLONY_COST;
-                                                let mut wh = anno_sim::warehouse::Warehouse::new(
-                                                    island_id, 0, bx, by,
-                                                );
-                                                // Seed initial capacities so
-                                                // carriers can deposit goods.
-                                                for g in [
-                                                    Good::Wood, Good::Iron, Good::Tools,
-                                                    Good::Food, Good::Cloth, Good::Bricks,
-                                                    Good::Stone, Good::Grain, Good::Flour,
-                                                    Good::Wool, Good::Sugar, Good::Tobacco,
-                                                ] {
-                                                    wh.set_capacity(g, 100);
-                                                }
-                                                sim.warehouses.push(wh);
-                                                // Initialize coverage for this island.
-                                                if !sim.coverage_maps.iter()
-                                                    .any(|c| c.island_id == island_id)
-                                                {
-                                                    sim.coverage_maps.push(
-                                                        anno_sim::coverage::CoverageMap::new(
-                                                            island_id,
-                                                            island.width as u16,
-                                                            island.height as u16,
-                                                        ),
-                                                    );
-                                                }
-                                                let msg = format!(
-                                                    "Colony founded on island {} at ({},{})",
-                                                    island_id, bx, by,
-                                                );
-                                                println!("{msg}");
-                                                save_banner = Some((msg, std::time::Instant::now()));
-                                                needs_redraw = true;
-                                            } else {
-                                                save_banner = Some((
-                                                    "colony FAILED: no buildable spot found"
-                                                        .to_string(),
-                                                    std::time::Instant::now(),
-                                                ));
-                                            }
+                                        let recalled: Vec<usize> = troop_assemblies[slot]
+                                            .iter()
+                                            .copied()
+                                            .filter(|&ui| {
+                                                sim.military_units
+                                                    .get(ui)
+                                                    .map(|u| u.owner == 0 && u.is_alive())
+                                                    .unwrap_or(false)
+                                            })
+                                            .collect();
+                                        troop_assemblies[slot] = recalled.clone();
+                                        if !recalled.is_empty() {
+                                            selected_units = recalled;
+                                            selected_trade_ship_idx = None;
+                                            selected_building_idx = None;
+                                            inspection = None;
+                                            println!(
+                                                "Recalled {} unit(s) from troop assembly {}",
+                                                selected_units.len(),
+                                                slot + 1,
+                                            );
                                         }
                                     }
                                 }
                             }
-                            Keycode::F4 => {
-                                // Buy a TradeShip at the player's first
-                                // active warehouse (1000 gold).
-                                const TRADE_SHIP_COST: i32 = 1000;
-                                if sim.players.first().map(|p| p.gold).unwrap_or(0)
-                                    < TRADE_SHIP_COST
-                                {
-                                    save_banner = Some((
-                                        "ship build FAILED: not enough gold (1000 needed)"
-                                            .to_string(),
-                                        std::time::Instant::now(),
-                                    ));
-                                } else if let Some(wh) = sim.warehouses.iter()
-                                    .find(|w| w.active && w.owner == 0)
-                                {
-                                    let (sx, sy) = (wh.tile_x as i32, wh.tile_y as i32);
-                                    sim.players[0].gold -= TRADE_SHIP_COST;
-                                    let ship = anno_sim::trade::TradeShip::new(
-                                        0, 0, sx, sy,
-                                    );
-                                    let msg = format!(
-                                        "Built TradeShip at ({sx},{sy}) — assign via R"
-                                    );
-                                    println!("{msg}");
-                                    save_banner = Some((msg, std::time::Instant::now()));
-                                    sim.trade_ships.push(ship);
-                                } else {
-                                    save_banner = Some((
-                                        "ship build FAILED: no warehouse"
-                                            .to_string(),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                            Keycode::F6 => {
-                                show_paths = !show_paths;
-                            }
-                            Keycode::F5 => {
-                                let snap = sim.snapshot();
-                                let msg = match anno_sim::save::save_to_file(
-                                    &quicksave_path, &snap,
-                                ) {
-                                    Ok(()) => format!(
-                                        "saved → {} ({} buildings, {} gold)",
-                                        quicksave_path.display(),
-                                        sim.buildings.len(),
-                                        sim.players.first().map(|p| p.gold).unwrap_or(0),
-                                    ),
-                                    Err(e) => format!("save FAILED: {e}"),
-                                };
-                                println!("{msg}");
-                                save_banner = Some((msg, std::time::Instant::now()));
-                            }
-                            Keycode::F9 => {
-                                let msg = match anno_sim::save::load_from_file(
-                                    &quicksave_path,
-                                ) {
-                                    Ok(state) => {
-                                        let bldgs = state.buildings.len();
-                                        let gold = state.players
-                                            .first().map(|p| p.gold).unwrap_or(0);
-                                        sim.apply_snapshot(state);
-                                        needs_redraw = true;
-                                        format!(
-                                            "loaded ← {} ({} buildings, {} gold)",
-                                            quicksave_path.display(), bldgs, gold,
-                                        )
-                                    }
-                                    Err(e) => format!("load FAILED: {e}"),
-                                };
-                                println!("{msg}");
-                                save_banner = Some((msg, std::time::Instant::now()));
-                            }
-                            Keycode::Equals | Keycode::Plus | Keycode::KpPlus => {
-                                display_zoom = (display_zoom + 1).min(8);
-                            }
-                            Keycode::Minus | Keycode::KpMinus => {
-                                display_zoom = (display_zoom - 1).max(1);
-                            }
-                            Keycode::Num1 => {
-                                if !selected_units.is_empty() {
-                                    apply_formation(
-                                        &mut sim.military_units,
-                                        &selected_units,
-                                        anno_sim::formation::Formation::Hori,
-                                    );
-                                } else if sprite_zoom != 0 {
-                                    sprite_zoom = 0;
-                                    needs_redraw = true;
-                                }
-                            }
-                            Keycode::Num2 => {
-                                if !selected_units.is_empty() {
-                                    apply_formation(
-                                        &mut sim.military_units,
-                                        &selected_units,
-                                        anno_sim::formation::Formation::Vert,
-                                    );
-                                } else if sprite_zoom != 1 && !sprites_by_zoom[1].is_empty() {
-                                    sprite_zoom = 1;
-                                    needs_redraw = true;
-                                }
-                            }
-                            Keycode::Num3 => {
-                                if !selected_units.is_empty() {
-                                    apply_formation(
-                                        &mut sim.military_units,
-                                        &selected_units,
-                                        anno_sim::formation::Formation::Quad,
-                                    );
-                                } else if sprite_zoom != 2 && !sprites_by_zoom[2].is_empty() {
-                                    sprite_zoom = 2;
-                                    needs_redraw = true;
-                                }
+                            Keycode::L => {
+                                save_panel = !save_panel;
                             }
                             _ => {}
                         }
@@ -2488,21 +2456,28 @@ fn main() {
                             let tex_x = (x - dst_x) / display_zoom;
                             let tex_y = (y - dst_y) / display_zoom;
                             let (tile_x, tile_y) = screen_to_tile(
-                                tex_x, tex_y, rs.origin_x, rs.origin_y,
-                                rs.tile_w, rs.tile_h,
+                                tex_x,
+                                tex_y,
+                                rs.origin_x,
+                                rs.origin_y,
+                                rs.tile_w,
+                                rs.tile_h,
                             );
                             let outcome = try_place_building(
-                                &mut sim, &mut islands, current_island,
-                                &defs, &cod, &placer, tile_x, tile_y,
-                                if editor_mode { editor_owner } else { 0 },
-                                editor_mode,
+                                &mut sim,
+                                &mut islands,
+                                current_island,
+                                &defs,
+                                &cod,
+                                &placer,
+                                tile_x,
+                                tile_y,
                             );
                             match outcome {
                                 PlaceOutcome::Placed => {
                                     println!(
                                         "Placed {} at ({},{})",
-                                        &placer.buildable[placer.selected].name,
-                                        tile_x, tile_y,
+                                        &placer.buildable[placer.selected].name, tile_x, tile_y,
                                     );
                                     if let (Some(sfx), Some(handle)) =
                                         (place_sound_slot, &audio.stream_handle)
@@ -2524,18 +2499,19 @@ fn main() {
                                         std::time::Instant::now(),
                                     ));
                                 }
-                                PlaceOutcome::WrongClimate { needs, actual } => {
+                                PlaceOutcome::MissingFertility { required } => {
                                     save_banner = Some((
                                         format!(
-                                            "build FAILED: needs {} climate (island is {})",
-                                            needs.label(), actual.label(),
+                                            "build FAILED: needs {} fertility",
+                                            fertility_label(required),
                                         ),
                                         std::time::Instant::now(),
                                     ));
                                 }
                                 PlaceOutcome::NotCoastal => {
                                     save_banner = Some((
-                                        "build FAILED: Fisheries must be placed on the coast".into(),
+                                        "build FAILED: Fisheries must be placed on the coast"
+                                            .into(),
                                         std::time::Instant::now(),
                                     ));
                                 }
@@ -2545,20 +2521,22 @@ fn main() {
                                 }
                                 PlaceOutcome::WrongTier { needed, have } => {
                                     let tier_name = |t: u8| match t {
-                                        0 => "Pioneer", 1 => "Settler",
-                                        2 => "Citizen", 3 => "Merchant",
+                                        0 => "Pioneer",
+                                        1 => "Settler",
+                                        2 => "Citizen",
+                                        3 => "Merchant",
                                         _ => "Aristocrat",
                                     };
                                     save_banner = Some((
                                         format!(
                                             "build FAILED: needs {} tier (you're at {})",
-                                            tier_name(needed), tier_name(have),
+                                            tier_name(needed),
+                                            tier_name(have),
                                         ),
                                         std::time::Instant::now(),
                                     ));
                                 }
-                                PlaceOutcome::NoIslandMap
-                                | PlaceOutcome::NoBuildingSelected => {}
+                                PlaceOutcome::NoIslandMap | PlaceOutcome::NoBuildingSelected => {}
                             }
                         }
                     } else if demolish_mode && !world_mode {
@@ -2571,7 +2549,12 @@ fn main() {
                             let tex_x = (x - dst_x) / display_zoom;
                             let tex_y = (y - dst_y) / display_zoom;
                             let (tile_x, tile_y) = screen_to_tile(
-                                tex_x, tex_y, rs.origin_x, rs.origin_y, rs.tile_w, rs.tile_h,
+                                tex_x,
+                                tex_y,
+                                rs.origin_x,
+                                rs.origin_y,
+                                rs.tile_w,
+                                rs.tile_h,
                             );
 
                             let island = &islands[current_island];
@@ -2583,8 +2566,10 @@ fn main() {
                                     let def = &defs[b.def_id as usize];
                                     let bx = b.tile_x as i32;
                                     let by = b.tile_y as i32;
-                                    tile_x >= bx && tile_x < bx + def.width as i32
-                                        && tile_y >= by && tile_y < by + def.height as i32
+                                    tile_x >= bx
+                                        && tile_x < bx + def.width as i32
+                                        && tile_y >= by
+                                        && tile_y < by + def.height as i32
                                 }
                             });
 
@@ -2647,64 +2632,12 @@ fn main() {
                                 }
                             }
                         }
-                    } else if trade_route_mode && !world_mode {
-                        // Trade-route mode: clicking a warehouse adds it as a stop.
-                        if let Some(ref rs) = rendered {
-                            let dst_w = rs.width as i32 * display_zoom;
-                            let dst_h = rs.height as i32 * display_zoom;
-                            let dst_x = (WINDOW_W as i32 - dst_w) / 2 + scroll_x;
-                            let dst_y = (WINDOW_H as i32 - dst_h) / 2 + scroll_y;
-                            let tex_x = (x - dst_x) / display_zoom;
-                            let tex_y = (y - dst_y) / display_zoom;
-                            let (tile_x, tile_y) = screen_to_tile(
-                                tex_x, tex_y, rs.origin_x, rs.origin_y,
-                                rs.tile_w, rs.tile_h,
-                            );
-                            let island_id = islands[current_island].number;
-                            let wh = sim.warehouses.iter().find(|w| {
-                                w.active
-                                    && w.island_id == island_id
-                                    && (w.tile_x as i32 - tile_x).abs() <= 2
-                                    && (w.tile_y as i32 - tile_y).abs() <= 2
-                            });
-                            if let Some(w) = wh {
-                                // First stop defaults to LOAD-only
-                                // (origin); subsequent stops default to
-                                // UNLOAD-only. Player can override via L/U/B.
-                                let default_mode = if draft_route_stops.is_empty() {
-                                    0 // LOAD
-                                } else {
-                                    1 // UNLOAD
-                                };
-                                let stop = (
-                                    w.island_id, w.tile_x, w.tile_y, default_mode,
-                                );
-                                let dup = draft_route_stops.last()
-                                    .map(|&(iid, x, y, _)| {
-                                        (iid, x, y) == (stop.0, stop.1, stop.2)
-                                    })
-                                    .unwrap_or(false);
-                                if !dup {
-                                    draft_route_stops.push(stop);
-                                    let mode_str = ["LOAD", "UNLOAD", "BOTH"][stop.3 as usize];
-                                    println!(
-                                        "Route stop {}: island {} ({},{}) [{}]",
-                                        draft_route_stops.len(),
-                                        stop.0, stop.1, stop.2, mode_str,
-                                    );
-                                }
-                            } else {
-                                println!(
-                                    "No warehouse near ({},{}) on this island",
-                                    tile_x, tile_y,
-                                );
-                            }
-                        }
                     } else {
-                        // Check if the click landed on a player-owned military unit.
-                        // If so, select it (Shift+click adds to selection); else drag.
+                        // Combat mode owns unit selection. Outside it,
+                        // left-click keeps its map drag / info behavior.
                         let mut hit_unit: Option<usize> = None;
-                        if !world_mode {
+                        let mut hit_trade_ship: Option<usize> = None;
+                        if combat_mode && !world_mode {
                             if let Some(ref rs) = rendered {
                                 let dst_w = rs.width as i32 * display_zoom;
                                 let dst_h = rs.height as i32 * display_zoom;
@@ -2713,13 +2646,24 @@ fn main() {
                                 let tex_x = (x - dst_x) / display_zoom;
                                 let tex_y = (y - dst_y) / display_zoom;
                                 let (tile_x, tile_y) = screen_to_tile(
-                                    tex_x, tex_y, rs.origin_x, rs.origin_y,
-                                    rs.tile_w, rs.tile_h,
+                                    tex_x,
+                                    tex_y,
+                                    rs.origin_x,
+                                    rs.origin_y,
+                                    rs.tile_w,
+                                    rs.tile_h,
                                 );
                                 hit_unit = sim.military_units.iter().position(|u| {
-                                    u.is_alive() && u.owner == 0
+                                    u.is_alive()
+                                        && u.owner == 0
                                         && (u.tile_x - tile_x).abs() <= 1
                                         && (u.tile_y - tile_y).abs() <= 1
+                                });
+                                hit_trade_ship = sim.trade_ships.iter().position(|s| {
+                                    s.active
+                                        && s.owner == 0
+                                        && (s.world_x - tile_x).abs() <= 1
+                                        && (s.world_y - tile_y).abs() <= 1
                                 });
                             }
                         }
@@ -2733,15 +2677,17 @@ fn main() {
                                 selected_units.push(ui);
                             }
                             selected_building_idx = None;
-                            println!(
-                                "Selected {} unit(s)",
-                                selected_units.len(),
-                            );
+                            selected_trade_ship_idx = None;
+                            println!("Selected {} unit(s)", selected_units.len(),);
+                        } else if let Some(si) = hit_trade_ship {
+                            selected_units.clear();
+                            selected_trade_ship_idx = Some(si);
+                            selected_building_idx = None;
+                            println!("Selected trade ship #{si}",);
                         } else {
-                            // No unit hit — try a building hit to open
-                            // the Anno-style info card. Falls through
-                            // to drag-pan if no building is under the
-                            // cursor either.
+                            // In info mode, clicks open the Anno-style
+                            // object card. Outside it, empty-map clicks
+                            // keep their drag-pan behavior.
                             let mut hit_building: Option<usize> = None;
                             if !world_mode {
                                 if let Some(ref rs) = rendered {
@@ -2752,8 +2698,12 @@ fn main() {
                                     let tex_x = (x - dst_x) / display_zoom;
                                     let tex_y = (y - dst_y) / display_zoom;
                                     let (tile_x, tile_y) = screen_to_tile(
-                                        tex_x, tex_y, rs.origin_x, rs.origin_y,
-                                        rs.tile_w, rs.tile_h,
+                                        tex_x,
+                                        tex_y,
+                                        rs.origin_x,
+                                        rs.origin_y,
+                                        rs.tile_w,
+                                        rs.tile_h,
                                     );
                                     let island_id = islands[current_island].number;
                                     hit_building = sim.buildings.iter().position(|b| {
@@ -2769,16 +2719,18 @@ fn main() {
                                     });
                                 }
                             }
-                            if hit_building.is_some() {
+                            if info_mode {
                                 selected_building_idx = hit_building;
                                 if !selected_units.is_empty() {
                                     selected_units.clear();
                                 }
+                                selected_trade_ship_idx = None;
                             } else {
                                 selected_building_idx = None;
                                 if !selected_units.is_empty() {
                                     selected_units.clear();
                                 }
+                                selected_trade_ship_idx = None;
                                 dragging = true;
                                 drag_start = (x - scroll_x, y - scroll_y);
                             }
@@ -2792,6 +2744,10 @@ fn main() {
                     y,
                     ..
                 } => {
+                    if sim.paused {
+                        sim.paused = false;
+                        continue;
+                    }
                     // If units are selected: issue a move order to that tile.
                     if !world_mode && !selected_units.is_empty() {
                         if let Some(ref rs) = rendered {
@@ -2802,8 +2758,12 @@ fn main() {
                             let tex_x = (x - dst_x) / display_zoom;
                             let tex_y = (y - dst_y) / display_zoom;
                             let (tile_x, tile_y) = screen_to_tile(
-                                tex_x, tex_y, rs.origin_x, rs.origin_y,
-                                rs.tile_w, rs.tile_h,
+                                tex_x,
+                                tex_y,
+                                rs.origin_x,
+                                rs.origin_y,
+                                rs.tile_w,
+                                rs.tile_h,
                             );
                             let mut moved = 0;
                             for &ui in &selected_units {
@@ -2817,10 +2777,7 @@ fn main() {
                                     }
                                 }
                             }
-                            println!(
-                                "Move order → ({},{}) for {moved} unit(s)",
-                                tile_x, tile_y,
-                            );
+                            println!("Move order → ({},{}) for {moved} unit(s)", tile_x, tile_y,);
                         }
                         continue;
                     }
@@ -2834,7 +2791,12 @@ fn main() {
                             let tex_x = (x - dst_x) / display_zoom;
                             let tex_y = (y - dst_y) / display_zoom;
                             let (tile_x, tile_y) = screen_to_tile(
-                                tex_x, tex_y, rs.origin_x, rs.origin_y, rs.tile_w, rs.tile_h,
+                                tex_x,
+                                tex_y,
+                                rs.origin_x,
+                                rs.origin_y,
+                                rs.tile_w,
+                                rs.tile_h,
                             );
 
                             let island = &islands[current_island];
@@ -2846,8 +2808,10 @@ fn main() {
                                     let def = &defs[b.def_id as usize];
                                     let bx = b.tile_x as i32;
                                     let by = b.tile_y as i32;
-                                    tile_x >= bx && tile_x < bx + def.width as i32
-                                        && tile_y >= by && tile_y < by + def.height as i32
+                                    tile_x >= bx
+                                        && tile_x < bx + def.width as i32
+                                        && tile_y >= by
+                                        && tile_y < by + def.height as i32
                                 }
                             });
 
@@ -2899,14 +2863,35 @@ fn main() {
                                 info.push_str("| WH: ");
                                 let mut goods_shown = 0;
                                 let all_goods = [
-                                    Good::Wood, Good::Iron, Good::Ore, Good::Gold,
-                                    Good::Wool, Good::Sugar, Good::Tobacco, Good::Cattle,
-                                    Good::Grain, Good::Flour, Good::Food, Good::Alcohol,
-                                    Good::Cloth, Good::Clothing, Good::Jewelry,
-                                    Good::Tools, Good::Bricks, Good::Swords, Good::Cannons,
-                                    Good::Muskets, Good::Stone, Good::Cocoa, Good::Spices,
-                                    Good::WildGame, Good::Cotton, Good::Silk, Good::Fish,
-                                    Good::Grapes, Good::TobaccoProducts,
+                                    Good::Wood,
+                                    Good::Iron,
+                                    Good::Ore,
+                                    Good::Gold,
+                                    Good::Wool,
+                                    Good::Sugar,
+                                    Good::Tobacco,
+                                    Good::Cattle,
+                                    Good::Grain,
+                                    Good::Flour,
+                                    Good::Food,
+                                    Good::Alcohol,
+                                    Good::Cloth,
+                                    Good::Clothing,
+                                    Good::Jewelry,
+                                    Good::Tools,
+                                    Good::Bricks,
+                                    Good::Swords,
+                                    Good::Cannons,
+                                    Good::Muskets,
+                                    Good::Stone,
+                                    Good::Cocoa,
+                                    Good::Spices,
+                                    Good::WildGame,
+                                    Good::Cotton,
+                                    Good::Silk,
+                                    Good::Fish,
+                                    Good::Grapes,
+                                    Good::TobaccoProducts,
                                 ];
                                 for &g in &all_goods {
                                     let qty = w.stock(g);
@@ -2926,9 +2911,11 @@ fn main() {
 
                             if building_idx.is_none() && warehouse_idx.is_none() {
                                 // Check what tile sprite is here
-                                if let Some(tile) = island.tiles.iter().find(|t| {
-                                    t.x as i32 == tile_x && t.y as i32 == tile_y
-                                }) {
+                                if let Some(tile) = island
+                                    .tiles
+                                    .iter()
+                                    .find(|t| t.x as i32 == tile_x && t.y as i32 == tile_y)
+                                {
                                     info.push_str(&format!("| sprite#{}", tile.building_id));
                                 } else {
                                     info.push_str("| (empty)");
@@ -2957,11 +2944,17 @@ fn main() {
                     last_drag_place_tile = None;
                 }
 
-                Event::KeyUp { keycode: Some(k), .. }
-                    if matches!(k, Keycode::LShift | Keycode::RShift) =>
-                {
-                    shift_held = false;
-                }
+                Event::KeyUp {
+                    keycode: Some(k), ..
+                } => match k {
+                    Keycode::LShift | Keycode::RShift => {
+                        shift_held = false;
+                    }
+                    Keycode::LCtrl | Keycode::RCtrl => {
+                        ctrl_held = false;
+                    }
+                    _ => {}
+                },
 
                 Event::TextInput { ref text, .. } if chat_active => {
                     if chat_input.len() < 200 {
@@ -2989,15 +2982,23 @@ fn main() {
                             let tex_x = (x - dst_x) / display_zoom;
                             let tex_y = (y - dst_y) / display_zoom;
                             let (tile_x, tile_y) = screen_to_tile(
-                                tex_x, tex_y, rs.origin_x, rs.origin_y,
-                                rs.tile_w, rs.tile_h,
+                                tex_x,
+                                tex_y,
+                                rs.origin_x,
+                                rs.origin_y,
+                                rs.tile_w,
+                                rs.tile_h,
                             );
                             if last_drag_place_tile != Some((tile_x, tile_y)) {
                                 let outcome = try_place_building(
-                                    &mut sim, &mut islands, current_island,
-                                    &defs, &cod, &placer, tile_x, tile_y,
-                                    if editor_mode { editor_owner } else { 0 },
-                                    editor_mode,
+                                    &mut sim,
+                                    &mut islands,
+                                    current_island,
+                                    &defs,
+                                    &cod,
+                                    &placer,
+                                    tile_x,
+                                    tile_y,
                                 );
                                 if matches!(outcome, PlaceOutcome::Placed) {
                                     needs_redraw = true;
@@ -3010,14 +3011,6 @@ fn main() {
                                 }
                             }
                         }
-                    }
-                }
-
-                Event::MouseWheel { y, .. } => {
-                    if y > 0 {
-                        display_zoom = (display_zoom + 1).min(8);
-                    } else if y < 0 {
-                        display_zoom = (display_zoom - 1).max(1);
                     }
                 }
 
@@ -3035,9 +3028,8 @@ fn main() {
                 let tex_x = (mouse_x - dst_x) / display_zoom;
                 let tex_y = (mouse_y - dst_y) / display_zoom;
 
-                let (tx, ty) = screen_to_tile(
-                    tex_x, tex_y, rs.origin_x, rs.origin_y, rs.tile_w, rs.tile_h,
-                );
+                let (tx, ty) =
+                    screen_to_tile(tex_x, tex_y, rs.origin_x, rs.origin_y, rs.tile_w, rs.tile_h);
                 if placer.active {
                     placer.hover_tile = Some((tx, ty));
                 }
@@ -3048,8 +3040,10 @@ fn main() {
                             let def = &defs[b.def_id as usize];
                             let bx = b.tile_x as i32;
                             let by = b.tile_y as i32;
-                            tx >= bx && tx < bx + def.width as i32
-                                && ty >= by && ty < by + def.height as i32
+                            tx >= bx
+                                && tx < bx + def.width as i32
+                                && ty >= by
+                                && ty < by + def.height as i32
                         }
                     });
                 }
@@ -3070,7 +3064,9 @@ fn main() {
             for ev in evs {
                 match ev {
                     anno_net::session::SessionEvent::PlayerJoined {
-                        slot, player_id, name,
+                        slot,
+                        player_id,
+                        name,
                     } => {
                         println!("[net] joined slot={slot} id={player_id} name={name}");
                         net_status = format!(
@@ -3091,7 +3087,9 @@ fn main() {
                         let line = format!("p{from_player}: {text}");
                         println!("[chat] {line}");
                         chat_log.push_back((line, std::time::Instant::now()));
-                        if chat_log.len() > 8 { chat_log.pop_front(); }
+                        if chat_log.len() > 8 {
+                            chat_log.pop_front();
+                        }
                         // Re-broadcast to peers so everyone sees client chats.
                         let msg = anno_net::protocol::NetMessage::chat(&text);
                         host.send_to_all(&msg);
@@ -3101,10 +3099,7 @@ fn main() {
                         // anything else is a stray broadcast we ignore.
                         if let Some(cmd) = anno_sim::commands::Command::decode(&data) {
                             let applied = sim.apply_command(&cmd);
-                            println!(
-                                "[cmd] from p{from_player}: {:?} (applied={applied})",
-                                cmd,
-                            );
+                            println!("[cmd] from p{from_player}: {:?} (applied={applied})", cmd,);
                         }
                     }
                     _ => {}
@@ -3136,14 +3131,19 @@ fn main() {
                             sim.apply_snapshot(snap);
                             needs_redraw = true;
                         } else {
-                            eprintln!("[net] failed to deserialize snapshot ({} bytes)", data.len());
+                            eprintln!(
+                                "[net] failed to deserialize snapshot ({} bytes)",
+                                data.len()
+                            );
                         }
                     }
                     anno_net::session::SessionEvent::Chat { from_player, text } => {
                         let line = format!("p{from_player}: {text}");
                         println!("[chat] {line}");
                         chat_log.push_back((line, std::time::Instant::now()));
-                        if chat_log.len() > 8 { chat_log.pop_front(); }
+                        if chat_log.len() > 8 {
+                            chat_log.pop_front();
+                        }
                     }
                     _ => {}
                 }
@@ -3151,9 +3151,8 @@ fn main() {
         }
 
         // Anno 1602 keeps the simulation running while menus are open;
-        // the player has to hit Space to pause manually. No auto-pause.
+        // the player has to hit Pause manually. No auto-pause.
 
-        let perf_sim_start = std::time::Instant::now();
         if dt_ms > 0 && dt_ms < 1000 {
             if net_client.is_none() {
                 sim.tick(dt_ms);
@@ -3163,9 +3162,7 @@ fn main() {
             //     FUN_00488b50("lastgame", path); reset counter
             // i.e. when not paused, accumulate frame time and on
             // crossing 599 999 ms (~10 min) write to "lastgame.bin".
-            if !sim.paused
-                && sim.autosave_timer_ms >= anno_sim::simulation::AUTOSAVE_INTERVAL_MS
-            {
+            if !sim.paused && sim.autosave_timer_ms >= anno_sim::simulation::AUTOSAVE_INTERVAL_MS {
                 sim.autosave_timer_ms = 0;
                 let path = save_dir.join(format!("{}.lastgame.bin", scenario_name));
                 let snap = sim.snapshot();
@@ -3176,28 +3173,31 @@ fn main() {
                 println!("{msg}");
                 save_banner = Some((msg, std::time::Instant::now()));
             }
-            // Drain objective completions for the chat log.
+            // Drain objective completions for the completion cue.
             if !sim.objective_completions.is_empty() {
-                let drained: Vec<usize> = sim.objective_completions.drain(..).collect();
-                for idx in drained {
-                    if let Some((obj, _)) = sim.objectives.items.get(idx) {
-                        let line = format!("[obj] complete: {}", obj.label());
-                        chat_log.push_back((line, std::time::Instant::now()));
-                        if chat_log.len() > 8 { chat_log.pop_front(); }
+                sim.objective_completions.clear();
+                if speech_enabled {
+                    if let (Some(sfx), Some(handle)) = (event_obj_done_slot, &audio.stream_handle) {
+                        audio.waves.play_once(
+                            sfx,
+                            WINDOW_W as i32 / 2,
+                            WINDOW_H as i32 / 2,
+                            handle,
+                        );
                     }
                 }
-                if let (Some(sfx), Some(handle)) = (event_obj_done_slot, &audio.stream_handle) {
-                    audio.waves.play_once(sfx, WINDOW_W as i32 / 2, WINDOW_H as i32 / 2, handle);
-                }
             }
-            // (Wake-up alarms via SFX removed — faithful Anno used voice
-            // announcements which we'll wire up properly later.)
+            // Wake-up alarms do not use a generic SFX slot; the routed
+            // announcement categories below own speech playback.
 
             // Drain sim event log lines. Voice announcements key off
             // the line prefix so we play one slot per announcement
-            // category — Anno used spoken cues, not SFX.
+            // category - Anno used spoken cues, not SFX.
             if !sim.event_log.is_empty() {
                 for line in sim.event_log.drain(..) {
+                    if !speech_enabled {
+                        continue;
+                    }
                     let voice_slot = if line.starts_with("[trader]") {
                         voice_trader_slot
                     } else if line.starts_with("[combat]") || line.contains("attack") {
@@ -3223,46 +3223,38 @@ fn main() {
                     } else {
                         None
                     };
-                    if let (Some(sfx), Some(handle)) =
-                        (voice_slot, &audio.stream_handle)
-                    {
-                        audio.waves.play_once(sfx, WINDOW_W as i32 / 2, WINDOW_H as i32 / 2, handle);
+                    if let (Some(sfx), Some(handle)) = (voice_slot, &audio.stream_handle) {
+                        audio.waves.play_once(
+                            sfx,
+                            WINDOW_W as i32 / 2,
+                            WINDOW_H as i32 / 2,
+                            handle,
+                        );
                     }
-                    chat_log.push_back((line, std::time::Instant::now()));
-                    if chat_log.len() > 8 { chat_log.pop_front(); }
                 }
             }
 
-            // Damage events are still produced by the sim but not
-            // surfaced as floating numbers (Anno didn't have those).
-            sim.damage_events.clear();
-
-            // Drain combat-destroyed buildings: clear matching island tiles
-            // so the static renderer no longer paints the dead footprint.
+            // Drain combat-destroyed buildings: replace the static
+            // footprint with the source `Ruinenr` tile(s), or clear it
+            // when haeuser.cod says `NORUINE`.
             if !sim.tile_clears.is_empty() {
                 let drained: Vec<_> = sim.tile_clears.drain(..).collect();
-                for (island_id, bx, by, bw, bh) in drained {
-                    if let Some(island) = islands.iter_mut()
-                        .find(|i| i.number == island_id)
-                    {
-                        island.tiles.retain(|t| {
-                            let in_footprint = t.x as u16 >= bx
-                                && (t.x as u16) < bx + bw as u16
-                                && t.y as u16 >= by
-                                && (t.y as u16) < by + bh as u16;
-                            !in_footprint
-                        });
-                    }
-                    chat_log.push_back((
-                        format!("[combat] building at ({bx},{by}) on island {island_id} destroyed"),
-                        std::time::Instant::now(),
-                    ));
-                    if chat_log.len() > 8 { chat_log.pop_front(); }
+                for clear in drained {
+                    let mut next_rand = || sim.next_source_rand();
+                    apply_tile_clear_event(&mut islands, &cod, clear, &mut next_rand);
                 }
-                if let (Some(sfx), Some(handle)) =
-                    (voice_attack_slot.or(event_destroy_slot), &audio.stream_handle)
-                {
-                    audio.waves.play_once(sfx, WINDOW_W as i32 / 2, WINDOW_H as i32 / 2, handle);
+                if speech_enabled {
+                    if let (Some(sfx), Some(handle)) = (
+                        voice_attack_slot.or(event_destroy_slot),
+                        &audio.stream_handle,
+                    ) {
+                        audio.waves.play_once(
+                            sfx,
+                            WINDOW_W as i32 / 2,
+                            WINDOW_H as i32 / 2,
+                            handle,
+                        );
+                    }
                 }
                 needs_redraw = true;
             }
@@ -3275,58 +3267,6 @@ fn main() {
             }
         }
 
-        // Event log: diff sim state vs last frame and post notable changes
-        // into the chat log (TTL 10s like network chat).
-        {
-            // 1. Diplomacy flips. Only report each pair once (i < j).
-            for i in 0..7u8 {
-                for j in (i + 1)..7u8 {
-                    let cur = sim.diplomacy.get(i, j);
-                    let prev = prev_diplomacy[i as usize][j as usize];
-                    if cur != prev {
-                        let label = match cur {
-                            Diplomacy::Allied => "ALLIED",
-                            Diplomacy::Neutral => "neutral",
-                            Diplomacy::War => "WAR",
-                        };
-                        let line = format!("[diplo] p{i} ↔ p{j} → {label}");
-                        chat_log.push_back((line, std::time::Instant::now()));
-                        if chat_log.len() > 8 { chat_log.pop_front(); }
-                        if cur == Diplomacy::War {
-                            if let (Some(sfx), Some(handle)) =
-                                (event_war_slot, &audio.stream_handle)
-                            {
-                                audio.waves.play_once(
-                                    sfx,
-                                    WINDOW_W as i32 / 2,
-                                    WINDOW_H as i32 / 2,
-                                    handle,
-                                );
-                            }
-                        }
-                        prev_diplomacy[i as usize][j as usize] = cur;
-                        prev_diplomacy[j as usize][i as usize] = cur;
-                    }
-                }
-            }
-            // 2. New AI buildings. Skip player 0 (the human's own builds
-            //    aren't surprising, and they're already logged on placement).
-            let mut counts: [usize; 7] = [0; 7];
-            for b in &sim.buildings {
-                let o = b.owner as usize;
-                if o < counts.len() { counts[o] += 1; }
-            }
-            for owner in 1..7 {
-                if counts[owner] > prev_building_counts[owner] {
-                    let delta = counts[owner] - prev_building_counts[owner];
-                    let line = format!("[build] p{owner} built {delta} building(s)");
-                    chat_log.push_back((line, std::time::Instant::now()));
-                    if chat_log.len() > 8 { chat_log.pop_front(); }
-                }
-                prev_building_counts[owner] = counts[owner];
-            }
-        }
-
         // Audio tick: cleanup finished sounds, auto-advance music
         audio.work_events();
         if music_enabled && !music_files.is_empty() {
@@ -3336,9 +3276,7 @@ fn main() {
                     // Track might have finished naturally (sink empty)
                     audio.streams.destroy(slot);
                     current_track = (current_track + 1) % music_files.len();
-                    if let Some(new_slot) =
-                        audio.streams.create(&music_files[current_track], 0)
-                    {
+                    if let Some(new_slot) = audio.streams.create(&music_files[current_track], 0) {
                         if let Some(ref handle) = audio.stream_handle {
                             audio.streams.play(new_slot, music_volume, handle);
                         }
@@ -3405,15 +3343,24 @@ fn main() {
                     rs.tile_h,
                     &sim,
                     world_mode,
-                    if world_mode { None } else { Some(&islands[current_island]) },
+                    if world_mode {
+                        None
+                    } else {
+                        Some(&islands[current_island])
+                    },
                     &islands,
                     &carrier_sprites[sprite_zoom],
                     &ship_sprites[sprite_zoom],
                     &soldier_sprites[sprite_zoom],
                     &selected_units,
+                    selected_trade_ship_idx,
                     carrier_walk_anz,
-                    ship_walk_anz,
-                    show_paths,
+                    carrier_empty_anim_offs,
+                    carrier_loaded_anim_offs,
+                    civilian_walk_anz,
+                    ship_sprite_layout,
+                    soldier_sprite_layout,
+                    anim_state.elapsed_ms,
                 );
 
                 // Selected-building service-radius preview. Anno
@@ -3435,8 +3382,7 @@ fn main() {
                             } else {
                                 def.radius
                             };
-                            if effective_radius > 0
-                                && b.island_id == islands[current_island].number
+                            if effective_radius > 0 && b.island_id == islands[current_island].number
                             {
                                 let half_tw = rs.tile_w / 2;
                                 let half_th = rs.tile_h / 2;
@@ -3445,15 +3391,17 @@ fn main() {
                                 let r = effective_radius as i32;
                                 let outline = if def.defensive_cannons > 0 {
                                     [0xFF, 0x40, 0x20, 0xFF] // tower-red
-                                } else { match def.prod_kind.as_str() {
-                                    "MARKT" | "KONTOR" => [0xFF, 0xE0, 0x40, 0xFF],
-                                    "KIRCHE" | "KAPELLE" => [0xFF, 0xCC, 0xCC, 0xFF],
-                                    "WIRT" => [0xFF, 0x88, 0x40, 0xFF],
-                                    "SCHULE" | "HOCHSCHULE" => [0x80, 0xC0, 0xFF, 0xFF],
-                                    "KLINIK" => [0xFF, 0x60, 0x60, 0xFF],
-                                    "THEATER" | "BADEHAUS" => [0xC0, 0x80, 0xFF, 0xFF],
-                                    _ => [0x80, 0xFF, 0xC0, 0xFF],
-                                }};
+                                } else {
+                                    match def.prod_kind.as_str() {
+                                        "MARKT" | "KONTOR" => [0xFF, 0xE0, 0x40, 0xFF],
+                                        "KIRCHE" | "KAPELLE" => [0xFF, 0xCC, 0xCC, 0xFF],
+                                        "WIRT" => [0xFF, 0x88, 0x40, 0xFF],
+                                        "SCHULE" | "HOCHSCHULE" => [0x80, 0xC0, 0xFF, 0xFF],
+                                        "KLINIK" => [0xFF, 0x60, 0x60, 0xFF],
+                                        "THEATER" | "BADEHAUS" => [0xC0, 0x80, 0xFF, 0xFF],
+                                        _ => [0x80, 0xFF, 0xC0, 0xFF],
+                                    }
+                                };
                                 // Manhattan-distance ring (matches the
                                 // coverage::apply_radius diamond).
                                 for dy in -r..=r {
@@ -3469,13 +3417,15 @@ fn main() {
                                             for sign in [-1i32, 1] {
                                                 let px = cx_pix + offset * sign;
                                                 let py = cy_pix;
-                                                if px < 0 || py < 0
+                                                if px < 0
+                                                    || py < 0
                                                     || (px as u32) >= rs.width
                                                     || (py as u32) >= rs.height
-                                                { continue; }
-                                                let off =
-                                                    ((py as u32 * rs.width
-                                                        + px as u32) * 4) as usize;
+                                                {
+                                                    continue;
+                                                }
+                                                let off = ((py as u32 * rs.width + px as u32) * 4)
+                                                    as usize;
                                                 if off + 3 < frame.len() {
                                                     frame[off] = outline[0];
                                                     frame[off + 1] = outline[1];
@@ -3483,62 +3433,6 @@ fn main() {
                                                     frame[off + 3] = 0xFF;
                                                 }
                                             }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Draw service coverage overlay (C key, single-island mode)
-                if show_coverage && !world_mode {
-                    let island = &islands[current_island];
-                    let island_id = island.number;
-                    let cov = sim.coverage_maps.iter().find(|c| c.island_id == island_id);
-                    if let Some(cov) = cov {
-                        let half_tw = rs.tile_w / 2;
-                        let half_th = rs.tile_h / 2;
-                        for tile in &island.tiles {
-                            let tx = tile.x as i32;
-                            let ty = tile.y as i32;
-                            let covered = cov.is_covered(tile.x as u16, tile.y as u16);
-                            let public = cov.public_coverage_at(tile.x as u16, tile.y as u16);
-                            let color: [u8; 4] = if covered {
-                                let blue = (public as u16 * 40).min(180) as u8;
-                                [0x30, 0xE0, blue.max(0x40), 0x50]
-                            } else {
-                                [0xE0, 0x30, 0x30, 0x60]
-                            };
-                            let sx = rs.origin_x + (tx - ty) * half_tw;
-                            let sy = rs.origin_y + (tx + ty) * half_th;
-                            for py in 0..rs.tile_h {
-                                let row_half = if py <= rs.tile_h / 2 {
-                                    py * half_tw / half_th.max(1)
-                                } else {
-                                    (rs.tile_h - py) * half_tw / half_th.max(1)
-                                };
-                                let row_start = half_tw - row_half;
-                                let row_end = half_tw + row_half;
-                                for px in row_start..row_end {
-                                    let fx = sx + px;
-                                    let fy = sy + py;
-                                    if fx >= 0 && fy >= 0
-                                        && (fx as u32) < rs.width
-                                        && (fy as u32) < rs.height
-                                    {
-                                        let off =
-                                            ((fy as u32 * rs.width + fx as u32) * 4) as usize;
-                                        if off + 3 < frame.len() {
-                                            let a = color[3] as u16;
-                                            let inv_a = 255 - a;
-                                            frame[off] = ((color[0] as u16 * a
-                                                + frame[off] as u16 * inv_a) / 255) as u8;
-                                            frame[off + 1] = ((color[1] as u16 * a
-                                                + frame[off + 1] as u16 * inv_a) / 255) as u8;
-                                            frame[off + 2] = ((color[2] as u16 * a
-                                                + frame[off + 2] as u16 * inv_a) / 255) as u8;
-                                            frame[off + 3] = 255;
                                         }
                                     }
                                 }
@@ -3559,8 +3453,12 @@ fn main() {
                                 .position(|m| m.island_id == island.number);
                             let can_place = island_map_idx.map_or(false, |idx| {
                                 can_place_building(
-                                    island, &sim.island_maps[idx],
-                                    hover_tx, hover_ty, def.width, def.height,
+                                    island,
+                                    &sim.island_maps[idx],
+                                    hover_tx,
+                                    hover_ty,
+                                    def.width,
+                                    def.height,
                                 )
                             });
                             let color = if can_place {
@@ -3573,8 +3471,7 @@ fn main() {
                             let half_th = rs.tile_h / 2;
                             let sprites = &sprites_by_zoom[sprite_zoom];
                             let cod_b = &cod.buildings[bb.def_idx];
-                            let stride = (cod_b.anim_anz.max(1)
-                                * cod_b.anim_add.max(1)) as usize;
+                            let stride = (cod_b.anim_anz.max(1) * cod_b.anim_add.max(1)) as usize;
                             let rot_offset = placer.orientation as usize * stride;
                             // First pass: blit each tile of the building
                             // sprite at 50% alpha so the player sees what
@@ -3590,8 +3487,7 @@ fn main() {
                                         + rot_offset
                                         + dy as usize * def.width as usize
                                         + dx as usize;
-                                    let anim_idx = anim_state
-                                        .animate(static_idx as u16) as usize;
+                                    let anim_idx = anim_state.animate(static_idx as u16) as usize;
                                     if let Some(sp) = sprites.get(anim_idx) {
                                         let bw = sp.0 as i32;
                                         let bh = sp.1 as i32;
@@ -3601,22 +3497,40 @@ fn main() {
                                         for py in 0..bh {
                                             for px in 0..bw {
                                                 let off_src = ((py * bw + px) * 4) as usize;
-                                                if off_src + 3 >= data.len() { continue; }
-                                                if data[off_src + 3] == 0 { continue; }
+                                                if off_src + 3 >= data.len() {
+                                                    continue;
+                                                }
+                                                if data[off_src + 3] == 0 {
+                                                    continue;
+                                                }
                                                 let fx = dst_x + px;
                                                 let fy = dst_y + py;
-                                                if fx < 0 || fy < 0 { continue; }
+                                                if fx < 0 || fy < 0 {
+                                                    continue;
+                                                }
                                                 if (fx as u32) >= rs.width
-                                                    || (fy as u32) >= rs.height { continue; }
-                                                let off_dst = ((fy as u32 * rs.width
-                                                    + fx as u32) * 4) as usize;
-                                                if off_dst + 3 >= frame.len() { continue; }
+                                                    || (fy as u32) >= rs.height
+                                                {
+                                                    continue;
+                                                }
+                                                let off_dst = ((fy as u32 * rs.width + fx as u32)
+                                                    * 4)
+                                                    as usize;
+                                                if off_dst + 3 >= frame.len() {
+                                                    continue;
+                                                }
                                                 frame[off_dst] = ((data[off_src] as u16
-                                                    + frame[off_dst] as u16) / 2) as u8;
+                                                    + frame[off_dst] as u16)
+                                                    / 2)
+                                                    as u8;
                                                 frame[off_dst + 1] = ((data[off_src + 1] as u16
-                                                    + frame[off_dst + 1] as u16) / 2) as u8;
+                                                    + frame[off_dst + 1] as u16)
+                                                    / 2)
+                                                    as u8;
                                                 frame[off_dst + 2] = ((data[off_src + 2] as u16
-                                                    + frame[off_dst + 2] as u16) / 2) as u8;
+                                                    + frame[off_dst + 2] as u16)
+                                                    / 2)
+                                                    as u8;
                                                 frame[off_dst + 3] = 255;
                                             }
                                         }
@@ -3640,8 +3554,7 @@ fn main() {
                                                 && (fx as u32) < rs.width
                                                 && (fy as u32) < rs.height
                                             {
-                                                let off = ((fy as u32 * rs.width + fx as u32)
-                                                    * 4)
+                                                let off = ((fy as u32 * rs.width + fx as u32) * 4)
                                                     as usize;
                                                 if off + 3 < frame.len() {
                                                     let a = color[3] as u16;
@@ -3713,8 +3626,7 @@ fn main() {
                                         && (fx as u32) < rs.width
                                         && (fy as u32) < rs.height
                                     {
-                                        let off =
-                                            ((fy as u32 * rs.width + fx as u32) * 4) as usize;
+                                        let off = ((fy as u32 * rs.width + fx as u32) * 4) as usize;
                                         if off + 3 < frame.len() {
                                             let a = highlight_color[3] as u16;
                                             let inv_a = 255 - a;
@@ -3739,49 +3651,6 @@ fn main() {
                     }
                 }
 
-                // Draw draft trade-route stops (yellow diamonds with index)
-                if trade_route_mode && !world_mode {
-                    let island_id = islands[current_island].number;
-                    let half_tw = rs.tile_w / 2;
-                    let half_th = rs.tile_h / 2;
-                    for (i, &(iid, wx, wy, _mode)) in draft_route_stops.iter().enumerate() {
-                        if iid != island_id {
-                            continue;
-                        }
-                        let tx = wx as i32;
-                        let ty = wy as i32;
-                        let cx = rs.origin_x + (tx - ty) * half_tw + half_tw;
-                        let cy = rs.origin_y + (tx + ty) * half_th + half_th;
-                        // Draw a yellow diamond marker
-                        let size: i32 = 6;
-                        for dy in -size..=size {
-                            for dx in -size..=size {
-                                if dx.abs() + dy.abs() > size {
-                                    continue;
-                                }
-                                let fx = cx + dx;
-                                let fy = cy + dy;
-                                if fx < 0 || fy < 0 { continue; }
-                                if (fx as u32) >= rs.width
-                                    || (fy as u32) >= rs.height { continue; }
-                                let off = ((fy as u32 * rs.width + fx as u32) * 4) as usize;
-                                if off + 3 >= frame.len() { continue; }
-                                frame[off] = 0xFF;
-                                frame[off + 1] = 0xD0;
-                                frame[off + 2] = 0x00;
-                                frame[off + 3] = 0xFF;
-                            }
-                        }
-                        // Draw stop number on top of diamond using tiny_font
-                        let label = format!("{}", i + 1);
-                        tiny_font::draw_str(
-                            &mut frame, rs.width, rs.height,
-                            cx - 2, cy - 4, &label,
-                            [0x00, 0x00, 0x00, 0xFF], 1,
-                        );
-                    }
-                }
-
                 // Draw status tints for dried-up plantations
                 // (yellow) and depleted mines (gray), so the player
                 // can spot non-functional buildings at a glance.
@@ -3790,18 +3659,21 @@ fn main() {
                     let half_tw = rs.tile_w / 2;
                     let half_th = rs.tile_h / 2;
                     for b in sim.buildings.iter() {
-                        if b.island_id != island_id { continue; }
+                        if b.island_id != island_id {
+                            continue;
+                        }
                         let def = &defs[b.def_id as usize];
                         let mut tint: Option<[u8; 4]> = None;
                         if def.can_dry_up && !b.active {
                             tint = Some([0xC0, 0xA0, 0x40, 0x80]); // yellow
-                        } else if def.ore_deposit
-                            != anno_sim::building::OreDeposit::None
+                        } else if def.ore_deposit != anno_sim::building::OreDeposit::None
                             && b.remaining_ore == 0
                         {
                             tint = Some([0x80, 0x80, 0x80, 0x80]); // gray
                         }
-                        let Some(tint) = tint else { continue; };
+                        let Some(tint) = tint else {
+                            continue;
+                        };
                         let bw = def.width as i32;
                         let bh = def.height as i32;
                         let bx = b.tile_x as i32;
@@ -3821,19 +3693,28 @@ fn main() {
                                     for px in (half_tw - row_half)..(half_tw + row_half) {
                                         let fx = sx + px;
                                         let fy = sy + py;
-                                        if fx < 0 || fy < 0 { continue; }
-                                        if (fx as u32) >= rs.width
-                                            || (fy as u32) >= rs.height { continue; }
+                                        if fx < 0 || fy < 0 {
+                                            continue;
+                                        }
+                                        if (fx as u32) >= rs.width || (fy as u32) >= rs.height {
+                                            continue;
+                                        }
                                         let off = ((fy as u32 * rs.width + fx as u32) * 4) as usize;
                                         if off + 3 < frame.len() {
                                             let a = tint[3] as u16;
                                             let inv_a = 255 - a;
                                             frame[off] = ((tint[0] as u16 * a
-                                                + frame[off] as u16 * inv_a) / 255) as u8;
+                                                + frame[off] as u16 * inv_a)
+                                                / 255)
+                                                as u8;
                                             frame[off + 1] = ((tint[1] as u16 * a
-                                                + frame[off + 1] as u16 * inv_a) / 255) as u8;
+                                                + frame[off + 1] as u16 * inv_a)
+                                                / 255)
+                                                as u8;
                                             frame[off + 2] = ((tint[2] as u16 * a
-                                                + frame[off + 2] as u16 * inv_a) / 255) as u8;
+                                                + frame[off + 2] as u16 * inv_a)
+                                                / 255)
+                                                as u8;
                                             frame[off + 3] = 255;
                                         }
                                     }
@@ -3877,21 +3758,28 @@ fn main() {
                                     for px in row_start..row_end {
                                         let fx = sx + px;
                                         let fy = sy + py;
-                                        if fx >= 0 && fy >= 0
+                                        if fx >= 0
+                                            && fy >= 0
                                             && (fx as u32) < rs.width
                                             && (fy as u32) < rs.height
                                         {
-                                            let off = ((fy as u32 * rs.width + fx as u32)
-                                                * 4) as usize;
+                                            let off =
+                                                ((fy as u32 * rs.width + fx as u32) * 4) as usize;
                                             if off + 3 < frame.len() {
                                                 let a = tint[3] as u16;
                                                 let inv_a = 255 - a;
                                                 frame[off] = ((tint[0] as u16 * a
-                                                    + frame[off] as u16 * inv_a) / 255) as u8;
+                                                    + frame[off] as u16 * inv_a)
+                                                    / 255)
+                                                    as u8;
                                                 frame[off + 1] = ((tint[1] as u16 * a
-                                                    + frame[off + 1] as u16 * inv_a) / 255) as u8;
+                                                    + frame[off + 1] as u16 * inv_a)
+                                                    / 255)
+                                                    as u8;
                                                 frame[off + 2] = ((tint[2] as u16 * a
-                                                    + frame[off + 2] as u16 * inv_a) / 255) as u8;
+                                                    + frame[off + 2] as u16 * inv_a)
+                                                    / 255)
+                                                    as u8;
                                                 frame[off + 3] = 255;
                                             }
                                         }
@@ -3902,10 +3790,9 @@ fn main() {
                         // Progress bar: above the building (top-back of footprint).
                         let cx_tile = bx;
                         let cy_tile = by;
-                        let bar_sx = rs.origin_x
-                            + (cx_tile - cy_tile) * half_tw + half_tw - bw * half_tw / 2;
-                        let bar_sy = rs.origin_y
-                            + (cx_tile + cy_tile) * half_th - 4;
+                        let bar_sx = rs.origin_x + (cx_tile - cy_tile) * half_tw + half_tw
+                            - bw * half_tw / 2;
+                        let bar_sy = rs.origin_y + (cx_tile + cy_tile) * half_th - 4;
                         let bar_w = (bw + bh) * half_tw / 2;
                         let bar_h = 3i32;
                         let prog = b.construction_progress_128() as i32;
@@ -3914,11 +3801,16 @@ fn main() {
                             for bx2 in 0..bar_w {
                                 let fx = bar_sx + bx2;
                                 let fy = bar_sy + by2;
-                                if fx < 0 || fy < 0 { continue; }
-                                if (fx as u32) >= rs.width
-                                    || (fy as u32) >= rs.height { continue; }
+                                if fx < 0 || fy < 0 {
+                                    continue;
+                                }
+                                if (fx as u32) >= rs.width || (fy as u32) >= rs.height {
+                                    continue;
+                                }
                                 let off = ((fy as u32 * rs.width + fx as u32) * 4) as usize;
-                                if off + 3 >= frame.len() { continue; }
+                                if off + 3 >= frame.len() {
+                                    continue;
+                                }
                                 let color = if bx2 < filled {
                                     [0x40, 0xFF, 0x40, 0xFF]
                                 } else {
@@ -3956,20 +3848,23 @@ fn main() {
                                             && (fx as u32) < rs.width
                                             && (fy as u32) < rs.height
                                         {
-                                            let off = ((fy as u32 * rs.width + fx as u32)
-                                                * 4) as usize;
+                                            let off =
+                                                ((fy as u32 * rs.width + fx as u32) * 4) as usize;
                                             if off + 3 < frame.len() {
                                                 let a = demo_color[3] as u16;
                                                 let inv_a = 255 - a;
                                                 frame[off] = ((demo_color[0] as u16 * a
                                                     + frame[off] as u16 * inv_a)
-                                                    / 255) as u8;
+                                                    / 255)
+                                                    as u8;
                                                 frame[off + 1] = ((demo_color[1] as u16 * a
                                                     + frame[off + 1] as u16 * inv_a)
-                                                    / 255) as u8;
+                                                    / 255)
+                                                    as u8;
                                                 frame[off + 2] = ((demo_color[2] as u16 * a
                                                     + frame[off + 2] as u16 * inv_a)
-                                                    / 255) as u8;
+                                                    / 255)
+                                                    as u8;
                                                 frame[off + 3] = 255;
                                             }
                                         }
@@ -3980,53 +3875,13 @@ fn main() {
                     }
                 }
 
-                // Faction outlines: thin colored rim on each player-owned
-                // building's footprint, so multi-player maps read at a
-                // glance who owns what.
-                if !world_mode {
-                    let island_id = islands[current_island].number;
-                    let half_tw = rs.tile_w / 2;
-                    let half_th = rs.tile_h / 2;
-                    for b in &sim.buildings {
-                        if !b.active || b.island_id != island_id { continue; }
-                        let def = &defs[b.def_id as usize];
-                        let bw = def.width as i32;
-                        let bh = def.height as i32;
-                        let color = player_color(b.owner);
-                        // Top corner of the diamond.
-                        let tx = b.tile_x as i32;
-                        let ty = b.tile_y as i32;
-                        let cx = rs.origin_x + (tx - ty) * half_tw + half_tw;
-                        let cy = rs.origin_y + (tx + ty) * half_th;
-                        // Draw a small 3x3 chip at the building's anchor.
-                        for cy_off in 0..3 {
-                            for cx_off in -1..=1 {
-                                let fx = cx + cx_off;
-                                let fy = cy + cy_off;
-                                if fx < 0 || fy < 0 { continue; }
-                                if (fx as u32) >= rs.width
-                                    || (fy as u32) >= rs.height { continue; }
-                                let off = ((fy as u32 * rs.width + fx as u32) * 4) as usize;
-                                if off + 3 >= frame.len() { continue; }
-                                frame[off]     = color[0];
-                                frame[off + 1] = color[1];
-                                frame[off + 2] = color[2];
-                                frame[off + 3] = 0xFF;
-                            }
-                        }
-                        let _ = (bw, bh); // footprint unused for chip variant
-                    }
-                }
-
                 // Fog-of-war: dim every island tile that hasn't been
                 // explored yet. Pulled from `sim.exploration` (per-island
                 // bitmap). Only relevant in single-island mode.
                 if !world_mode {
                     let island = &islands[current_island];
                     let island_id = island.number;
-                    if let Some(em) = sim.exploration.iter()
-                        .find(|e| e.island_id == island_id)
-                    {
+                    if let Some(em) = sim.exploration.iter().find(|e| e.island_id == island_id) {
                         let half_tw = rs.tile_w / 2;
                         let half_th = rs.tile_h / 2;
                         for tile in &island.tiles {
@@ -4048,11 +3903,16 @@ fn main() {
                                 for px in row_start..row_end {
                                     let fx = sx + px;
                                     let fy = sy + py;
-                                    if fx < 0 || fy < 0 { continue; }
-                                    if (fx as u32) >= rs.width
-                                        || (fy as u32) >= rs.height { continue; }
+                                    if fx < 0 || fy < 0 {
+                                        continue;
+                                    }
+                                    if (fx as u32) >= rs.width || (fy as u32) >= rs.height {
+                                        continue;
+                                    }
                                     let off = ((fy as u32 * rs.width + fx as u32) * 4) as usize;
-                                    if off + 3 >= frame.len() { continue; }
+                                    if off + 3 >= frame.len() {
+                                        continue;
+                                    }
                                     // 60% darken toward dark gray.
                                     frame[off] = (frame[off] as u16 * 80 / 255) as u8;
                                     frame[off + 1] = (frame[off + 1] as u16 * 80 / 255) as u8;
@@ -4073,11 +3933,7 @@ fn main() {
                 let dst_y = (WINDOW_H as i32 - dst_h as i32) / 2 + scroll_y;
 
                 canvas
-                    .copy(
-                        &texture,
-                        None,
-                        Some(Rect::new(dst_x, dst_y, dst_w, dst_h)),
-                    )
+                    .copy(&texture, None, Some(Rect::new(dst_x, dst_y, dst_w, dst_h)))
                     .ok();
 
                 // Draw minimap in the bottom-right corner
@@ -4106,7 +3962,8 @@ fn main() {
                                     mini_rgba[dst_off] = frame[src_off];
                                     mini_rgba[dst_off + 1] = frame[src_off + 1];
                                     mini_rgba[dst_off + 2] = frame[src_off + 2];
-                                    mini_rgba[dst_off + 3] = if frame[src_off + 3] > 0 { 220 } else { 80 };
+                                    mini_rgba[dst_off + 3] =
+                                        if frame[src_off + 3] > 0 { 220 } else { 80 };
                                 }
                             }
                         }
@@ -4120,7 +3977,9 @@ fn main() {
                         let half_tw = rs.tile_w / 2;
                         let half_th = rs.tile_h / 2;
                         for b in &sim.buildings {
-                            if !b.active { continue; }
+                            if !b.active {
+                                continue;
+                            }
                             if b.island_id != islands[current_island].number {
                                 continue;
                             }
@@ -4143,10 +4002,13 @@ fn main() {
                                 for dx in 0..2 {
                                     let px = mx + dx;
                                     let py = my + dy;
-                                    if px < 0 || py < 0
+                                    if px < 0
+                                        || py < 0
                                         || px >= mini_w as i32
                                         || py >= mini_h as i32
-                                    { continue; }
+                                    {
+                                        continue;
+                                    }
                                     let off = ((py as u32 * mini_w + px as u32) * 4) as usize;
                                     if off + 3 < mini_rgba.len() {
                                         mini_rgba[off..off + 4].copy_from_slice(&color);
@@ -4165,9 +4027,11 @@ fn main() {
 
                     // Adjust for centering offset
                     let center_off_x = ((WINDOW_W as i32 - dst_w as i32) / 2) as f64
-                        / display_zoom as f64 * mini_scale;
+                        / display_zoom as f64
+                        * mini_scale;
                     let center_off_y = ((WINDOW_H as i32 - dst_h as i32) / 2) as f64
-                        / display_zoom as f64 * mini_scale;
+                        / display_zoom as f64
+                        * mini_scale;
                     let vp_x = vp_left - center_off_x as i32;
                     let vp_y = vp_top - center_off_y as i32;
 
@@ -4195,26 +4059,31 @@ fn main() {
                     }
 
                     // Blit minimap to a texture and draw it
-                    if let Ok(mut mini_tex) = texture_creator
-                        .create_texture_streaming(PixelFormatEnum::RGBA32, mini_w, mini_h)
-                    {
-                        mini_tex.update(None, &mini_rgba, (mini_w * 4) as usize).ok();
+                    if let Ok(mut mini_tex) = texture_creator.create_texture_streaming(
+                        PixelFormatEnum::RGBA32,
+                        mini_w,
+                        mini_h,
+                    ) {
+                        mini_tex
+                            .update(None, &mini_rgba, (mini_w * 4) as usize)
+                            .ok();
                         mini_tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                         let mini_x = WINDOW_W as i32 - mini_w as i32 - minimap_margin;
                         let mini_y = WINDOW_H as i32 - mini_h as i32 - minimap_margin;
 
                         // Draw dark background behind minimap
                         canvas.set_draw_color(sdl2::pixels::Color::RGBA(0, 0, 0, 180));
-                        canvas.fill_rect(Rect::new(
-                            mini_x - 2, mini_y - 2,
-                            mini_w + 4, mini_h + 4,
-                        )).ok();
+                        canvas
+                            .fill_rect(Rect::new(mini_x - 2, mini_y - 2, mini_w + 4, mini_h + 4))
+                            .ok();
 
-                        canvas.copy(
-                            &mini_tex,
-                            None,
-                            Some(Rect::new(mini_x, mini_y, mini_w, mini_h)),
-                        ).ok();
+                        canvas
+                            .copy(
+                                &mini_tex,
+                                None,
+                                Some(Rect::new(mini_x, mini_y, mini_w, mini_h)),
+                            )
+                            .ok();
 
                         // Handle minimap clicks — clicking the minimap scrolls the main view
                         if minimap_clicked {
@@ -4222,10 +4091,8 @@ fn main() {
                             let click_tex_x = (minimap_click_x - mini_x) as f64 / mini_scale;
                             let click_tex_y = (minimap_click_y - mini_y) as f64 / mini_scale;
                             // Center the viewport on the clicked point
-                            scroll_x = -(click_tex_x as i32 * display_zoom)
-                                + WINDOW_W as i32 / 2;
-                            scroll_y = -(click_tex_y as i32 * display_zoom)
-                                + WINDOW_H as i32 / 2;
+                            scroll_x = -(click_tex_x as i32 * display_zoom) + WINDOW_W as i32 / 2;
+                            scroll_y = -(click_tex_y as i32 * display_zoom) + WINDOW_H as i32 / 2;
                             minimap_clicked = false;
                         }
                     }
@@ -4234,83 +4101,92 @@ fn main() {
         }
 
         // Draw population/economy HUD in top-left corner
-        if show_hud && !placer.active {
-        if let Some(ref player) = sim.players.first() {
-            let tier_names = ["Pioneer", "Settler", "Citizen", "Merchant", "Aristocrat"];
-            let hud_scale = 2u32;
-            let line_h = (tiny_font::measure("X", hud_scale) + hud_scale) as i32 + 2;
-            let hud_w = 220u32;
-            let mut lines: Vec<String> = Vec::new();
+        if !placer.active {
+            if let Some(ref player) = sim.players.first() {
+                let tier_names = ["Pioneer", "Settler", "Citizen", "Merchant", "Aristocrat"];
+                let hud_scale = 2u32;
+                let line_h = (tiny_font::measure("X", hud_scale) + hud_scale) as i32 + 2;
+                let hud_w = 220u32;
+                let mut lines: Vec<String> = Vec::new();
 
-            // Population tiers
-            let total_pop: u32 = player.population.iter().sum();
-            lines.push(format!("POP {}", total_pop));
-            for i in 0..5 {
-                let pop = player.population[i];
-                if pop > 0 {
-                    let sat = player.satisfaction[i] as u32 * 100 / 128;
-                    let tax = player.tax_rates[i] as u32 * 100 / 128;
-                    lines.push(format!(
-                        " {}:{} S{}% T{}%",
-                        &tier_names[i][..3], pop, sat, tax
-                    ));
+                // Population tiers
+                let total_pop: u32 = player.population.iter().sum();
+                lines.push(format!("POP {}", total_pop));
+                for i in 0..5 {
+                    let pop = player.population[i];
+                    if pop > 0 {
+                        let sat = player.satisfaction[i] as u32 * 100 / 128;
+                        let tax = player.tax_rates[i] as u32 * 100 / 128;
+                        lines.push(format!(
+                            " {}:{} S{}% T{}%",
+                            &tier_names[i][..3],
+                            pop,
+                            sat,
+                            tax
+                        ));
+                    }
+                }
+                // Economy
+                lines.push(format!("GOLD {}", player.gold));
+
+                let hud_h = (lines.len() as u32 * line_h as u32) + 8;
+                let mut hud_buf = vec![0u8; (hud_w * hud_h * 4) as usize];
+                // Fill with semi-transparent dark background
+                for i in 0..(hud_w * hud_h) as usize {
+                    hud_buf[i * 4] = 0;
+                    hud_buf[i * 4 + 1] = 0;
+                    hud_buf[i * 4 + 2] = 0x10;
+                    hud_buf[i * 4 + 3] = 180;
+                }
+                // Render text lines
+                for (li, line) in lines.iter().enumerate() {
+                    let color = if line.starts_with("GOLD") {
+                        [0xFF, 0xD7, 0x00, 0xFF] // Gold color
+                    } else if line.starts_with("POP") {
+                        [0xFF, 0xFF, 0xFF, 0xFF] // White
+                    } else {
+                        [0xCC, 0xCC, 0xCC, 0xFF] // Light gray
+                    };
+                    tiny_font::draw_str(
+                        &mut hud_buf,
+                        hud_w,
+                        hud_h,
+                        4,
+                        4 + li as i32 * line_h,
+                        line,
+                        color,
+                        hud_scale,
+                    );
+                }
+
+                if let Ok(mut hud_tex) =
+                    texture_creator.create_texture_streaming(PixelFormatEnum::RGBA32, hud_w, hud_h)
+                {
+                    hud_tex.update(None, &hud_buf, (hud_w * 4) as usize).ok();
+                    hud_tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                    canvas
+                        .copy(&hud_tex, None, Some(Rect::new(8, 8, hud_w, hud_h)))
+                        .ok();
                 }
             }
-            // Economy
-            lines.push(format!("GOLD {}", player.gold));
-
-            let hud_h = (lines.len() as u32 * line_h as u32) + 8;
-            let mut hud_buf = vec![0u8; (hud_w * hud_h * 4) as usize];
-            // Fill with semi-transparent dark background
-            for i in 0..(hud_w * hud_h) as usize {
-                hud_buf[i * 4] = 0;
-                hud_buf[i * 4 + 1] = 0;
-                hud_buf[i * 4 + 2] = 0x10;
-                hud_buf[i * 4 + 3] = 180;
-            }
-            // Render text lines
-            for (li, line) in lines.iter().enumerate() {
-                let color = if line.starts_with("GOLD") {
-                    [0xFF, 0xD7, 0x00, 0xFF] // Gold color
-                } else if line.starts_with("POP") {
-                    [0xFF, 0xFF, 0xFF, 0xFF] // White
-                } else {
-                    [0xCC, 0xCC, 0xCC, 0xFF] // Light gray
-                };
-                tiny_font::draw_str(
-                    &mut hud_buf, hud_w, hud_h,
-                    4, 4 + li as i32 * line_h,
-                    line, color, hud_scale,
-                );
-            }
-
-            if let Ok(mut hud_tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, hud_w, hud_h)
-            {
-                hud_tex.update(None, &hud_buf, (hud_w * 4) as usize).ok();
-                hud_tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                canvas.copy(&hud_tex, None, Some(Rect::new(8, 8, hud_w, hud_h))).ok();
-            }
         }
-        } // show_hud
 
         // Inspection detail panel (top-right). Multi-line read-out for
         // whatever the player right-clicked on — fed by the same
         // `inspection` state that drives the title-bar summary.
         if let Some(ref insp) = inspection {
             let mut lines: Vec<(String, [u8; 4])> = Vec::new();
-            // Climate badge for the active island so the player can see at
-            // a glance what plantations are buildable here.
+            // Fertility badge for the active island so the player can
+            // see what plantations are buildable here.
             if !world_mode {
                 let isl = &islands[current_island];
-                let climate = anno_sim::climate::climate_for_y(
-                    isl.y_pos as u32, 512,
-                );
+                let has_fertility = !isl.active_fertilities().is_empty();
                 lines.push((
-                    format!("Climate: {}", climate.label()),
-                    match climate {
-                        anno_sim::climate::Climate::North => [0xAA, 0xCC, 0xFF, 0xFF],
-                        anno_sim::climate::Climate::South => [0xFF, 0xCC, 0x88, 0xFF],
+                    format!("Fertility: {}", fertility_list_label(isl)),
+                    if has_fertility {
+                        [0xAA, 0xFF, 0xAA, 0xFF]
+                    } else {
+                        [0xCC, 0xCC, 0xCC, 0xFF]
                     },
                 ));
             }
@@ -4325,7 +4201,10 @@ fn main() {
                     .unwrap_or_else(|| format!("Bldg#{}", b.def_id));
                 lines.push((name, [0xFF, 0xD7, 0x00, 0xFF]));
                 lines.push((
-                    format!("Tile ({},{}) {}x{}", b.tile_x, b.tile_y, def.width, def.height),
+                    format!(
+                        "Tile ({},{}) {}x{}",
+                        b.tile_x, b.tile_y, def.width, def.height
+                    ),
                     [0xCC, 0xCC, 0xCC, 0xFF],
                 ));
                 lines.push((
@@ -4334,14 +4213,14 @@ fn main() {
                 ));
                 if !b.is_built() {
                     let pct = b.construction_progress_128() as u32 * 100 / 128;
-                    lines.push((
-                        format!("Construction: {pct}%"),
-                        [0x66, 0xCC, 0xFF, 0xFF],
-                    ));
+                    lines.push((format!("Construction: {pct}%"), [0x66, 0xCC, 0xFF, 0xFF]));
                 }
                 if def.output_good != Good::None {
                     lines.push((
-                        format!("Out: {:?} {}/{}", def.output_good, b.output_stock, def.storage_capacity),
+                        format!(
+                            "Out: {:?} {}/{}",
+                            def.output_good, b.output_stock, def.storage_capacity
+                        ),
                         [0xCC, 0xFF, 0xCC, 0xFF],
                     ));
                     if def.input_good_1 != Good::None {
@@ -4357,8 +4236,7 @@ fn main() {
                         ));
                     }
                     let eff_pct = b.efficiency as u32 * 100 / 128;
-                    lines.push((format!("Efficiency: {eff_pct}%"),
-                        [0xCC, 0xCC, 0xCC, 0xFF]));
+                    lines.push((format!("Efficiency: {eff_pct}%"), [0xCC, 0xCC, 0xCC, 0xFF]));
                 }
                 if def.maintenance_cost > 0 {
                     lines.push((
@@ -4371,18 +4249,19 @@ fn main() {
                 // satisfaction down.
                 let is_residence = def.kind == "WOHN" || def.prod_kind == "WOHN";
                 if is_residence {
-                    let tier = (b.house_tier as usize)
-                        .min(anno_sim::population::TIER_DEMANDS.len() - 1);
+                    let tier =
+                        (b.house_tier as usize).min(anno_sim::population::TIER_DEMANDS.len() - 1);
                     if let Some(p) = sim.players.first() {
                         for &g in anno_sim::population::TIER_DEMANDS[tier] {
                             // Find the demand slot index by good — match
                             // population::DEMAND_GOODS.
                             let slot_idx = anno_sim::population::DEMAND_GOODS
-                                .iter().position(|&dg| dg == g);
+                                .iter()
+                                .position(|&dg| dg == g);
                             let pct = match slot_idx {
                                 Some(i) if p.demands[i].demand > 0 => {
-                                    (p.demands[i].supply as u64 * 100
-                                        / p.demands[i].demand as u64) as u32
+                                    (p.demands[i].supply as u64 * 100 / p.demands[i].demand as u64)
+                                        as u32
                                 }
                                 _ => 100,
                             };
@@ -4393,10 +4272,7 @@ fn main() {
                             } else {
                                 [0xCC, 0xFF, 0xCC, 0xFF]
                             };
-                            lines.push((
-                                format!("  {:?}: {}%", g, pct),
-                                color,
-                            ));
+                            lines.push((format!("  {:?}: {}%", g, pct), color));
                         }
                     }
                 }
@@ -4407,9 +4283,10 @@ fn main() {
                 ));
                 // Show stored orientation when this is a non-default tile
                 // (loaded from SZS, etc.) so authors can debug rotation.
-                let tile = islands[current_island].tiles.iter().find(|t| {
-                    t.x as i32 == insp.tile_x && t.y as i32 == insp.tile_y
-                });
+                let tile = islands[current_island]
+                    .tiles
+                    .iter()
+                    .find(|t| t.x as i32 == insp.tile_x && t.y as i32 == insp.tile_y);
                 if let Some(t) = tile {
                     if t.orientation != 0 {
                         lines.push((
@@ -4422,7 +4299,10 @@ fn main() {
             if let Some(wi) = insp.warehouse_idx {
                 let wh = &sim.warehouses[wi];
                 lines.push((
-                    format!("Warehouse @ ({},{})  owner p{}", wh.tile_x, wh.tile_y, wh.owner),
+                    format!(
+                        "Warehouse @ ({},{})  owner p{}",
+                        wh.tile_x, wh.tile_y, wh.owner
+                    ),
                     [0xFF, 0xD7, 0x00, 0xFF],
                 ));
                 let stocks = wh.all_stock();
@@ -4436,8 +4316,10 @@ fn main() {
                         ));
                     }
                     if stocks.len() > 8 {
-                        lines.push((format!("  +{} more…", stocks.len() - 8),
-                            [0x88, 0x88, 0x88, 0xFF]));
+                        lines.push((
+                            format!("  +{} more…", stocks.len() - 8),
+                            [0x88, 0x88, 0x88, 0xFF],
+                        ));
                     }
                 }
             }
@@ -4455,134 +4337,26 @@ fn main() {
             }
             for (i, (text, color)) in lines.iter().enumerate() {
                 tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, 4 + i as i32 * line_h, text, *color, scale,
+                    &mut buf,
+                    panel_w,
+                    panel_h,
+                    4,
+                    4 + i as i32 * line_h,
+                    text,
+                    *color,
+                    scale,
                 );
             }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            if let Ok(mut tex) =
+                texture_creator.create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
             {
                 tex.update(None, &buf, (panel_w * 4) as usize).ok();
                 tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                 let tx = WINDOW_W as i32 - panel_w as i32 - 8;
                 let ty = 8i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Shortage banner (bottom-center): pulses yellow when one or more
-        // goods can't meet half the current demand. Always visible — no
-        // toggle, since this is a persistent gameplay warning.
-        if let Some(p) = sim.players.first() {
-            let shortages = anno_sim::population::severe_shortages(p);
-            if !shortages.is_empty() {
-                let names: Vec<String> = shortages.iter()
-                    .map(|g| format!("{:?}", g))
-                    .collect();
-                let label = format!("SHORTAGE: {}", names.join(" "));
-                let scale = 2u32;
-                let text_w = tiny_font::measure(&label, scale) as i32;
-                let banner_w = (text_w + 16) as u32;
-                let banner_h = (5 * scale + 8) as u32;
-                let mut buf = vec![0u8; (banner_w * banner_h * 4) as usize];
-                // Pulse alpha by wall-clock so it's hard to ignore.
-                let pulse = ((sim.game_clock as u32 % 20) as i32 - 10).abs();
-                let bg_a = (140 + pulse * 8).min(220) as u8;
-                for i in 0..(banner_w * banner_h) as usize {
-                    buf[i * 4] = 0x40;
-                    buf[i * 4 + 1] = 0x10;
-                    buf[i * 4 + 2] = 0x00;
-                    buf[i * 4 + 3] = bg_a;
-                }
-                tiny_font::draw_str(
-                    &mut buf, banner_w, banner_h,
-                    8, 4, &label,
-                    [0xFF, 0xCC, 0x00, 0xFF], scale,
-                );
-                if let Ok(mut tex) = texture_creator
-                    .create_texture_streaming(PixelFormatEnum::RGBA32, banner_w, banner_h)
-                {
-                    tex.update(None, &buf, (banner_w * 4) as usize).ok();
-                    tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                    let tx = (WINDOW_W as i32 - banner_w as i32) / 2;
-                    let ty = WINDOW_H as i32 - banner_h as i32 - 60;
-                    canvas.copy(&tex, None, Some(Rect::new(tx, ty, banner_w, banner_h))).ok();
-                }
-            }
-        }
-
-        // Draw tax adjustment panel (center-top)
-        if tax_panel {
-            if let Some(ref player) = sim.players.first() {
-                let tier_names = ["Pioneer", "Settler", "Citizen", "Merchant", "Aristocrat"];
-                let tax_scale = 2u32;
-                let line_h = 14i32;
-                let panel_w = 380u32;
-                let panel_h = (7 * line_h as u32) + 12;
-                let mut panel_buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-                // Dark background
-                for i in 0..(panel_w * panel_h) as usize {
-                    panel_buf[i * 4] = 0;
-                    panel_buf[i * 4 + 1] = 0;
-                    panel_buf[i * 4 + 2] = 0x18;
-                    panel_buf[i * 4 + 3] = 210;
-                }
-                // Title
-                tiny_font::draw_str(
-                    &mut panel_buf, panel_w, panel_h,
-                    4, 4, "TAX RATES",
-                    [0xFF, 0xD7, 0x00, 0xFF], tax_scale,
-                );
-                // Income display
-                let income = player.calculate_income();
-                let costs = player.calculate_costs();
-                let net = player.net_balance();
-                tiny_font::draw_str(
-                    &mut panel_buf, panel_w, panel_h,
-                    120, 4,
-                    &format!("Inc:{} Cost:{} Net:{}", income, costs, net),
-                    [0xAA, 0xAA, 0xAA, 0xFF], tax_scale,
-                );
-                // Per-tier rows. Each row also previews the per-tier
-                // contribution to income and the next-tick growth delta
-                // so the player can see the consequences of a tax change.
-                for i in 0..5 {
-                    let y = 4 + (i + 2) as i32 * line_h;
-                    let rate = player.tax_rates[i] as u32 * 100 / 128;
-                    let sat = player.satisfaction[i] as u32 * 100 / 128;
-                    let pop = player.population[i];
-                    let tier_inc = (pop as i32
-                        * player.tax_rates[i] as i32
-                        * player.satisfaction[i] as i32) / (128 * 128);
-                    // Cribbed from population::growth_delta math.
-                    let permille = (player.satisfaction[i] as i32 - 64) * 50 / 64;
-                    let delta = ((pop as i64 * permille as i64) / 1000) as i32;
-                    let delta = delta.clamp(-50, 50);
-                    let selected = i == tax_tier;
-                    let arrow = if selected { ">" } else { " " };
-                    let line = format!(
-                        "{}{} Tax:{}% Sat:{}% Pop:{} (+{} g, Δ{:+})",
-                        arrow, tier_names[i], rate, sat, pop, tier_inc, delta,
-                    );
-                    let color = if selected {
-                        [0xFF, 0xFF, 0x00, 0xFF] // Yellow for selected
-                    } else {
-                        [0xCC, 0xCC, 0xCC, 0xFF]
-                    };
-                    tiny_font::draw_str(
-                        &mut panel_buf, panel_w, panel_h,
-                        4, y, &line, color, tax_scale,
-                    );
-                }
-
-                if let Ok(mut tax_tex) = texture_creator
-                    .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-                {
-                    tax_tex.update(None, &panel_buf, (panel_w * 4) as usize).ok();
-                    tax_tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                    let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                    canvas.copy(&tax_tex, None, Some(Rect::new(tx, 8, panel_w, panel_h))).ok();
-                }
+                canvas
+                    .copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h)))
+                    .ok();
             }
         }
 
@@ -4602,15 +4376,24 @@ fn main() {
                 buf[i * 4 + 3] = 210;
             }
             tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "DIPLOMACY",
-                [0xFF, 0xD7, 0x00, 0xFF], dscale,
+                &mut buf,
+                panel_w,
+                panel_h,
+                4,
+                4,
+                "DIPLOMACY",
+                [0xFF, 0xD7, 0x00, 0xFF],
+                dscale,
             );
             tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4 + line_h,
-                "Up/Dn pick  Lt/Rt cycle  G gold  T tools",
-                [0xAA, 0xAA, 0xAA, 0xFF], dscale,
+                &mut buf,
+                panel_w,
+                panel_h,
+                4,
+                4 + line_h,
+                DIPLOMACY_PANEL_HELP,
+                [0xAA, 0xAA, 0xAA, 0xFF],
+                dscale,
             );
             // Per-counterpart rows (binary-verified slot layout):
             //   slot 4 = free trader (1 602 exe :83179, PLAYER4 1M gold)
@@ -4627,9 +4410,13 @@ fn main() {
                 };
                 let selected = tgt == diplomacy_target;
                 let arrow = if selected { ">" } else { " " };
-                let alive = sim.players.get(tgt as usize)
-                    .map(|p| p.state != anno_sim::player::PlayerState::Empty
-                            && p.state != anno_sim::player::PlayerState::Defeated)
+                let alive = sim
+                    .players
+                    .get(tgt as usize)
+                    .map(|p| {
+                        p.state != anno_sim::player::PlayerState::Empty
+                            && p.state != anno_sim::player::PlayerState::Defeated
+                    })
                     .unwrap_or(false);
                 let label = match tgt {
                     4 => "Free Trader",
@@ -4648,28 +4435,26 @@ fn main() {
                         Diplomacy::Neutral => [0xCC, 0xCC, 0xCC, 0xFF],
                     }
                 };
-                tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, y, &line, color, dscale,
-                );
+                tiny_font::draw_str(&mut buf, panel_w, panel_h, 4, y, &line, color, dscale);
             }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            if let Ok(mut tex) =
+                texture_creator.create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
             {
                 tex.update(None, &buf, (panel_w * 4) as usize).ok();
                 tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                 let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                canvas.copy(&tex, None, Some(Rect::new(tx, 8, panel_w, panel_h))).ok();
+                canvas
+                    .copy(&tex, None, Some(Rect::new(tx, 8, panel_w, panel_h)))
+                    .ok();
             }
         }
 
-        // Scenario picker (F2). Re-execs the binary with the chosen .szs.
-        if scenario_picker {
-            let panel_w = 480u32;
-            let line_h = 12i32;
-            let header_h = 30i32;
-            let visible = scenario_files.len().min(20) as i32;
-            let panel_h = (header_h + visible * line_h + 12) as u32;
+        // Video sequences / speech menu (F) - manual Appendix D.
+        if video_speech_panel {
+            let scale = 2u32;
+            let line_h = 14i32;
+            let panel_w = 360u32;
+            let panel_h = (5 * line_h + 12) as u32;
             let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
             for i in 0..(panel_w * panel_h) as usize {
                 buf[i * 4] = 0;
@@ -4678,88 +4463,73 @@ fn main() {
                 buf[i * 4 + 3] = 220;
             }
             tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "SCENARIO PICKER (Up/Down, Enter to load, F2/Esc to close)",
-                [0xFF, 0xD7, 0x00, 0xFF], 1,
+                &mut buf,
+                panel_w,
+                panel_h,
+                4,
+                4,
+                "VIDEO / SPEECH",
+                [0xFF, 0xD7, 0x00, 0xFF],
+                scale,
             );
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 16,
-                "Re-launches the game with the chosen scenario.",
-                [0xCC, 0xCC, 0xCC, 0xFF], 1,
-            );
-            // Compute a small visible window around `scenario_sel`.
-            let total = scenario_files.len();
-            let max_visible = visible as usize;
-            let start = if total <= max_visible {
-                0
-            } else {
-                scenario_sel.saturating_sub(max_visible / 2)
-                    .min(total - max_visible)
-            };
-            for (row, idx) in (start..(start + max_visible).min(total)).enumerate() {
-                let path = &scenario_files[idx];
-                let label = path.file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let arrow = if idx == scenario_sel { "> " } else { "  " };
-                // Tutorial scenarios (Tutorial0.szs … Tutorial4.szs)
-                // ship with the original game and are the faithful
-                // replacement for an in-engine tutorial banner.
-                let is_tutorial = label.to_ascii_lowercase().starts_with("tutorial");
-                let suffix = if is_tutorial { "  [tutorial]" } else { "" };
-                let line = format!("{arrow}{label}{suffix}");
-                let color = if idx == scenario_sel {
-                    [0xFF, 0xFF, 0x00, 0xFF]
-                } else if is_tutorial {
-                    [0x80, 0xFF, 0xC0, 0xFF]
-                } else {
-                    [0xCC, 0xCC, 0xCC, 0xFF]
-                };
-                let y = header_h + row as i32 * line_h;
-                tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, y, &line, color, 1,
-                );
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Help / keybindings panel (F11). Read-only reference so the
-        // player doesn't have to memorise every hotkey.
-        if help_panel {
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 480u32;
-            let lines = [
-                "KEYBINDINGS (F11/Esc close)",
-                "",
-                "Build / city",
-                "  B   build mode    D   demolish    Z   rotate    [/]  category",
-                "  T   tax panel     Y   diplomacy   F7  found colony",
-                "  F8  export islands as .szs",
-                "Trade",
-                "  R   trade route   Shift+R routes  J   fleet     A   market",
-                "  F4  buy ship      U   warehouses",
-                "Diagnostics",
-                "  ?   objectives    H   HUD         C   coverage",
-                "  F6  paths         F12 perf",
-                "World / view",
-                "  W   world toggle  G   speed up    Space pause  Tab next island",
-                "  M/N/V audio       S   screenshot  +/- zoom",
-                "Save / system",
-                "  F2 scenarios  F3 save slots  F5 quicksave  F9 quickload",
-                "  F10 settings  F11 this help",
+            let rows = [
+                (
+                    "Video sequences",
+                    if video_sequences_enabled { "ON" } else { "OFF" },
+                ),
+                (
+                    "Speech announcements",
+                    if speech_enabled { "ON" } else { "OFF" },
+                ),
             ];
-            let panel_h = (line_h * lines.len() as i32 + 8) as u32;
+            for (idx, (label, state)) in rows.iter().enumerate() {
+                let selected = idx == video_speech_sel;
+                let arrow = if selected { ">" } else { " " };
+                let line = format!("{arrow} {label}: {state}");
+                let color = if selected {
+                    [0xFF, 0xFF, 0x00, 0xFF]
+                } else {
+                    [0xCC, 0xCC, 0xCC, 0xFF]
+                };
+                tiny_font::draw_str(
+                    &mut buf,
+                    panel_w,
+                    panel_h,
+                    4,
+                    4 + line_h * (idx as i32 + 2),
+                    &line,
+                    color,
+                    scale,
+                );
+            }
+            tiny_font::draw_str(
+                &mut buf,
+                panel_w,
+                panel_h,
+                4,
+                4 + line_h * 4,
+                "Up/Dn pick  Lt/Rt/Enter toggle  F/Esc close",
+                [0xAA, 0xAA, 0xAA, 0xFF],
+                1,
+            );
+            if let Ok(mut tex) =
+                texture_creator.create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            {
+                tex.update(None, &buf, (panel_w * 4) as usize).ok();
+                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
+                canvas
+                    .copy(&tex, None, Some(Rect::new(tx, 60, panel_w, panel_h)))
+                    .ok();
+            }
+        }
+
+        // Options menu (O) - manual Appendix D.
+        if options_panel {
+            let scale = 2u32;
+            let line_h = 14i32;
+            let panel_w = 360u32;
+            let panel_h = (7 * line_h + 12) as u32;
             let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
             for i in 0..(panel_w * panel_h) as usize {
                 buf[i * 4] = 0;
@@ -4767,41 +4537,95 @@ fn main() {
                 buf[i * 4 + 2] = 0x18;
                 buf[i * 4 + 3] = 220;
             }
-            for (i, l) in lines.iter().enumerate() {
-                let color = if l.starts_with(' ') {
-                    [0xCC, 0xCC, 0xCC, 0xFF]
-                } else if i == 0 {
-                    [0xFF, 0xD7, 0x00, 0xFF]
-                } else if l.is_empty() {
-                    [0; 4]
+            tiny_font::draw_str(
+                &mut buf,
+                panel_w,
+                panel_h,
+                4,
+                4,
+                "OPTIONS",
+                [0xFF, 0xD7, 0x00, 0xFF],
+                scale,
+            );
+            let music_volume_pct = (music_volume * 100.0).round() as u32;
+            let rows = [
+                (
+                    "Music",
+                    if music_enabled {
+                        "ON".to_string()
+                    } else {
+                        "OFF".to_string()
+                    },
+                ),
+                ("Music volume", format!("{music_volume_pct}%")),
+                (
+                    "Video sequences",
+                    if video_sequences_enabled {
+                        "ON".to_string()
+                    } else {
+                        "OFF".to_string()
+                    },
+                ),
+                (
+                    "Speech announcements",
+                    if speech_enabled {
+                        "ON".to_string()
+                    } else {
+                        "OFF".to_string()
+                    },
+                ),
+            ];
+            for (idx, (label, state)) in rows.iter().enumerate() {
+                let selected = idx == options_sel;
+                let arrow = if selected { ">" } else { " " };
+                let line = format!("{arrow} {label}: {state}");
+                let color = if selected {
+                    [0xFF, 0xFF, 0x00, 0xFF]
                 } else {
-                    [0x99, 0xCC, 0xFF, 0xFF]
+                    [0xCC, 0xCC, 0xCC, 0xFF]
                 };
-                tiny_font::draw_str(&mut buf, panel_w, panel_h,
-                    4, 4 + i as i32 * line_h, l, color, scale);
+                tiny_font::draw_str(
+                    &mut buf,
+                    panel_w,
+                    panel_h,
+                    4,
+                    4 + line_h * (idx as i32 + 2),
+                    &line,
+                    color,
+                    scale,
+                );
             }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            tiny_font::draw_str(
+                &mut buf,
+                panel_w,
+                panel_h,
+                4,
+                4 + line_h * 6,
+                "Up/Dn pick  Lt/Rt/Enter change  O/Esc close",
+                [0xAA, 0xAA, 0xAA, 0xFF],
+                1,
+            );
+            if let Ok(mut tex) =
+                texture_creator.create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
             {
                 tex.update(None, &buf, (panel_w * 4) as usize).ok();
                 tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                 let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+                canvas
+                    .copy(&tex, None, Some(Rect::new(tx, 60, panel_w, panel_h)))
+                    .ok();
             }
         }
 
-        // Route list panel (Shift+R): list of player-owned trade routes
-        // with stop count + ship count; Backspace deletes the selected
-        // route and any ships running it.
-        if route_list_panel {
+        // Own ships list (S) — manual Appendix D.
+        if ship_panel {
             let scale = 1u32;
             let line_h = (5 * scale + 3) as i32;
-            let panel_w = 380u32;
+            let panel_w = 520u32;
             let header_h = 28i32;
-            let routes: Vec<&anno_sim::trade::TradeRoute> = sim.trade_routes
-                .iter().filter(|r| r.owner == 0).collect();
-            let visible = routes.len().max(1);
+            let rows = visible_ship_list_rows(&sim.trade_ships, &sim.military_units);
+
+            let visible = rows.len().max(1);
             let panel_h = (header_h + visible as i32 * line_h + 12) as u32;
             let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
             for i in 0..(panel_w * panel_h) as usize {
@@ -4811,91 +4635,60 @@ fn main() {
                 buf[i * 4 + 3] = 220;
             }
             tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "ROUTES (Shift+R close, Up/Dn pick, Bksp delete)",
-                [0xFF, 0xD7, 0x00, 0xFF], 1,
+                &mut buf,
+                panel_w,
+                panel_h,
+                4,
+                4,
+                "SHIPS (S/Esc close)",
+                [0xFF, 0xD7, 0x00, 0xFF],
+                scale,
             );
-            if routes.is_empty() {
+            if rows.is_empty() {
                 tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, header_h, "(no active routes)",
-                    [0x88, 0x88, 0x88, 0xFF], scale,
+                    &mut buf,
+                    panel_w,
+                    panel_h,
+                    4,
+                    header_h,
+                    "(no ships)",
+                    [0x88, 0x88, 0x88, 0xFF],
+                    scale,
                 );
             } else {
-                for (i, r) in routes.iter().enumerate() {
-                    let ships = sim.trade_ships.iter()
-                        .filter(|s| s.route_id == r.id && s.active)
-                        .count();
-                    let arrow = if i == route_list_sel { ">" } else { " " };
-                    let line = format!(
-                        "{} route {}  stops:{}  ships:{}  active:{}",
-                        arrow, r.id, r.stops.len(), ships, r.active,
+                for (row, ship) in rows.iter().enumerate() {
+                    let color = if ship.warship {
+                        [0xFF, 0xCC, 0xAA, 0xFF]
+                    } else {
+                        [0xAA, 0xDD, 0xFF, 0xFF]
+                    };
+                    let line = ship_list_line(ship);
+                    tiny_font::draw_str(
+                        &mut buf,
+                        panel_w,
+                        panel_h,
+                        4,
+                        header_h + row as i32 * line_h,
+                        &line,
+                        color,
+                        scale,
                     );
-                    let color = if i == route_list_sel {
-                        [0xFF, 0xFF, 0x00, 0xFF]
-                    } else { [0xCC, 0xCC, 0xCC, 0xFF] };
-                    tiny_font::draw_str(&mut buf, panel_w, panel_h,
-                        4, header_h + i as i32 * line_h, &line, color, scale);
                 }
             }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            if let Ok(mut tex) =
+                texture_creator.create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
             {
                 tex.update(None, &buf, (panel_w * 4) as usize).ok();
                 tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                 let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
                 let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+                canvas
+                    .copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h)))
+                    .ok();
             }
         }
 
-        // Settings panel (F10). Up/Down picks a row, Left/Right adjusts;
-        // each edit auto-persists to ~/.config/anno/settings.toml.
-        if settings_panel {
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 360u32;
-            let header_h = 30i32;
-            let n = anno_sim::settings::Settings::COUNT as i32;
-            let panel_h = (header_h + n * line_h + 12) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4,
-                "SETTINGS (Up/Dn pick, Left/Right ±5, F10/Esc close)",
-                [0xFF, 0xD7, 0x00, 0xFF], 1,
-            );
-            for i in 0..n {
-                let y = header_h + i * line_h;
-                let label = anno_sim::settings::Settings::label(i as usize);
-                let value = settings.value(i as usize);
-                let arrow = if i as usize == settings_sel { ">" } else { " " };
-                let line = format!("{arrow} {:<14} {:>3}", label, value);
-                let color = if i as usize == settings_sel {
-                    [0xFF, 0xFF, 0x00, 0xFF]
-                } else {
-                    [0xCC, 0xCC, 0xCC, 0xFF]
-                };
-                tiny_font::draw_str(&mut buf, panel_w, panel_h, 4, y, &line, color, scale);
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Save / load slot picker (F3). 10 named slots per scenario.
+        // Save / load slot picker (L). 10 named slots per scenario.
         if save_panel {
             let panel_w = 480u32;
             let header_h = 28i32;
@@ -4909,9 +4702,14 @@ fn main() {
                 buf[i * 4 + 3] = 220;
             }
             tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "SAVE SLOTS (Up/Dn pick, S=save, L=load, F3/Esc close)",
-                [0xFF, 0xD7, 0x00, 0xFF], 1,
+                &mut buf,
+                panel_w,
+                panel_h,
+                4,
+                4,
+                "SAVE SLOTS (Up/Dn pick, S=save, L=load, Esc close)",
+                [0xFF, 0xD7, 0x00, 0xFF],
+                1,
             );
             for slot in 0..10 {
                 let path = slot_path(slot);
@@ -4936,37 +4734,47 @@ fn main() {
                 let y = header_h + slot as i32 * line_h;
                 tiny_font::draw_str(&mut buf, panel_w, panel_h, 4, y, &line, color, 1);
             }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            if let Ok(mut tex) =
+                texture_creator.create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
             {
                 tex.update(None, &buf, (panel_w * 4) as usize).ok();
                 tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                 let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
                 let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+                canvas
+                    .copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h)))
+                    .ok();
             }
         }
 
-        // Building info card. Anno surfaced building info this way:
-        // click a building, see a small floating window with name +
-        // production status. Closes when the player clicks something
-        // else, presses Esc, or the building is destroyed.
+        // Building info card. In info mode, clicking a building opens a
+        // small floating window with name + production status. Closes
+        // when the player clicks something else, presses Esc, or the
+        // building is destroyed.
         if let Some(bi) = selected_building_idx {
             if bi >= sim.buildings.len() || !sim.buildings[bi].active {
                 selected_building_idx = None;
             } else {
                 let b = &sim.buildings[bi];
                 let def = &defs[b.def_id as usize];
-                let name = cod.buildings.get(b.def_id as usize)
+                let name = cod
+                    .buildings
+                    .get(b.def_id as usize)
                     .and_then(|p| p.properties.get("Name").cloned())
                     .unwrap_or_else(|| format!("Bldg#{}", b.def_id));
                 let mut lines: Vec<String> = vec![
                     format!("{} (Esc close)", name),
-                    format!("at ({},{}) island {} owner {}",
-                        b.tile_x, b.tile_y, b.island_id, b.owner),
-                    format!("size {}x{}  hp {}/{}",
-                        def.width, def.height, b.health,
-                        anno_sim::building::BUILDING_MAX_HEALTH),
+                    format!(
+                        "at ({},{}) island {} owner {}",
+                        b.tile_x, b.tile_y, b.island_id, b.owner
+                    ),
+                    format!(
+                        "size {}x{}  hp {}/{}",
+                        def.width,
+                        def.height,
+                        b.health,
+                        anno_sim::building::BUILDING_MAX_HEALTH
+                    ),
                 ];
                 if !b.is_built() {
                     let pct = if def.cost_wood + def.cost_tools + def.cost_bricks == 0 {
@@ -4977,32 +4785,33 @@ fn main() {
                         100 - (needed * 100 / total.max(1))
                     };
                     lines.push(format!("under construction ({}%)", pct));
-                    lines.push(format!("needs wood:{} tools:{} bricks:{}",
-                        b.wood_needed, b.tools_needed, b.bricks_needed));
+                    lines.push(format!(
+                        "needs wood:{} tools:{} bricks:{}",
+                        b.wood_needed, b.tools_needed, b.bricks_needed
+                    ));
                 }
                 if def.output_good != Good::None {
                     lines.push(format!(
                         "produces {:?}: {}/{}  eff {}%",
-                        def.output_good, b.output_stock, def.storage_capacity,
+                        def.output_good,
+                        b.output_stock,
+                        def.storage_capacity,
                         b.efficiency as u32 * 100 / 128,
                     ));
                     if def.input_good_1 != Good::None {
-                        lines.push(format!(
-                            "in1 {:?}: {}",
-                            def.input_good_1, b.input_1_stock,
-                        ));
+                        lines.push(format!("in1 {:?}: {}", def.input_good_1, b.input_1_stock,));
                     }
                     if def.input_good_2 != Good::None {
-                        lines.push(format!(
-                            "in2 {:?}: {}",
-                            def.input_good_2, b.input_2_stock,
-                        ));
+                        lines.push(format!("in2 {:?}: {}", def.input_good_2, b.input_2_stock,));
                     }
                 }
                 if def.prod_kind == "WOHN" {
                     let tier_name = match b.house_tier {
-                        0 => "Pioneer", 1 => "Settler", 2 => "Citizen",
-                        3 => "Merchant", _ => "Aristocrat",
+                        0 => "Pioneer",
+                        1 => "Settler",
+                        2 => "Citizen",
+                        3 => "Merchant",
+                        _ => "Aristocrat",
                     };
                     lines.push(format!("residence tier: {}", tier_name));
                 }
@@ -5010,9 +4819,7 @@ fn main() {
                     lines.push(format!("upkeep: {}/tick", def.maintenance_cost));
                 }
                 // Mine deposit status (RE: haeuser.cod Erzbergnr).
-                if def.ore_deposit
-                    != anno_sim::building::OreDeposit::None
-                {
+                if def.ore_deposit != anno_sim::building::OreDeposit::None {
                     let total = def.ore_deposit.capacity();
                     lines.push(format!(
                         "ore deposit: {}/{} t remaining",
@@ -5024,10 +4831,7 @@ fn main() {
                 }
                 // Maxenergy progress bar (RE: haeuser.cod Maxenergy).
                 if def.max_energy > 0 {
-                    lines.push(format!(
-                        "wear: {}/{} cycles",
-                        b.total_work, def.max_energy,
-                    ));
+                    lines.push(format!("wear: {}/{} cycles", b.total_work, def.max_energy,));
                 }
                 // Defensive cannons (RE: haeuser.cod Kanon).
                 if def.defensive_cannons > 0 {
@@ -5041,13 +4845,6 @@ fn main() {
                 if def.can_dry_up && !b.active {
                     lines.push("DRIED UP — bulldoze and replant".to_string());
                 }
-                // Idle warning.
-                if b.is_built() && b.idle_ticks > 0 {
-                    lines.push(format!(
-                        "idle: {} cycles (limit {})",
-                        b.idle_ticks, def.max_no_input_ticks,
-                    ));
-                }
                 let scale = 1u32;
                 let line_h = (5 * scale + 3) as i32;
                 let panel_w = 280u32;
@@ -5060,101 +4857,49 @@ fn main() {
                     buf[i * 4 + 3] = 220;
                 }
                 tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, 4, &lines[0], [0xFF, 0xD7, 0x00, 0xFF], scale,
+                    &mut buf,
+                    panel_w,
+                    panel_h,
+                    4,
+                    4,
+                    &lines[0],
+                    [0xFF, 0xD7, 0x00, 0xFF],
+                    scale,
                 );
                 for (i, line) in lines.iter().enumerate().skip(1) {
                     tiny_font::draw_str(
-                        &mut buf, panel_w, panel_h,
-                        4, 4 + i as i32 * line_h, line,
-                        [0xCC, 0xCC, 0xCC, 0xFF], scale,
+                        &mut buf,
+                        panel_w,
+                        panel_h,
+                        4,
+                        4 + i as i32 * line_h,
+                        line,
+                        [0xCC, 0xCC, 0xCC, 0xFF],
+                        scale,
                     );
                 }
-                if let Ok(mut tex) = texture_creator
-                    .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-                {
+                if let Ok(mut tex) = texture_creator.create_texture_streaming(
+                    PixelFormatEnum::RGBA32,
+                    panel_w,
+                    panel_h,
+                ) {
                     tex.update(None, &buf, (panel_w * 4) as usize).ok();
                     tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                    canvas.copy(&tex, None, Some(Rect::new(8, 60, panel_w, panel_h))).ok();
+                    canvas
+                        .copy(&tex, None, Some(Rect::new(8, 60, panel_w, panel_h)))
+                        .ok();
                 }
             }
         }
 
-        // Objectives panel (?). Read-only — pulls live from sim.objectives.
-        // Player evaluation screen (Shift+V) — manual sec. 5.2.
-        // Total per-player account view: gold, population, income,
-        // costs, net balance. Color-codes net (green positive, red
-        // negative).
-        if eval_panel {
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 360u32;
-            let n_rows = sim.players.len() as i32;
-            let panel_h = (32 + (n_rows + 1) * line_h + 8) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "EVALUATION (Shift+V/Esc close)",
-                [0xFF, 0xD7, 0x00, 0xFF], scale,
-            );
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4 + line_h,
-                "p#  gold     pop   income  cost  net",
-                [0xCC, 0xCC, 0xCC, 0xFF], scale,
-            );
-            for (i, p) in sim.players.iter().enumerate() {
-                let income = p.calculate_income();
-                let costs = p.calculate_costs();
-                let net = p.net_balance();
-                let pop: u32 = p.population.iter().sum();
-                let net_color = if net >= 0 {
-                    [0x40, 0xFF, 0x80, 0xFF]
-                } else {
-                    [0xFF, 0x60, 0x60, 0xFF]
-                };
-                let line = format!(
-                    "{}  {:>6}  {:>5}  {:>5}   {:>4}  {:>4}",
-                    i, p.gold, pop, income, costs, net,
-                );
-                tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, 4 + line_h * (2 + i as i32),
-                    &line, net_color, scale,
-                );
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                canvas.copy(&tex, None, Some(Rect::new(tx, 60, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Cities list (Shift+C) — manual sec. 5.2. Lists every
-        // active warehouse (= "city"). Other-player cities are only
-        // shown if a trade agreement exists.
+        // Cities list (C) — manual Appendix D. Uses STADT4 city
+        // records; other-player cities are only shown if a trade
+        // agreement exists.
         if cities_panel {
             let scale = 1u32;
             let line_h = (5 * scale + 3) as i32;
-            let panel_w = 360u32;
-            let visible: Vec<(usize, &anno_sim::warehouse::Warehouse)> = sim
-                .warehouses
-                .iter()
-                .enumerate()
-                .filter(|(_, w)| {
-                    w.active && (w.owner == 0
-                        || sim.diplomacy.has_trade_agreement(0, w.owner))
-                })
-                .collect();
+            let panel_w = 430u32;
+            let visible = visible_city_list_rows(&islands, &sim.diplomacy);
             let n = visible.len() as i32;
             let panel_h = (28 + (n + 1).max(2) * line_h + 8) as u32;
             let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
@@ -5165,343 +4910,64 @@ fn main() {
                 buf[i * 4 + 3] = 220;
             }
             tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "CITIES (Shift+C/Esc close)",
-                [0xFF, 0xD7, 0x00, 0xFF], scale,
+                &mut buf,
+                panel_w,
+                panel_h,
+                4,
+                4,
+                "CITIES (C/Esc close)",
+                [0xFF, 0xD7, 0x00, 0xFF],
+                scale,
             );
             tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4 + line_h,
-                "owner  island  tile",
-                [0xCC, 0xCC, 0xCC, 0xFF], scale,
+                &mut buf,
+                panel_w,
+                panel_h,
+                4,
+                4 + line_h,
+                "city                 owner   pop  island",
+                [0xCC, 0xCC, 0xCC, 0xFF],
+                scale,
             );
-            for (row, (_, w)) in visible.iter().enumerate() {
-                let line = format!(
-                    "p{}     {}      ({},{})",
-                    w.owner, w.island_id, w.tile_x, w.tile_y,
-                );
-                let color = if w.owner == 0 {
+            for (row, city) in visible.iter().enumerate() {
+                let line = city_list_line(city);
+                let color = if city.owner == 0 {
                     [0x80, 0xFF, 0xC0, 0xFF]
                 } else {
                     [0xCC, 0xCC, 0xCC, 0xFF]
                 };
                 tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, 4 + line_h * (2 + row as i32),
-                    &line, color, scale,
+                    &mut buf,
+                    panel_w,
+                    panel_h,
+                    4,
+                    4 + line_h * (2 + row as i32),
+                    &line,
+                    color,
+                    scale,
                 );
             }
             if visible.is_empty() {
                 tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, 4 + line_h * 2,
-                    "(no cities — found a Kontor with F7)",
-                    [0x88, 0x88, 0x88, 0xFF], scale,
+                    &mut buf,
+                    panel_w,
+                    panel_h,
+                    4,
+                    4 + line_h * 2,
+                    "(no known cities)",
+                    [0x88, 0x88, 0x88, 0xFF],
+                    scale,
                 );
             }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            if let Ok(mut tex) =
+                texture_creator.create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
             {
                 tex.update(None, &buf, (panel_w * 4) as usize).ok();
                 tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                 let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                canvas.copy(&tex, None, Some(Rect::new(tx, 60, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Music jukebox (Shift+J) — list MUSIC8 tracks; Up/Down
-        // moves selection, Enter switches the currently-playing
-        // track.
-        if music_panel {
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 360u32;
-            let max_visible = 16i32;
-            let total = music_files.len() as i32;
-            let visible = total.min(max_visible);
-            let panel_h = (28 + (visible + 1) * line_h + 8) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4,
-                "JUKEBOX (Shift+J/Esc  Up/Dn pick  Enter play)",
-                [0xFF, 0xD7, 0x00, 0xFF], scale,
-            );
-            let start = if total <= max_visible {
-                0
-            } else {
-                music_sel.saturating_sub(max_visible as usize / 2)
-                    .min(total as usize - max_visible as usize)
-            };
-            for (row, idx) in (start..(start + max_visible as usize)
-                .min(total as usize)).enumerate()
-            {
-                let name = std::path::Path::new(&music_files[idx])
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?");
-                let arrow = if idx == music_sel { "> " } else { "  " };
-                let color = if idx == music_sel {
-                    [0xFF, 0xFF, 0x00, 0xFF]
-                } else {
-                    [0xCC, 0xCC, 0xCC, 0xFF]
-                };
-                tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, 28 + row as i32 * line_h,
-                    &format!("{arrow}{name}"), color, scale,
-                );
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                canvas.copy(&tex, None, Some(Rect::new(tx, 60, panel_w, panel_h))).ok();
-            }
-        }
-
-        if obj_panel {
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 360u32;
-            let header_h = 28i32;
-            let n = sim.objectives.items.len() as i32;
-            let panel_h = (header_h + n * line_h + 12) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            let (done, total) = sim.objectives.progress();
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4,
-                &format!("OBJECTIVES {}/{} (?/Esc close)", done, total),
-                [0xFF, 0xD7, 0x00, 0xFF], 2,
-            );
-            for (i, (obj, done_flag)) in sim.objectives.items.iter().enumerate() {
-                let y = header_h + i as i32 * line_h;
-                let mark = if *done_flag { "[x]" } else { "[ ]" };
-                let line = format!("{} {}", mark, obj.label());
-                let color = if *done_flag {
-                    [0x66, 0xFF, 0x66, 0xFF]
-                } else {
-                    [0xCC, 0xCC, 0xCC, 0xFF]
-                };
-                tiny_font::draw_str(&mut buf, panel_w, panel_h, 4, y, &line, color, scale);
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Ship freight panel (J): one row per active TradeShip with route,
-        // state, cargo, and profit. Helpful for spotting idle ships or
-        // ones that aren't picking up the goods you expect.
-        if ship_panel {
-            use anno_sim::trade::ShipState;
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 480u32;
-            let active_ships: Vec<(usize, &anno_sim::trade::TradeShip)> = sim
-                .trade_ships
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.active)
-                .collect();
-            let panel_h = (28 + (active_ships.len() as i32 * 2 + 1).max(2) * line_h) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4,
-                "FLEET (J/Esc close)",
-                [0xFF, 0xD7, 0x00, 0xFF], 2,
-            );
-            if active_ships.is_empty() {
-                tiny_font::draw_str(
-                    &mut buf, panel_w, panel_h,
-                    4, 24, "(no active ships)",
-                    [0x88, 0x88, 0x88, 0xFF], scale,
-                );
-            } else {
-                for (row, (idx, ship)) in active_ships.iter().enumerate() {
-                    let y0 = 22 + row as i32 * 2 * line_h;
-                    let stops = sim.trade_routes.iter()
-                        .find(|r| r.id == ship.route_id)
-                        .map(|r| r.stops.len())
-                        .unwrap_or(0);
-                    let state_str = match ship.state {
-                        ShipState::Sailing => "sailing",
-                        ShipState::Trading => "trading",
-                        ShipState::Waiting => "waiting",
-                        ShipState::Idle    => "idle",
-                    };
-                    let state_color = match ship.state {
-                        ShipState::Sailing => [0x66, 0xCC, 0xFF, 0xFF],
-                        ShipState::Trading => [0xCC, 0xFF, 0xCC, 0xFF],
-                        ShipState::Waiting => [0xFF, 0xCC, 0x66, 0xFF],
-                        ShipState::Idle    => [0xAA, 0xAA, 0xAA, 0xFF],
-                    };
-                    let head = format!(
-                        "#{} p{}  route {}  stop {}/{}  @({},{}) {} profit:{}g",
-                        idx, ship.owner, ship.route_id,
-                        ship.current_stop + 1, stops.max(1),
-                        ship.world_x, ship.world_y, state_str, ship.profit,
-                    );
-                    tiny_font::draw_str(
-                        &mut buf, panel_w, panel_h,
-                        4, y0, &head, state_color, scale,
-                    );
-                    let cargo = if ship.cargo.is_empty() {
-                        "  cargo: (empty)".to_string()
-                    } else {
-                        let parts: Vec<String> = ship.cargo.iter()
-                            .filter(|(_, q)| *q > 0)
-                            .take(8)
-                            .map(|(g, q)| format!("{:?}:{}", g, q))
-                            .collect();
-                        format!(
-                            "  cargo {}/{}: {}",
-                            ship.cargo_total,
-                            anno_sim::trade::SHIP_CARGO_CAPACITY,
-                            parts.join(" "),
-                        )
-                    };
-                    tiny_font::draw_str(
-                        &mut buf, panel_w, panel_h,
-                        4, y0 + line_h, &cargo,
-                        [0xCC, 0xCC, 0xCC, 0xFF], scale,
-                    );
-                }
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Market panel (A) — buy / sell goods at the player's first
-        // active warehouse using `prices::price_of`.
-        if market_panel {
-            const GOODS: &[Good] = &[
-                Good::Wood, Good::Iron, Good::Ore, Good::Gold,
-                Good::Wool, Good::Sugar, Good::Tobacco, Good::Cattle,
-                Good::Grain, Good::Flour, Good::Food, Good::Alcohol,
-                Good::Cloth, Good::Clothing, Good::Jewelry, Good::Tools,
-                Good::Bricks, Good::Swords, Good::Cannons, Good::Muskets,
-                Good::Stone, Good::Cocoa, Good::Spices, Good::WildGame,
-                Good::Cotton, Good::Silk, Good::Fish, Good::Grapes,
-                Good::TobaccoProducts,
-            ];
-            let panel_w = 380u32;
-            let header_h = 30i32;
-            let line_h = 12i32;
-            let visible = (GOODS.len() as i32).min(20);
-            let panel_h = (header_h + visible * line_h + 12) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x18;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4, "MARKET (A close  Lt/Rt ±10 trade  B buy-max  N sell-min)",
-                [0xFF, 0xD7, 0x00, 0xFF], 1,
-            );
-            let gold_now = sim.players.first().map(|p| p.gold).unwrap_or(0);
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 16, &format!("gold:{gold_now}  Good      stock  b/s   buy/sell"),
-                [0xCC, 0xCC, 0xCC, 0xFF], 1,
-            );
-            // Sliding window centered on selection.
-            let total = GOODS.len();
-            let max_visible = visible as usize;
-            let start = if total <= max_visible {
-                0
-            } else {
-                market_sel.saturating_sub(max_visible / 2)
-                    .min(total - max_visible)
-            };
-            // Pull stock + slider state for player 0's first warehouse.
-            let player_wh = sim.warehouses.iter()
-                .find(|w| w.active && w.owner == 0);
-            let stock_for = |g: Good| -> u16 {
-                player_wh.map(|w| w.stock(g)).unwrap_or(0)
-            };
-            let slider_for = |g: Good| -> anno_sim::warehouse::TradeSlider {
-                player_wh.map(|w| w.slider(g)).unwrap_or_default()
-            };
-            for (row, idx) in (start..(start + max_visible).min(total)).enumerate() {
-                let g = GOODS[idx];
-                let price = sim.current_price(g);
-                let stock = stock_for(g);
-                let slider = slider_for(g);
-                let label_full = format!("{:?}", g);
-                let label = if label_full.len() > 9 {
-                    label_full[..9].to_string()
-                } else {
-                    label_full
-                };
-                let arrow = if idx == market_sel { ">" } else { " " };
-                // Compact slider chip: "b25/s30" (None entries shown as ".").
-                let buy_chip = match slider.buy_max_stock {
-                    Some(n) => format!("b{n}"),
-                    None => "b.".into(),
-                };
-                let sell_chip = match slider.sell_min_keep {
-                    Some(n) => format!("s{n}"),
-                    None => "s.".into(),
-                };
-                let line = format!(
-                    "{arrow} {:<9}  {:>4} {:>4}/{:<4} {:>3}/{:<3}",
-                    label, stock, buy_chip, sell_chip, price.buy, price.sell,
-                );
-                let color = if idx == market_sel {
-                    [0xFF, 0xFF, 0x00, 0xFF]
-                } else {
-                    [0xCC, 0xCC, 0xCC, 0xFF]
-                };
-                let y = header_h + row as i32 * line_h;
-                tiny_font::draw_str(&mut buf, panel_w, panel_h, 4, y, &line, color, 1);
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
-                let ty = 60i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+                canvas
+                    .copy(&tex, None, Some(Rect::new(tx, 60, panel_w, panel_h)))
+                    .ok();
             }
         }
 
@@ -5509,7 +4975,8 @@ fn main() {
         // live input box while typing.
         {
             let chat_ttl = std::time::Duration::from_secs(10);
-            while chat_log.front()
+            while chat_log
+                .front()
                 .map(|(_, t)| t.elapsed() > chat_ttl)
                 .unwrap_or(false)
             {
@@ -5532,35 +4999,37 @@ fn main() {
                 for (line, _) in chat_log.iter() {
                     let color = if line.starts_with("you:") {
                         [0xCC, 0xFF, 0xCC, 0xFF]
-                    } else if line.starts_with("[diplo]") {
-                        [0xFF, 0xCC, 0x66, 0xFF] // amber
-                    } else if line.starts_with("[build]") {
-                        [0x99, 0xCC, 0xFF, 0xFF] // cool blue
                     } else {
                         [0xFF, 0xFF, 0xFF, 0xFF]
                     };
-                    tiny_font::draw_str(
-                        &mut buf, panel_w, panel_h,
-                        4, y, line, color, scale,
-                    );
+                    tiny_font::draw_str(&mut buf, panel_w, panel_h, 4, y, line, color, scale);
                     y += line_h;
                 }
                 if chat_active {
                     let prompt = format!("> {}_", chat_input);
                     tiny_font::draw_str(
-                        &mut buf, panel_w, panel_h,
-                        4, y, &prompt,
-                        [0xFF, 0xD7, 0x00, 0xFF], scale,
+                        &mut buf,
+                        panel_w,
+                        panel_h,
+                        4,
+                        y,
+                        &prompt,
+                        [0xFF, 0xD7, 0x00, 0xFF],
+                        scale,
                     );
                 }
-                if let Ok(mut tex) = texture_creator
-                    .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-                {
+                if let Ok(mut tex) = texture_creator.create_texture_streaming(
+                    PixelFormatEnum::RGBA32,
+                    panel_w,
+                    panel_h,
+                ) {
                     tex.update(None, &buf, (panel_w * 4) as usize).ok();
                     tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                     let tx = 8i32;
                     let ty = WINDOW_H as i32 - panel_h as i32 - 8;
-                    canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+                    canvas
+                        .copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h)))
+                        .ok();
                 }
             }
         }
@@ -5576,19 +5045,19 @@ fn main() {
         let human_gold = sim.players.first().map(|p| p.gold).unwrap_or(0);
         let zoom_label = ["GFX", "MGFX", "SGFX"][sprite_zoom];
 
-        let title = if trade_route_mode {
-            let last_mode = draft_route_stops.last()
-                .map(|s| ["LOAD", "UNLOAD", "BOTH"][s.3 as usize])
-                .unwrap_or("—");
+        let title = if options_panel {
             format!(
-                "TRADE ROUTE — click warehouses ({} stops, last={}) — L/U/B=last-stop mode Enter=commit Esc=cancel",
-                draft_route_stops.len(),
-                last_mode,
+                "OPTIONS - music:{} volume:{:.0}% video:{} speech:{} - Up/Down=select Left/Right=change O/Esc=close",
+                if music_enabled { "ON" } else { "OFF" },
+                music_volume * 100.0,
+                if video_sequences_enabled { "ON" } else { "OFF" },
+                if speech_enabled { "ON" } else { "OFF" },
             )
-        } else if tax_panel {
+        } else if video_speech_panel {
             format!(
-                "TAX PANEL — Up/Down=select tier Left/Right=adjust T/Esc=close — gold:{}",
-                sim.players.first().map(|p| p.gold).unwrap_or(0),
+                "VIDEO/SPEECH - video:{} speech:{} - Up/Down=select Left/Right=toggle F/Esc=close",
+                if video_sequences_enabled { "ON" } else { "OFF" },
+                if speech_enabled { "ON" } else { "OFF" },
             )
         } else if diplomacy_panel {
             use anno_sim::combat::Diplomacy;
@@ -5598,7 +5067,7 @@ fn main() {
                 Diplomacy::War => "WAR",
             };
             format!(
-                "DIPLOMACY — vs Player {} = {} — Up/Down=select Left/Right=cycle Y/Esc=close",
+                "DIPLOMACY — vs Player {} = {} — Up/Down=select Left/Right=cycle D/Esc=close",
                 diplomacy_target, cur,
             )
         } else if demolish_mode {
@@ -5616,11 +5085,10 @@ fn main() {
                 "hover over a building to demolish".to_string()
             };
             format!("DEMOLISH MODE — {} — Esc=cancel", hover_info)
+        } else if info_mode {
+            "INFO MODE — click building or warehouse for status — I/Esc=close".to_string()
         } else if let Some(ref insp) = inspection {
-            format!(
-                "INSPECT — {} — Esc=close",
-                insp.info,
-            )
+            format!("INSPECT — {} — Esc=close", insp.info,)
         } else if placer.active {
             let page_indices = placer.page_index_slice();
             let build_list: String = page_indices
@@ -5649,7 +5117,7 @@ fn main() {
                 String::new()
             };
             format!(
-                "BUILD MODE [{cat_label}] — gold:{} cost:{}{} — pg{}/{} — {} — [/]=cat PgUp/Dn=page Z=rot Esc=cancel",
+                "BUILD MODE [{cat_label}] — gold:{} cost:{}{} — pg{}/{} — {} — [/]=cat PgUp/Dn=page Z/X=rot Esc=cancel",
                 human_gold,
                 sel_cost,
                 rot_label,
@@ -5657,15 +5125,29 @@ fn main() {
                 pg_total,
                 build_list,
             )
+        } else if combat_mode {
+            if let Some(si) = selected_trade_ship_idx {
+                format!("COMBAT MODE — selected trade ship #{si} — W=white flag K/Esc=close")
+            } else if selected_units.is_empty() {
+                "COMBAT MODE — click own ships/units to select — K/Esc=close".to_string()
+            } else {
+                format!(
+                    "COMBAT MODE — selected {} unit(s) — RMB=move Ctrl+1-9=store 1-9=recall W=white flag K/Esc=close",
+                    selected_units.len(),
+                )
+            }
         } else if !selected_units.is_empty() {
             format!(
                 "Anno 1602 — selected {} unit(s) — RMB=move-here Esc=deselect — {:02}:{:02} {} — gold:{}",
                 selected_units.len(),
-                minutes, seconds, speed_label, human_gold,
+                minutes,
+                seconds,
+                speed_label,
+                human_gold,
             )
         } else {
             format!(
-                "Anno 1602 [{}] — '{}' — {:02}:{:02} {} — carriers:{} ships:{} units:{} routes:{} gold:{} — {zoom_label} {}x — B=build D=demolish T=tax Y=diplo R=route G=graphs P=prod",
+                "Anno 1602 [{}] — '{}' — {:02}:{:02} {} — carriers:{} ships:{} units:{} routes:{} gold:{} — {zoom_label} {}x — B=build I=info K=combat D=diplo L=save S=ships C=cities",
                 net_status,
                 scenario_name,
                 minutes,
@@ -5698,62 +5180,12 @@ fn main() {
         };
         canvas.window_mut().set_title(&title).ok();
 
-        // Scenario-editor HUD: a small panel pinned to the top-left
-        // showing edit-mode status, current placement owner, and the
-        // shortcut keys.
-        if editor_mode {
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 240u32;
-            let panel_h = (line_h * 4 + 12) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0x10;
-                buf[i * 4 + 2] = 0;
-                buf[i * 4 + 3] = 220;
-            }
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4,
-                &format!("EDITOR  player {}", editor_owner),
-                [0x80, 0xFF, 0x80, 0xFF], scale,
-            );
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4 + line_h,
-                "Shift+E exit  [/] cycle owner",
-                [0xCC, 0xCC, 0xCC, 0xFF], scale,
-            );
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4 + line_h * 2,
-                "G add gold goal  P add pop goal",
-                [0xCC, 0xCC, 0xCC, 0xFF], scale,
-            );
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                4, 4 + line_h * 3,
-                "Backspace pop goal  F8 export .szs",
-                [0xCC, 0xCC, 0xCC, 0xFF], scale,
-            );
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                canvas.copy(&tex, None, Some(Rect::new(8, 8, panel_w, panel_h))).ok();
-            }
-        }
-
         // Outcome banner overlay — drawn centred so the player can see
         // it in-window, not just in the title bar.
         if sim.outcome != anno_sim::simulation::GameOutcome::Pending {
             let (label, color) = match sim.outcome {
-                anno_sim::simulation::GameOutcome::Victory =>
-                    ("VICTORY", [0x40, 0xFF, 0x80, 0xFF]),
-                anno_sim::simulation::GameOutcome::Defeat =>
-                    ("DEFEAT", [0xFF, 0x40, 0x40, 0xFF]),
+                anno_sim::simulation::GameOutcome::Victory => ("VICTORY", [0x40, 0xFF, 0x80, 0xFF]),
+                anno_sim::simulation::GameOutcome::Defeat => ("DEFEAT", [0xFF, 0x40, 0x40, 0xFF]),
                 _ => ("", [0xFF, 0xFF, 0xFF, 0xFF]),
             };
             let scale = 4u32;
@@ -5767,77 +5199,21 @@ fn main() {
                 buf[i * 4 + 3] = 220;
             }
             let text_x = (panel_w as i32 - (label.len() as i32) * 4 * scale as i32) / 2;
-            tiny_font::draw_str(
-                &mut buf, panel_w, panel_h,
-                text_x, 8, label, color, scale,
-            );
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
+            tiny_font::draw_str(&mut buf, panel_w, panel_h, text_x, 8, label, color, scale);
+            if let Ok(mut tex) =
+                texture_creator.create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
             {
                 tex.update(None, &buf, (panel_w * 4) as usize).ok();
                 tex.set_blend_mode(sdl2::render::BlendMode::Blend);
                 let tx = (WINDOW_W as i32 - panel_w as i32) / 2;
                 let ty = 80i32;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
-            }
-        }
-
-        // Perf overlay (F12). Drawn last so it lands on top of everything.
-        if show_perf {
-            let scale = 1u32;
-            let line_h = (5 * scale + 3) as i32;
-            let panel_w = 200u32;
-            let panel_h = (line_h * 4 + 8) as u32;
-            let mut buf = vec![0u8; (panel_w * panel_h * 4) as usize];
-            for i in 0..(panel_w * panel_h) as usize {
-                buf[i * 4] = 0;
-                buf[i * 4 + 1] = 0;
-                buf[i * 4 + 2] = 0x00;
-                buf[i * 4 + 3] = 200;
-            }
-            let n = perf_history.len() as u32;
-            let avg = |idx: usize| -> u32 {
-                if n == 0 { return 0; }
-                let s: u64 = perf_history.iter()
-                    .map(|s| match idx { 0 => s.0, 1 => s.1, _ => s.2 } as u64)
-                    .sum();
-                (s / n as u64) as u32
-            };
-            let lines = [
-                format!("PERF (F12) n={}", n),
-                format!("sim {:>5} us", avg(0)),
-                format!("render {:>5} us", avg(1)),
-                format!("frame {:>5} us  {} fps",
-                    avg(2),
-                    if avg(2) == 0 { 0 } else { 1_000_000 / avg(2) },
-                ),
-            ];
-            for (i, line) in lines.iter().enumerate() {
-                tiny_font::draw_str(&mut buf, panel_w, panel_h,
-                    4, 4 + i as i32 * line_h, line,
-                    [0xCC, 0xFF, 0xCC, 0xFF], scale);
-            }
-            if let Ok(mut tex) = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGBA32, panel_w, panel_h)
-            {
-                tex.update(None, &buf, (panel_w * 4) as usize).ok();
-                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                let tx = WINDOW_W as i32 - panel_w as i32 - 8;
-                let ty = WINDOW_H as i32 - panel_h as i32 - 8;
-                canvas.copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h))).ok();
+                canvas
+                    .copy(&tex, None, Some(Rect::new(tx, ty, panel_w, panel_h)))
+                    .ok();
             }
         }
 
         canvas.present();
-
-        // Sample perf for next-frame overlay.
-        let frame_us = frame_started.elapsed().as_micros() as u32;
-        frame_started = std::time::Instant::now();
-        let sim_us = perf_sim_start.elapsed().as_micros() as u32;
-        // Render us is approximate: total frame minus the sim portion.
-        let render_us = frame_us.saturating_sub(sim_us);
-        if perf_history.len() >= 60 { perf_history.pop_front(); }
-        perf_history.push_back((sim_us, render_us, frame_us));
     }
 }
 
@@ -5852,7 +5228,1082 @@ struct RenderState {
     tile_h: i32,
 }
 
-/// Draw simulation entities (carriers, ships, military) on top of terrain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShipSpriteLayout {
+    small_trader_base: usize,
+    large_trader_base: usize,
+    free_trader_base: usize,
+    small_warship_base: usize,
+    large_warship_base: usize,
+    pirate_ship_base: usize,
+}
+
+impl ShipSpriteLayout {
+    fn from_figure_defs(
+        handel1: Option<&anno_formats::figuren::FigureDef>,
+        handel2: Option<&anno_formats::figuren::FigureDef>,
+        handler: Option<&anno_formats::figuren::FigureDef>,
+        krieg1: Option<&anno_formats::figuren::FigureDef>,
+        krieg2: Option<&anno_formats::figuren::FigureDef>,
+        pirat: Option<&anno_formats::figuren::FigureDef>,
+    ) -> Self {
+        Self {
+            small_trader_base: figure_walk_sprite_base(handel1, 0),
+            large_trader_base: figure_walk_sprite_base(handel2, 32),
+            free_trader_base: figure_walk_sprite_base(handler, 16),
+            small_warship_base: figure_walk_sprite_base(krieg1, 64),
+            large_warship_base: figure_walk_sprite_base(krieg2, 48),
+            pirate_ship_base: figure_walk_sprite_base(pirat, 80),
+        }
+    }
+
+    fn trader_base(self, class: TradeShipClass) -> usize {
+        match class {
+            TradeShipClass::SmallTrader => self.small_trader_base,
+            TradeShipClass::LargeTrader => self.large_trader_base,
+        }
+    }
+
+    fn naval_base(self, unit_type: UnitType) -> Option<usize> {
+        match unit_type {
+            UnitType::SmallWarship => Some(self.small_warship_base),
+            UnitType::LargeWarship => Some(self.large_warship_base),
+            UnitType::PirateShip => Some(self.pirate_ship_base),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SoldierSpriteFamily {
+    bases: [usize; 4],
+    frames_per_dir: usize,
+    frame_speed_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SoldierSpriteLayout {
+    infantry: SoldierSpriteFamily,
+    cavalry: SoldierSpriteFamily,
+    cannon: SoldierSpriteFamily,
+    musketeer: SoldierSpriteFamily,
+}
+
+impl SoldierSpriteLayout {
+    fn from_figures(figures: &anno_formats::figuren::FiguresFile) -> Self {
+        Self {
+            infantry: soldier_family_from_figures(
+                figures,
+                ["SOLDAT1", "SOLDAT2", "SOLDAT3", "SOLDAT4"],
+                [0, 280, 560, 840],
+            ),
+            cavalry: soldier_family_from_figures(
+                figures,
+                ["KAVALERIE1", "KAVALERIE2", "KAVALERIE3", "KAVALERIE4"],
+                [1120, 1424, 1728, 2032],
+            ),
+            cannon: soldier_family_from_figures(
+                figures,
+                ["KANONIER1", "KANONIER2", "KANONIER3", "KANONIER4"],
+                [2336, 2552, 2768, 2984],
+            ),
+            musketeer: soldier_family_from_figures(
+                figures,
+                ["MUSKETIER1", "MUSKETIER2", "MUSKETIER3", "MUSKETIER4"],
+                [3200, 3336, 3472, 3608],
+            ),
+        }
+    }
+
+    fn family(self, unit_type: UnitType) -> Option<SoldierSpriteFamily> {
+        match unit_type {
+            UnitType::Infantry => Some(self.infantry),
+            UnitType::Cavalry => Some(self.cavalry),
+            UnitType::Cannon => Some(self.cannon),
+            UnitType::Musketeer => Some(self.musketeer),
+            _ => None,
+        }
+    }
+
+    fn sprite_index(
+        self,
+        unit_type: UnitType,
+        owner: u8,
+        direction: u8,
+        elapsed_ms: u32,
+        moving: bool,
+    ) -> Option<usize> {
+        let family = self.family(unit_type)?;
+        let variant = owner_sprite_variant(owner);
+        let frame = if moving {
+            ((elapsed_ms / family.frame_speed_ms.max(1)) as usize) % family.frames_per_dir.max(1)
+        } else {
+            0
+        };
+        Some(rotated_walk_sprite_index(
+            family.bases[variant],
+            family.frames_per_dir,
+            direction,
+            frame,
+        ))
+    }
+}
+
+fn soldier_family_from_figures(
+    figures: &anno_formats::figuren::FiguresFile,
+    names: [&str; 4],
+    fallback_bases: [usize; 4],
+) -> SoldierSpriteFamily {
+    let mut bases = fallback_bases;
+    let mut frames_per_dir = 8usize;
+    let mut frame_speed_ms = 100u32;
+    for (idx, name) in names.iter().enumerate() {
+        if let Some(def) = figures.find(name) {
+            bases[idx] = figure_walk_sprite_base(Some(def), fallback_bases[idx]);
+            if let Some(walk) = def.walk_anim() {
+                if let Some(frames) = usize::try_from(walk.anim_anz)
+                    .ok()
+                    .filter(|&frames| frames > 0)
+                {
+                    frames_per_dir = frames;
+                }
+                if let Some(speed) = u32::try_from(walk.anim_speed)
+                    .ok()
+                    .filter(|&speed| speed > 0)
+                {
+                    frame_speed_ms = speed;
+                }
+            }
+        }
+    }
+    SoldierSpriteFamily {
+        bases,
+        frames_per_dir,
+        frame_speed_ms,
+    }
+}
+
+fn owner_sprite_variant(owner: u8) -> usize {
+    usize::from(owner.min(3))
+}
+
+fn figure_walk_sprite_base(
+    figure: Option<&anno_formats::figuren::FigureDef>,
+    fallback: usize,
+) -> usize {
+    figure
+        .and_then(|f| {
+            let anim_offs = f.walk_anim().map(|a| a.anim_offs).unwrap_or(0);
+            usize::try_from(f.gfx + anim_offs).ok()
+        })
+        .unwrap_or(fallback)
+}
+
+fn live_ship_sprite_index(base: usize, heading: u8) -> usize {
+    base + usize::from(heading % 8)
+}
+
+fn entity_walk_sprite_index(
+    base_sprite: u16,
+    anim_offs: usize,
+    frames_per_dir: usize,
+    direction: u8,
+    anim_frame: u8,
+) -> usize {
+    let frames = frames_per_dir.max(1);
+    base_sprite as usize
+        + anim_offs
+        + usize::from(direction % 8) * frames
+        + usize::from(anim_frame) % frames
+}
+
+fn rotated_walk_sprite_index(
+    base: usize,
+    frames_per_dir: usize,
+    direction: u8,
+    frame: usize,
+) -> usize {
+    let frames = frames_per_dir.max(1);
+    base + usize::from(direction % 8) * frames + frame % frames
+}
+
+fn civilian_frames_per_dir_from_figures(figures: &anno_formats::figuren::FiguresFile) -> usize {
+    usize::from(anno_sim::civilian::CivilianConfig::from_figures(figures).frames_per_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anno_formats::figuren::{FigureAnim, FigureDef};
+
+    fn test_building_def(
+        required_fertility: Option<anno_formats::szs::Fertility>,
+    ) -> anno_sim::building::BuildingDef {
+        anno_sim::building::BuildingDef {
+            id: 0,
+            category: 0,
+            width: 1,
+            height: 1,
+            production_type: anno_sim::types::ProductionType::Plantation,
+            kind: "GEBAEUDE".into(),
+            prod_kind: "PLANTAGE".into(),
+            radius: 0,
+            output_good: Good::Tobacco,
+            input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 0,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
+            maintenance_cost: 0,
+            native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
+            has_door: false,
+            upgradeable: false,
+            max_energy: 0,
+            ore_deposit: anno_sim::building::OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
+            max_brand_damage_ticks: anno_sim::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: anno_sim::building::NO_RUIN_ID,
+            required_fertility,
+        }
+    }
+
+    fn test_processing_def() -> anno_sim::building::BuildingDef {
+        let mut def = test_building_def(None);
+        def.prod_kind = "HANDWERK".into();
+        def.output_good = Good::Tools;
+        def.input_good_1 = Good::Iron;
+        def.input_good_2 = Good::Wood;
+        def.input_1_rate = 1;
+        def.input_2_rate = 1;
+        def.storage_capacity = 50;
+        def
+    }
+
+    fn test_cod_processing_building(gfx: i32) -> anno_formats::cod::BuildingDef {
+        let mut building = anno_formats::cod::BuildingDef::default();
+        building.nummer = 0;
+        building.gfx = gfx;
+        building.kind = "GEBAEUDE".into();
+        building.rotate = 1;
+        building.anim_anz = 1;
+        building.anim_add = 1;
+        building
+            .properties
+            .insert("ProdKind".into(), "HANDWERK".into());
+        building
+            .properties
+            .insert("Name".into(), "Processor".into());
+        building
+    }
+
+    fn flat_test_island(number: u8) -> Island {
+        let mut tiles = Vec::new();
+        for y in 0..4 {
+            for x in 0..4 {
+                tiles.push(IslandTile {
+                    building_id: 9999,
+                    x,
+                    y,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                });
+            }
+        }
+        Island {
+            number,
+            width: 4,
+            height: 4,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles,
+            city: None,
+        }
+    }
+
+    fn city_test_island(
+        number: u8,
+        owner_slot: u8,
+        name: &str,
+        tier_population: [u32; 5],
+    ) -> Island {
+        Island {
+            number,
+            width: 4,
+            height: 4,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles: Vec::new(),
+            city: Some(anno_formats::szs::City {
+                island_index: number,
+                owner_slot,
+                tier_population,
+                name: name.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn diplomacy_panel_help_omits_fixed_tribute_shortcut() {
+        assert!(!DIPLOMACY_PANEL_HELP.contains('G'));
+        assert!(!DIPLOMACY_PANEL_HELP
+            .to_ascii_lowercase()
+            .contains("tribute"));
+    }
+
+    #[test]
+    fn city_list_uses_stadt4_names_and_trade_agreements() {
+        let islands = vec![
+            city_test_island(0, 0, "Larrach", [3, 5, 0, 0, 0]),
+            city_test_island(1, 1, "Hidden", [11, 0, 0, 0, 0]),
+            city_test_island(2, 2, "Partner", [0, 0, 17, 0, 0]),
+            city_test_island(3, 0, "", [99, 0, 0, 0, 0]),
+        ];
+        let mut diplomacy = anno_sim::combat::DiplomacyMatrix::new();
+        assert!(diplomacy.propose_trade_agreement(0, 2));
+
+        let rows = visible_city_list_rows(&islands, &diplomacy);
+
+        assert_eq!(
+            rows,
+            vec![
+                CityListRow {
+                    name: "Larrach".into(),
+                    owner: 0,
+                    island_number: 0,
+                    population: 8,
+                },
+                CityListRow {
+                    name: "Partner".into(),
+                    owner: 2,
+                    island_number: 2,
+                    population: 17,
+                },
+            ]
+        );
+        assert_eq!(city_list_line(&rows[0]), "Larrach              p0     8 i0");
+    }
+
+    #[test]
+    fn ship_list_uses_names_and_omits_route_debug_fields() {
+        let mut trade_ship = anno_sim::trade::TradeShip::new_with_class(
+            0,
+            42,
+            100,
+            200,
+            TradeShipClass::LargeTrader,
+            60,
+        )
+        .with_name("Seehind".into());
+        trade_ship.state = anno_sim::trade::ShipState::Sailing;
+        trade_ship.cargo_total = 12;
+        trade_ship.cargo.push((Good::Wood, 12));
+        let other_ship = anno_sim::trade::TradeShip::new(1, 7, 10, 20).with_name("Hidden".into());
+        let mut warship = anno_sim::combat::MilitaryUnit::with_name(
+            UnitType::SmallWarship,
+            0,
+            5,
+            6,
+            "Defender".into(),
+        );
+        warship.cannons = 4;
+
+        let rows = visible_ship_list_rows(&[trade_ship, other_ship], &[warship]);
+
+        assert_eq!(
+            rows,
+            vec![
+                ShipListRow {
+                    name: "Seehind".into(),
+                    kind: "large trader",
+                    status: "sailing",
+                    warship: false,
+                },
+                ShipListRow {
+                    name: "Defender".into(),
+                    kind: "small warship",
+                    status: "ready",
+                    warship: true,
+                },
+            ]
+        );
+        let line = ship_list_line(&rows[0]);
+        assert!(line.starts_with("Seehind"));
+        assert!(line.contains("large trader"));
+        assert!(line.ends_with("sailing"));
+        assert!(!line.contains("route"));
+        assert!(!line.contains("cargo"));
+        assert!(!line.contains("(100,200)"));
+    }
+
+    fn test_island(y_pos: u16, fertilities: [u8; 8]) -> Island {
+        Island {
+            number: 0,
+            width: 10,
+            height: 10,
+            x_pos: 0,
+            y_pos,
+            fertilities,
+            tiles: Vec::new(),
+            city: None,
+        }
+    }
+
+    fn load_test_cod() -> CodFile {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("extracted/haeuser.cod");
+        let data = std::fs::read(&path).expect("read haeuser.cod");
+        CodFile::parse(&data).expect("parse haeuser.cod")
+    }
+
+    fn seeded_rand(seed: u32) -> impl FnMut() -> u16 {
+        let mut rng = anno_sim::source_rand::SourceRand::new(seed);
+        move || rng.next()
+    }
+
+    #[test]
+    fn tile_clear_event_places_land_ruin_from_ruinenr() {
+        let cod = load_test_cod();
+        let mut islands = vec![test_island(10, [7; 8])];
+        islands[0].tiles.push(IslandTile {
+            building_id: cod.constants["GFXBODEN"] as u16,
+            x: 3,
+            y: 4,
+            orientation: 0,
+            anim_count: 0,
+            flags: 0,
+        });
+
+        apply_tile_clear_event(
+            &mut islands,
+            &cod,
+            TileClear {
+                island_id: 0,
+                tile_x: 3,
+                tile_y: 4,
+                width: 1,
+                height: 1,
+                ruin_id: 0,
+            },
+            &mut seeded_rand(3),
+        );
+
+        assert_eq!(islands[0].tiles.len(), 1);
+        assert_eq!(
+            islands[0].tiles[0].building_id,
+            (cod.constants["GFXBODEN"] + 400) as u16
+        );
+    }
+
+    #[test]
+    fn tile_clear_event_uses_strand_ruin_table_shift() {
+        let cod = load_test_cod();
+        let strand_gfx = cod
+            .buildings
+            .iter()
+            .find(|b| b.kind == "STRAND")
+            .expect("STRAND building")
+            .gfx as u16;
+        let mut islands = vec![test_island(10, [7; 8])];
+        islands[0].tiles.push(IslandTile {
+            building_id: strand_gfx,
+            x: 2,
+            y: 2,
+            orientation: 0,
+            anim_count: 0,
+            flags: 0,
+        });
+
+        apply_tile_clear_event(
+            &mut islands,
+            &cod,
+            TileClear {
+                island_id: 0,
+                tile_x: 2,
+                tile_y: 2,
+                width: 1,
+                height: 1,
+                ruin_id: 0,
+            },
+            &mut seeded_rand(3),
+        );
+
+        assert_eq!(islands[0].tiles.len(), 1);
+        assert_eq!(
+            islands[0].tiles[0].building_id,
+            (cod.constants["GFXBODEN"] + 413) as u16
+        );
+    }
+
+    #[test]
+    fn tile_clear_event_places_multitile_kontor_ruin_ladder() {
+        let cod = load_test_cod();
+        let mut islands = vec![test_island(10, [7; 8])];
+        islands[0].tiles.push(IslandTile {
+            building_id: (cod.constants["GFXKONTOR"] as u16),
+            x: 1,
+            y: 1,
+            orientation: 0,
+            anim_count: 0,
+            flags: 0,
+        });
+
+        apply_tile_clear_event(
+            &mut islands,
+            &cod,
+            TileClear {
+                island_id: 0,
+                tile_x: 1,
+                tile_y: 1,
+                width: 2,
+                height: 3,
+                ruin_id: 8,
+            },
+            &mut seeded_rand(1),
+        );
+
+        let base = (cod.constants["GFXKONTOR"] + 144) as u16;
+        let mut got: Vec<_> = islands[0]
+            .tiles
+            .iter()
+            .map(|t| (t.x, t.y, t.building_id))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                (1, 1, base),
+                (1, 2, base + 2),
+                (1, 3, base + 4),
+                (2, 1, base + 1),
+                (2, 2, base + 3),
+                (2, 3, base + 5),
+            ],
+        );
+    }
+
+    #[test]
+    fn tile_clear_event_uses_randanz_randadd_variant_definition() {
+        let cod = load_test_cod();
+        let mut islands = vec![test_island(10, [7; 8])];
+        islands[0].tiles.push(IslandTile {
+            building_id: cod.constants["GFXBODEN"] as u16,
+            x: 4,
+            y: 4,
+            orientation: 0,
+            anim_count: 0,
+            flags: 0,
+        });
+
+        apply_tile_clear_event(
+            &mut islands,
+            &cod,
+            TileClear {
+                island_id: 0,
+                tile_x: 4,
+                tile_y: 4,
+                width: 1,
+                height: 1,
+                ruin_id: 4,
+            },
+            &mut seeded_rand(1),
+        );
+
+        assert_eq!(islands[0].tiles.len(), 1);
+        assert_eq!(
+            islands[0].tiles[0].building_id,
+            (cod.constants["GFXROHST"] + 89) as u16
+        );
+    }
+
+    #[test]
+    fn placement_fertility_gate_uses_insel5_not_y_climate() {
+        use anno_formats::szs::Fertility;
+
+        let tobacco_def = test_building_def(Some(Fertility::Tobacco));
+        let south_barren = test_island(450, [7; 8]);
+        let north_tobacco = test_island(10, [1, 7, 7, 7, 7, 7, 7, 7]);
+
+        assert_eq!(
+            missing_required_fertility(&tobacco_def, &south_barren),
+            Some(Fertility::Tobacco),
+        );
+        assert_eq!(
+            missing_required_fertility(&tobacco_def, &north_tobacco),
+            None
+        );
+    }
+
+    #[test]
+    fn fertility_list_label_reports_scenario_fertilities() {
+        let island = test_island(0, [1, 6, 7, 7, 7, 7, 7, 7]);
+
+        assert_eq!(fertility_list_label(&island), "Tobacco, Cocoa");
+    }
+
+    #[test]
+    fn live_ship_sprite_index_adds_wrapped_heading_to_base() {
+        assert_eq!(live_ship_sprite_index(16, 0), 16);
+        assert_eq!(live_ship_sprite_index(16, 7), 23);
+        assert_eq!(live_ship_sprite_index(16, 8), 16);
+    }
+
+    #[test]
+    fn entity_walk_sprite_index_uses_base_animation_direction_and_frame() {
+        assert_eq!(entity_walk_sprite_index(0, 64, 8, 7, 9), 121);
+        assert_eq!(
+            entity_walk_sprite_index(anno_sim::civilian::sprite_base_for(2), 0, 8, 3, 10,),
+            1426,
+        );
+    }
+
+    #[test]
+    fn civilian_frames_per_dir_comes_from_figuren_cod_when_available() {
+        let figures = anno_formats::figuren::FiguresFile {
+            constants: Default::default(),
+            figures: vec![FigureDef {
+                name: "PASSANT".into(),
+                anims: vec![FigureAnim {
+                    nummer: 0,
+                    anim_anz: 6,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        assert_eq!(civilian_frames_per_dir_from_figures(&figures), 6);
+        assert_eq!(
+            civilian_frames_per_dir_from_figures(&anno_formats::figuren::FiguresFile {
+                constants: Default::default(),
+                figures: Vec::new(),
+            }),
+            8,
+        );
+    }
+
+    #[test]
+    fn init_simulation_uses_player4_relationships_without_forced_slot1_war_or_militia() {
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: Vec::new(),
+            players: vec![
+                anno_formats::szs::PlayerSlotInit {
+                    state_byte: 0x00,
+                    ai_active: true,
+                    relationships: [0, 0, 0, 0, 3, 3, 3],
+                    ..Default::default()
+                },
+                anno_formats::szs::PlayerSlotInit {
+                    state_byte: 0x0c,
+                    ai_active: true,
+                    relationships: [0, 0, 0, 0, 3, 3, 3],
+                    ..Default::default()
+                },
+            ],
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: Vec::new(),
+        };
+
+        let sim = init_simulation(&szs, &cod, &[], anno_sim::trade::ShipCargoConfig::default());
+
+        assert_eq!(sim.diplomacy.get(0, 1), Diplomacy::Neutral);
+        assert!(sim.military_units.is_empty());
+    }
+
+    #[test]
+    fn init_simulation_uses_player4_starting_gold_exactly() {
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: Vec::new(),
+            players: vec![
+                anno_formats::szs::PlayerSlotInit {
+                    state_byte: 0x00,
+                    ai_active: true,
+                    starting_gold: 0,
+                    ..Default::default()
+                },
+                anno_formats::szs::PlayerSlotInit {
+                    state_byte: 0x0c,
+                    ai_active: true,
+                    starting_gold: 1234,
+                    ..Default::default()
+                },
+            ],
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: Vec::new(),
+        };
+
+        let sim = init_simulation(&szs, &cod, &[], anno_sim::trade::ShipCargoConfig::default());
+
+        assert_eq!(sim.players[0].gold, 0);
+        assert_eq!(sim.players[1].gold, 1234);
+    }
+
+    #[test]
+    fn init_simulation_does_not_seed_processor_input_stock() {
+        let mut island = flat_test_island(0);
+        island.tiles.push(IslandTile {
+            building_id: 0,
+            x: 1,
+            y: 1,
+            orientation: 0,
+            anim_count: 0,
+            flags: 0,
+        });
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![island],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![test_cod_processing_building(0)],
+        };
+        let defs = vec![test_processing_def()];
+
+        let sim = init_simulation(
+            &szs,
+            &cod,
+            &defs,
+            anno_sim::trade::ShipCargoConfig::default(),
+        );
+
+        assert_eq!(sim.buildings.len(), 1);
+        assert_eq!(sim.buildings[0].input_1_stock, 0);
+        assert_eq!(sim.buildings[0].input_2_stock, 0);
+    }
+
+    #[test]
+    fn placement_does_not_seed_processor_input_stock() {
+        let defs = vec![test_processing_def()];
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![test_cod_processing_building(0)],
+        };
+        let mut islands = vec![flat_test_island(0)];
+        let island_map = IslandMap::from_island(&islands[0], &cod.buildings);
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.island_maps.push(island_map);
+        let mut placer = BuildingPlacer::new(&cod, &defs);
+        placer.active = true;
+
+        let outcome = try_place_building(&mut sim, &mut islands, 0, &defs, &cod, &placer, 1, 1);
+
+        assert!(matches!(outcome, PlaceOutcome::Placed));
+        assert_eq!(sim.buildings.len(), 1);
+        assert_eq!(sim.buildings[0].input_1_stock, 0);
+        assert_eq!(sim.buildings[0].input_2_stock, 0);
+    }
+
+    #[test]
+    fn init_simulation_does_not_generate_route_or_ship_without_ship4_trader() {
+        let city = |island_index: u8, owner_slot: u8, name: &str| anno_formats::szs::City {
+            island_index,
+            owner_slot,
+            tier_population: [0; 5],
+            name: name.into(),
+        };
+        let island = |number: u8, x_pos: u16, y_pos: u16, city| Island {
+            number,
+            width: 8,
+            height: 8,
+            x_pos,
+            y_pos,
+            fertilities: [7; 8],
+            tiles: Vec::new(),
+            city: Some(city),
+        };
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![
+                island(0, 10, 10, city(0, 0, "A")),
+                island(1, 40, 40, city(1, 0, "B")),
+            ],
+            players: vec![anno_formats::szs::PlayerSlotInit {
+                state_byte: 0x00,
+                ai_active: true,
+                ..Default::default()
+            }],
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: Vec::new(),
+        };
+
+        let sim = init_simulation(&szs, &cod, &[], anno_sim::trade::ShipCargoConfig::default());
+
+        assert_eq!(sim.warehouses.len(), 2);
+        assert!(sim.trade_routes.is_empty());
+        assert!(sim.trade_ships.is_empty());
+        assert_eq!(sim.players[0].total_population, 0);
+    }
+
+    #[test]
+    fn ship4_trader_does_not_generate_synthetic_route() {
+        let city = |island_index: u8, owner_slot: u8, name: &str| anno_formats::szs::City {
+            island_index,
+            owner_slot,
+            tier_population: [0; 5],
+            name: name.into(),
+        };
+        let island = |number: u8, x_pos: u16, y_pos: u16, city| Island {
+            number,
+            width: 8,
+            height: 8,
+            x_pos,
+            y_pos,
+            fertilities: [7; 8],
+            tiles: Vec::new(),
+            city: Some(city),
+        };
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![
+                island(0, 10, 10, city(0, 0, "A")),
+                island(1, 40, 40, city(1, 0, "B")),
+            ],
+            players: vec![anno_formats::szs::PlayerSlotInit {
+                state_byte: 0x00,
+                ai_active: true,
+                ..Default::default()
+            }],
+            mission: None,
+            scenario: Default::default(),
+            ships: vec![anno_formats::szs::Ship {
+                name: "Seehind".into(),
+                x: 12,
+                y: 13,
+                owner: 0,
+                ship_class: anno_formats::szs::ShipClass::SmallTrader as u8,
+                heading_byte: 4,
+                cargo_slots: [0; 7],
+            }],
+        };
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: Vec::new(),
+        };
+
+        let sim = init_simulation(&szs, &cod, &[], anno_sim::trade::ShipCargoConfig::default());
+
+        assert_eq!(sim.warehouses.len(), 2);
+        assert!(sim.trade_routes.is_empty());
+        assert_eq!(sim.trade_ships.len(), 1);
+        assert_eq!(
+            sim.trade_ships[0].route_id,
+            anno_sim::data_bridge::UNROUTED_TRADER_ROUTE_ID
+        );
+        assert_eq!(
+            (sim.trade_ships[0].world_x, sim.trade_ships[0].world_y),
+            (12, 13)
+        );
+    }
+
+    #[test]
+    fn init_simulation_has_no_generated_objectives_without_mission_goals() {
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: Vec::new(),
+            players: vec![anno_formats::szs::PlayerSlotInit {
+                state_byte: 0x00,
+                ai_active: true,
+                ..Default::default()
+            }],
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: Vec::new(),
+        };
+
+        let sim = init_simulation(&szs, &cod, &[], anno_sim::trade::ShipCargoConfig::default());
+
+        assert!(sim.objectives.items.is_empty());
+        assert_eq!(sim.players[0].total_population, 0);
+    }
+
+    #[test]
+    fn init_simulation_loads_population_only_from_stadt4() {
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![Island {
+                number: 0,
+                width: 8,
+                height: 8,
+                x_pos: 10,
+                y_pos: 10,
+                fertilities: [7; 8],
+                tiles: Vec::new(),
+                city: Some(anno_formats::szs::City {
+                    island_index: 0,
+                    owner_slot: 0,
+                    tier_population: [3, 5, 7, 11, 13],
+                    name: "A".into(),
+                }),
+            }],
+            players: vec![anno_formats::szs::PlayerSlotInit {
+                state_byte: 0x00,
+                ai_active: true,
+                ..Default::default()
+            }],
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: Vec::new(),
+        };
+
+        let sim = init_simulation(&szs, &cod, &[], anno_sim::trade::ShipCargoConfig::default());
+
+        assert_eq!(sim.players[0].population, [3, 5, 7, 11, 13]);
+        assert_eq!(sim.players[0].total_population, 39);
+    }
+
+    #[test]
+    fn ship_sprite_layout_uses_source_gfx_and_anim_offset() {
+        fn def(gfx: i32, anim_offs: i32) -> FigureDef {
+            FigureDef {
+                gfx,
+                anims: vec![FigureAnim {
+                    nummer: 0,
+                    anim_offs,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+
+        let small = def(0, 0);
+        let large = def(32, 0);
+        let handler = def(16, 0);
+        let small_warship = def(64, 0);
+        let large_warship = def(48, 0);
+        let pirate = def(80, 0);
+        let layout = ShipSpriteLayout::from_figure_defs(
+            Some(&small),
+            Some(&large),
+            Some(&handler),
+            Some(&small_warship),
+            Some(&large_warship),
+            Some(&pirate),
+        );
+
+        assert_eq!(layout.trader_base(TradeShipClass::SmallTrader), 0);
+        assert_eq!(layout.trader_base(TradeShipClass::LargeTrader), 32);
+        assert_eq!(layout.free_trader_base, 16);
+        assert_eq!(layout.naval_base(UnitType::SmallWarship), Some(64));
+        assert_eq!(layout.naval_base(UnitType::LargeWarship), Some(48));
+        assert_eq!(layout.naval_base(UnitType::PirateShip), Some(80));
+        assert_eq!(layout.naval_base(UnitType::Infantry), None);
+        assert_eq!(figure_walk_sprite_base(Some(&def(40, 3)), 0), 43);
+    }
+
+    #[test]
+    fn soldier_sprite_layout_uses_source_bases_and_owner_variants() {
+        fn def(name: &str, gfx: i32, anim_speed: i32) -> FigureDef {
+            FigureDef {
+                name: name.into(),
+                gfx,
+                anims: vec![FigureAnim {
+                    nummer: 0,
+                    anim_anz: 8,
+                    anim_speed,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+        let figures = anno_formats::figuren::FiguresFile {
+            constants: Default::default(),
+            figures: vec![
+                def("SOLDAT1", 0, 80),
+                def("SOLDAT2", 280, 80),
+                def("SOLDAT3", 560, 80),
+                def("SOLDAT4", 840, 80),
+                def("KAVALERIE1", 1120, 75),
+                def("KAVALERIE2", 1424, 75),
+                def("KAVALERIE3", 1728, 75),
+                def("KAVALERIE4", 2032, 75),
+                def("KANONIER1", 2336, 95),
+                def("KANONIER2", 2552, 95),
+                def("KANONIER3", 2768, 95),
+                def("KANONIER4", 2984, 95),
+                def("MUSKETIER1", 3200, 100),
+                def("MUSKETIER2", 3336, 100),
+                def("MUSKETIER3", 3472, 100),
+                def("MUSKETIER4", 3608, 100),
+            ],
+        };
+        let layout = SoldierSpriteLayout::from_figures(&figures);
+
+        assert_eq!(
+            layout.sprite_index(UnitType::Infantry, 0, 2, 0, false),
+            Some(16),
+        );
+        assert_eq!(
+            layout.sprite_index(UnitType::Infantry, 1, 7, 240, true),
+            Some(339),
+        );
+        assert_eq!(
+            layout.sprite_index(UnitType::Cavalry, 2, 1, 150, true),
+            Some(1738),
+        );
+        assert_eq!(
+            layout.sprite_index(UnitType::Cannon, 3, 0, 95, true),
+            Some(2985),
+        );
+        assert_eq!(
+            layout.sprite_index(UnitType::Musketeer, 4, 1, 200, true),
+            Some(3618),
+        );
+        assert_eq!(
+            layout.sprite_index(UnitType::SmallWarship, 0, 0, 0, false),
+            None,
+        );
+        assert_eq!(owner_sprite_variant(6), 3);
+    }
+}
+
+/// Draw simulation entities (carriers, civilians, ships, military) on top of terrain.
 fn overlay_entities(
     rgba: &mut [u8],
     img_w: u32,
@@ -5869,9 +6320,14 @@ fn overlay_entities(
     ship_sprites: &[(u32, u32, Vec<u8>)],
     soldier_sprites: &[(u32, u32, Vec<u8>)],
     selected_units: &[usize],
+    selected_trade_ship_idx: Option<usize>,
     carrier_walk_anz: usize,
-    ship_walk_anz: usize,
-    show_paths: bool,
+    carrier_empty_anim_offs: usize,
+    carrier_loaded_anim_offs: usize,
+    civilian_walk_anz: usize,
+    ship_sprite_layout: ShipSpriteLayout,
+    soldier_sprite_layout: SoldierSpriteLayout,
+    anim_elapsed_ms: u32,
 ) {
     let half_tw = tile_w / 2;
     let half_th = tile_h / 2;
@@ -5885,52 +6341,22 @@ fn overlay_entities(
         (sx, sy)
     };
 
-    // Path overlay (F6): trace each active carrier's remaining A* path
-    // and each trade ship's ocean path. Drawn first so entity sprites
-    // sit on top.
-    if show_paths {
-        // Carrier paths (yellow dots).
-        for figure in &sim.figures {
-            if !figure.is_active() { continue; }
-            if figure.path_idx >= figure.path.len() { continue; }
-            let (ix, iy) = if world_mode {
-                if (figure.building_idx as usize) < sim.buildings.len() {
-                    let bld = &sim.buildings[figure.building_idx as usize];
-                    island_offset_for(bld.island_id, sim, current_island, islands)
-                } else { (0, 0) }
-            } else if let Some(island) = current_island {
-                if (figure.building_idx as usize) < sim.buildings.len() {
-                    let bld = &sim.buildings[figure.building_idx as usize];
-                    if bld.island_id != island.number { continue; }
-                    (0, 0)
-                } else { continue; }
-            } else { (0, 0) };
-            for &(tx, ty) in figure.path.iter().skip(figure.path_idx) {
-                let (sx, sy) = tile_to_screen(tx, ty, ix, iy);
-                draw_marker(rgba, img_w, img_h,
-                    sx + half_tw, sy + half_th, 1,
-                    &[0xFF, 0xE0, 0x40, 0xC0]);
-            }
-        }
-        // Ship ocean paths (cyan dots, world coords directly).
-        for ship in &sim.trade_ships {
-            if !ship.active { continue; }
-            for &(tx, ty) in ship.path.iter().skip(ship.path_idx) {
-                let (sx, sy) = tile_to_screen(tx, ty, 0, 0);
-                draw_marker(rgba, img_w, img_h,
-                    sx + half_tw, sy + half_th, 1,
-                    &[0x40, 0xE0, 0xFF, 0xC0]);
-            }
-        }
-    }
-
-    // Draw carriers (sprites if available, colored dots fallback).
+    // Draw carrier/civilian figures from TRAEGER.BSH.
     // Layout (from figuren.cod TRAEGER): 8 rotations × `carrier_walk_anz`
     // frames laid out as base + dir*anz + frame. base_sprite is the per-figure
     // offset in the BSH (TRAEGER=0, ESEL=192, etc.).
     let carrier_frames_per_dir = carrier_walk_anz.max(1);
+    let civilian_frames_per_dir = civilian_walk_anz.max(1);
     for figure in &sim.figures {
         if !figure.is_active() {
+            continue;
+        }
+        let is_carrier = matches!(
+            figure.action,
+            ActionType::CarryingGoods | ActionType::Returning
+        );
+        let is_civilian = anno_sim::civilian::is_civilian(figure);
+        if !is_carrier && !is_civilian {
             continue;
         }
 
@@ -5956,23 +6382,53 @@ fn overlay_entities(
 
         let (sx, sy) = tile_to_screen(figure.tile_x as i32, figure.tile_y as i32, ix, iy);
 
-        // Try sprite rendering. TRAEGER has two walk animations
+        // Try sprite rendering. Carrier TRAEGER has two walk animations
         // (`figuren.cod` Nummer:TRAEGER):
         //   anim 0 = empty walking, AnimOffs 0   (8 rotations × 8 frames = 64 sprites)
         //   anim 1 = loaded walking, AnimOffs 64 (same shape)
         // We pick the animation by figure action: empty when Returning,
         // loaded when CarryingGoods. The original game does NOT carry
         // per-good sprites — the loaded silhouette is generic.
-        let dir = (figure.direction as usize) % 8;
-        let frame = (figure.anim_frame as usize) % carrier_frames_per_dir;
-        let anim_offs = match figure.action {
-            ActionType::CarryingGoods => carrier_frames_per_dir * 8, // anim 1 base = 64
-            _ => 0,
+        //
+        // Civilian wanderers already store the resolved GFXZIVIL base
+        // (`ADELWEIBL`..`PILGER`) in `base_sprite`, and their ANIM blocks
+        // start at offset 0, so no TRAEGER loaded/empty offset applies.
+        let (sprite_idx, fallback_color, fallback_radius) = if is_civilian {
+            (
+                entity_walk_sprite_index(
+                    figure.base_sprite,
+                    0,
+                    civilian_frames_per_dir,
+                    figure.direction,
+                    figure.anim_frame,
+                ),
+                [0xE8, 0xD8, 0xB0, 0xFF],
+                2,
+            )
+        } else {
+            let anim_offs = if figure.action == ActionType::CarryingGoods {
+                carrier_loaded_anim_offs
+            } else {
+                carrier_empty_anim_offs
+            };
+            // No per-good chip: TRAEGER in the original has only
+            // empty/loaded animations, not per-good sprites.
+            (
+                entity_walk_sprite_index(
+                    figure.base_sprite,
+                    anim_offs,
+                    carrier_frames_per_dir,
+                    figure.direction,
+                    figure.anim_frame,
+                ),
+                match figure.action {
+                    ActionType::CarryingGoods => [0xFF, 0xDD, 0x00, 0xFF],
+                    ActionType::Returning => [0x88, 0xAA, 0x00, 0xFF],
+                    _ => [0xFF, 0xFF, 0xFF, 0xFF],
+                },
+                3,
+            )
         };
-        let sprite_idx = figure.base_sprite as usize
-            + anim_offs
-            + dir * carrier_frames_per_dir
-            + frame;
 
         let mut drew_sprite = false;
         if sprite_idx < carrier_sprites.len() {
@@ -5980,26 +6436,21 @@ fn overlay_entities(
             if sw > 0 && sh > 0 {
                 let dy = sy + half_th - sh as i32;
                 blit_rgba(
-                    rgba, img_w, img_h,
+                    rgba,
+                    img_w,
+                    img_h,
                     sx + half_tw - sw as i32 / 2,
                     dy,
-                    data, sw, sh,
+                    data,
+                    sw,
+                    sh,
                 );
                 drew_sprite = true;
             }
         }
         if !drew_sprite {
-            // Fallback: colored dot
-            let color = match figure.action {
-                ActionType::CarryingGoods => [0xFF, 0xDD, 0x00, 0xFF],
-                ActionType::Returning => [0x88, 0xAA, 0x00, 0xFF],
-                _ => [0xFF, 0xFF, 0xFF, 0xFF],
-            };
-            draw_marker(rgba, img_w, img_h, sx, sy, 3, &color);
+            draw_marker(rgba, img_w, img_h, sx, sy, fallback_radius, &fallback_color);
         }
-
-        // No per-good chip: TRAEGER in the original has only empty/loaded
-        // animations, not per-good sprites (verified in figuren.cod).
     }
 
     // Draw warehouses (blue squares)
@@ -6020,7 +6471,6 @@ fn overlay_entities(
     }
 
     // Draw military units (sprites if available, colored markers fallback)
-    const SOLDIER_FRAMES_PER_DIR: usize = 8;
     for (uidx, unit) in sim.military_units.iter().enumerate() {
         if !unit.is_alive() {
             continue;
@@ -6035,37 +6485,76 @@ fn overlay_entities(
             let cy = sy + half_th;
             let r = (half_tw + half_th) / 2 + 2;
             draw_ring(rgba, img_w, img_h, cx, cy, r, &[0xFF, 0xFF, 0x00, 0xFF]);
-        } else {
-            // Faction color ring so multi-player maps read at a glance.
-            let owner_color = player_color(unit.owner);
-            let cx = sx + half_tw;
-            let cy = sy + half_th;
-            let r = (half_tw + half_th) / 2 + 1;
-            draw_ring(rgba, img_w, img_h, cx, cy, r, &owner_color);
         }
 
-        // Use direction to pick a sprite frame (8 dirs × frames)
-        let dir = (unit.direction as usize) % 8;
-        let sprite_idx = dir * SOLDIER_FRAMES_PER_DIR;
-        if sprite_idx < soldier_sprites.len() {
-            let (sw, sh, ref data) = soldier_sprites[sprite_idx];
-            if sw > 0 && sh > 0 {
-                blit_rgba(
-                    rgba, img_w, img_h,
-                    sx + half_tw - sw as i32 / 2,
-                    sy - sh as i32 + half_th,
-                    data, sw, sh,
-                );
-                // For selected: also draw a small target marker at destination
-                if is_selected
-                    && (unit.tile_x != unit.target_x || unit.tile_y != unit.target_y)
-                {
-                    let (tsx, tsy) = tile_to_screen(unit.target_x, unit.target_y, ix, iy);
-                    draw_marker(rgba, img_w, img_h,
-                        tsx + half_tw, tsy + half_th, 3,
-                        &[0xFF, 0xFF, 0x00, 0xFF]);
+        if let Some(base) = ship_sprite_layout.naval_base(unit.unit_type) {
+            let sprite_idx = live_ship_sprite_index(base, unit.direction);
+            if sprite_idx < ship_sprites.len() {
+                let (sw, sh, ref data) = ship_sprites[sprite_idx];
+                if sw > 0 && sh > 0 {
+                    blit_rgba(
+                        rgba,
+                        img_w,
+                        img_h,
+                        sx + half_tw - sw as i32 / 2,
+                        sy - sh as i32 + half_th,
+                        data,
+                        sw,
+                        sh,
+                    );
+                    if is_selected && (unit.tile_x != unit.target_x || unit.tile_y != unit.target_y)
+                    {
+                        let (tsx, tsy) = tile_to_screen(unit.target_x, unit.target_y, ix, iy);
+                        draw_marker(
+                            rgba,
+                            img_w,
+                            img_h,
+                            tsx + half_tw,
+                            tsy + half_th,
+                            3,
+                            &[0xFF, 0xFF, 0x00, 0xFF],
+                        );
+                    }
+                    continue;
                 }
-                continue;
+            }
+        }
+
+        if let Some(sprite_idx) = soldier_sprite_layout.sprite_index(
+            unit.unit_type,
+            unit.owner,
+            unit.direction,
+            anim_elapsed_ms,
+            unit.tile_x != unit.target_x || unit.tile_y != unit.target_y,
+        ) {
+            if sprite_idx < soldier_sprites.len() {
+                let (sw, sh, ref data) = soldier_sprites[sprite_idx];
+                if sw > 0 && sh > 0 {
+                    blit_rgba(
+                        rgba,
+                        img_w,
+                        img_h,
+                        sx + half_tw - sw as i32 / 2,
+                        sy - sh as i32 + half_th,
+                        data,
+                        sw,
+                        sh,
+                    );
+                    if is_selected && (unit.tile_x != unit.target_x || unit.tile_y != unit.target_y)
+                    {
+                        let (tsx, tsy) = tile_to_screen(unit.target_x, unit.target_y, ix, iy);
+                        draw_marker(
+                            rgba,
+                            img_w,
+                            img_h,
+                            tsx + half_tw,
+                            tsy + half_th,
+                            3,
+                            &[0xFF, 0xFF, 0x00, 0xFF],
+                        );
+                    }
+                    continue;
+                }
             }
         }
 
@@ -6076,55 +6565,77 @@ fn overlay_entities(
         } else {
             [0xFF, 0x40, 0x40, 0xFF]
         };
-        let size = if unit.unit_type.stats().is_ranged { 4 } else { 3 };
+        let size = if unit.unit_type.stats().is_ranged {
+            4
+        } else {
+            3
+        };
         draw_marker(rgba, img_w, img_h, sx, sy, size, &color);
     }
 
     // Draw trade ships (sprites if available, cyan diamonds fallback).
-    //
-    // SHIP.BSH layout (figuren.cod HANDEL1): Rotate:1, AnimAnz:`ship_walk_anz`.
-    // The full anim cycle IS the rotation set — `ship_walk_anz` evenly-spaced
-    // angles around 360°. We map our 8 compass headings onto that range.
-    let ship_anz = ship_walk_anz.max(1);
-    for ship in &sim.trade_ships {
+    // SHIP.BSH live hull groups use `figuren.cod` Gfx as the first of
+    // eight heading sprites. The matching dead/sinking hull is `Gfx + 8`.
+    for (sidx, ship) in sim.trade_ships.iter().enumerate() {
         if !ship.active {
             continue;
         }
         let (sx, sy) = tile_to_screen(ship.world_x, ship.world_y, 0, 0);
+        let is_selected = selected_trade_ship_idx == Some(sidx);
+        if is_selected {
+            let cx = sx + half_tw;
+            let cy = sy + half_th;
+            let r = (half_tw + half_th) / 2 + 2;
+            draw_ring(rgba, img_w, img_h, cx, cy, r, &[0xFF, 0xFF, 0x00, 0xFF]);
+        }
 
-        let dir = (ship.heading as usize) % 8;
-        let sprite_idx = dir * ship_anz / 8;
+        let sprite_idx =
+            live_ship_sprite_index(ship_sprite_layout.trader_base(ship.class), ship.heading);
         if sprite_idx < ship_sprites.len() {
             let (sw, sh, ref data) = ship_sprites[sprite_idx];
             if sw > 0 && sh > 0 {
                 blit_rgba(
-                    rgba, img_w, img_h,
+                    rgba,
+                    img_w,
+                    img_h,
                     sx + half_tw - sw as i32 / 2,
                     sy - sh as i32 + half_th,
-                    data, sw, sh,
+                    data,
+                    sw,
+                    sh,
                 );
                 continue;
             }
         }
-        draw_diamond(rgba, img_w, img_h, sx, sy, 5, &[0x00, 0xFF, 0xFF, 0xFF]);
+        let color = if is_selected {
+            [0xFF, 0xFF, 0x00, 0xFF]
+        } else {
+            [0x00, 0xFF, 0xFF, 0xFF]
+        };
+        draw_diamond(rgba, img_w, img_h, sx, sy, 5, &color);
     }
 
-    // Free traders use the same SHIP.BSH cycle as regular trade ships;
-    // tinted diamond fallback colour to distinguish them on the minimap
-    // and when sprites are missing.
+    // Free traders are figuren.cod `HANDLER` ships, not player
+    // HANDEL1/HANDEL2 hulls.
     for trader in &sim.free_traders {
-        if !trader.active { continue; }
+        if !trader.active {
+            continue;
+        }
         let (sx, sy) = tile_to_screen(trader.world_x, trader.world_y, 0, 0);
-        let dir = (trader.heading as usize) % 8;
-        let sprite_idx = dir * ship_anz / 8;
+        let sprite_idx =
+            live_ship_sprite_index(ship_sprite_layout.free_trader_base, trader.heading);
         if sprite_idx < ship_sprites.len() {
             let (sw, sh, ref data) = ship_sprites[sprite_idx];
             if sw > 0 && sh > 0 {
                 blit_rgba(
-                    rgba, img_w, img_h,
+                    rgba,
+                    img_w,
+                    img_h,
                     sx + half_tw - sw as i32 / 2,
                     sy - sh as i32 + half_th,
-                    data, sw, sh,
+                    data,
+                    sw,
+                    sh,
                 );
                 continue;
             }
@@ -6246,19 +6757,9 @@ fn init_simulation(
     szs: &SzsFile,
     cod: &CodFile,
     defs: &[anno_sim::building::BuildingDef],
+    ship_cargo_config: anno_sim::trade::ShipCargoConfig,
 ) -> Simulation {
-    let mut instances = data_bridge::load_building_instances(szs, cod, defs);
-
-    // Seed processing buildings with input materials
-    for inst in &mut instances {
-        let def = &defs[inst.def_id as usize];
-        if def.input_good_1 != Good::None {
-            inst.input_1_stock = def.storage_capacity;
-        }
-        if def.input_good_2 != Good::None {
-            inst.input_2_stock = def.storage_capacity;
-        }
-    }
+    let instances = data_bridge::load_building_instances(szs, cod, defs);
 
     // Create warehouses — one per island with production
     // buildings OR a STADT4 city. The STADT4 fallback covers
@@ -6283,8 +6784,7 @@ fn init_simulation(
     // when the scenario provides it. Falls back to a centroid
     // of production buildings only when no Kontor is placed
     // (Continous-Play templates with bare land).
-    let mut warehouses =
-        anno_sim::data_bridge::kontor_warehouses_from_szs(szs, cod, defs);
+    let mut warehouses = anno_sim::data_bridge::kontor_warehouses_from_szs(szs, cod, defs);
     let kontor_islands: std::collections::HashSet<u8> =
         warehouses.iter().map(|w| w.island_id).collect();
     for &island_id in &island_ids {
@@ -6303,21 +6803,35 @@ fn init_simulation(
             .map(|c| c.owner_slot)
             .unwrap_or(0);
         let (avg_x, avg_y) = if !island_buildings.is_empty() {
-            let ax = island_buildings.iter().map(|b| b.tile_x as u32).sum::<u32>()
+            let ax = island_buildings
+                .iter()
+                .map(|b| b.tile_x as u32)
+                .sum::<u32>()
                 / island_buildings.len() as u32;
-            let ay = island_buildings.iter().map(|b| b.tile_y as u32).sum::<u32>()
+            let ay = island_buildings
+                .iter()
+                .map(|b| b.tile_y as u32)
+                .sum::<u32>()
                 / island_buildings.len() as u32;
             (ax as u16, ay as u16)
         } else if let Some(island) = island {
             // Dwelling-only pirate/native settlements: anchor on
             // the island centre. The original engine drops a
             // Kontor here on first sight.
-            (island.x_pos + island.width as u16 / 2,
-             island.y_pos + island.height as u16 / 2)
+            (
+                island.x_pos + island.width as u16 / 2,
+                island.y_pos + island.height as u16 / 2,
+            )
         } else {
             continue;
         };
-        warehouses.push(Warehouse::new(island_id, owner, avg_x, avg_y));
+        warehouses.push(Warehouse::with_capacity(
+            island_id,
+            owner,
+            avg_x,
+            avg_y,
+            anno_sim::warehouse::BASE_KONTOR_CAPACITY,
+        ));
     }
 
     // Build island walkability maps
@@ -6332,7 +6846,11 @@ fn init_simulation(
         .islands
         .iter()
         .map(|island| {
-            anno_sim::coverage::CoverageMap::new(island.number, island.width as u16, island.height as u16)
+            anno_sim::coverage::CoverageMap::new(
+                island.number,
+                island.width as u16,
+                island.height as u16,
+            )
         })
         .collect();
 
@@ -6349,12 +6867,14 @@ fn init_simulation(
     );
 
     let mut sim = Simulation::new();
+    sim.diplomacy = anno_sim::data_bridge::diplomacy_from_player4_relationships(&szs.players);
     sim.building_defs = defs.to_vec();
     sim.buildings = instances;
     sim.warehouses = warehouses;
     sim.island_maps = island_maps;
     sim.coverage_maps = coverage_maps;
     sim.ocean_map = Some(ocean_map);
+    sim.ship_cargo_config = ship_cargo_config;
 
     // Initialise the seven player slots from PLAYER4's state_byte
     // (0x00 = human, 0x0c = AI rival, 0x0d/0x0e/0x0b = reserved
@@ -6382,90 +6902,48 @@ fn init_simulation(
         let mut p = match effective_state {
             0x00 => Player::new_human(slot),
             0x0c => Player::new_ai(slot, 0),
-            _    => {
+            _ => {
                 let mut p = Player::new_ai(slot, 0);
                 p.state = PlayerState::Empty;
                 p
             }
         };
         if let Some(init) = init {
-            if init.starting_gold > 0 {
-                p.gold = init.starting_gold;
-            }
+            p.gold = init.starting_gold;
         }
         sim.players.push(p);
 
-        // Spawn an AI controller alongside every AI rival slot.
-        // Personality + difficulty derive from PLAYER4's
-        // `slot_u16_0x18` (heuristic mapping, see
-        // `ai::personality_from_slot_byte`).
+        // Spawn an AI controller alongside every AI rival slot. The raw
+        // PLAYER4 `slot_u16_0x18` byte is parsed, but its binary semantics are
+        // not pinned, so `personality_from_slot_byte` currently returns the
+        // conservative default instead of inventing per-scenario AI behavior.
         if effective_state == 0x0c {
             let slot_byte = init.map(|p| p.slot_u16_0x18).unwrap_or(0);
-            let (personality, difficulty) =
-                anno_sim::ai::personality_from_slot_byte(slot_byte);
-            sim.ai_controllers.push(AiController::new(slot, personality, difficulty));
+            let (personality, difficulty) = anno_sim::ai::personality_from_slot_byte(slot_byte);
+            sim.ai_controllers
+                .push(AiController::new(slot, personality, difficulty));
         }
     }
 
     // Seed populations from STADT4 city records when the
     // scenario provides them. Each city's tier_population
-    // contributes to its owner_slot's player_population. Falls
-    // back to dev defaults when no STADT4 carries population
-    // for slots 0 and 1 (Continous-Play templates ship empty
-    // cities).
-    let mut seeded_from_stadt4: std::collections::HashSet<u8> =
-        std::collections::HashSet::new();
+    // contributes to its owner_slot's player_population.
     for island in &szs.islands {
-        let Some(city) = island.city.as_ref() else { continue };
-        if city.tier_population.iter().all(|&v| v == 0) { continue; }
+        let Some(city) = island.city.as_ref() else {
+            continue;
+        };
+        if city.tier_population.iter().all(|&v| v == 0) {
+            continue;
+        }
         let slot = city.owner_slot as usize;
         if let Some(p) = sim.players.get_mut(slot) {
             for tier in 0..5 {
                 p.population[tier] += city.tier_population[tier];
             }
-            seeded_from_stadt4.insert(city.owner_slot);
         }
     }
-    if let Some(p) = sim.players.get_mut(0) {
+    for p in &mut sim.players {
         p.total_population = p.population.iter().sum();
-        if !seeded_from_stadt4.contains(&0) {
-            p.population[0] = 200;
-            p.population[1] = 100;
-            p.population[2] = 50;
-            p.total_population = p.population.iter().sum();
-        }
-    }
-    if let Some(p) = sim.players.get_mut(1) {
-        if p.state != PlayerState::Empty {
-            if !seeded_from_stadt4.contains(&1) {
-                p.population[0] = 150;
-                p.population[1] = 50;
-            }
-            p.total_population = p.population.iter().sum();
-        }
-    }
-
-    // Starting militia for the human player. Rival AI militia is
-    // only seeded when slot 1 actually holds an AI rival (i.e. its
-    // PLAYER4 state_byte was 0x0c, not the Empty placeholder used
-    // for Continous-Play templates without configured rivals).
-    sim.military_units
-        .push(MilitaryUnit::new(UnitType::Infantry, 0, 20, 20));
-    sim.military_units
-        .push(MilitaryUnit::new(UnitType::Infantry, 0, 21, 20));
-    sim.military_units
-        .push(MilitaryUnit::new(UnitType::Cannon, 0, 18, 20));
-    let slot1_is_ai = sim.players.get(1)
-        .map(|p| p.state != PlayerState::Empty)
-        .unwrap_or(false);
-    if slot1_is_ai {
-        sim.diplomacy.set(0, 1, Diplomacy::War);
-        sim.military_units
-            .push(MilitaryUnit::new(UnitType::Infantry, 1, 25, 20));
-        sim.military_units
-            .push(MilitaryUnit::new(UnitType::Infantry, 1, 25, 21));
-        sim.military_units
-            .push(MilitaryUnit::new(UnitType::Musketeer, 1, 27, 20));
     }
 
     // Spawn warships from SHIP4: SmallWarship / LargeWarship /
@@ -6473,7 +6951,8 @@ fn init_simulation(
     // exact spawn coordinates the scenario author placed them.
     let warships = anno_sim::data_bridge::warships_from_ships(&szs.ships);
     if !warships.is_empty() {
-        let named: Vec<&str> = warships.iter()
+        let named: Vec<&str> = warships
+            .iter()
             .filter(|u| !u.name.is_empty())
             .map(|u| u.name.as_str())
             .take(5)
@@ -6485,8 +6964,10 @@ fn init_simulation(
         } else {
             format!(" — {}", named.join(", "))
         };
-        println!("Spawning {} static warship(s) from SHIP4{suffix}",
-            warships.len());
+        println!(
+            "Spawning {} static warship(s) from SHIP4{suffix}",
+            warships.len()
+        );
         // Native-faction warships (owner 5, including those that
         // sail under the PIRAT figure) are hostile to the player
         // by default — the scenario authors place them as
@@ -6505,12 +6986,7 @@ fn init_simulation(
                 let cx = u.tile_x;
                 let cy = u.tile_y;
                 let r = 16i32;
-                u.patrol = vec![
-                    (cx + r, cy),
-                    (cx,     cy + r),
-                    (cx - r, cy),
-                    (cx,     cy - r),
-                ];
+                u.patrol = vec![(cx + r, cy), (cx, cy + r), (cx - r, cy), (cx, cy - r)];
                 u.target_x = u.patrol[0].0;
                 u.target_y = u.patrol[0].1;
             }
@@ -6520,58 +6996,11 @@ fn init_simulation(
     // Spawn trader hulls from SHIP4 too: SmallTrader / LargeTrader
     // records become TradeShip instances at their authored
     // coordinates with a sentinel route_id so the trade tick
-    // leaves them inert until a route is assigned. Below the dev-
-    // default trade route still adds its own routed ship.
-    let mut traders = anno_sim::data_bridge::traders_from_ships(&szs.ships);
+    // leaves them inert until a route is assigned.
+    let traders = anno_sim::data_bridge::traders_from_ships(&szs.ships, sim.ship_cargo_config);
     if !traders.is_empty() {
-        // Auto-generate a per-owner round-trip route between
-        // the owner's first two warehouses so the spawned
-        // traders start carrying goods on scenario load.
-        let next_route_id = sim.trade_routes.iter()
-            .map(|r| r.id).max().unwrap_or(0).wrapping_add(1);
-        let routes = anno_sim::data_bridge::auto_routes_for_traders(
-            &mut traders, &sim.warehouses, next_route_id);
-        let routed_count = traders.iter()
-            .filter(|t| t.route_id != anno_sim::data_bridge::UNROUTED_TRADER_ROUTE_ID)
-            .count();
-        println!("Spawning {} static trader(s) from SHIP4 ({} auto-routed)",
-            traders.len(), routed_count);
-        sim.trade_routes.extend(routes);
+        println!("Spawning {} static trader(s) from SHIP4", traders.len());
         sim.trade_ships.extend(traders);
-    }
-
-    // Dev-default trade route between the first two
-    // PLAYER-OWNED warehouses. Now that warehouses inherit
-    // their owner from STADT4, picking the first two
-    // warehouses indiscriminately could route a player ship
-    // through pirate or native ports — restrict to slot 0.
-    let wh_islands: Vec<(u8, u16, u16)> = sim
-        .warehouses
-        .iter()
-        .filter(|w| w.owner == 0)
-        .map(|w| (w.island_id, w.tile_x, w.tile_y))
-        .collect();
-    if wh_islands.len() >= 2 {
-        let mut route = TradeRoute::new(0, 0);
-        route.add_stop(RouteStop {
-            island_id: wh_islands[0].0,
-            warehouse_x: wh_islands[0].1,
-            warehouse_y: wh_islands[0].2,
-            load_goods: vec![(Good::Spices, 10)],
-            unload_goods: vec![Good::Grain],
-        });
-        route.add_stop(RouteStop {
-            island_id: wh_islands[1].0,
-            warehouse_x: wh_islands[1].1,
-            warehouse_y: wh_islands[1].2,
-            load_goods: vec![(Good::Grain, 10)],
-            unload_goods: vec![Good::Spices],
-        });
-        route.activate();
-
-        let ship = TradeShip::new(0, 0, wh_islands[0].1 as i32, wh_islands[0].2 as i32);
-        sim.trade_routes.push(route);
-        sim.trade_ships.push(ship);
     }
 
     sim
@@ -6688,8 +7117,7 @@ fn render_world(
                                         && (px as u32) < final_w
                                         && (py as u32) < final_h
                                     {
-                                        let doff =
-                                            ((py as u32 * final_w + px as u32) * 4) as usize;
+                                        let doff = ((py as u32 * final_w + px as u32) * 4) as usize;
                                         if doff + 3 < rgba.len() {
                                             rgba[doff] = r;
                                             rgba[doff + 1] = g;
@@ -6737,7 +7165,16 @@ fn render_world(
             continue;
         }
 
-        blit_rgba(&mut rgba, img_w, img_h, sx, sy - (sh as i32 - tile_h), sprite_data, sw, sh);
+        blit_rgba(
+            &mut rgba,
+            img_w,
+            img_h,
+            sx,
+            sy - (sh as i32 - tile_h),
+            sprite_data,
+            sw,
+            sh,
+        );
     }
 
     (rgba, img_w, img_h, origin_x, origin_y)
@@ -6786,27 +7223,19 @@ fn render_island(
             continue;
         }
 
-        blit_rgba(&mut rgba, img_w, img_h, sx, sy - (sh as i32 - tile_h), sprite_data, sw, sh);
+        blit_rgba(
+            &mut rgba,
+            img_w,
+            img_h,
+            sx,
+            sy - (sh as i32 - tile_h),
+            sprite_data,
+            sw,
+            sh,
+        );
     }
 
     (rgba, img_w, img_h, origin_x, origin_y)
-}
-
-/// Distinctive RGBA color per player slot, used for ownership rings on
-/// Player owner colour. Slot 0 = blue (human), 1-3 = AI rivals,
-/// 4 = free trader (white sail), 5 = natives (tan), 6 = pirates
-/// (red).
-fn player_color(owner: u8) -> [u8; 4] {
-    match owner {
-        0 => [0x40, 0x80, 0xFF, 0xFF], // human:   blue
-        1 => [0xFF, 0x80, 0x40, 0xFF], // AI 1:    orange
-        2 => [0x40, 0xFF, 0x80, 0xFF], // AI 2:    green
-        3 => [0xC0, 0x40, 0xFF, 0xFF], // AI 3:    purple
-        4 => [0xF0, 0xF0, 0xF0, 0xFF], // trader:  white
-        5 => [0xC0, 0x90, 0x60, 0xFF], // natives: tan
-        6 => [0xFF, 0x40, 0x40, 0xFF], // pirates: red
-        _ => [0xCC, 0xCC, 0xCC, 0xFF], // fallback gray
-    }
 }
 
 fn blit_rgba(
@@ -6846,26 +7275,6 @@ fn blit_rgba(
             dst[dst_off + 3] = 255;
         }
     }
-}
-
-fn save_ppm(rgba: &[u8], width: u32, height: u32, name: &str) {
-    let filename = format!("{name}_game_screenshot.ppm");
-    let mut ppm = Vec::with_capacity((width * height * 3 + 100) as usize);
-    ppm.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
-    for y in 0..height {
-        for x in 0..width {
-            let off = ((y * width + x) * 4) as usize;
-            if off + 2 < rgba.len() {
-                ppm.push(rgba[off]);
-                ppm.push(rgba[off + 1]);
-                ppm.push(rgba[off + 2]);
-            } else {
-                ppm.extend_from_slice(&[0, 0, 0]);
-            }
-        }
-    }
-    std::fs::write(&filename, &ppm).expect("Failed to write screenshot");
-    println!("Screenshot saved to {filename}");
 }
 
 fn find_data_dir() -> std::path::PathBuf {

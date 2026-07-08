@@ -18,22 +18,92 @@ use crate::warehouse::Warehouse;
 /// Maximum stops per trade route.
 pub const MAX_ROUTE_STOPS: usize = 8;
 
-/// Default cargo capacity per trade ship (tons).
-///
-/// The original game has per-class capacity from figuren.cod
-/// `Maxware` × 10 t/slot:
-///
-///   HANDEL1 (small trader)  Maxware 4 → 40 t
-///   HANDEL2 (large trader)  Maxware 6 → 60 t
-///   HANDLER (free trader)   Maxware 6 → 60 t
-///   KRIEG1  (small warship) Maxware 3 → 30 t
-///   KRIEG2  (large warship) Maxware 8 → 80 t
-///   PIRAT   (pirate ship)   Maxware 5 → 50 t
-///
-/// `TradeShip` doesn't currently carry a per-instance ship class,
-/// so this is a placeholder mid-point. When ships gain a class
-/// field, switch this to a per-class lookup.
-pub const SHIP_CARGO_CAPACITY: u16 = 50;
+/// Cargo units represented by one figuren.cod `Maxware` slot.
+pub const CARGO_TONS_PER_MAXWARE: u16 = 10;
+
+/// Source fallback for HANDEL1 (`Maxware: 4`).
+pub const DEFAULT_SMALL_TRADER_CARGO_CAPACITY: u16 = 40;
+
+/// Source fallback for HANDEL2 / HANDLER (`Maxware: 6`).
+pub const DEFAULT_LARGE_TRADER_CARGO_CAPACITY: u16 = 60;
+
+fn default_ship_cargo_capacity() -> u16 {
+    DEFAULT_SMALL_TRADER_CARGO_CAPACITY
+}
+
+/// Trade-ship classes represented by `TradeShip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TradeShipClass {
+    SmallTrader,
+    LargeTrader,
+}
+
+impl Default for TradeShipClass {
+    fn default() -> Self {
+        Self::SmallTrader
+    }
+}
+
+/// Source-derived trade-ship cargo capacities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShipCargoConfig {
+    pub small_trader_capacity: u16,
+    pub large_trader_capacity: u16,
+    pub free_trader_capacity: u16,
+}
+
+impl Default for ShipCargoConfig {
+    fn default() -> Self {
+        Self {
+            small_trader_capacity: DEFAULT_SMALL_TRADER_CARGO_CAPACITY,
+            large_trader_capacity: DEFAULT_LARGE_TRADER_CARGO_CAPACITY,
+            free_trader_capacity: DEFAULT_LARGE_TRADER_CARGO_CAPACITY,
+        }
+    }
+}
+
+impl ShipCargoConfig {
+    pub fn from_figures(figures: &anno_formats::figuren::FiguresFile) -> Self {
+        let default = Self::default();
+        Self {
+            small_trader_capacity: capacity_from_figure(
+                figures,
+                "HANDEL1",
+                default.small_trader_capacity,
+            ),
+            large_trader_capacity: capacity_from_figure(
+                figures,
+                "HANDEL2",
+                default.large_trader_capacity,
+            ),
+            free_trader_capacity: capacity_from_figure(
+                figures,
+                "HANDLER",
+                default.free_trader_capacity,
+            ),
+        }
+    }
+
+    pub fn capacity_for(self, class: TradeShipClass) -> u16 {
+        match class {
+            TradeShipClass::SmallTrader => self.small_trader_capacity,
+            TradeShipClass::LargeTrader => self.large_trader_capacity,
+        }
+    }
+}
+
+fn capacity_from_figure(
+    figures: &anno_formats::figuren::FiguresFile,
+    name: &str,
+    fallback: u16,
+) -> u16 {
+    figures
+        .find(name)
+        .and_then(|def| u16::try_from(def.max_ware()).ok())
+        .filter(|&maxware| maxware > 0)
+        .and_then(|maxware| maxware.checked_mul(CARGO_TONS_PER_MAXWARE))
+        .unwrap_or(fallback)
+}
 
 // Per-good buy/sell prices live in `crate::prices`. The flat constants that
 // used to live here (8 sell / 6 buy) have been replaced with `price_of`.
@@ -88,6 +158,9 @@ impl TradeRoute {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeShip {
     pub owner: u8,
+    /// Authored ship name from SHIP4 when available.
+    #[serde(default)]
+    pub name: String,
     pub route_id: u16,
     /// Current position (world coordinates).
     pub world_x: i32,
@@ -96,6 +169,11 @@ pub struct TradeShip {
     /// ship moves; used to pick the right rotation sprite at render time.
     #[serde(default)]
     pub heading: u8,
+    /// Scenario-authored trader hull class. This is needed for source
+    /// sprite identity (HANDEL1 vs HANDEL2), while cargo capacity stores
+    /// the class's `Maxware × 10` hold size.
+    #[serde(default)]
+    pub class: TradeShipClass,
     /// Movement speed in tiles per ship tick.
     pub speed: u16,
     /// Current stop index in route.
@@ -106,10 +184,16 @@ pub struct TradeShip {
     pub cargo: Vec<(Good, u16)>,
     /// Total cargo currently loaded.
     pub cargo_total: u16,
+    /// Per-instance cargo capacity in tons. Source: figuren.cod
+    /// `Maxware × 10` for the ship's class.
+    #[serde(default = "default_ship_cargo_capacity")]
+    pub cargo_capacity: u16,
     /// Gold earned from trading.
     pub profit: i32,
     pub active: bool,
-    /// Pre-computed ocean path (world coordinates). Empty = direct movement fallback.
+    /// Pre-computed ocean path (world coordinates).
+    /// Empty means either the ship is docked, has no ocean map, or is
+    /// waiting for a valid navigable route.
     pub path: Vec<(i32, i32)>,
     /// Current index into path.
     pub path_idx: usize,
@@ -130,21 +214,71 @@ pub enum ShipState {
 
 impl TradeShip {
     pub fn new(owner: u8, route_id: u16, world_x: i32, world_y: i32) -> Self {
-        Self {
+        Self::new_with_capacity(
             owner,
             route_id,
             world_x,
             world_y,
+            DEFAULT_SMALL_TRADER_CARGO_CAPACITY,
+        )
+    }
+
+    pub fn new_with_capacity(
+        owner: u8,
+        route_id: u16,
+        world_x: i32,
+        world_y: i32,
+        cargo_capacity: u16,
+    ) -> Self {
+        Self::new_with_class(
+            owner,
+            route_id,
+            world_x,
+            world_y,
+            TradeShipClass::SmallTrader,
+            cargo_capacity,
+        )
+    }
+
+    pub fn new_with_class(
+        owner: u8,
+        route_id: u16,
+        world_x: i32,
+        world_y: i32,
+        class: TradeShipClass,
+        cargo_capacity: u16,
+    ) -> Self {
+        Self {
+            owner,
+            name: String::new(),
+            route_id,
+            world_x,
+            world_y,
             heading: 0,
+            class,
             speed: 2,
             current_stop: 0,
             state: ShipState::Idle,
             cargo: Vec::new(),
             cargo_total: 0,
+            cargo_capacity,
             profit: 0,
             active: true,
             path: Vec::new(),
             path_idx: 0,
+        }
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
+
+    pub fn cargo_capacity(&self) -> u16 {
+        if self.cargo_capacity == 0 {
+            DEFAULT_SMALL_TRADER_CARGO_CAPACITY
+        } else {
+            self.cargo_capacity
         }
     }
 
@@ -159,7 +293,7 @@ impl TradeShip {
 
     /// Add goods to cargo. Returns amount actually loaded.
     pub fn load(&mut self, good: Good, amount: u16) -> u16 {
-        let space = SHIP_CARGO_CAPACITY.saturating_sub(self.cargo_total);
+        let space = self.cargo_capacity().saturating_sub(self.cargo_total);
         let loaded = amount.min(space);
         if loaded > 0 {
             if let Some(entry) = self.cargo.iter_mut().find(|(g, _)| *g == good) {
@@ -209,8 +343,10 @@ pub fn tick_trade_ship(
         ShipState::Idle => {
             // Start the route
             ship.current_stop = 0;
-            compute_path_to_stop(ship, route, ocean_map);
-            ship.state = ShipState::Sailing;
+            ship.state = match compute_path_to_stop(ship, route, ocean_map) {
+                RoutePathStatus::AlreadyAtStop => ShipState::Trading,
+                _ => ShipState::Sailing,
+            };
         }
         ShipState::Sailing => {
             if !ship.path.is_empty() && ship.path_idx < ship.path.len() {
@@ -227,9 +363,8 @@ pub fn tick_trade_ship(
                     ship.world_y = ny;
                     ship.path_idx += 1;
                 }
-                ship.heading = compass_heading(
-                    ship.world_x - prev_x, ship.world_y - prev_y, ship.heading,
-                );
+                ship.heading =
+                    compass_heading(ship.world_x - prev_x, ship.world_y - prev_y, ship.heading);
 
                 // Check if we reached end of path (near destination)
                 if ship.path_idx >= ship.path.len() {
@@ -238,24 +373,15 @@ pub fn tick_trade_ship(
                     ship.state = ShipState::Trading;
                 }
             } else {
-                // Fallback: direct movement (no path computed or path exhausted)
-                let stop = &route.stops[ship.current_stop];
-                let target_x = stop.warehouse_x as i32;
-                let target_y = stop.warehouse_y as i32;
-
-                let dx = target_x - ship.world_x;
-                let dy = target_y - ship.world_y;
-
-                if dx == 0 && dy == 0 {
-                    ship.state = ShipState::Trading;
-                } else {
-                    let steps = ship.speed as i32;
-                    if dx.abs() > dy.abs() {
-                        ship.world_x += dx.signum() * steps.min(dx.abs());
-                    } else {
-                        ship.world_y += dy.signum() * steps.min(dy.abs());
+                if ocean_map.is_some() {
+                    match compute_path_to_stop(ship, route, ocean_map) {
+                        RoutePathStatus::AlreadyAtStop => ship.state = ShipState::Trading,
+                        RoutePathStatus::PathReady
+                        | RoutePathStatus::Blocked
+                        | RoutePathStatus::LegacyDirect => {}
                     }
-                    ship.heading = compass_heading(dx, dy, ship.heading);
+                } else {
+                    sail_direct_to_stop(ship, route);
                 }
             }
         }
@@ -263,11 +389,10 @@ pub fn tick_trade_ship(
             let stop = &route.stops[ship.current_stop];
 
             // Find the warehouse at this stop
-            if let Some(wh) = warehouses.iter_mut().find(|w| {
-                w.island_id == stop.island_id
-                    && w.owner == ship.owner
-                    && w.active
-            }) {
+            if let Some(wh) = warehouses
+                .iter_mut()
+                .find(|w| w.island_id == stop.island_id && w.owner == ship.owner && w.active)
+            {
                 // Unload goods (sell to warehouse)
                 for &good in &stop.unload_goods {
                     let amount = ship.cargo_amount(good);
@@ -298,8 +423,10 @@ pub fn tick_trade_ship(
 
             // Advance to next stop and compute ocean path
             ship.current_stop = (ship.current_stop + 1) % route.stops.len();
-            compute_path_to_stop(ship, route, ocean_map);
-            ship.state = ShipState::Sailing;
+            ship.state = match compute_path_to_stop(ship, route, ocean_map) {
+                RoutePathStatus::AlreadyAtStop => ShipState::Trading,
+                _ => ShipState::Sailing,
+            };
         }
         ShipState::Waiting => {
             // Re-check if we can trade
@@ -309,6 +436,29 @@ pub fn tick_trade_ship(
 
     ship.profit += gold_delta;
     gold_delta
+}
+
+fn sail_direct_to_stop(ship: &mut TradeShip, route: &TradeRoute) {
+    let Some(stop) = route.stops.get(ship.current_stop) else {
+        return;
+    };
+    let target_x = stop.warehouse_x as i32;
+    let target_y = stop.warehouse_y as i32;
+
+    let dx = target_x - ship.world_x;
+    let dy = target_y - ship.world_y;
+
+    if dx == 0 && dy == 0 {
+        ship.state = ShipState::Trading;
+    } else {
+        let steps = ship.speed as i32;
+        if dx.abs() > dy.abs() {
+            ship.world_x += dx.signum() * steps.min(dx.abs());
+        } else {
+            ship.world_y += dy.signum() * steps.min(dy.abs());
+        }
+        ship.heading = compass_heading(dx, dy, ship.heading);
+    }
 }
 
 /// Map a (dx, dy) movement vector to an 8-direction compass heading
@@ -333,22 +483,34 @@ pub(crate) fn compass_heading(dx: i32, dy: i32, prev: u8) -> u8 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutePathStatus {
+    /// No ocean map was supplied; use legacy direct sailing.
+    LegacyDirect,
+    /// The ship is already at the navigable tile for the route stop.
+    AlreadyAtStop,
+    /// A non-empty ocean path was stored on the ship.
+    PathReady,
+    /// An ocean map exists, but no navigable route could be found.
+    Blocked,
+}
+
 /// Compute an ocean A* path from ship's current position to the next route stop.
 fn compute_path_to_stop(
     ship: &mut TradeShip,
     route: &TradeRoute,
     ocean_map: Option<&crate::ocean_map::OceanMap>,
-) {
+) -> RoutePathStatus {
     ship.path.clear();
     ship.path_idx = 0;
 
     let ocean = match ocean_map {
         Some(m) => m,
-        None => return, // No ocean map — use direct movement fallback
+        None => return RoutePathStatus::LegacyDirect,
     };
 
     if ship.current_stop >= route.stops.len() {
-        return;
+        return RoutePathStatus::Blocked;
     }
     let stop = &route.stops[ship.current_stop];
     let target_x = stop.warehouse_x as i32;
@@ -357,18 +519,28 @@ fn compute_path_to_stop(
     // Find nearest navigable tiles to start and end
     let start = match ocean.nearest_navigable(ship.world_x, ship.world_y) {
         Some(p) => p,
-        None => return,
+        None => return RoutePathStatus::Blocked,
     };
     let goal = match ocean.nearest_navigable(target_x, target_y) {
         Some(p) => p,
-        None => return,
+        None => return RoutePathStatus::Blocked,
     };
 
-    if let Some(path) = crate::ocean_map::find_ocean_path(ocean, start, goal) {
-        ship.path = path;
-        ship.path_idx = 0;
+    if start == goal {
+        return RoutePathStatus::AlreadyAtStop;
     }
-    // If pathfinding fails, path stays empty and ship uses direct movement
+
+    if let Some(path) = crate::ocean_map::find_ocean_path(ocean, start, goal) {
+        if path.is_empty() {
+            RoutePathStatus::AlreadyAtStop
+        } else {
+            ship.path = path;
+            ship.path_idx = 0;
+            RoutePathStatus::PathReady
+        }
+    } else {
+        RoutePathStatus::Blocked
+    }
 }
 
 /// Free trader AI: finds profitable trades between warehouses.
@@ -376,6 +548,7 @@ fn compute_path_to_stop(
 pub fn free_trader_find_trade(
     warehouses: &[Warehouse],
     ship_owner: u8,
+    cargo_capacity: u16,
 ) -> Option<(usize, usize, Good, u16)> {
     // Find pairs of warehouses where one has excess and the other has deficit
     let owner_whs: Vec<(usize, &Warehouse)> = warehouses
@@ -403,7 +576,7 @@ pub fn free_trader_find_trade(
                 if amount_b < 5 {
                     // Warehouse B needs this good
                     let surplus = amount_a - 5; // Keep 5 in source
-                    let transfer = surplus.min(SHIP_CARGO_CAPACITY);
+                    let transfer = surplus.min(cargo_capacity);
                     if let Some(ref best) = best_trade {
                         if surplus > best.4 {
                             best_trade = Some((i, j, *good, transfer, surplus));
@@ -428,16 +601,39 @@ mod tests {
     }
 
     #[test]
+    fn ship_cargo_config_reads_figuren_maxware() {
+        let mut small = anno_formats::figuren::FigureDef::default();
+        small.name = "HANDEL1".into();
+        small.properties.insert("Maxware".into(), "4".into());
+        let mut large = anno_formats::figuren::FigureDef::default();
+        large.name = "HANDEL2".into();
+        large.properties.insert("Maxware".into(), "6".into());
+        let mut handler = anno_formats::figuren::FigureDef::default();
+        handler.name = "HANDLER".into();
+        handler.properties.insert("Maxware".into(), "6".into());
+        let figures = anno_formats::figuren::FiguresFile {
+            constants: Default::default(),
+            figures: vec![small, large, handler],
+        };
+
+        let config = ShipCargoConfig::from_figures(&figures);
+
+        assert_eq!(config.small_trader_capacity, 40);
+        assert_eq!(config.large_trader_capacity, 60);
+        assert_eq!(config.free_trader_capacity, 60);
+    }
+
+    #[test]
     fn compass_heading_8way() {
-        assert_eq!(compass_heading(0, -1, 0), 0);  // N
-        assert_eq!(compass_heading(1, -1, 0), 1);  // NE
-        assert_eq!(compass_heading(1, 0, 0), 2);   // E
-        assert_eq!(compass_heading(1, 1, 0), 3);   // SE
-        assert_eq!(compass_heading(0, 1, 0), 4);   // S
-        assert_eq!(compass_heading(-1, 1, 0), 5);  // SW
-        assert_eq!(compass_heading(-1, 0, 0), 6);  // W
+        assert_eq!(compass_heading(0, -1, 0), 0); // N
+        assert_eq!(compass_heading(1, -1, 0), 1); // NE
+        assert_eq!(compass_heading(1, 0, 0), 2); // E
+        assert_eq!(compass_heading(1, 1, 0), 3); // SE
+        assert_eq!(compass_heading(0, 1, 0), 4); // S
+        assert_eq!(compass_heading(-1, 1, 0), 5); // SW
+        assert_eq!(compass_heading(-1, 0, 0), 6); // W
         assert_eq!(compass_heading(-1, -1, 0), 7); // NW
-        // Stalled ships keep their previous heading
+                                                   // Stalled ships keep their previous heading
         assert_eq!(compass_heading(0, 0, 5), 5);
     }
 
@@ -452,7 +648,10 @@ mod tests {
         assert_eq!(ship.cargo_total, 5);
 
         // Load up to capacity
-        assert_eq!(ship.load(Good::Cloth, SHIP_CARGO_CAPACITY), SHIP_CARGO_CAPACITY - 5);
+        assert_eq!(
+            ship.load(Good::Cloth, ship.cargo_capacity()),
+            ship.cargo_capacity() - 5
+        );
     }
 
     #[test]
@@ -492,8 +691,10 @@ mod tests {
         }
 
         // Ship should have executed at least one complete trade cycle
-        assert!(ship.profit != 0 || ship.cargo_total > 0 || total_gold != 0,
-            "Ship should have traded something");
+        assert!(
+            ship.profit != 0 || ship.cargo_total > 0 || total_gold != 0,
+            "Ship should have traded something"
+        );
     }
 
     #[test]
@@ -532,17 +733,69 @@ mod tests {
         let mut total_gold = 0i32;
         for _ in 0..200 {
             total_gold += tick_trade_ship(&mut ship, &route, &mut warehouses, None);
-            if ship.profit != 0
-                && warehouses[1].stock(Good::Wood) > 0
-                && ship.cargo_total == 0
-            {
+            if ship.profit != 0 && warehouses[1].stock(Good::Wood) > 0 && ship.cargo_total == 0 {
                 break;
             }
         }
         let p = price_of(Good::Wood);
         // Bought 10 (-10*buy), sold 10 (+10*sell).
         let expected = 10 * (p.sell - p.buy);
-        assert_eq!(total_gold, expected, "want {expected} gold, got {total_gold}");
+        assert_eq!(
+            total_gold, expected,
+            "want {expected} gold, got {total_gold}"
+        );
+    }
+
+    #[test]
+    fn ocean_mapped_ship_stalls_when_stop_has_no_navigable_approach() {
+        let szs = anno_formats::szs::SzsFile {
+            chunks: Vec::new(),
+            islands: vec![anno_formats::szs::Island {
+                number: 0,
+                width: 100,
+                height: 100,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: Vec::new(),
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let ocean = crate::ocean_map::OceanMap::from_scenario(&szs);
+
+        let mut route = TradeRoute::new(0, 0);
+        route.add_stop(RouteStop {
+            island_id: 0,
+            warehouse_x: 50,
+            warehouse_y: 50,
+            load_goods: vec![],
+            unload_goods: vec![],
+        });
+        route.add_stop(RouteStop {
+            island_id: 0,
+            warehouse_x: 105,
+            warehouse_y: 50,
+            load_goods: vec![],
+            unload_goods: vec![],
+        });
+        route.activate();
+
+        let mut ship = TradeShip::new(0, 0, 105, 50);
+        let mut warehouses = vec![make_warehouse(0, 0, 50, 50)];
+
+        tick_trade_ship(&mut ship, &route, &mut warehouses, Some(&ocean));
+        assert_eq!(ship.state, ShipState::Sailing);
+        assert_eq!((ship.world_x, ship.world_y), (105, 50));
+
+        for _ in 0..5 {
+            tick_trade_ship(&mut ship, &route, &mut warehouses, Some(&ocean));
+        }
+        assert_eq!((ship.world_x, ship.world_y), (105, 50));
+        assert!(ship.path.is_empty());
     }
 
     #[test]
@@ -575,10 +828,10 @@ mod tests {
         let wh_b = make_warehouse(1, 0, 20, 20);
 
         wh_a.deposit(Good::Spices, 25); // Surplus
-        // wh_b has no spices — needs some
+                                        // wh_b has no spices — needs some
 
         let warehouses = vec![wh_a, wh_b];
-        let trade = free_trader_find_trade(&warehouses, 0);
+        let trade = free_trader_find_trade(&warehouses, 0, DEFAULT_SMALL_TRADER_CARGO_CAPACITY);
 
         assert!(trade.is_some(), "Should find a trade opportunity");
         let (from, to, good, _amount) = trade.unwrap();

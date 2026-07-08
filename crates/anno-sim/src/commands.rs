@@ -23,22 +23,31 @@ pub enum Command {
     Buy { player: u8, good: Good, qty: u16 },
     /// Sell `qty` of `good` at the current market price (credits gold).
     Sell { player: u8, good: Good, qty: u16 },
-    /// Send a gift of gold from `from` to `to`. Anno 1602 manual:
-    /// `Pay tribute` action in the diplomacy panel — players may
-    /// transfer gold to another player at any time. We allow only
-    /// non-negative amounts and clamp to the sender's balance.
+    /// Send the selected tribute amount from `from` to `to`. Anno 1602 manual
+    /// section 7.4 describes a diplomacy-panel tribute slider followed by a
+    /// hand click; live UI callers must supply that sourced amount instead of
+    /// inventing a fixed shortcut value.
     GiftGold { from: u8, to: u8, amount: i32 },
     /// Send a gift of `qty` `good` from `from` to `to` via their
     /// active warehouses. Drains from the sender's first matching
     /// warehouse, deposits into the recipient's first matching one.
-    GiftGoods { from: u8, to: u8, good: Good, qty: u16 },
+    GiftGoods {
+        from: u8,
+        to: u8,
+        good: Good,
+        qty: u16,
+    },
     /// Arm a naval unit with cannons (manual sec. 9.2.3 "Arming
     /// your ships"). `target_cannons` is the desired count; the
     /// command clamps to the ship class's `cannon_capacity`. Each
     /// cannon costs `Cannons` from the player's nearest active
     /// warehouse + 200 gold (manual: cannons are crafted-good
     /// expenditure plus an installation fee).
-    ArmShip { player: u8, unit_index: u32, target_cannons: u8 },
+    ArmShip {
+        player: u8,
+        unit_index: u32,
+        target_cannons: u8,
+    },
     /// Native trade — deliver goods (manual sec. 8.6).
     /// Withdraws `qty` of `good` from any of `player`'s active
     /// warehouses and credits the corresponding native village's
@@ -60,15 +69,6 @@ pub enum Command {
         village_idx: u32,
         good: Good,
         qty: u16,
-    },
-    /// Set construction priority for a player-owned pending
-    /// building. 0 = normal, 1 = high, 2 = critical. The entity
-    /// tick drains materials in priority-descending order so a
-    /// short-supply scenario favours the prioritised buildings.
-    SetBuildPriority {
-        player: u8,
-        building_idx: u32,
-        priority: u8,
     },
     /// Manually load goods onto a trade ship at a warehouse
     /// (manual sec. 5.3 + 8.3). Withdraws `qty` of `good` from
@@ -157,7 +157,11 @@ mod tests {
 
     #[test]
     fn round_trip_tax_command() {
-        let c = Command::SetTaxRate { player: 0, tier: 2, rate: 96 };
+        let c = Command::SetTaxRate {
+            player: 0,
+            tier: 2,
+            rate: 96,
+        };
         let encoded = c.encode();
         assert_eq!(encoded[0], COMMAND_TAG);
         let back = Command::decode(&encoded).expect("decode");
@@ -179,10 +183,16 @@ mod tests {
 
     #[test]
     fn round_trip_buy_sell() {
-        let buy = Command::Buy { player: 0, good: Good::Wood, qty: 25 };
+        let buy = Command::Buy {
+            player: 0,
+            good: Good::Wood,
+            qty: 25,
+        };
         let back = Command::decode(&buy.encode()).unwrap();
         if let Command::Buy { qty, .. } = back {
             assert_eq!(qty, 25);
-        } else { panic!(); }
+        } else {
+            panic!();
+        }
     }
 }

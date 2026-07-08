@@ -11,28 +11,22 @@
 //!   path-around it). 32 frames per anim, three anims (start-up,
 //!   peak burn, dying down) at 50 ms each.
 //! - `haeuser.cod` building Kind `BRANDECK` exists for the burning
-//!   ruin tile pre-removal; we reuse the existing combat-damage
-//!   pipeline (`combat::DamageEvent`, `BuildingInstance::health`)
-//!   instead of adding a separate ruin record.
+//!   tile overlay. This module currently applies fire damage directly
+//!   to `BuildingInstance::health`; static `Ruinenr` replacement is
+//!   handled by the simulation destruction event after a building dies.
 //!
 //! Per-building fire damage cap is RE-cited:
 //! - `haeuser.cod` building defaults `Maxbrand: 4` — the per-
-//!   building maximum number of fire-damage ticks before the
-//!   building burns out. The COD parser at `1602_exe.c:68086`
-//!   (`s_Maxbrand_0049a288`) reads this field at HAUS_PRODTYP
-//!   level. Below: `MAX_BRAND_DAMAGE_TICKS = 4`.
+//!   building fire-damage cap. The COD parser at
+//!   `1602_exe.c:68086` (`s_Maxbrand_0049a288`) reads this field at
+//!   HAUS_PRODTYP level. `BuildingDef::max_brand_damage_ticks`
+//!   carries the inherited source value into the simulator.
 //!
-//! Eruption / ignition probabilities remain SPECULATIVE — those
-//! live in dispatcher functions not yet located. We gate spawns on
-//! the existing event-tick rate (`tick_events` 10 000 ms) so the
-//! disaster cadence stays sane in long games.
+//! Live fire and volcano scheduling need decoded source triggers/anchors.
+//! This module keeps the lower-level effects available without inventing
+//! origins from ordinary player buildings.
 
 use crate::building::BuildingInstance;
-use crate::combat::DamageEvent;
-
-/// Probability gate (1-in-N) that a fire ignites somewhere on the
-/// human player's settlement during a single event tick. SPECULATIVE.
-pub const FIRE_IGNITION_GATE: u64 = 8;
 
 /// Damage applied to a building when fire ticks (per 10s event
 /// tick). Calibrated against a player observation reported on
@@ -44,20 +38,11 @@ pub const FIRE_IGNITION_GATE: u64 = 8;
 /// round to 2.
 pub const FIRE_TICK_DAMAGE: u16 = 2;
 
-/// Maximum fire damage ticks a single building can absorb before
-/// burnout. RE: `haeuser.cod` default `Maxbrand: 4` (parsed at
-/// `1602_exe.c:68086`). Each `ignite_building` call counts as one
-/// tick; multiplied by `FIRE_TICK_DAMAGE` this caps total fire hp
-/// loss per ignition cycle at 20.
-pub const MAX_BRAND_DAMAGE_TICKS: u16 = 4;
-
-/// Probability gate (1-in-N) that a fire on a building this tick
-/// extinguishes naturally. SPECULATIVE.
-pub const FIRE_EXTINGUISH_GATE: u64 = 4;
-
-/// Probability gate (1-in-N) that a volcanic island erupts during a
-/// single event tick. SPECULATIVE.
-pub const VOLCANO_ERUPTION_GATE: u64 = 32;
+/// Default fire damage cap. RE: `haeuser.cod` default
+/// `Maxbrand: 4` (parsed at `1602_exe.c:68086`). The simulation
+/// uses each building definition's inherited `Maxbrand` value when
+/// available.
+pub const MAX_BRAND_DAMAGE_TICKS: u16 = crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS;
 
 /// Damage radius of a volcanic eruption, in tiles. SPECULATIVE.
 pub const VOLCANO_RADIUS: u16 = 6;
@@ -65,48 +50,48 @@ pub const VOLCANO_RADIUS: u16 = 6;
 /// Damage applied to every building in the eruption radius. SPECULATIVE.
 pub const VOLCANO_DAMAGE: u16 = 35;
 
-/// Mark a building as on fire by setting its health into the
-/// "burning" range and emitting a damage event. The combat pipeline
-/// already removes buildings whose health reaches 0.
-pub fn ignite_building(
+/// Apply one source-capped fire-damage tick to a building using the
+/// `Maxbrand` cap carried by its building definition. Returns `true`
+/// when damage was applied.
+pub fn ignite_building_with_cap(
     building: &mut BuildingInstance,
-    damage_events: &mut Vec<DamageEvent>,
-) {
+    max_brand_damage_ticks: u16,
+) -> bool {
+    let cap = if max_brand_damage_ticks == 0 {
+        MAX_BRAND_DAMAGE_TICKS
+    } else {
+        max_brand_damage_ticks
+    };
+    if building.fire_damage_ticks >= cap {
+        return false;
+    }
+    building.fire_damage_ticks += 1;
     let dmg = FIRE_TICK_DAMAGE.min(building.health);
     building.health = building.health.saturating_sub(dmg);
-    damage_events.push(DamageEvent {
-        x: building.tile_x as i32,
-        y: building.tile_y as i32,
-        amount: dmg,
-        target: 1,
-    });
+    dmg > 0
+}
+
+/// Apply a fire-damage tick using the source default cap.
+pub fn ignite_building(building: &mut BuildingInstance) -> bool {
+    ignite_building_with_cap(building, MAX_BRAND_DAMAGE_TICKS)
 }
 
 /// Apply volcano eruption damage to every active building within
 /// `VOLCANO_RADIUS` Chebyshev tiles of the centre. Mirrors the
-/// engine's per-building damage path so destruction goes through
-/// the existing combat clean-up.
-pub fn erupt_at(
-    cx: u16,
-    cy: u16,
-    island_id: u8,
-    buildings: &mut [BuildingInstance],
-    damage_events: &mut Vec<DamageEvent>,
-) -> u32 {
+/// engine's per-building damage path.
+pub fn erupt_at(cx: u16, cy: u16, island_id: u8, buildings: &mut [BuildingInstance]) -> u32 {
     let mut hit = 0u32;
     for b in buildings.iter_mut() {
-        if !b.active || b.island_id != island_id { continue; }
+        if !b.active || b.island_id != island_id {
+            continue;
+        }
         let dx = (b.tile_x as i32 - cx as i32).abs();
         let dy = (b.tile_y as i32 - cy as i32).abs();
-        if dx.max(dy) > VOLCANO_RADIUS as i32 { continue; }
+        if dx.max(dy) > VOLCANO_RADIUS as i32 {
+            continue;
+        }
         let dmg = VOLCANO_DAMAGE.min(b.health);
         b.health = b.health.saturating_sub(dmg);
-        damage_events.push(DamageEvent {
-            x: b.tile_x as i32,
-            y: b.tile_y as i32,
-            amount: dmg,
-            target: 1,
-        });
         hit += 1;
     }
     hit
@@ -124,14 +109,29 @@ mod tests {
     }
 
     #[test]
-    fn ignite_drops_health_and_emits_event() {
+    fn ignite_drops_health() {
         let mut b = mk(0, 5, 5);
         let h0 = b.health;
-        let mut events = Vec::new();
-        ignite_building(&mut b, &mut events);
+        assert!(ignite_building(&mut b));
         assert!(b.health < h0);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].amount, FIRE_TICK_DAMAGE.min(BUILDING_MAX_HEALTH));
+        assert_eq!(b.fire_damage_ticks, 1);
+        assert_eq!(b.health, h0 - FIRE_TICK_DAMAGE.min(BUILDING_MAX_HEALTH));
+    }
+
+    #[test]
+    fn ignite_stops_at_maxbrand_tick_cap() {
+        let mut b = mk(0, 5, 5);
+        for _ in 0..MAX_BRAND_DAMAGE_TICKS {
+            assert!(ignite_building(&mut b));
+        }
+        let capped_health = b.health;
+        assert!(!ignite_building(&mut b));
+        assert_eq!(b.fire_damage_ticks, MAX_BRAND_DAMAGE_TICKS);
+        assert_eq!(b.health, capped_health);
+        assert_eq!(
+            b.health,
+            BUILDING_MAX_HEALTH - FIRE_TICK_DAMAGE * MAX_BRAND_DAMAGE_TICKS
+        );
     }
 
     #[test]
@@ -139,11 +139,10 @@ mod tests {
         let mut buildings = vec![
             mk(0, 10, 10),
             mk(0, 10 + VOLCANO_RADIUS as u16, 10), // on the edge
-            mk(0, 50, 50),                          // far away
-            mk(1, 10, 10),                          // different island
+            mk(0, 50, 50),                         // far away
+            mk(1, 10, 10),                         // different island
         ];
-        let mut events = Vec::new();
-        let hit = erupt_at(10, 10, 0, &mut buildings, &mut events);
+        let hit = erupt_at(10, 10, 0, &mut buildings);
         assert_eq!(hit, 2);
         assert!(buildings[0].health < BUILDING_MAX_HEALTH);
         assert!(buildings[1].health < BUILDING_MAX_HEALTH);
