@@ -503,15 +503,15 @@ impl LandFigureDefinition {
         }
     }
 
-    /// `Shotradius:` in the source runtime's fixed-point units. The figure
-    /// loader and candidate scorer use this representation, not the textual
-    /// tile value exposed by [`Self::source_shot_radius`].
+    /// `Shotradius:` in the source runtime units. `FUN_00441210` multiplies
+    /// the parsed value by 8 before storing the unsigned definition field at
+    /// `+0x4a`; `FUN_00454250` consumes that field directly.
     pub const fn source_runtime_shot_radius(self) -> u16 {
         match self.family {
-            LandFigureFamily::Infantry | LandFigureFamily::Cavalry => 24,
-            LandFigureFamily::Musketeer => 128,
-            LandFigureFamily::Cannoneer => 224,
-            LandFigureFamily::NativeSpearman => 32,
+            LandFigureFamily::Infantry | LandFigureFamily::Cavalry => 6,
+            LandFigureFamily::Musketeer => 32,
+            LandFigureFamily::Cannoneer => 56,
+            LandFigureFamily::NativeSpearman => 8,
         }
     }
 
@@ -1665,19 +1665,32 @@ mod tests {
     #[test]
     fn land_figure_motion_properties_match_authored_bases() {
         let cases = [
-            (1, 260, 0, 1, 20, 0.75, 0.0),
-            (5, 400, 1, 1, 18, 0.75, 0.0),
-            (9, 210, 0, 2, 15, 4.0, 0.0),
-            (13, 230, 2, 3, 12, 7.0, 0.0),
-            (33, 280, 0, 1, 18, 1.0, 0.0),
+            (1, 260, 0, 1, 20, 640, 0.75, 6, 0.0),
+            (5, 400, 1, 1, 18, 576, 0.75, 6, 0.0),
+            (9, 210, 0, 2, 15, 480, 4.0, 32, 0.0),
+            (13, 230, 2, 3, 12, 384, 7.0, 56, 0.0),
+            (33, 280, 0, 1, 18, 576, 1.0, 8, 0.0),
         ];
-        for (id, speed, speed_type, max_step_count, max_energy, shot_radius, turn_time) in cases {
+        for (
+            id,
+            speed,
+            speed_type,
+            max_step_count,
+            max_energy,
+            runtime_energy,
+            shot_radius,
+            runtime_shot_radius,
+            turn_time,
+        ) in cases
+        {
             let definition = LandFigureDefinition::from_id(id).unwrap();
             assert_eq!(definition.source_move_speed(), speed);
             assert_eq!(definition.source_speed_type(), speed_type);
             assert_eq!(definition.source_max_step_count(), max_step_count);
             assert_eq!(definition.source_max_energy(), max_energy);
+            assert_eq!(definition.source_runtime_energy_cap(), runtime_energy);
             assert_eq!(definition.source_shot_radius(), shot_radius);
+            assert_eq!(definition.source_runtime_shot_radius(), runtime_shot_radius);
             assert_eq!(definition.source_turn_time(), turn_time);
         }
     }

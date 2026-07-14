@@ -147,9 +147,10 @@ impl FigureDef {
         self.prop_int("Maxkanon")
     }
 
-    /// Ship firing/approach radius (`Shotradius:`). The figure loader writes
-    /// this unsigned 16-bit value at runtime offset `+0x4a`; the ship-route
-    /// caller `FUN_00455a20` supplies `Shotradius >> 3` to
+    /// Ship firing/approach radius (`Shotradius:`). The figure loader
+    /// multiplies it by 8 before writing the unsigned 16-bit runtime value
+    /// at offset `+0x4a`; the ship-route caller `FUN_00455a20` supplies
+    /// `Shotradius >> 3` to
     /// `FUN_0046dde0` when it marks target-approach rays.
     pub fn shot_radius(&self) -> i32 {
         self.prop_int("Shotradius")

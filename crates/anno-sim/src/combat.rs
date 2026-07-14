@@ -15,6 +15,7 @@
 
 use crate::source_rand::SourceRand;
 use crate::source_route::SourceTargetDescriptor;
+use anno_formats::szs::LandFigureDefinition;
 
 /// `FUN_00446ca0` initializes byte zero of each newly allocated type-4
 /// runtime slot to `0x2d`; `FUN_004581f0` uses that byte as its raw-grid
@@ -110,6 +111,9 @@ const DETECTION_RANGE: u32 = 6;
 /// `FUN_0045cd20` only pairs figures whose raw type-4 coordinates differ by
 /// at most `0x60` in either axis before it writes a candidate record.
 const SOURCE_KIND4_CANDIDATE_AXIS_LIMIT: u32 = 0x60;
+/// `FUN_00456d00` only scores source candidates within the attacker's raw
+/// `Shotradius + 0x40` envelope after `FUN_0045cd20` fills its broader list.
+const SOURCE_KIND4_CANDIDATE_SCORE_RADIUS_MARGIN: u32 = 0x40;
 
 /// Military unit types (from FUN_00451890 switch cases).
 ///
@@ -670,14 +674,10 @@ fn is_source_kind4_land_figure(unit: &MilitaryUnit) -> bool {
 /// Rebuild the source type-4 candidate relationship before its movement
 /// dispatch. `FUN_00451890` calls `FUN_0045cd20` immediately before it
 /// invokes `FUN_00456d00`: pairs are co-island, active, differently owned,
-/// non-allied, and lie in a raw `0x60 × 0x60` neighborhood. The source stores
-/// at most 32 candidates; this model keeps the selected lowest-metric entry
-/// and refreshes its moving coordinate every dispatch.
-///
-/// The remaining score-table terms in `FUN_00454250` are deliberately kept
-/// out of this supplier pass until their compiled tables are extracted. The
-/// neighborhood and candidate lifetime here are the directly reconstructed
-/// parts of the source producer.
+/// non-allied, and lie in a raw `0x60 × 0x60` neighborhood. `FUN_00456d00`
+/// only ranks candidates after the current route program reaches its terminal
+/// opcode; it retains candidates inside the attacker's `Shotradius + 0x40`
+/// envelope and ranks them with `FUN_00454250`'s generated score curves.
 pub fn acquire_source_kind4_candidates(
     units: &mut [MilitaryUnit],
     diplomacy: &DiplomacyMatrix,
@@ -694,19 +694,9 @@ pub fn acquire_source_kind4_candidates(
         let source_owner = units[unit_index].owner;
         let source_position = (units[unit_index].tile_x, units[unit_index].tile_y);
         let existing_target = usize::try_from(units[unit_index].combat_target).ok();
-        let selected = existing_target
-            .filter(|&target_index| {
-                source_kind4_candidate_allowed(
-                    units,
-                    unit_index,
-                    target_index,
-                    source_island,
-                    source_owner,
-                    source_position,
-                    diplomacy,
-                )
-            })
-            .or_else(|| {
+        let selected = if source_kind4_program_is_terminal(&units[unit_index]) {
+            {
+                let attacker = &units[unit_index];
                 units
                     .iter()
                     .enumerate()
@@ -721,17 +711,36 @@ pub fn acquire_source_kind4_candidates(
                             diplomacy,
                         )
                     })
-                    .min_by_key(|(target_index, target)| {
-                        (
-                            crate::source_route::source_target_metric(
-                                source_position,
-                                (target.tile_x, target.tile_y),
-                            ),
-                            *target_index,
-                        )
+                    .filter_map(|(target_index, target)| {
+                        let metric = crate::source_route::source_target_metric(
+                            source_position,
+                            (target.tile_x, target.tile_y),
+                        );
+                        source_kind4_candidate_score(attacker, target, metric).map(|score| {
+                            (
+                                score,
+                                std::cmp::Reverse(target.source_runtime_slot.unwrap_or(u16::MAX)),
+                                std::cmp::Reverse(target_index),
+                                target_index,
+                            )
+                        })
                     })
-                    .map(|(target_index, _)| target_index)
-            });
+                    .max_by_key(|(score, slot, index, _)| (*score, *slot, *index))
+                    .map(|(_, _, _, target_index)| target_index)
+            }
+        } else {
+            existing_target.filter(|&target_index| {
+                source_kind4_candidate_allowed(
+                    units,
+                    unit_index,
+                    target_index,
+                    source_island,
+                    source_owner,
+                    source_position,
+                    diplomacy,
+                )
+            })
+        };
 
         let Some(target_index) = selected else {
             units[unit_index].combat_target = -1;
@@ -771,6 +780,124 @@ fn source_kind4_candidate_allowed(
         && diplomacy.get(source_owner, target.owner) != Diplomacy::Allied
         && source_position.0.abs_diff(target.tile_x) <= SOURCE_KIND4_CANDIDATE_AXIS_LIMIT
         && source_position.1.abs_diff(target.tile_y) <= SOURCE_KIND4_CANDIDATE_AXIS_LIMIT
+}
+
+/// Score a type-4 candidate exactly along the type-4 branch of
+/// `FUN_00454250`. The four lookup tables are generated at startup by
+/// `FUN_00442a90`; this evaluates the same integer-linear segments directly,
+/// including the zero-filled tail after the final distance segment.
+fn source_kind4_candidate_score(
+    attacker: &MilitaryUnit,
+    target: &MilitaryUnit,
+    candidate_metric: u32,
+) -> Option<u16> {
+    let attacker_definition = source_kind4_definition(attacker)?;
+    let target_definition = source_kind4_definition(target)?;
+    let attacker_shot_radius = u32::from(attacker_definition.source_runtime_shot_radius());
+    if candidate_metric > attacker_shot_radius + SOURCE_KIND4_CANDIDATE_SCORE_RADIUS_MARGIN {
+        return None;
+    }
+
+    let attacker_max_energy = u32::from(attacker_definition.source_runtime_energy_cap());
+    let target_max_energy = u32::from(target_definition.source_runtime_energy_cap());
+    let attacker_strength = source_kind4_strength(attacker, attacker_definition);
+    let target_strength = source_kind4_strength(target, target_definition);
+    let target_energy = u32::from(target.source_energy);
+    let target_shot_radius = u32::from(target_definition.source_runtime_shot_radius());
+
+    let depleted_ratio = target_energy.saturating_sub(attacker_strength) * 128 / target_max_energy;
+    let mut score = u32::from(source_kind4_curve_depleted(depleted_ratio as usize));
+    let attacker_ratio = attacker_strength * 128 / target_max_energy;
+    score += u32::from(source_kind4_curve_attacker(
+        attacker_ratio.min(0x100) as usize,
+    ));
+    if candidate_metric <= target_shot_radius {
+        let retaliation_ratio = target_strength * 128 / attacker_max_energy;
+        score += u32::from(source_kind4_curve_retaliation(
+            retaliation_ratio.min(0x100) as usize,
+        ));
+    }
+
+    let approach_distance = candidate_metric.saturating_sub(attacker_shot_radius);
+    score += u32::from(source_kind4_curve_approach(approach_distance as usize));
+    if target_shot_radius < attacker_shot_radius {
+        score += 35;
+    }
+    Some(score as u16)
+}
+
+fn source_kind4_definition(unit: &MilitaryUnit) -> Option<LandFigureDefinition> {
+    unit.source_figure_definition_id
+        .and_then(LandFigureDefinition::from_id)
+}
+
+/// `FUN_00456d00` and the type-4 target branch of `FUN_00454250` compute
+/// effective strength from live energy, authored energy cap, and hitpoint.
+fn source_kind4_strength(unit: &MilitaryUnit, definition: LandFigureDefinition) -> u32 {
+    let energy_cap = u32::from(definition.source_runtime_energy_cap());
+    let energy_term = u32::from(unit.source_energy) * 0x55 / energy_cap;
+    (energy_term + 0x2b) * u32::from(definition.source_runtime_hit_points()) / 128
+}
+
+fn source_kind4_curve_depleted(index: usize) -> u8 {
+    source_kind4_curve_value(
+        index,
+        &[
+            (0, 0x19, 0x1e, 0x11),
+            (0x19, 0x40, 0x11, 9),
+            (0x40, 0x60, 9, 5),
+            (0x60, 0x80, 5, 0),
+        ],
+    )
+}
+
+fn source_kind4_curve_attacker(index: usize) -> u8 {
+    source_kind4_curve_value(
+        index,
+        &[
+            (0, 0x19, 0, 8),
+            (0x19, 0x40, 8, 0x14),
+            (0x40, 0x60, 0x14, 0x32),
+            (0x60, 0x80, 0x32, 0x3c),
+            (0x80, 0xc0, 0x3c, 0x28),
+            (0xc0, 0x100, 0x28, 0x14),
+        ],
+    )
+}
+
+fn source_kind4_curve_retaliation(index: usize) -> u8 {
+    source_kind4_curve_value(
+        index,
+        &[
+            (0, 6, 0, 0xc),
+            (6, 0xc, 0xc, 0x1c),
+            (0xc, 0x26, 0x1c, 0x2d),
+            (0x26, 0x40, 0x2d, 0x3c),
+            (0x40, 0x60, 0x3c, 0x32),
+            (0x60, 0x80, 0x32, 0x28),
+            (0x80, 0x100, 0x28, 0x1e),
+        ],
+    )
+}
+
+fn source_kind4_curve_approach(index: usize) -> u8 {
+    source_kind4_curve_value(
+        index,
+        &[(0, 0x18, 0x28, 0x14), (0x18, 0x30, 0x14, 10), (0x30, 0x60, 10, 0)],
+    )
+}
+
+fn source_kind4_curve_value(index: usize, segments: &[(usize, usize, i32, i32)]) -> u8 {
+    for &(start, end, start_value, end_value) in segments {
+        if (start..=end).contains(&index) {
+            if index == end {
+                return end_value as u8;
+            }
+            let step = (end_value * 256 - start_value * 256) / (end - start) as i32;
+            return ((start_value * 256 + step * (index - start) as i32) >> 8) as u8;
+        }
+    }
+    0
 }
 
 /// Detect combat engagements and apply damage for one tick.
@@ -1658,13 +1785,13 @@ mod tests {
             source_kind4_unit(2, 2, 202, 220),
             source_kind4_unit(3, 3, 300, 200),
         ];
-        units[0].source_route_program[0] = 0x21;
         let diplomacy = DiplomacyMatrix::new();
 
         acquire_source_kind4_candidates(&mut units, &diplomacy);
 
-        // The source metric is 11 for slot 1 and 20 for slot 2. Slot 3 is
-        // outside `FUN_0045cd20`'s raw-axis candidate window.
+        // Slots 1 and 2 tie under their identical source score; the producer
+        // traverses runtime slots in ascending order. Slot 3 is outside
+        // `FUN_0045cd20`'s raw-axis candidate window.
         assert_eq!(units[0].combat_target, 1);
         assert_eq!((units[0].target_x, units[0].target_y), (210, 205));
         assert_eq!(
@@ -1687,6 +1814,88 @@ mod tests {
 
         assert_eq!(units[0].combat_target, 2);
         assert_eq!((units[0].target_x, units[0].target_y), (208, 200));
+    }
+
+    #[test]
+    fn source_kind4_candidates_follow_fun_00454250_score_order() {
+        let mut attacker = MilitaryUnit::new(UnitType::Musketeer, 0, 200, 200);
+        attacker.source_island_id = Some(10);
+        attacker.source_runtime_slot = Some(0);
+        attacker.source_figure_definition_id = Some(9);
+        attacker.source_energy = 480;
+
+        let mut nearby_infantry = MilitaryUnit::new(UnitType::Infantry, 1, 206, 200);
+        nearby_infantry.source_island_id = Some(10);
+        nearby_infantry.source_runtime_slot = Some(1);
+        nearby_infantry.source_figure_definition_id = Some(1);
+        nearby_infantry.source_energy = 640;
+
+        let mut farther_cannon = MilitaryUnit::new(UnitType::Cannon, 2, 220, 200);
+        farther_cannon.source_island_id = Some(10);
+        farther_cannon.source_runtime_slot = Some(2);
+        farther_cannon.source_figure_definition_id = Some(13);
+        farther_cannon.source_energy = 384;
+
+        let infantry_score = source_kind4_candidate_score(&attacker, &nearby_infantry, 6)
+            .expect("infantry is in the source score envelope");
+        let cannon_score = source_kind4_candidate_score(&attacker, &farther_cannon, 20)
+            .expect("cannon is in the source score envelope");
+        assert!(cannon_score > infantry_score);
+
+        let mut units = vec![attacker, nearby_infantry, farther_cannon];
+        acquire_source_kind4_candidates(&mut units, &DiplomacyMatrix::new());
+        assert_eq!(units[0].combat_target, 2);
+        assert_eq!((units[0].target_x, units[0].target_y), (220, 200));
+    }
+
+    #[test]
+    fn source_kind4_score_curves_match_fun_00442a90_boundaries() {
+        assert_eq!(source_kind4_curve_depleted(0), 30);
+        assert_eq!(source_kind4_curve_depleted(0x19), 17);
+        assert_eq!(source_kind4_curve_depleted(0x40), 9);
+        assert_eq!(source_kind4_curve_depleted(0x80), 0);
+
+        assert_eq!(source_kind4_curve_attacker(0), 0);
+        assert_eq!(source_kind4_curve_attacker(0x40), 20);
+        assert_eq!(source_kind4_curve_attacker(0x80), 60);
+        assert_eq!(source_kind4_curve_attacker(0x100), 20);
+
+        assert_eq!(source_kind4_curve_retaliation(0), 0);
+        assert_eq!(source_kind4_curve_retaliation(0x40), 60);
+        assert_eq!(source_kind4_curve_retaliation(0x100), 30);
+
+        assert_eq!(source_kind4_curve_approach(0), 40);
+        assert_eq!(source_kind4_curve_approach(0x30), 10);
+        assert_eq!(source_kind4_curve_approach(0x60), 0);
+        assert_eq!(source_kind4_curve_approach(0x61), 0);
+    }
+
+    #[test]
+    fn source_kind4_active_route_keeps_its_existing_candidate() {
+        let mut attacker = MilitaryUnit::new(UnitType::Musketeer, 0, 200, 200);
+        attacker.source_island_id = Some(10);
+        attacker.source_runtime_slot = Some(0);
+        attacker.source_figure_definition_id = Some(9);
+        attacker.source_energy = 480;
+        attacker.source_route_program[0] = 0x21;
+        attacker.combat_target = 1;
+
+        let mut infantry = MilitaryUnit::new(UnitType::Infantry, 1, 206, 200);
+        infantry.source_island_id = Some(10);
+        infantry.source_runtime_slot = Some(1);
+        infantry.source_figure_definition_id = Some(1);
+        infantry.source_energy = 640;
+
+        let mut cannon = MilitaryUnit::new(UnitType::Cannon, 2, 220, 200);
+        cannon.source_island_id = Some(10);
+        cannon.source_runtime_slot = Some(2);
+        cannon.source_figure_definition_id = Some(13);
+        cannon.source_energy = 384;
+
+        let mut units = vec![attacker, infantry, cannon];
+        acquire_source_kind4_candidates(&mut units, &DiplomacyMatrix::new());
+        assert_eq!(units[0].combat_target, 1);
+        assert_eq!((units[0].target_x, units[0].target_y), (206, 200));
     }
 
     #[test]
