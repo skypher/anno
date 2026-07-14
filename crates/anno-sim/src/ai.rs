@@ -1,17 +1,11 @@
 //! AI controller for computer players.
 //!
-//! Ported from FUN_0042b4b0 (AI main tick) and related functions.
-//! Three personality types control decision-making:
-//!   - Economic (Strategy 0): prioritizes building placement and production chains
-//!   - Military (Strategy 1): prioritizes unit production and attacks
-//!   - Balanced (Strategy 2): hybrid of economic and military
-//!
-//! AI operates on cooldown timers to avoid excessive computation per tick.
+//! The source PLAYER4 state is parsed, but its command and pacing semantics
+//! are not yet decoded. Controllers therefore preserve scenario state without
+//! synthesizing construction, military, tax, market, or route commands.
 
-use crate::building::{BuildingDef, BuildingInstance};
 use crate::player::{Player, PlayerState};
 use crate::types::Good;
-use crate::warehouse::Warehouse;
 
 /// AI personality type (maps to strategy selector at personality offset +2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +16,7 @@ pub enum AiPersonality {
     Balanced = 2,
 }
 
-/// Difficulty level (scales AI unit counts and aggression).
+/// Difficulty level retained from the AI controller snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Difficulty {
@@ -41,15 +35,6 @@ pub fn personality_from_slot_byte(b: u16) -> (AiPersonality, Difficulty) {
     (AiPersonality::Economic, Difficulty::Medium)
 }
 
-/// Building construction priority for AI decision-making.
-/// Ordered by importance within each phase.
-#[derive(Debug, Clone)]
-pub struct BuildPriority {
-    pub good: Good,
-    pub min_population: u32,
-    pub max_count: u16,
-}
-
 /// AI state for a single player.
 #[derive(Debug, Clone)]
 pub struct AiController {
@@ -57,81 +42,17 @@ pub struct AiController {
     pub personality: AiPersonality,
     pub difficulty: Difficulty,
 
-    /// Cooldown timers (in economy ticks).
+    /// Retained cooldown fields from persisted AI state.
     pub build_cooldown: u32,
     pub military_cooldown: u32,
     pub trade_cooldown: u32,
 
-    /// Current build phase (advances as population grows).
+    /// Retained build phase from persisted AI state.
     pub build_phase: u8,
 
-    /// Total buildings constructed by AI.
+    /// Retained construction count from persisted AI state.
     pub buildings_placed: u32,
 }
-
-/// Standard building priority for economic personality.
-/// Mirrors the original AI's construction order from FUN_00429aa0.
-const ECONOMIC_PRIORITIES: &[BuildPriority] = &[
-    // Phase 0: Pioneer basics
-    BuildPriority {
-        good: Good::Food,
-        min_population: 0,
-        max_count: 2,
-    },
-    BuildPriority {
-        good: Good::Cloth,
-        min_population: 0,
-        max_count: 1,
-    },
-    // Phase 1: Settler needs
-    BuildPriority {
-        good: Good::Food,
-        min_population: 100,
-        max_count: 4,
-    },
-    BuildPriority {
-        good: Good::Cloth,
-        min_population: 100,
-        max_count: 2,
-    },
-    BuildPriority {
-        good: Good::Alcohol,
-        min_population: 200,
-        max_count: 2,
-    },
-    // Phase 2: Citizen needs
-    BuildPriority {
-        good: Good::TobaccoProducts,
-        min_population: 300,
-        max_count: 1,
-    },
-    BuildPriority {
-        good: Good::Spices,
-        min_population: 300,
-        max_count: 1,
-    },
-    BuildPriority {
-        good: Good::Tools,
-        min_population: 200,
-        max_count: 1,
-    },
-    BuildPriority {
-        good: Good::Bricks,
-        min_population: 200,
-        max_count: 1,
-    },
-    // Phase 3: Merchant needs
-    BuildPriority {
-        good: Good::Cocoa,
-        min_population: 500,
-        max_count: 1,
-    },
-    BuildPriority {
-        good: Good::Jewelry,
-        min_population: 500,
-        max_count: 1,
-    },
-];
 
 impl AiController {
     pub fn new(player_idx: u8, personality: AiPersonality, difficulty: Difficulty) -> Self {
@@ -152,234 +73,27 @@ impl AiController {
     pub fn tick(
         &mut self,
         player: &Player,
-        buildings: &[BuildingInstance],
-        building_defs: &[BuildingDef],
-        warehouses: &[Warehouse],
+        _buildings: &[crate::building::BuildingInstance],
+        _building_defs: &[crate::building::BuildingDef],
+        _warehouses: &[crate::warehouse::Warehouse],
     ) -> Vec<AiAction> {
         if player.state != PlayerState::AiActive {
             return Vec::new();
         }
 
-        let mut actions = Vec::new();
-
-        // Decrement cooldowns
-        if self.build_cooldown > 0 {
-            self.build_cooldown -= 1;
-        }
-        if self.military_cooldown > 0 {
-            self.military_cooldown -= 1;
-        }
-        if self.trade_cooldown > 0 {
-            self.trade_cooldown -= 1;
-        }
-
-        match self.personality {
-            AiPersonality::Economic => {
-                self.tick_economic(player, buildings, building_defs, warehouses, &mut actions);
-            }
-            AiPersonality::Military => {
-                self.tick_economic(player, buildings, building_defs, warehouses, &mut actions);
-                self.tick_military(player, &mut actions);
-            }
-            AiPersonality::Balanced => {
-                self.tick_economic(player, buildings, building_defs, warehouses, &mut actions);
-                if player.total_population > 200 {
-                    self.tick_military(player, &mut actions);
-                }
-            }
-        }
-
-        // Tax rate adjustment
-        self.adjust_taxes(player, &mut actions);
-
-        // Gold management
-        self.manage_gold(player, &mut actions);
-
-        // Trade route expansion (any personality once it has the warehouses).
-        self.tick_trade(player, warehouses, &mut actions);
-
-        actions
-    }
-
-    /// Economic strategy: decide what to build.
-    fn tick_economic(
-        &mut self,
-        player: &Player,
-        buildings: &[BuildingInstance],
-        building_defs: &[BuildingDef],
-        _warehouses: &[Warehouse],
-        actions: &mut Vec<AiAction>,
-    ) {
-        if self.build_cooldown > 0 {
-            return;
-        }
-
-        let total_pop = player.total_population;
-
-        // Count existing production buildings by output good
-        let mut good_counts: std::collections::HashMap<Good, u16> =
-            std::collections::HashMap::new();
-        for b in buildings {
-            if b.owner == self.player_idx && b.active {
-                if (b.def_id as usize) < building_defs.len() {
-                    let def = &building_defs[b.def_id as usize];
-                    if def.output_good != Good::None {
-                        *good_counts.entry(def.output_good).or_default() += 1;
-                    }
-                }
-            }
-        }
-
-        // Check priority list for unmet needs
-        for priority in ECONOMIC_PRIORITIES {
-            if total_pop < priority.min_population {
-                continue;
-            }
-
-            let current = good_counts.get(&priority.good).copied().unwrap_or(0);
-            if current < priority.max_count {
-                // Check if we can afford it
-                if player.gold > 500 {
-                    actions.push(AiAction::RequestBuild {
-                        good: priority.good,
-                        priority: (priority.max_count - current) as u8,
-                    });
-                    self.build_cooldown = self.build_interval();
-                    break; // One build decision per tick
-                }
-            }
-        }
-
-        // Check for supply shortages — if a demand is unmet, build more of that good
-        for slot in &player.demands {
-            if slot.demand > 0 && slot.supply < slot.demand / 2 {
-                // Severe shortage — try to address it
-                // (The RequestBuild above handles this via priority list)
-            }
-        }
-    }
-
-    /// Military strategy: decide about unit production.
-    fn tick_military(&mut self, player: &Player, actions: &mut Vec<AiAction>) {
-        if self.military_cooldown > 0 {
-            return;
-        }
-
-        // Scale military by difficulty
-        let unit_target = match self.difficulty {
-            Difficulty::Easy => 1,
-            Difficulty::Medium => 3,
-            Difficulty::Hard => 6,
-            Difficulty::Expert => 12,
-        };
-
-        // Only build military if economy is stable
-        if player.gold > 2000 && player.total_population > 100 {
-            actions.push(AiAction::RequestMilitary {
-                unit_count: unit_target,
-            });
-            self.military_cooldown = 10; // 10 economy ticks (~100 seconds)
-        }
-    }
-
-    /// Adjust tax rates based on satisfaction and gold.
-    fn adjust_taxes(&self, player: &Player, actions: &mut Vec<AiAction>) {
-        for tier in 0..5 {
-            if player.population[tier] == 0 {
-                continue;
-            }
-
-            let sat = player.satisfaction[tier];
-            let current_tax = player.tax_rates[tier];
-
-            // If satisfaction is high and we need money, raise taxes
-            let new_tax = if sat > 96 && player.gold < 3000 {
-                (current_tax + 8).min(96)
-            } else if sat < 64 && current_tax > 32 {
-                // Satisfaction low — lower taxes to prevent citizens leaving
-                current_tax - 8
-            } else {
-                continue; // No change needed
-            };
-
-            if new_tax != current_tax {
-                actions.push(AiAction::SetTaxRate {
-                    tier: tier as u8,
-                    rate: new_tax,
-                });
-            }
-        }
-    }
-
-    /// Manage gold — sell excess resources if gold is low.
-    fn manage_gold(&self, player: &Player, actions: &mut Vec<AiAction>) {
-        if player.gold < 1000 {
-            actions.push(AiAction::SellExcess);
-        }
-    }
-
-    /// Decide whether to start a new trade route.
-    /// Triggered when:
-    ///   - trade_cooldown has elapsed,
-    ///   - the AI has at least 2 warehouses on different islands,
-    ///   - it can afford a ship (1000 gold buffer above subsistence).
-    /// The dispatcher picks the actual stops; we just emit the request.
-    pub(crate) fn tick_trade(
-        &mut self,
-        player: &Player,
-        warehouses: &[Warehouse],
-        actions: &mut Vec<AiAction>,
-    ) {
-        if self.trade_cooldown > 0 {
-            return;
-        }
-        if player.gold < 2000 {
-            return;
-        }
-        let mut islands: Vec<u8> = warehouses
-            .iter()
-            .filter(|w| w.active && w.owner == self.player_idx)
-            .map(|w| w.island_id)
-            .collect();
-        islands.sort();
-        islands.dedup();
-        if islands.len() < 2 {
-            return;
-        }
-        actions.push(AiAction::EstablishTradeRoute);
-        self.trade_cooldown = match self.difficulty {
-            Difficulty::Easy => 30,
-            Difficulty::Medium => 20,
-            Difficulty::Hard => 12,
-            Difficulty::Expert => 8,
-        };
-    }
-
-    /// Build interval depends on difficulty (faster on higher difficulty).
-    fn build_interval(&self) -> u32 {
-        match self.difficulty {
-            Difficulty::Easy => 8,   // ~80 seconds
-            Difficulty::Medium => 5, // ~50 seconds
-            Difficulty::Hard => 3,   // ~30 seconds
-            Difficulty::Expert => 2, // ~20 seconds
-        }
+        Vec::new()
     }
 }
 
-/// Actions the AI wants to take. Applied by the simulation dispatcher.
+/// Reserved AI actions awaiting decoded source command semantics.
 #[derive(Debug, Clone)]
 pub enum AiAction {
-    /// Request construction of a building producing this good.
+    /// Reserved for decoded source AI construction commands.
     RequestBuild { good: Good, priority: u8 },
-    /// Request military unit production.
-    RequestMilitary { unit_count: u32 },
-    /// Adjust tax rate for a population tier.
+    /// Reserved for decoded source AI tax commands.
     SetTaxRate { tier: u8, rate: u8 },
-    /// Sell excess warehouse goods for gold.
+    /// Reserved for decoded source AI market commands.
     SellExcess,
-    /// Establish a trade route across the AI's owned warehouses (the
-    /// dispatcher picks the actual stops + spawns a ship).
-    EstablishTradeRoute,
 }
 
 #[cfg(test)]
@@ -398,9 +112,9 @@ mod tests {
 
         let _ = ai.tick(&player, &[], &[], &[]);
 
-        assert_eq!(ai.build_cooldown, 7);
-        assert_eq!(ai.military_cooldown, 3);
-        assert_eq!(ai.trade_cooldown, 5);
+        assert_eq!(ai.build_cooldown, 8);
+        assert_eq!(ai.military_cooldown, 4);
+        assert_eq!(ai.trade_cooldown, 6);
     }
 
     #[test]
@@ -410,12 +124,11 @@ mod tests {
         let mut player = Player::new_ai(1, 0);
         player.gold = 5_000;
         let _ = ai.tick(&player, &[], &[], &[]);
-        // Just the normal -1 decrement.
-        assert_eq!(ai.build_cooldown, 7);
+        assert_eq!(ai.build_cooldown, 8);
     }
 
     #[test]
-    fn economic_ai_requests_food_first() {
+    fn economic_ai_does_not_synthesize_build_request() {
         let mut ai = AiController::new(1, AiPersonality::Economic, Difficulty::Medium);
         let mut player = Player::new_ai(1, 0);
         player.population[0] = 50; // Some pioneers
@@ -424,36 +137,20 @@ mod tests {
 
         let actions = ai.tick(&player, &[], &[], &[]);
 
-        // Should request Food production first (highest priority for pioneers)
-        let build_actions: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, AiAction::RequestBuild { .. }))
-            .collect();
-        assert!(!build_actions.is_empty(), "AI should request a build");
-        if let AiAction::RequestBuild { good, .. } = &build_actions[0] {
-            assert_eq!(*good, Good::Food, "First build should be Food");
-        }
+        assert!(actions.is_empty());
     }
 
     #[test]
-    fn ai_lowers_taxes_when_satisfaction_low() {
-        let ai = AiController::new(1, AiPersonality::Economic, Difficulty::Medium);
+    fn ai_does_not_synthesize_tax_change_from_satisfaction() {
+        let mut ai = AiController::new(1, AiPersonality::Economic, Difficulty::Medium);
         let mut player = Player::new_ai(1, 0);
         player.population[0] = 100;
         player.satisfaction[0] = 40; // Below 64 threshold
         player.tax_rates[0] = 64; // Above 32 minimum
 
-        let mut actions = Vec::new();
-        ai.adjust_taxes(&player, &mut actions);
+        let actions = ai.tick(&player, &[], &[], &[]);
 
-        let tax_actions: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, AiAction::SetTaxRate { .. }))
-            .collect();
-        assert!(!tax_actions.is_empty(), "Should adjust taxes");
-        if let AiAction::SetTaxRate { rate, .. } = tax_actions[0] {
-            assert!(*rate < 64, "Should lower tax rate");
-        }
+        assert!(actions.is_empty());
     }
 
     #[test]
@@ -468,12 +165,12 @@ mod tests {
     }
 
     #[test]
-    fn military_scales_with_difficulty() {
-        for (diff, expected_min) in [
-            (Difficulty::Easy, 1),
-            (Difficulty::Medium, 3),
-            (Difficulty::Hard, 6),
-            (Difficulty::Expert, 12),
+    fn military_ai_does_not_synthesize_unit_request() {
+        for diff in [
+            Difficulty::Easy,
+            Difficulty::Medium,
+            Difficulty::Hard,
+            Difficulty::Expert,
         ] {
             let mut ai = AiController::new(1, AiPersonality::Military, diff);
             let mut player = Player::new_ai(1, 0);
@@ -482,18 +179,11 @@ mod tests {
             player.total_population = 200;
 
             let actions = ai.tick(&player, &[], &[], &[]);
-            let mil: Vec<_> = actions
-                .iter()
-                .filter(|a| matches!(a, AiAction::RequestMilitary { .. }))
-                .collect();
             assert!(
-                !mil.is_empty(),
-                "Military AI should request units at {:?}",
+                actions.is_empty(),
+                "Military AI must not synthesize units at {:?}: {actions:?}",
                 diff
             );
-            if let AiAction::RequestMilitary { unit_count } = mil[0] {
-                assert_eq!(*unit_count, expected_min);
-            }
         }
     }
 }

@@ -32,7 +32,7 @@ pub struct CodFile {
 /// A building/terrain definition from haeuser.cod.
 #[derive(Debug, Clone)]
 pub struct BuildingDef {
-    /// Building number (sequential ID used in INSELHAUS records as sprite index)
+    /// Building number from the source definition.
     pub nummer: i32,
     /// Source `Id` field from haeuser.cod, resolved through the constant table.
     pub source_id: i32,
@@ -56,6 +56,9 @@ pub struct BuildingDef {
     pub anim_add: i32,
     /// Animation speed in milliseconds per frame (0 = use default 200ms)
     pub anim_time: i32,
+    /// Source `NoShotFlg` bit consumed by `FUN_0046f6d0` when it constructs
+    /// the ship-route obstacle overlay.
+    pub no_shot: bool,
     /// Resolved `Ruinenr` code from haeuser.cod. The original parser
     /// registers symbolic tokens in `1602_exe.c:66354-66367`
     /// (`RUINE_HOLZ = 0`, `RUINE_STEIN = 2`, …, `NORUINE = 255`) and
@@ -80,9 +83,78 @@ impl Default for BuildingDef {
             anim_anz: 1,
             anim_add: 0,
             anim_time: 0,
+            no_shot: false,
             ruinenr: 255,
             properties: HashMap::new(),
         }
+    }
+}
+
+impl BuildingDef {
+    /// Runtime kind code assigned by the `FUN_00460750` symbol table before
+    /// haeuser.cod is parsed. The table deliberately aliases terrain and
+    /// production labels into one code space; for example `STRASSE` and
+    /// `HANDWERK` both resolve to 1.
+    pub fn source_kind_code(&self) -> Option<u8> {
+        match self.kind.as_str() {
+            "UNUSED" => Some(0),
+            "STRASSE" | "HANDWERK" => Some(1),
+            "PLANTAGE" => Some(2),
+            "TOR" | "BERGWERK" => Some(3),
+            "MAUER" | "WEIDETIER" => Some(4),
+            "MAUERSTRAND" | "JAGDHAUS" => Some(5),
+            "TURM" | "FISCHEREI" => Some(6),
+            "TURMSTRAND" | "MARKT" => Some(7),
+            "KONTOR" => Some(8),
+            "ROHSTOFF" => Some(9),
+            "WALD" | "ROHSTWACHS" => Some(10),
+            "BODEN" | "STEINBRUCH" => Some(11),
+            "RUINE" | "ROHSTERZ" => Some(12),
+            "PLATZ" | "WOHNUNG" => Some(13),
+            "GEBAEUDE" => Some(14),
+            "FELS" | "MILITAR" => Some(15),
+            "FLUSS" | "WACHTURM" => Some(16),
+            "FLUSSECK" | "WIRT" => Some(17),
+            "BRUECKE" | "KAPELLE" => Some(18),
+            "MEER" | "KIRCHE" => Some(19),
+            "BRANDUNG" | "BADEHAUS" => Some(20),
+            "BRANDECK" | "THEATER" => Some(21),
+            "MUENDUNG" | "KLINIK" => Some(22),
+            "STRAND" | "SCHULE" => Some(23),
+            "STRANDMUND" | "HOCHSCHULE" => Some(24),
+            "STRANDECKA" | "GALGEN" => Some(25),
+            "STRANDECKI" | "BRUNNEN" => Some(26),
+            "STRANDVARI" | "SCHLOSS" => Some(27),
+            "STRANDHAUS" | "DENKMAL" => Some(28),
+            "STRANDRUINE" | "TRIUMPH" => Some(29),
+            "PIER" => Some(30),
+            "HANG" | "PIRATWOHN" => Some(31),
+            "HANGECK" | "pMAUER" => Some(32),
+            "HANGQUELL" => Some(33),
+            "MINE" => Some(34),
+            "HQ" => Some(35),
+            "HAFEN" => Some(36),
+            "WMUEHLE" => Some(37),
+            _ => None,
+        }
+    }
+
+    /// The four movement-type path classes compiled from `Wegspeed` by the
+    /// original building loader. At `0x00462852..0x0046287d` it stores
+    /// `min(126, floor(speed * 32 / 100))` into the runtime definition;
+    /// `FUN_0046f230` later copies one selected class into path-grid
+    /// metadata. `None` preserves an absent or malformed source property.
+    pub fn source_path_classes(&self) -> Option<[u8; 4]> {
+        let speeds: Vec<i32> = self
+            .properties
+            .get("Wegspeed")?
+            .split(',')
+            .map(str::trim)
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .ok()?;
+        let speeds: [i32; 4] = speeds.try_into().ok()?;
+        Some(speeds.map(|speed| (speed.saturating_mul(32) / 100).clamp(0, 126) as u8))
     }
 }
 
@@ -115,6 +187,11 @@ impl CodFile {
         let mut constants: HashMap<String, i32> = HashMap::new();
         let mut buildings: Vec<BuildingDef> = Vec::new();
         let mut building_by_nummer: HashMap<i32, BuildingDef> = HashMap::new();
+        // `@field: +/-value` is evaluated by the executable parser against
+        // the last value assigned to that field, before `ObjFill` copies are
+        // applied to the next runtime record. Keep that state separate from
+        // `current`, whose fields may be replaced by an ObjFill template.
+        let mut directive_values: HashMap<String, i32> = HashMap::new();
         let mut current = BuildingDef::default();
         let mut in_building = false;
         let mut obj_depth = 0i32;
@@ -130,7 +207,6 @@ impl CodFile {
             if line.is_empty() {
                 continue;
             }
-
 
             // Handle sub-objects (Objekt: ... EndObj;)
             // We still parse key:value pairs inside sub-objects and store them
@@ -166,18 +242,14 @@ impl CodFile {
                             } else {
                                 key.to_string()
                             };
-                            current
-                                .properties
-                                .insert(storage_key, value.to_string());
+                            current.properties.insert(storage_key, value.to_string());
                         }
                     } else if let Some((name, expr)) = line.split_once('=') {
                         // Constants inside sub-objects
                         let name = name.trim();
                         let expr = expr.trim();
                         if !name.is_empty()
-                            && name
-                                .chars()
-                                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                         {
                             let val = Self::eval(&constants, expr);
                             constants.insert(name.to_string(), val);
@@ -219,24 +291,29 @@ impl CodFile {
 
             // Parse Gfx / @Gfx
             if let Some(val_str) = line.strip_prefix("@Gfx:") {
-                let val_str = val_str.trim();
-                if let Some(delta) = val_str.strip_prefix('+') {
-                    current.gfx += Self::eval(&constants, delta.trim());
-                } else if val_str.starts_with('-') {
-                    current.gfx += Self::eval(&constants, val_str);
-                } else {
-                    current.gfx = Self::eval(&constants, val_str);
-                }
+                current.gfx =
+                    Self::eval_directive(&constants, &mut directive_values, "Gfx", val_str.trim());
                 continue;
             }
             if let Some(val_str) = line.strip_prefix("Gfx:") {
                 current.gfx = Self::eval(&constants, val_str.trim());
+                directive_values.insert("Gfx".to_string(), current.gfx);
                 continue;
             }
 
             // Parse Baugfx
+            if let Some(val_str) = line.strip_prefix("@Baugfx:") {
+                current.baugfx = Self::eval_directive(
+                    &constants,
+                    &mut directive_values,
+                    "Baugfx",
+                    val_str.trim(),
+                );
+                continue;
+            }
             if let Some(val_str) = line.strip_prefix("Baugfx:") {
                 current.baugfx = Self::eval(&constants, val_str.trim());
+                directive_values.insert("Baugfx".to_string(), current.baugfx);
                 continue;
             }
 
@@ -300,15 +377,24 @@ impl CodFile {
                 continue;
             }
 
+            // Parse NoShotFlg. The executable stores bit zero at runtime
+            // definition offset 0x6a, bit 0x10; ship routing consults it in
+            // `FUN_0046f6d0`.
+            if let Some(val_str) = line.strip_prefix("NoShotFlg:") {
+                current.no_shot = Self::eval(&constants, val_str.trim()) & 1 != 0;
+                current
+                    .properties
+                    .insert("NoShotFlg".to_string(), val_str.trim().to_string());
+                continue;
+            }
+
             if let Some(val_str) = line.strip_prefix("@Ruinenr:") {
-                let val_str = val_str.trim();
-                if let Some(delta) = val_str.strip_prefix('+') {
-                    current.ruinenr += Self::eval_ruinenr(&constants, delta.trim());
-                } else if val_str.starts_with('-') {
-                    current.ruinenr += Self::eval_ruinenr(&constants, val_str);
-                } else {
-                    current.ruinenr = Self::eval_ruinenr(&constants, val_str);
-                }
+                current.ruinenr = Self::eval_ruinenr_directive(
+                    &constants,
+                    &mut directive_values,
+                    "Ruinenr",
+                    val_str.trim(),
+                );
                 current
                     .properties
                     .insert("Ruinenr".to_string(), current.ruinenr.to_string());
@@ -316,6 +402,7 @@ impl CodFile {
             }
             if let Some(val_str) = line.strip_prefix("Ruinenr:") {
                 current.ruinenr = Self::eval_ruinenr(&constants, val_str.trim());
+                directive_values.insert("Ruinenr".to_string(), current.ruinenr);
                 current
                     .properties
                     .insert("Ruinenr".to_string(), current.ruinenr.to_string());
@@ -324,14 +411,8 @@ impl CodFile {
 
             // Parse @Id: (incremental) and Id: (absolute)
             if let Some(val_str) = line.strip_prefix("@Id:") {
-                let val_str = val_str.trim();
-                if let Some(delta) = val_str.strip_prefix('+') {
-                    current.source_id += Self::eval(&constants, delta.trim());
-                } else if val_str.starts_with('-') {
-                    current.source_id += Self::eval(&constants, val_str);
-                } else {
-                    current.source_id = Self::eval(&constants, val_str);
-                }
+                current.source_id =
+                    Self::eval_directive(&constants, &mut directive_values, "Id", val_str.trim());
                 current
                     .properties
                     .insert("Id".to_string(), current.source_id.to_string());
@@ -339,6 +420,7 @@ impl CodFile {
             }
             if let Some(val_str) = line.strip_prefix("Id:") {
                 current.source_id = Self::eval(&constants, val_str.trim());
+                directive_values.insert("Id".to_string(), current.source_id);
                 current
                     .properties
                     .insert("Id".to_string(), current.source_id.to_string());
@@ -349,18 +431,12 @@ impl CodFile {
             if let Some((name, expr)) = line.split_once('=') {
                 let name = name.trim();
                 let expr = expr.trim();
-                if !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     let val = Self::eval(&constants, expr);
                     constants.insert(name.to_string(), val);
                     // Also store named values from building context
                     if in_building {
-                        current
-                            .properties
-                            .insert(name.to_string(), val.to_string());
+                        current.properties.insert(name.to_string(), val.to_string());
                     }
                 }
                 continue;
@@ -425,6 +501,24 @@ impl CodFile {
         0
     }
 
+    fn eval_directive(
+        constants: &HashMap<String, i32>,
+        directive_values: &mut HashMap<String, i32>,
+        name: &str,
+        expr: &str,
+    ) -> i32 {
+        let expr = expr.trim();
+        let value = if let Some(delta) = expr.strip_prefix('+') {
+            directive_values.get(name).copied().unwrap_or(0) + Self::eval(constants, delta)
+        } else if expr.starts_with('-') {
+            directive_values.get(name).copied().unwrap_or(0) + Self::eval(constants, expr)
+        } else {
+            Self::eval(constants, expr)
+        };
+        directive_values.insert(name.to_string(), value);
+        value
+    }
+
     fn eval_ruinenr(constants: &HashMap<String, i32>, expr: &str) -> i32 {
         match expr.trim() {
             "RUINE_HOLZ" => 0,
@@ -445,12 +539,29 @@ impl CodFile {
         }
     }
 
+    fn eval_ruinenr_directive(
+        constants: &HashMap<String, i32>,
+        directive_values: &mut HashMap<String, i32>,
+        name: &str,
+        expr: &str,
+    ) -> i32 {
+        let expr = expr.trim();
+        let value = if let Some(delta) = expr.strip_prefix('+') {
+            directive_values.get(name).copied().unwrap_or(0) + Self::eval_ruinenr(constants, delta)
+        } else if expr.starts_with('-') {
+            directive_values.get(name).copied().unwrap_or(0) + Self::eval_ruinenr(constants, expr)
+        } else {
+            Self::eval_ruinenr(constants, expr)
+        };
+        directive_values.insert(name.to_string(), value);
+        value
+    }
+
     fn eval_u16(constants: &HashMap<String, i32>, expr: &str) -> u16 {
         Self::eval(constants, expr).clamp(0, u16::MAX as i32) as u16
     }
 
-    /// Look up a building by its sprite index (Gfx value).
-    /// This is what INSELHAUS building_id maps to.
+    /// Look up a building by its STADTFLD sprite index (`Gfx` value).
     pub fn building_by_gfx(&self, gfx: i32) -> Option<&BuildingDef> {
         self.buildings.iter().find(|b| b.gfx == gfx)
     }
@@ -571,7 +682,44 @@ mod tests {
         assert_eq!(cod.buildings[1].nummer, 0);
         assert_eq!(cod.buildings[1].gfx, 0);
         assert_eq!(cod.buildings[1].kind, "BODEN");
+        assert_eq!(cod.buildings[1].source_kind_code(), Some(11));
         assert_eq!(cod.buildings[1].source_id, 0);
+        assert_eq!(
+            cod.buildings[1].source_path_classes(),
+            Some([38, 38, 38, 32]),
+            "BODEN inherits default Wegspeed classes"
+        );
+
+        let pasture_nummer = cod.constants["HAUSWACHS"];
+        let pasture = cod
+            .buildings
+            .iter()
+            .find(|b| b.nummer == pasture_nummer)
+            .expect("first pasture definition");
+        assert_eq!(pasture.source_path_classes(), Some([46, 38, 54, 32]));
+
+        let road = cod
+            .buildings
+            .iter()
+            .find(|b| b.kind == "STRASSE")
+            .expect("STRASSE definition");
+        assert_eq!(road.source_path_classes(), Some([32, 32, 32, 32]));
+        assert!(
+            cod.buildings
+                .iter()
+                .all(|building| building.source_path_classes().is_some()),
+            "every source building definition retains four Wegspeed classes"
+        );
+        assert!(
+            cod.buildings
+                .iter()
+                .all(|building| building.source_kind_code().is_some()),
+            "every top-level source building kind has an executable code"
+        );
+        assert!(
+            cod.buildings.iter().any(|building| building.no_shot),
+            "NoShotFlg definitions retain the source bit used by ship routing"
+        );
 
         // Should have ~500 buildings
         assert!(
@@ -588,22 +736,35 @@ mod tests {
         // baseline values feeding the simulation's
         // population.rs CONSUMPTION_PER_100 table.
         for b in &cod.buildings {
-            if b.kind != "HQ" { continue; }
-            if b.properties.get("Bauinfra")
-                .map(|s| s.starts_with("INFRA_KONTOR")).unwrap_or(false) {
+            if b.kind != "HQ" {
                 continue;
             }
-            assert_eq!(b.properties.get("Nahrung").map(|s| s.as_str()),
-                Some("1.3"), "Nr={}", b.nummer);
-            assert_eq!(b.properties.get("Steuer").map(|s| s.as_str()),
-                Some("2.6"), "Nr={}", b.nummer);
+            if b.properties
+                .get("Bauinfra")
+                .map(|s| s.starts_with("INFRA_KONTOR"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            assert_eq!(
+                b.properties.get("Nahrung").map(|s| s.as_str()),
+                Some("1.3"),
+                "Nr={}",
+                b.nummer
+            );
+            assert_eq!(
+                b.properties.get("Steuer").map(|s| s.as_str()),
+                Some("2.6"),
+                "Nr={}",
+                b.nummer
+            );
         }
 
         let ruin_cases = [
             (270, 8),   // RUINE_KONTOR_1
             (271, 9),   // ObjFill: BASE, then @Ruinenr: +1
-            (272, 9),   // ObjFill: BASE, then @Ruinenr: +1
-            (273, 9),   // ObjFill: BASE, then @Ruinenr: +1
+            (272, 10),  // next @Ruinenr: +1 directive value
+            (273, 11),  // next @Ruinenr: +1 directive value
             (274, 0),   // RUINE_HOLZ
             (275, 0),   // RUINE_HOLZ
             (276, 2),   // RUINE_STEIN
@@ -619,13 +780,29 @@ mod tests {
             assert_eq!(b.ruinenr, ruinenr, "Nr={nummer} Ruinenr");
         }
 
+        let road_id = cod.constants["IDROAD"];
+        let road_gfx = cod.constants["GFXROAD"];
+        for (source_id_offset, gfx_offset, kind) in [
+            (20, 40, "PLATZ"),
+            (21, 44, "PLATZ"),
+            (22, 48, "PLATZ"),
+            (23, 52, "GEBAEUDE"),
+        ] {
+            let building = cod
+                .building_by_source_id(road_id + source_id_offset)
+                .unwrap_or_else(|| panic!("missing road source ID {source_id_offset}"));
+            assert_eq!(building.gfx, road_gfx + gfx_offset);
+            assert_eq!(building.kind, kind);
+        }
+
         let idruine = cod.constants["IDRUINE"];
         assert_eq!(
             cod.ruin_building(0, false).map(|b| (b.source_id, b.gfx)),
             Some((idruine, cod.constants["GFXBODEN"] + 400)),
         );
         assert_eq!(
-            cod.ruin_building(0, false).map(|b| (b.rand_anz, b.rand_add)),
+            cod.ruin_building(0, false)
+                .map(|b| (b.rand_anz, b.rand_add)),
             Some((6, 1)),
         );
         assert_eq!(
@@ -633,7 +810,8 @@ mod tests {
             Some((idruine + 9, cod.constants["GFXBODEN"] + 413)),
         );
         assert_eq!(
-            cod.ruin_building(4, false).map(|b| (b.rand_anz, b.rand_add)),
+            cod.ruin_building(4, false)
+                .map(|b| (b.rand_anz, b.rand_add)),
             Some((2, 1)),
         );
         assert_eq!(
@@ -642,11 +820,17 @@ mod tests {
         );
         assert_eq!(
             cod.ruin_building(8, false).map(|b| (b.source_id, b.gfx)),
-            Some((cod.constants["IDHAFEN"] + 20, cod.constants["GFXKONTOR"] + 144)),
+            Some((
+                cod.constants["IDHAFEN"] + 20,
+                cod.constants["GFXKONTOR"] + 144
+            )),
         );
         assert_eq!(
             cod.ruin_building(14, false).map(|b| (b.source_id, b.gfx)),
-            Some((cod.constants["IDDIVERS"] + 22, cod.constants["GFXMARKT"] + 192)),
+            Some((
+                cod.constants["IDDIVERS"] + 22,
+                cod.constants["GFXMARKT"] + 192
+            )),
         );
         assert!(cod.ruin_building(255, false).is_none());
 

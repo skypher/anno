@@ -107,9 +107,8 @@ pub struct BuildingDef {
     /// entries — pirate Kontor + huts. Mirrors `native` for the
     /// pirate slot 6.
     pub pirate_owned: bool,
-    /// Defensive cannon count (`Kanon: <n>` in haeuser.cod). 4
-    /// turret/castle buildings carry `Kanon: 2`. Drives passive
-    /// defensive damage radiating from owned towers/castles.
+    /// Defensive cannon count (`Kanon: <n>` in haeuser.cod). Four
+    /// turret/castle buildings carry `Kanon: 2`.
     pub defensive_cannons: u8,
     /// Fire-damage cap from `Maxbrand` in haeuser.cod. The shipping
     /// file sets the template/default to 4, and the stateful COD
@@ -188,8 +187,7 @@ pub struct BuildingInstance {
     #[serde(default)]
     pub construction_ms_total: u32,
 
-    /// Hit points for combat damage. Decremented by adjacent enemy units
-    /// each military tick; building is removed when health reaches 0.
+    /// Hit points used by modeled disaster effects.
     #[serde(default = "default_building_health")]
     pub health: u16,
 

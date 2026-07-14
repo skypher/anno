@@ -530,7 +530,12 @@ fn compute_path_to_stop(
         return RoutePathStatus::AlreadyAtStop;
     }
 
-    if let Some(path) = crate::ocean_map::find_ocean_path(ocean, start, goal) {
+    let path = if ocean.has_source_ship_route_grid() {
+        ocean.find_source_ship_path(start, goal)
+    } else {
+        crate::ocean_map::find_ocean_path(ocean, start, goal)
+    };
+    if let Some(path) = path {
         if path.is_empty() {
             RoutePathStatus::AlreadyAtStop
         } else {
@@ -796,6 +801,64 @@ mod tests {
         }
         assert_eq!((ship.world_x, ship.world_y), (105, 50));
         assert!(ship.path.is_empty());
+    }
+
+    #[test]
+    fn source_ocean_trade_path_uses_source_direction_blockers() {
+        let scenario = anno_formats::szs::SzsFile {
+            chunks: Vec::new(),
+            islands: vec![anno_formats::szs::Island {
+                number: 0,
+                width: 3,
+                height: 3,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: vec![anno_formats::szs::IslandTile {
+                    building_id: 0,
+                    x: 1,
+                    y: 1,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                }],
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let definitions = [anno_formats::cod::BuildingDef {
+            source_id: 0x4e20,
+            kind: "BODEN".to_string(),
+            ..Default::default()
+        }];
+        let ocean = crate::ocean_map::OceanMap::from_source_scenario(&scenario, &definitions);
+        let mut route = TradeRoute::new(0, 0);
+        route.add_stop(RouteStop {
+            island_id: 0,
+            warehouse_x: 2,
+            warehouse_y: 1,
+            load_goods: vec![],
+            unload_goods: vec![],
+        });
+        route.add_stop(RouteStop {
+            island_id: 0,
+            warehouse_x: 0,
+            warehouse_y: 1,
+            load_goods: vec![],
+            unload_goods: vec![],
+        });
+        route.activate();
+        let mut ship = TradeShip::new(0, 0, 0, 1);
+
+        assert_eq!(
+            compute_path_to_stop(&mut ship, &route, Some(&ocean)),
+            RoutePathStatus::PathReady
+        );
+        assert_eq!(ship.path.last(), Some(&(2, 1)));
+        assert!(!ship.path.contains(&(1, 1)));
     }
 
     #[test]

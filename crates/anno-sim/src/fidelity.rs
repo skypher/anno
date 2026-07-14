@@ -149,11 +149,11 @@ pub const TIMING_SPECS: [TimingSpec; 8] = [
     TimingSpec {
         subsystem: Subsystem::Military,
         interval_ms: MILITARY_TICK_MS,
-        status: FidelityStatus::BinaryVerified,
+        status: FidelityStatus::StandIn,
         source: SourceRef {
             source: "decompiled/1602_exe.c",
-            location: "FUN_0047a020 / FUN_0047a8c0",
-            note: "military and projectile dispatcher cadence",
+            location: "FUN_00451890 / main dispatcher:97979-97998",
+            note: "the executable advances entity state machines every engine update; the retained 10 s simulation timer is not its combat cadence",
         },
     },
     TimingSpec {
@@ -419,7 +419,7 @@ mod tests {
             .into_iter()
             .map(|spec| spec.subsystem)
             .collect();
-        assert_eq!(timing, vec![Subsystem::Events]);
+        assert_eq!(timing, vec![Subsystem::Military, Subsystem::Events]);
 
         let probability: Vec<_> = unresolved_probability_specs()
             .into_iter()

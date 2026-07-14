@@ -348,6 +348,7 @@ impl FiguresFile {
     pub fn find(&self, name: &str) -> Option<&FigureDef> {
         self.figures.iter().find(|f| f.name == name)
     }
+
 }
 
 fn decrypt(data: &[u8]) -> String {

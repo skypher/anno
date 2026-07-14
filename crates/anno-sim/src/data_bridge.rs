@@ -863,11 +863,17 @@ mod tests {
         use crate::combat::UnitType;
         use anno_formats::szs::Ship;
         let mk = |owner: u8, class: u8, x: u16, y: u16| Ship {
+            raw_record: [0; anno_formats::szs::SHIP4_RECORD_BYTES],
             name: "test".into(),
             x,
             y,
             owner,
+            figure_definition_id: class.into(),
             ship_class: class,
+            stored_energy: 0,
+            runtime_slot: 0,
+            figure_kind: 0,
+            animation_state: 0,
             heading_byte: 0,
             cargo_slots: [0; 7],
         };
@@ -895,11 +901,17 @@ mod tests {
     fn traders_from_ships_routes_traders_only_with_sentinel_id() {
         use anno_formats::szs::Ship;
         let mk = |owner: u8, class: u8, x: u16, y: u16| Ship {
+            raw_record: [0; anno_formats::szs::SHIP4_RECORD_BYTES],
             name: "test".into(),
             x,
             y,
             owner,
+            figure_definition_id: class.into(),
             ship_class: class,
+            stored_energy: 0,
+            runtime_slot: 0,
+            figure_kind: 0,
+            animation_state: 0,
             heading_byte: 0,
             cargo_slots: [0; 7],
         };
@@ -1305,8 +1317,8 @@ mod tests {
         let ruin_cases = [
             (270, 8), // RUINE_KONTOR_1
             (271, 9), // ObjFill: BASE, then @Ruinenr: +1
-            (272, 9), // ObjFill: BASE, then @Ruinenr: +1
-            (273, 9), // ObjFill: BASE, then @Ruinenr: +1
+            (272, 10), // next @Ruinenr: +1 directive value
+            (273, 11), // next @Ruinenr: +1 directive value
             (274, 0), // RUINE_HOLZ
             (275, 0), // RUINE_HOLZ
             (276, 2), // RUINE_STEIN

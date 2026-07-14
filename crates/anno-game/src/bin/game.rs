@@ -37,7 +37,7 @@
 use anno_audio::engine::AudioEngine;
 use anno_formats::cod::CodFile;
 use anno_formats::col::parse_col;
-use anno_formats::szs::{Island, IslandTile, SzsFile};
+use anno_formats::szs::{Island, IslandTile, ShipClass, SzsFile};
 use anno_render::sprite::{SpriteCategory, SpriteManager};
 use anno_sim::ai::AiController;
 use anno_sim::building::BuildingInstance;
@@ -1166,12 +1166,22 @@ fn main() {
     // Pull the layout bits we'll use during render. Falls back to the old
     // heuristic values if the figure can't be found.
     let traeger_def = figures.find("TRAEGER").cloned();
-    let handel1_def = figures.find("HANDEL1").cloned();
-    let handel2_def = figures.find("HANDEL2").cloned();
+    let handel1_def = figures
+        .find(ShipClass::SmallTrader.source_figure_name())
+        .cloned();
+    let handel2_def = figures
+        .find(ShipClass::LargeTrader.source_figure_name())
+        .cloned();
     let handler_def = figures.find("HANDLER").cloned();
-    let krieg1_def = figures.find("KRIEG1").cloned();
-    let krieg2_def = figures.find("KRIEG2").cloned();
-    let pirat_def = figures.find("PIRAT").cloned();
+    let krieg1_def = figures
+        .find(ShipClass::SmallWarship.source_figure_name())
+        .cloned();
+    let krieg2_def = figures
+        .find(ShipClass::LargeWarship.source_figure_name())
+        .cloned();
+    let pirat_def = figures
+        .find(ShipClass::PirateShip.source_figure_name())
+        .cloned();
     let ship_cargo_config = anno_sim::trade::ShipCargoConfig::from_figures(&figures);
     let ship_sprite_layout = ShipSpriteLayout::from_figure_defs(
         handel1_def.as_ref(),
@@ -6007,11 +6017,19 @@ mod tests {
     #[test]
     fn placement_does_not_seed_processor_input_stock() {
         let defs = vec![test_processing_def()];
+        let ground = anno_formats::cod::BuildingDef {
+            source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE,
+            kind: "BODEN".into(),
+            ..Default::default()
+        };
         let cod = CodFile {
             constants: Default::default(),
-            buildings: vec![test_cod_processing_building(0)],
+            buildings: vec![test_cod_processing_building(0), ground],
         };
         let mut islands = vec![flat_test_island(0)];
+        for tile in &mut islands[0].tiles {
+            tile.building_id = 0;
+        }
         let island_map = IslandMap::from_island(&islands[0], &cod.buildings);
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -6105,11 +6123,17 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: vec![anno_formats::szs::Ship {
+                raw_record: [0; anno_formats::szs::SHIP4_RECORD_BYTES],
                 name: "Seehind".into(),
                 x: 12,
                 y: 13,
                 owner: 0,
+                figure_definition_id: anno_formats::szs::ShipClass::SmallTrader as u16,
                 ship_class: anno_formats::szs::ShipClass::SmallTrader as u8,
+                stored_energy: 0,
+                runtime_slot: 0,
+                figure_kind: 0,
+                animation_state: 0,
                 heading_byte: 4,
                 cargo_slots: [0; 7],
             }],
@@ -6132,6 +6156,45 @@ mod tests {
             (sim.trade_ships[0].world_x, sim.trade_ships[0].world_y),
             (12, 13)
         );
+    }
+
+    #[test]
+    fn ship4_native_warship_does_not_receive_synthetic_patrol() {
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: Vec::new(),
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: vec![anno_formats::szs::Ship {
+                raw_record: [0; anno_formats::szs::SHIP4_RECORD_BYTES],
+                name: "Raider".into(),
+                x: 120,
+                y: 240,
+                owner: 5,
+                figure_definition_id: anno_formats::szs::ShipClass::PirateShip as u16,
+                ship_class: anno_formats::szs::ShipClass::PirateShip as u8,
+                stored_energy: 0,
+                runtime_slot: 0,
+                figure_kind: 0,
+                animation_state: 0,
+                heading_byte: 0,
+                cargo_slots: [0; 7],
+            }],
+        };
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: Vec::new(),
+        };
+
+        let sim = init_simulation(&szs, &cod, &[], anno_sim::trade::ShipCargoConfig::default());
+
+        assert_eq!(sim.military_units.len(), 1);
+        let ship = &sim.military_units[0];
+        assert_eq!((ship.tile_x, ship.tile_y), (120, 240));
+        assert_eq!((ship.target_x, ship.target_y), (120, 240));
+        assert!(ship.patrol.is_empty());
+        assert_eq!(sim.diplomacy.get(0, 5), Diplomacy::Neutral);
     }
 
     #[test]
@@ -6854,8 +6917,8 @@ fn init_simulation(
         })
         .collect();
 
-    // Build ocean navigability map for ship pathfinding
-    let ocean_map = anno_sim::ocean_map::OceanMap::from_scenario(szs);
+    // Build the source static-map overlay for ship pathfinding.
+    let ocean_map = anno_sim::ocean_map::OceanMap::from_source_scenario(szs, &cod.buildings);
     println!(
         "Ocean map: {}x{} ({} navigable tiles)",
         ocean_map.width,
@@ -6968,30 +7031,7 @@ fn init_simulation(
             "Spawning {} static warship(s) from SHIP4{suffix}",
             warships.len()
         );
-        // Native-faction warships (owner 5, including those that
-        // sail under the PIRAT figure) are hostile to the player
-        // by default — the scenario authors place them as
-        // raiders, not as neutral ships. Mark slot 0 ↔ slot 5
-        // at war so the combat tick treats them properly.
-        if warships.iter().any(|u| u.owner == 5) {
-            sim.diplomacy.set(0, 5, Diplomacy::War);
-        }
-        // Native warships (owner 5) get a 4-waypoint square
-        // patrol around their spawn so they roam instead of
-        // sitting idle when no enemies are visible. The
-        // existing tick_combat logic will interrupt the patrol
-        // when a hostile unit comes into range.
-        for mut u in warships {
-            if u.owner == 5 {
-                let cx = u.tile_x;
-                let cy = u.tile_y;
-                let r = 16i32;
-                u.patrol = vec![(cx + r, cy), (cx, cy + r), (cx - r, cy), (cx, cy - r)];
-                u.target_x = u.patrol[0].0;
-                u.target_y = u.patrol[0].1;
-            }
-            sim.military_units.push(u);
-        }
+        sim.military_units.extend(warships);
     }
     // Spawn trader hulls from SHIP4 too: SmallTrader / LargeTrader
     // records become TradeShip instances at their authored

@@ -7,6 +7,8 @@
 //!
 //! The map is built once from scenario data and cached.
 
+use crate::source_route::{source_direction_delta, SourcePathGrid};
+use anno_formats::cod::BuildingDef as CodBuilding;
 use anno_formats::szs::SzsFile;
 
 /// World ocean navigability map.
@@ -16,6 +18,10 @@ pub struct OceanMap {
     pub height: u16,
     /// true = navigable (ocean), false = blocked (land)
     grid: Vec<bool>,
+    /// Static source direction markers projected by `FUN_0046f6d0`. When
+    /// present, ship routing uses the source fixed-cost expansion rather than
+    /// the legacy A* implementation below.
+    source_ship_route_grid: Option<SourcePathGrid>,
 }
 
 impl OceanMap {
@@ -64,7 +70,77 @@ impl OceanMap {
             width,
             height,
             grid,
+            source_ship_route_grid: None,
         }
+    }
+
+    /// Build a ship navigation map from the source static-map cells and the
+    /// `FUN_0046f6d0` direction-marker overlay.
+    pub fn from_source_scenario(szs: &SzsFile, definitions: &[CodBuilding]) -> Self {
+        let mut map = Self::from_scenario(szs);
+        let mut source_grid = SourcePathGrid::new((0, 0), map.width as usize, map.height as usize);
+
+        for island in &szs.islands {
+            source_grid.overlay_source_ship_route_blockers(island, definitions);
+        }
+
+        for y in 0..i32::from(map.height) {
+            for x in 0..i32::from(map.width) {
+                map.grid[y as usize * map.width as usize + x as usize] = source_grid
+                    .is_direction_clear((x, y))
+                    .expect("source grid covers OceanMap bounds");
+            }
+        }
+        map.source_ship_route_grid = Some(source_grid);
+        map
+    }
+
+    /// True when this map was built from source static-map direction markers.
+    pub fn has_source_ship_route_grid(&self) -> bool {
+        self.source_ship_route_grid.is_some()
+    }
+
+    /// Find a source ship route using the recovered `FUN_0046c7d0` fixed-cost
+    /// expansion over the stored `FUN_0046f6d0` blockers.
+    pub fn find_source_ship_path(
+        &self,
+        start: (i32, i32),
+        goal: (i32, i32),
+    ) -> Option<Vec<(i32, i32)>> {
+        let grid = self.source_ship_route_grid.clone()?;
+        Self::source_path_from_grid(grid, start, goal)
+    }
+
+    /// Run the source ship search in the centered `2r + 1` window used by
+    /// `FUN_00455a20` and `FUN_00456920`. Their live route-state branches
+    /// supply `r = 0x50` or `r = 0x28`.
+    pub fn find_source_ship_path_in_radius(
+        &self,
+        start: (i32, i32),
+        goal: (i32, i32),
+        radius: usize,
+    ) -> Option<Vec<(i32, i32)>> {
+        let grid = self
+            .source_ship_route_grid
+            .as_ref()?
+            .source_window(start, radius)?;
+        Self::source_path_from_grid(grid, start, goal)
+    }
+
+    fn source_path_from_grid(
+        mut grid: SourcePathGrid,
+        start: (i32, i32),
+        goal: (i32, i32),
+    ) -> Option<Vec<(i32, i32)>> {
+        let steps = grid.route_to(start, goal).ok()?;
+        let mut position = start;
+        let mut path = Vec::with_capacity(steps.len());
+        for step in steps {
+            let (dx, dy) = source_direction_delta(step.direction)?;
+            position = (position.0 + dx, position.1 + dy);
+            path.push(position);
+        }
+        Some(path)
     }
 
     /// Check if a world tile is navigable (ocean).
@@ -289,6 +365,7 @@ mod tests {
             width: 20,
             height: 20,
             grid,
+            source_ship_route_grid: None,
         }
     }
 
@@ -299,7 +376,10 @@ mod tests {
         // warehouse pair, asserting that no returned path
         // crosses a non-navigable tile.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/A Plague of Pirates.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -329,8 +409,10 @@ mod tests {
             for j in (i + 1)..centres.len() {
                 if let Some(p) = find_ocean_path(&ocean, centres[i], centres[j]) {
                     for &(x, y) in &p {
-                        assert!(ocean.is_navigable(x, y),
-                            "ocean path crosses land at ({x}, {y})");
+                        assert!(
+                            ocean.is_navigable(x, y),
+                            "ocean path crosses land at ({x}, {y})"
+                        );
                     }
                 }
             }
@@ -386,5 +468,51 @@ mod tests {
         let map = make_simple_ocean();
         let nav = map.nearest_navigable(0, 0);
         assert_eq!(nav, Some((0, 0)));
+    }
+
+    #[test]
+    fn source_ocean_uses_fun_0046f6d0_blockers_and_fun_0046c7d0_routes() {
+        let scenario = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![anno_formats::szs::Island {
+                number: 0,
+                width: 3,
+                height: 3,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: vec![anno_formats::szs::IslandTile {
+                    building_id: 0,
+                    x: 1,
+                    y: 1,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                }],
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let definitions = [CodBuilding {
+            source_id: 0x4e20,
+            kind: "BODEN".to_string(),
+            ..Default::default()
+        }];
+        let ocean = OceanMap::from_source_scenario(&scenario, &definitions);
+
+        assert!(ocean.has_source_ship_route_grid());
+        assert!(!ocean.is_navigable(1, 1));
+        let path = ocean.find_source_ship_path((0, 1), (2, 1)).unwrap();
+        assert_eq!(path.last(), Some(&(2, 1)));
+        assert!(!path.contains(&(1, 1)));
+        assert!(ocean
+            .find_source_ship_path_in_radius((0, 1), (2, 1), 1)
+            .is_none());
+        assert!(ocean
+            .find_source_ship_path_in_radius((0, 1), (2, 1), 2)
+            .is_some());
     }
 }

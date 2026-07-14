@@ -139,12 +139,14 @@ fn main() {
     }
     println!();
 
-    // Resolve byte 0x48 candidates against figuren.cod symbolic
-    // names so we can name the ship types.
+    // Display a diagnostic contrast with the text declaration order.
+    // The SHIP4 loader passes the full little-endian word at 0x48..0x49
+    // to the executable's compiled definition table; this vector lookup
+    // is not that source mapping.
     let fig_path = "/home/sky/anno/extracted/figuren.cod";
     if let Ok(fig_bytes) = std::fs::read(fig_path) {
         let figs = FiguresFile::parse(&fig_bytes);
-        println!("\nResolving byte 0x48 against figuren.cod by VEC INDEX:");
+        println!("\nText declaration-order diagnostic for byte 0x48 (not source mapping):");
         for type_byte in type_distribution.keys() {
             let resolved = figs.figures.get(*type_byte as usize)
                 .map(|f| f.name.clone())

@@ -554,120 +554,16 @@ pub fn tick_combat(
     dead
 }
 
-/// Damage to enemy buildings from adjacent military units. Called each
-/// military tick. Returns the indices of buildings that hit 0 HP.
-///
-/// Per tick: 5 hp drained per adjacent enemy land unit (within 2 tiles
-/// of the building's footprint). Naval units don't damage land buildings.
-/// Defensive tower / castle damage. Buildings with
-/// `defensive_cannons > 0` (RE: haeuser.cod `Kanon: 2`) fire on
-/// hostile units within range each combat tick. Range scales with
-/// cannon count: 4 + cannons. Damage per hostile in range is 0.05
-/// per cannon.
+/// Tower/castle cannon behavior awaits decoded combat timing, targeting,
+/// range, and damage state. `Kanon` remains available on the building
+/// definition, but does not infer those missing values.
 pub fn tick_tower_defense(
     units: &mut [MilitaryUnit],
     buildings: &[crate::building::BuildingInstance],
     diplomacy: &DiplomacyMatrix,
     defs: &[crate::building::BuildingDef],
 ) {
-    for b in buildings.iter() {
-        if !b.active {
-            continue;
-        }
-        if (b.def_id as usize) >= defs.len() {
-            continue;
-        }
-        let def = &defs[b.def_id as usize];
-        if def.defensive_cannons == 0 {
-            continue;
-        }
-        let bx = b.tile_x as i32 + def.width as i32 / 2;
-        let by = b.tile_y as i32 + def.height as i32 / 2;
-        let range = 4 + def.defensive_cannons as i32;
-        let dmg = 0.05 * def.defensive_cannons as f32;
-        for u in units.iter_mut() {
-            if !u.is_alive() || u.owner == b.owner {
-                continue;
-            }
-            if diplomacy.get(u.owner, b.owner) != Diplomacy::War {
-                continue;
-            }
-            let dx = (u.tile_x - bx).abs();
-            let dy = (u.tile_y - by).abs();
-            if dx.max(dy) > range {
-                continue;
-            }
-            u.health -= dmg;
-            if !u.is_alive() {
-                u.active = false;
-            }
-        }
-    }
-}
-
-pub fn tick_building_damage(
-    units: &[MilitaryUnit],
-    buildings: &mut [crate::building::BuildingInstance],
-    diplomacy: &DiplomacyMatrix,
-    defs: &[crate::building::BuildingDef],
-) -> Vec<usize> {
-    const DMG_PER_ENEMY: u16 = 5;
-    let mut destroyed = Vec::new();
-    for (bi, b) in buildings.iter_mut().enumerate() {
-        if !b.active {
-            continue;
-        }
-        if (b.def_id as usize) >= defs.len() {
-            continue;
-        }
-        let def = &defs[b.def_id as usize];
-        let bx = b.tile_x as i32;
-        let by = b.tile_y as i32;
-        let bw = def.width as i32;
-        let bh = def.height as i32;
-        let mut hostile = 0u16;
-        for u in units.iter() {
-            if !u.is_alive() || u.owner == b.owner {
-                continue;
-            }
-            if u.unit_type.stats().is_naval {
-                continue;
-            }
-            if diplomacy.get(u.owner, b.owner) != Diplomacy::War {
-                continue;
-            }
-            // Adjacent if within 2 tiles of the footprint.
-            let dx = if u.tile_x < bx {
-                bx - u.tile_x
-            } else if u.tile_x >= bx + bw {
-                u.tile_x - (bx + bw - 1)
-            } else {
-                0
-            };
-            let dy = if u.tile_y < by {
-                by - u.tile_y
-            } else if u.tile_y >= by + bh {
-                u.tile_y - (by + bh - 1)
-            } else {
-                0
-            };
-            if dx.max(dy) <= 2 {
-                hostile = hostile.saturating_add(1);
-            }
-        }
-        if hostile == 0 {
-            continue;
-        }
-        let total = DMG_PER_ENEMY.saturating_mul(hostile);
-        if b.health <= total {
-            b.health = 0;
-            b.active = false;
-            destroyed.push(bi);
-        } else {
-            b.health -= total;
-        }
-    }
-    destroyed
+    let _ = (units, buildings, diplomacy, defs);
 }
 
 /// Refresh each escort unit's `target_x/target_y` from the ship it's
@@ -1066,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn tower_defense_damages_hostile_in_range() {
+    fn tower_defense_does_not_infer_range_or_damage() {
         use crate::building::{BuildingDef, BuildingInstance, OreDeposit};
         use crate::types::ProductionType;
         let mk_tower = |cannons: u8| BuildingDef {
@@ -1118,8 +1014,8 @@ mod tests {
         diplo.set(0, 1, Diplomacy::War);
         let h_before = (units[0].health, units[1].health);
         tick_tower_defense(&mut units, &buildings, &diplo, &defs);
-        assert!(units[0].health < h_before.0, "near unit takes damage");
-        assert_eq!(units[1].health, h_before.1, "far unit unaffected");
+        assert_eq!(units[0].health, h_before.0);
+        assert_eq!(units[1].health, h_before.1);
     }
 
     #[test]

@@ -111,16 +111,17 @@ impl Island {
     /// slot order so callers can correlate with the binary's
     /// internal indexing.
     pub fn active_fertilities(&self) -> Vec<Fertility> {
-        self.fertilities.iter()
+        self.fertilities
+            .iter()
             .filter_map(|&b| Fertility::from_byte(b))
             .collect()
     }
 }
 
-/// One of the five ship types `SHIP4` records track. Order
-/// follows figuren.cod's HANDEL1 / HANDEL2 / KRIEG1 / KRIEG2
-/// / PIRAT entries; the byte values 0x15..0x1F map onto them
-/// in ascending size/strength.
+/// One of the five ship types `SHIP4` records track. The values are source
+/// executable definition IDs: the pointer table registered by
+/// `FUN_00441210` at `0x00498b98` maps 0x15/0x17/0x19/0x1B/0x1F to
+/// HANDEL1/HANDEL2/KRIEG1/KRIEG2/PIRAT, respectively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum ShipClass {
@@ -151,12 +152,27 @@ impl ShipClass {
         }
     }
 
+    /// Symbolic `figuren.cod` definition named by the source executable's
+    /// compiled definition table for this SHIP4 class.
+    pub fn source_figure_name(self) -> &'static str {
+        match self {
+            ShipClass::SmallTrader => "HANDEL1",
+            ShipClass::LargeTrader => "HANDEL2",
+            ShipClass::SmallWarship => "KRIEG1",
+            ShipClass::LargeWarship => "KRIEG2",
+            ShipClass::PirateShip => "PIRAT",
+        }
+    }
+
     /// True when this ship class is a combat-capable warship
     /// (small / large warship or pirate). Used by callers to
     /// route SHIP4 records to the simulation's MilitaryUnit
     /// path versus the TradeShip path.
     pub fn is_warship(self) -> bool {
-        matches!(self, ShipClass::SmallWarship | ShipClass::LargeWarship | ShipClass::PirateShip)
+        matches!(
+            self,
+            ShipClass::SmallWarship | ShipClass::LargeWarship | ShipClass::PirateShip
+        )
     }
 
     /// Per-cargo-slot maximum quantity for this ship class,
@@ -184,9 +200,13 @@ impl ShipClass {
 /// confirms the chunk is always exactly `N * 436` bytes. The
 /// fields decoded here are the ones needed to reconstruct
 /// initial ship layouts; remaining bytes (cargo manifest, AI
-/// state, route table) are preserved on the raw chunk.
+/// state, route table) are preserved in `Ship::raw_record`.
 #[derive(Debug, Clone)]
 pub struct Ship {
+    /// Complete 436-byte SHIP4 source record. The typed fields below expose
+    /// audited projections; remaining bytes retain authored runtime state
+    /// for source-backed consumers.
+    pub raw_record: [u8; SHIP4_RECORD_BYTES],
     /// Ship name as displayed in the original game UI (e.g.
     /// "Carnera", "Seehind", "Palstek"). 28-byte slot, CP1252,
     /// null-terminated.
@@ -216,15 +236,41 @@ pub struct Ship {
     /// Kontor at runtime. Crosstab: 27/27 PirateShip records
     /// → owner 5; 0/418 SHIP4 records → owner 6.
     pub owner: u8,
-    /// Ship class byte at record offset 0x48. Audit surfaces
+    /// Full source figure-definition ID at record offsets 0x48..0x49.
+    /// `0x0045f550` passes this little-endian word as the second argument
+    /// to `FUN_00446ca0` when allocating the live source figure
+    /// (`0x0045f79a..0x0045f7a4`). It indexes the executable's compiled
+    /// figure-definition table, not the declaration order in figuren.cod.
+    pub figure_definition_id: u16,
+    /// Low byte of [`Ship::figure_definition_id`] at record offset 0x48.
+    /// Audit surfaces
     /// exactly 5 distinct values across all shipping content:
     /// 0x15, 0x17, 0x19, 0x1B, 0x1F — one per ship type
     /// (small trader / large trader / small warship / large
     /// warship / pirate ship). The mapping to figuren.cod's
-    /// HANDEL1/HANDEL2/KRIEG1/KRIEG2/PIRAT entries hasn't
-    /// been verified against a binary function yet; the raw
-    /// byte is exposed for downstream interpretation.
+    /// HANDEL1/HANDEL2/KRIEG1/KRIEG2/PIRAT entries is exposed
+    /// through `ShipClass`.
     pub ship_class: u8,
+    /// Serialized energy at record offset 0x3C. The source
+    /// SHIP4 loader copies it to the live ship record and caps
+    /// it by the figure definition's `Maxenergy` value before
+    /// the ship enters the entity scheduler (`0x0045f550`,
+    /// `0x0045f700..0x0045f70d`).
+    pub stored_energy: u16,
+    /// Live-ship slot selected by the scenario at record offset
+    /// 0x46. The source loader uses this as the index into its
+    /// 0x218-byte ship-record array (`0x0045f5c3..0x0045f5da`).
+    pub runtime_slot: u16,
+    /// Source figure category at record offset 0x4A. The SHIP4
+    /// loader passes it as the first argument when creating the
+    /// runtime figure (`0x0045f79a..0x0045f7a4`).
+    pub figure_kind: u8,
+    /// Initial figure-animation state at record offset 0x4E.
+    /// After allocating the stationary source figure, the
+    /// SHIP4 loader passes this value to `0x00446d90`, which
+    /// selects the animation and resets its frame counters
+    /// (`0x0045f7d8..0x0045f7ff`).
+    pub animation_state: u8,
     /// (See `ShipClass::from_byte` for the typed decode.)
     /// Compass-heading byte at record offset 0x42. Raw value
     /// ranges 0..14 across the corpus; 95% are even. Likely a
@@ -276,7 +322,7 @@ impl Ship {
     }
 }
 
-const SHIP4_RECORD_BYTES: usize = 436;
+pub const SHIP4_RECORD_BYTES: usize = 436;
 const SHIP4_NAME_BYTES: usize = 28;
 
 /// Per-island city info parsed from a STADT4 chunk (168 bytes).
@@ -353,12 +399,34 @@ pub struct City {
 /// specific binary function yet.
 #[derive(Debug, Clone, Copy)]
 pub struct IslandTile {
+    /// Low 16 bits of the source definition ID. The INSELHAUS loader at
+    /// `0x004685af` adds [`INSELHAUS_SOURCE_ID_BASE`] and resolves the
+    /// compiled definition; this is not a STADTFLD sprite index.
     pub building_id: u16,
     pub x: u8,
     pub y: u8,
     pub orientation: u8,
     pub anim_count: u8,
     pub flags: u16,
+}
+
+/// Constant added to each INSELHAUS u16 before the original loader resolves
+/// its compiled building definition at `0x004685af`.
+pub const INSELHAUS_SOURCE_ID_BASE: i32 = 0x4e20;
+
+impl IslandTile {
+    /// Resolved haeuser.cod source ID used by the original INSELHAUS loader.
+    pub fn source_id(self) -> i32 {
+        INSELHAUS_SOURCE_ID_BASE + i32::from(self.building_id)
+    }
+
+    /// Owner code consumed by `FUN_00464370` while loading this INSELHAUS
+    /// record. The loader reads bits 14..=16 of the four-byte word beginning
+    /// at record offset 4; those are anim_count bits 6..=7 followed by flags
+    /// bit 0.
+    pub fn source_owner(self) -> u8 {
+        (self.anim_count >> 6) | ((self.flags as u8 & 1) << 2)
+    }
 }
 
 /// Parsed save/scenario file.
@@ -483,15 +551,21 @@ impl Mission {
     pub fn goals(&self) -> MissionGoals {
         let read_u32 = |i: usize| -> u32 {
             let off = i * 4;
-            if off + 4 > self.goals_raw.len() { return 0; }
+            if off + 4 > self.goals_raw.len() {
+                return 0;
+            }
             u32::from_le_bytes([
-                self.goals_raw[off], self.goals_raw[off + 1],
-                self.goals_raw[off + 2], self.goals_raw[off + 3],
+                self.goals_raw[off],
+                self.goals_raw[off + 1],
+                self.goals_raw[off + 2],
+                self.goals_raw[off + 3],
             ])
         };
         let triple = |start: usize| -> Option<PopulationGoal> {
             let total = read_u32(start);
-            if total == 0 { return None; }
+            if total == 0 {
+                return None;
+            }
             let tier_raw = read_u32(start + 1);
             let tier = if (1..=4).contains(&tier_raw) {
                 Some(tier_raw as u8)
@@ -506,12 +580,16 @@ impl Mission {
         };
         let coop_active = self.flags & MISSION_FLAG_COOPERATIVE != 0;
         MissionGoals {
-            primary:   (self.flags & MISSION_FLAG_POPULATION  != 0).then(|| triple(0)).flatten(),
-            secondary: (self.flags & MISSION_FLAG_POPULATION2 != 0).then(|| triple(3)).flatten(),
-            tertiary:  (self.flags & MISSION_FLAG_POPULATION3 != 0).then(|| triple(6)).flatten(),
-            cooperative_population: coop_active
-                .then(|| read_u32(18))
-                .filter(|&v| v > 0),
+            primary: (self.flags & MISSION_FLAG_POPULATION != 0)
+                .then(|| triple(0))
+                .flatten(),
+            secondary: (self.flags & MISSION_FLAG_POPULATION2 != 0)
+                .then(|| triple(3))
+                .flatten(),
+            tertiary: (self.flags & MISSION_FLAG_POPULATION3 != 0)
+                .then(|| triple(6))
+                .flatten(),
+            cooperative_population: coop_active.then(|| read_u32(18)).filter(|&v| v > 0),
             cooperative_tier: coop_active
                 .then(|| read_u32(19))
                 .filter(|&v| (1..=4).contains(&v))
@@ -568,8 +646,7 @@ pub const MISSION_FLAG_PIRATE: u32 = 1 << 10;
 /// | 0x8000 | Monopoly                              | second monopoly slot |
 /// | 0x10000 | On His Majesty's Service0, Monopoly  | "rare resources" |
 pub const MISSION_FLAG_OBSERVED_UNMODELLED: u32 =
-    0x0000_0080 | 0x0000_0200 | 0x0000_1000 |
-    0x0000_4000 | 0x0000_8000 | 0x0001_0000;
+    0x0000_0080 | 0x0000_0200 | 0x0000_1000 | 0x0000_4000 | 0x0000_8000 | 0x0001_0000;
 
 /// One population requirement: total inhabitants, optional tier,
 /// and how many of those total must be at that tier. Cross-
@@ -823,7 +900,10 @@ impl SzsFile {
             let name_bytes = &data[pos..pos + 16];
             let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
             let name = match std::str::from_utf8(&name_bytes[..name_end]) {
-                Ok(s) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
+                Ok(s)
+                    if !s.is_empty()
+                        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                {
                     s.to_string()
                 }
                 _ => {
@@ -865,10 +945,8 @@ impl SzsFile {
                 // between for the same island).
                 for j in (i + 1)..chunks.len() {
                     match chunks[j].name.as_str() {
-                        "INSELHAUS" => island.tiles =
-                            Self::parse_inselhaus(&chunks[j].data),
-                        "STADT4" => island.city =
-                            Self::parse_stadt4(&chunks[j].data),
+                        "INSELHAUS" => island.tiles = Self::parse_inselhaus(&chunks[j].data),
+                        "STADT4" => island.city = Self::parse_stadt4(&chunks[j].data),
                         "INSEL5" => break, // next island
                         _ => {}
                     }
@@ -880,17 +958,20 @@ impl SzsFile {
         }
 
         // Extract per-slot player init from the PLAYER4 chunk.
-        let players = chunks.iter()
+        let players = chunks
+            .iter()
             .find(|c| c.name == "PLAYER4")
             .map(|c| Self::parse_player4(&c.data))
             .unwrap_or_default();
 
-        let mission = chunks.iter()
+        let mission = chunks
+            .iter()
             .find(|c| c.name == "AUFTRAG4")
             .and_then(|c| Self::parse_auftrag4(&c.data));
 
         let read_u32 = |name: &str| -> Option<u32> {
-            chunks.iter()
+            chunks
+                .iter()
                 .find(|c| c.name == name)
                 .filter(|c| c.data.len() >= 4)
                 .map(|c| u32::from_le_bytes([c.data[0], c.data[1], c.data[2], c.data[3]]))
@@ -902,12 +983,20 @@ impl SzsFile {
             ranking: read_u32("SZENE_RANKING"),
         };
 
-        let ships = chunks.iter()
+        let ships = chunks
+            .iter()
             .find(|c| c.name == "SHIP4")
             .map(|c| Self::parse_ship4(&c.data))
             .unwrap_or_default();
 
-        Ok(SzsFile { chunks, islands, players, mission, scenario, ships })
+        Ok(SzsFile {
+            chunks,
+            islands,
+            players,
+            mission,
+            scenario,
+            ships,
+        })
     }
 
     fn parse_ship4(data: &[u8]) -> Vec<Ship> {
@@ -915,34 +1004,73 @@ impl SzsFile {
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
             let off = i * SHIP4_RECORD_BYTES;
+            let mut raw_record = [0u8; SHIP4_RECORD_BYTES];
+            raw_record.copy_from_slice(&data[off..off + SHIP4_RECORD_BYTES]);
             let name_bytes = &data[off..off + SHIP4_NAME_BYTES];
-            let name_end = name_bytes.iter().position(|&b| b == 0)
+            let name_end = name_bytes
+                .iter()
+                .position(|&b| b == 0)
                 .unwrap_or(SHIP4_NAME_BYTES);
             let name: String = name_bytes[..name_end]
-                .iter().map(|&b| char::from(b)).collect();
+                .iter()
+                .map(|&b| char::from(b))
+                .collect();
             let x = u16::from_le_bytes([data[off + 28], data[off + 29]]);
             let y = u16::from_le_bytes([data[off + 30], data[off + 31]]);
-            let ship_class = if off + 0x49 <= data.len() { data[off + 0x48] } else { 0 };
-            let owner      = if off + 0x4C <= data.len() { data[off + 0x4B] } else { 0 };
-            let heading_byte = if off + 0x43 <= data.len() { data[off + 0x42] } else { 0 };
+            let stored_energy = u16::from_le_bytes([data[off + 0x3c], data[off + 0x3d]]);
+            let runtime_slot = u16::from_le_bytes([data[off + 0x46], data[off + 0x47]]);
+            let figure_definition_id = u16::from_le_bytes([data[off + 0x48], data[off + 0x49]]);
+            let ship_class = figure_definition_id as u8;
+            let figure_kind = if off + 0x4b <= data.len() {
+                data[off + 0x4a]
+            } else {
+                0
+            };
+            let owner = if off + 0x4C <= data.len() {
+                data[off + 0x4B]
+            } else {
+                0
+            };
+            let animation_state = if off + 0x4f <= data.len() {
+                data[off + 0x4e]
+            } else {
+                0
+            };
+            let heading_byte = if off + 0x43 <= data.len() {
+                data[off + 0x42]
+            } else {
+                0
+            };
             let mut cargo_slots = [0u32; 7];
             for (i, slot) in cargo_slots.iter_mut().enumerate() {
                 let o = off + 0x174 + i * 8;
                 if o + 4 <= data.len() {
-                    *slot = u32::from_le_bytes([
-                        data[o], data[o + 1], data[o + 2], data[o + 3],
-                    ]);
+                    *slot = u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
                 }
             }
             out.push(Ship {
-                name, x, y, owner, ship_class, heading_byte, cargo_slots,
+                raw_record,
+                name,
+                x,
+                y,
+                owner,
+                figure_definition_id,
+                ship_class,
+                stored_energy,
+                runtime_slot,
+                figure_kind,
+                animation_state,
+                heading_byte,
+                cargo_slots,
             });
         }
         out
     }
 
     fn parse_auftrag4(data: &[u8]) -> Option<Mission> {
-        if data.len() < AUFTRAG4_TOTAL_BYTES { return None; }
+        if data.len() < AUFTRAG4_TOTAL_BYTES {
+            return None;
+        }
         let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
 
         // Briefing text: CP1252, null-terminated, starts at 0x68.
@@ -958,21 +1086,26 @@ impl SzsFile {
             .collect();
 
         let goals_raw = data[AUFTRAG4_GOALS_OFFSET..AUFTRAG4_TOTAL_BYTES].to_vec();
-        Some(Mission { flags, briefing, goals_raw })
+        Some(Mission {
+            flags,
+            briefing,
+            goals_raw,
+        })
     }
 
     fn parse_player4(data: &[u8]) -> Vec<PlayerSlotInit> {
         let mut out = Vec::new();
         for slot in 0..PLAYER4_MAX_SLOTS {
             let off = slot * PLAYER4_SLOT_BYTES;
-            if off + 16 > data.len() { break; }
-            let starting_gold = i32::from_le_bytes([
-                data[off], data[off + 1], data[off + 2], data[off + 3],
-            ]);
+            if off + 16 > data.len() {
+                break;
+            }
+            let starting_gold =
+                i32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
             // Byte 12 = 0x00 (active player / fixed faction) vs
             // 0xff (slot inactive — AI fills it on game start).
             let state_byte = data[off + 4];
-            let color_idx  = data[off + 7];
+            let color_idx = data[off + 7];
             let slot_byte12 = data[off + 12];
             // 1602_exe.c FUN_00473c50:82622 includes the slot
             // only when byte 0x0d is 0 for AI rivals (state_byte
@@ -985,42 +1118,55 @@ impl SzsFile {
             };
             let slot_u16_0x18 = if off + 0x1A <= data.len() {
                 u16::from_le_bytes([data[off + 0x18], data[off + 0x19]])
-            } else { 0 };
+            } else {
+                0
+            };
             let slot_u32_0x34 = if off + 0x38 <= data.len() {
                 u32::from_le_bytes([
-                    data[off + 0x34], data[off + 0x35],
-                    data[off + 0x36], data[off + 0x37],
+                    data[off + 0x34],
+                    data[off + 0x35],
+                    data[off + 0x36],
+                    data[off + 0x37],
                 ])
-            } else { 0 };
+            } else {
+                0
+            };
             let read_array = |start: usize| -> [u32; 7] {
                 let mut arr = [0u32; 7];
                 for (i, slot_val) in arr.iter_mut().enumerate() {
                     let o = off + start + i * 8;
                     if o + 4 <= data.len() {
-                        *slot_val = u32::from_le_bytes([
-                            data[o], data[o + 1],
-                            data[o + 2], data[o + 3],
-                        ]);
+                        *slot_val =
+                            u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
                     }
                 }
                 arr
             };
             let relations_0xc0 = read_array(0xC0);
-            let relationships  = read_array(0x140);
-            let events_0x1c0   = read_array(0x1C0);
+            let relationships = read_array(0x140);
+            let events_0x1c0 = read_array(0x1C0);
             let name_off = off + PLAYER4_NAME_OFFSET;
             let name = if name_off + PLAYER4_NAME_BYTES <= data.len() {
                 let name_bytes = &data[name_off..name_off + PLAYER4_NAME_BYTES];
-                let end = name_bytes.iter().position(|&b| b == 0)
+                let end = name_bytes
+                    .iter()
+                    .position(|&b| b == 0)
                     .unwrap_or(PLAYER4_NAME_BYTES);
                 name_bytes[..end].iter().map(|&b| char::from(b)).collect()
             } else {
                 String::new()
             };
             out.push(PlayerSlotInit {
-                starting_gold, state_byte, color_idx, slot_byte12,
-                ai_active, name, slot_u32_0x34,
-                relations_0xc0, relationships, events_0x1c0,
+                starting_gold,
+                state_byte,
+                color_idx,
+                slot_byte12,
+                ai_active,
+                name,
+                slot_u32_0x34,
+                relations_0xc0,
+                relationships,
+                events_0x1c0,
                 slot_u16_0x18,
             });
         }
@@ -1078,15 +1224,20 @@ impl SzsFile {
     }
 
     fn parse_stadt4(data: &[u8]) -> Option<City> {
-        if data.len() < 0xa8 { return None; }
+        if data.len() < 0xa8 {
+            return None;
+        }
         let island_index = data[0];
         let owner_slot = data[2];
-        let read_u32 = |off: usize| u32::from_le_bytes([
-            data[off], data[off + 1], data[off + 2], data[off + 3],
-        ]);
+        let read_u32 = |off: usize| {
+            u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+        };
         let tier_population = [
-            read_u32(0x60), read_u32(0x64), read_u32(0x68),
-            read_u32(0x6C), read_u32(0x70),
+            read_u32(0x60),
+            read_u32(0x64),
+            read_u32(0x68),
+            read_u32(0x6C),
+            read_u32(0x70),
         ];
         let name_start = 0x87;
         let name_end = data[name_start..]
@@ -1098,7 +1249,12 @@ impl SzsFile {
             .iter()
             .map(|&b| char::from(b))
             .collect();
-        Some(City { island_index, owner_slot, tier_population, name })
+        Some(City {
+            island_index,
+            owner_slot,
+            tier_population,
+            name,
+        })
     }
 
     fn parse_inselhaus(data: &[u8]) -> Vec<IslandTile> {
@@ -1134,6 +1290,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inselhaus_id_uses_executable_definition_base() {
+        let tile = IslandTile {
+            building_id: 0x01ab,
+            x: 0,
+            y: 0,
+            orientation: 0,
+            anim_count: 0,
+            flags: 0,
+        };
+
+        assert_eq!(tile.source_id(), 0x4e20 + 0x01ab);
+        assert_eq!(tile.source_owner(), 0);
+
+        let owned = IslandTile {
+            anim_count: 0x80,
+            flags: 1,
+            ..tile
+        };
+        assert_eq!(owned.source_owner(), 6);
+    }
+
+    #[test]
     fn round_trip_encoded_islands() {
         let islands = vec![
             Island {
@@ -1144,20 +1322,31 @@ mod tests {
                 y_pos: 200,
                 tiles: vec![
                     IslandTile {
-                        building_id: 1234, x: 5, y: 7,
-                        orientation: 1, anim_count: 0, flags: 0,
+                        building_id: 1234,
+                        x: 5,
+                        y: 7,
+                        orientation: 1,
+                        anim_count: 0,
+                        flags: 0,
                     },
                     IslandTile {
-                        building_id: 42, x: 9, y: 9,
-                        orientation: 0, anim_count: 2, flags: 1,
+                        building_id: 42,
+                        x: 9,
+                        y: 9,
+                        orientation: 0,
+                        anim_count: 2,
+                        flags: 1,
                     },
                 ],
                 fertilities: [7; 8],
                 city: None,
             },
             Island {
-                number: 4, width: 60, height: 40,
-                x_pos: 500, y_pos: 600,
+                number: 4,
+                width: 60,
+                height: 40,
+                x_pos: 500,
+                y_pos: 600,
                 tiles: vec![],
                 fertilities: [7; 8],
                 city: None,
@@ -1220,13 +1409,19 @@ mod tests {
         }
 
         assert!(szs.islands.len() > 5, "Atoll should have many islands");
-        assert!(!szs.islands[0].tiles.is_empty(), "First island should have tiles");
+        assert!(
+            !szs.islands[0].tiles.is_empty(),
+            "First island should have tiles"
+        );
     }
 
     #[test]
     fn player4_extracts_starting_gold() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/Tutorial0.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -1236,25 +1431,36 @@ mod tests {
             }
         };
         let szs = SzsFile::parse(&data).expect("parse Tutorial0");
-        assert!(szs.players.len() == 7,
-            "PLAYER4 chunk yields exactly 7 slots, got {}", szs.players.len());
+        assert!(
+            szs.players.len() == 7,
+            "PLAYER4 chunk yields exactly 7 slots, got {}",
+            szs.players.len()
+        );
         // Tutorial scenarios start with non-zero gold so a player
         // can actually do anything; the binary's editor shows this
         // is configurable per-slot.
         let slot0 = szs.players[0].starting_gold;
-        assert!(slot0 > 0,
+        assert!(
+            slot0 > 0,
             "tutorial slot 0 starting_gold should be positive (got {})",
-            slot0);
+            slot0
+        );
         // Slot 4 is the free trader (1602_exe.c:83179) — every
         // surveyed scenario gives it 1 000 000 gold.
-        assert_eq!(szs.players[4].starting_gold, 1_000_000,
-            "slot 4 (free trader) should have 1M gold");
+        assert_eq!(
+            szs.players[4].starting_gold, 1_000_000,
+            "slot 4 (free trader) should have 1M gold"
+        );
         // Slot 6 is the pirate faction.
-        assert_eq!(szs.players[6].starting_gold, 5_000,
-            "slot 6 (pirates) should have 5 000 gold");
+        assert_eq!(
+            szs.players[6].starting_gold, 5_000,
+            "slot 6 (pirates) should have 5 000 gold"
+        );
         // Tutorial0 ships the default German male player name.
-        assert_eq!(szs.players[0].name, "Wilfried",
-            "slot 0 player name should be the default 'Wilfried'");
+        assert_eq!(
+            szs.players[0].name, "Wilfried",
+            "slot 0 player name should be the default 'Wilfried'"
+        );
         // Faction-state byte: 0 = human, 0x0c = AI, 0x0d = trader,
         // 0x0e = native, 0x0b = pirate (cross-scenario verified).
         assert_eq!(szs.players[0].state_byte, 0x00, "slot 0 = human");
@@ -1275,8 +1481,10 @@ mod tests {
         // filter. Tutorial0 has byte 0x0d == 0x00 for every AI
         // rival (slots 1..=3), so all four are `true`.
         for slot in 0..7 {
-            assert!(szs.players[slot].ai_active,
-                "Tutorial0 slot {slot} should be ai_active");
+            assert!(
+                szs.players[slot].ai_active,
+                "Tutorial0 slot {slot} should be ai_active"
+            );
         }
     }
 
@@ -1292,7 +1500,10 @@ mod tests {
         // non-empty value here, the test will fail and the
         // reader can grow to expose the field.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
         if !scenes.exists() {
             println!("Skipping: scenes dir not found");
@@ -1301,16 +1512,30 @@ mod tests {
         let mut scanned_slots = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             // Inspect the raw PLAYER4 chunk for byte at slot+0x400.
-            let Some(p4) = parsed.chunks.iter().find(|c| c.name == "PLAYER4") else { continue };
+            let Some(p4) = parsed.chunks.iter().find(|c| c.name == "PLAYER4") else {
+                continue;
+            };
             for slot in 0..7 {
                 let off = slot * 1072 + 0x400;
-                if off >= p4.data.len() { continue; }
+                if off >= p4.data.len() {
+                    continue;
+                }
                 assert_eq!(p4.data[off], 0,
                     "{:?} slot {slot}: PLAYER4 byte 0x400 should be NUL (empty string), got 0x{:02X}",
                     path.file_stem().unwrap(), p4.data[off]);
@@ -1327,24 +1552,46 @@ mod tests {
         // Equivalent assertion: every PLAYER4 slot's byte 5
         // matches its slot index. Corpus-wide invariant.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut total = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
-            let Some(p4) = parsed.chunks.iter().find(|c| c.name == "PLAYER4") else { continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let Some(p4) = parsed.chunks.iter().find(|c| c.name == "PLAYER4") else {
+                continue;
+            };
             for slot in 0..7 {
                 let off = slot * 1072 + 5;
-                if off >= p4.data.len() { continue; }
-                assert_eq!(p4.data[off], slot as u8,
+                if off >= p4.data.len() {
+                    continue;
+                }
+                assert_eq!(
+                    p4.data[off],
+                    slot as u8,
                     "{:?} slot {slot}: byte 0x05 should echo slot index",
-                    path.file_stem().unwrap());
+                    path.file_stem().unwrap()
+                );
                 total += 1;
             }
         }
@@ -1358,24 +1605,46 @@ mod tests {
         // (undefined1)DAT_005bafdc here at FUN_00478160:85405
         // — a "record-version / valid-slot" marker.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut total = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
-            let Some(p4) = parsed.chunks.iter().find(|c| c.name == "PLAYER4") else { continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let Some(p4) = parsed.chunks.iter().find(|c| c.name == "PLAYER4") else {
+                continue;
+            };
             for slot in 0..7 {
                 let off = slot * 1072 + 6;
-                if off >= p4.data.len() { continue; }
-                assert_eq!(p4.data[off], 0x01,
+                if off >= p4.data.len() {
+                    continue;
+                }
+                assert_eq!(
+                    p4.data[off],
+                    0x01,
                     "{:?} slot {slot}: byte 0x06 should be the 0x01 record marker",
-                    path.file_stem().unwrap());
+                    path.file_stem().unwrap()
+                );
                 total += 1;
             }
         }
@@ -1389,21 +1658,39 @@ mod tests {
         // A new scenario with RANKING > 3 (or < 0 if signed)
         // would break our scenario picker UI.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut total = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             if let Some(r) = parsed.scenario.ranking {
-                assert!(r <= 3,
+                assert!(
+                    r <= 3,
                     "{:?} has RANKING {} > 3",
-                    path.file_stem().unwrap(), r);
+                    path.file_stem().unwrap(),
+                    r
+                );
                 total += 1;
             }
         }
@@ -1418,23 +1705,44 @@ mod tests {
         // Uga Bunga, Manakaru, ...). The pattern almost
         // certainly seeds the hostile-faction stockpile.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut natives_seen = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             for chunk in parsed.chunks.iter().filter(|c| c.name == "STADT4") {
-                if chunk.data.len() < 0x28 { continue; }
-                let r = |o: usize| u32::from_le_bytes([
-                    chunk.data[o], chunk.data[o + 1],
-                    chunk.data[o + 2], chunk.data[o + 3],
-                ]);
+                if chunk.data.len() < 0x28 {
+                    continue;
+                }
+                let r = |o: usize| {
+                    u32::from_le_bytes([
+                        chunk.data[o],
+                        chunk.data[o + 1],
+                        chunk.data[o + 2],
+                        chunk.data[o + 3],
+                    ])
+                };
                 let v = [r(0x18), r(0x1C), r(0x20), r(0x24)];
                 let owner = chunk.data[2];
                 if v == [0; 4] {
@@ -1443,18 +1751,25 @@ mod tests {
                     // Non-zero must be (200,200,200,200) AND
                     // owner must be a non-active faction
                     // (5 native or 6 pirate).
-                    assert_eq!(v, [200; 4],
+                    assert_eq!(
+                        v,
+                        [200; 4],
                         "{:?}: STADT4 0x18..0x28 stockpile must be [200; 4], got {v:?}",
-                        path.file_stem().unwrap());
-                    assert!(owner == 5 || owner == 6,
+                        path.file_stem().unwrap()
+                    );
+                    assert!(
+                        owner == 5 || owner == 6,
                         "{:?}: stockpile only on native/pirate, owner={owner}",
-                        path.file_stem().unwrap());
+                        path.file_stem().unwrap()
+                    );
                     natives_seen += 1;
                 }
             }
         }
-        assert!(natives_seen > 0,
-            "audit must include at least one native/pirate stockpiled city");
+        assert!(
+            natives_seen > 0,
+            "audit must include at least one native/pirate stockpiled city"
+        );
     }
 
     #[test]
@@ -1467,32 +1782,53 @@ mod tests {
         // reads as `(byte_0x05 << 8)`, matching the
         // 4352/4608/5120/6912/7936 values seen in the audit.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut total = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             for chunk in parsed.chunks.iter().filter(|c| c.name == "STADT4") {
-                if chunk.data.len() < 8 { continue; }
+                if chunk.data.len() < 8 {
+                    continue;
+                }
                 let b4 = chunk.data[4];
                 let b5 = chunk.data[5];
                 // byte 0x04: typically 0 in shipping content,
                 // small values (≤ 0x1F) in scenarios that
                 // pre-configure the stage marker.
-                assert!(b4 <= 0x1F,
+                assert!(
+                    b4 <= 0x1F,
                     "{:?}: STADT4 byte 0x04 = {b4:#04x} unexpectedly large",
-                    path.file_stem().unwrap());
+                    path.file_stem().unwrap()
+                );
                 // Stage marker: either 0 (empty/uninhabited) or
                 // 0x11..=0x1F (occupied tier in shipping corpus).
-                assert!(b5 == 0 || (0x11..=0x1F).contains(&b5),
+                assert!(
+                    b5 == 0 || (0x11..=0x1F).contains(&b5),
                     "{:?}: STADT4 byte 0x05 = {b5:#04x} out of range",
-                    path.file_stem().unwrap());
+                    path.file_stem().unwrap()
+                );
                 total += 1;
             }
         }
@@ -1505,25 +1841,41 @@ mod tests {
         // islands and 0x51 on a single outlier. Pin the
         // overwhelming majority and document the outlier.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut total = 0;
         let mut outliers = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             for chunk in parsed.chunks.iter().filter(|c| c.name == "INSEL5") {
-                if chunk.data.len() < 0x60 { continue; }
+                if chunk.data.len() < 0x60 {
+                    continue;
+                }
                 let b = chunk.data[0x5D];
                 if b != 0x11 {
                     outliers += 1;
-                    assert_eq!(b, 0x51,
-                        "unexpected INSEL5 byte 0x5D outlier: {b:#04x}");
+                    assert_eq!(b, 0x51, "unexpected INSEL5 byte 0x5D outlier: {b:#04x}");
                 }
                 total += 1;
             }
@@ -1542,21 +1894,38 @@ mod tests {
         // one0 is one of the Pirata-style scenarios where the
         // entire map starts in an unusual state.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut total_islands = 0;
         let mut nonzero = Vec::new();
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
             for chunk in parsed.chunks.iter().filter(|c| c.name == "INSEL5") {
-                if chunk.data.len() < 4 { continue; }
+                if chunk.data.len() < 4 {
+                    continue;
+                }
                 total_islands += 1;
                 if chunk.data[3] != 0 {
                     nonzero.push((stem.clone(), chunk.data[3]));
@@ -1566,13 +1935,19 @@ mod tests {
         assert!(total_islands > 0);
         // Only Trust no one0 should hit the non-zero branch.
         for (scen, val) in &nonzero {
-            assert_eq!(scen, "Trust no one0",
-                "unexpected INSEL5 byte 0x03 outlier: {scen} value 0x{val:02X}");
-            assert_eq!(*val, 2,
-                "Trust no one0 should consistently use byte 0x03 = 2");
+            assert_eq!(
+                scen, "Trust no one0",
+                "unexpected INSEL5 byte 0x03 outlier: {scen} value 0x{val:02X}"
+            );
+            assert_eq!(
+                *val, 2,
+                "Trust no one0 should consistently use byte 0x03 = 2"
+            );
         }
-        assert!(!nonzero.is_empty(),
-            "Trust no one0 must contribute the documented outliers");
+        assert!(
+            !nonzero.is_empty(),
+            "Trust no one0 must contribute the documented outliers"
+        );
     }
 
     #[test]
@@ -1581,29 +1956,53 @@ mod tests {
         // (heading × 2). Ship::heading() halves it to recover
         // the 0..=7 cardinal direction.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut total = 0;
         let mut max_heading = 0u8;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             for s in &parsed.ships {
                 let h = s.heading();
-                assert!(h <= 7, "{:?} ship {:?} heading {} > 7",
-                    path.file_stem().unwrap(), s.name, h);
-                if h > max_heading { max_heading = h; }
+                assert!(
+                    h <= 7,
+                    "{:?} ship {:?} heading {} > 7",
+                    path.file_stem().unwrap(),
+                    s.name,
+                    h
+                );
+                if h > max_heading {
+                    max_heading = h;
+                }
                 total += 1;
             }
         }
         assert!(total > 0);
-        assert!(max_heading > 0,
-            "audit must include at least one non-N heading");
+        assert!(
+            max_heading > 0,
+            "audit must include at least one non-N heading"
+        );
     }
 
     #[test]
@@ -1617,21 +2016,40 @@ mod tests {
         // values each) since this field encodes per-slot AI
         // unlocks / starting-state mask.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut slot4_seen = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             if let Some(p) = parsed.players.get(4) {
-                assert_eq!(p.slot_u32_0x34, 0,
+                assert_eq!(
+                    p.slot_u32_0x34,
+                    0,
                     "{:?}: slot 4 (trader) slot_u32_0x34 must be 0, got 0x{:08X}",
-                    path.file_stem().unwrap(), p.slot_u32_0x34);
+                    path.file_stem().unwrap(),
+                    p.slot_u32_0x34
+                );
                 slot4_seen += 1;
             }
         }
@@ -1650,27 +2068,46 @@ mod tests {
         // (TaskList #115); this invariant guards the value
         // range against corruption.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut total_slots = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             for player in &parsed.players {
                 for v in player.relations_0xc0 {
-                    assert!(v <= 3,
+                    assert!(
+                        v <= 3,
                         "{:?}: PLAYER4 0xC0 entry {v} > 3",
-                        path.file_stem().unwrap());
+                        path.file_stem().unwrap()
+                    );
                 }
                 for v in player.relationships {
-                    assert!(v <= 3,
+                    assert!(
+                        v <= 3,
                         "{:?}: PLAYER4 0x140 entry {v} > 3",
-                        path.file_stem().unwrap());
+                        path.file_stem().unwrap()
+                    );
                 }
                 total_slots += 1;
             }
@@ -1687,30 +2124,54 @@ mod tests {
         // Pin the correlation as a corpus invariant — gives
         // us a redundant cross-check on the owner byte.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut total = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
-            let Some(s4) = parsed.chunks.iter().find(|c| c.name == "SHIP4") else { continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let Some(s4) = parsed.chunks.iter().find(|c| c.name == "SHIP4") else {
+                continue;
+            };
             for record in s4.data.chunks_exact(436) {
-                if record.len() < 0x4C { continue; }
+                if record.len() < 0x4C {
+                    continue;
+                }
                 let b4a = record[0x4A];
                 let owner = record[0x4B];
                 let want = match owner {
                     0..=3 => 0x01,
-                    5     => 0x03,
-                    _     => unreachable!("owner {owner} unexpected"),
+                    5 => 0x03,
+                    _ => unreachable!("owner {owner} unexpected"),
                 };
-                assert_eq!(b4a, want,
+                assert_eq!(
+                    b4a,
+                    want,
                     "{:?}: SHIP4 byte 0x4A {:#04x} doesn't match owner {} pattern",
-                    path.file_stem().unwrap(), b4a, owner);
+                    path.file_stem().unwrap(),
+                    b4a,
+                    owner
+                );
                 total += 1;
             }
         }
@@ -1723,23 +2184,46 @@ mod tests {
         // corpus. Likely a record-format / sprite-anchor
         // constant the engine never varies.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let mut total = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
-            let Some(s4) = parsed.chunks.iter().find(|c| c.name == "SHIP4") else { continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let Some(s4) = parsed.chunks.iter().find(|c| c.name == "SHIP4") else {
+                continue;
+            };
             for record in s4.data.chunks_exact(436) {
-                if record.len() < 0x42 { continue; }
-                assert_eq!(record[0x41], 80,
+                if record.len() < 0x42 {
+                    continue;
+                }
+                assert_eq!(
+                    record[0x41],
+                    80,
                     "{:?}: SHIP4 byte 0x41 should be 80, got {}",
-                    path.file_stem().unwrap(), record[0x41]);
+                    path.file_stem().unwrap(),
+                    record[0x41]
+                );
                 total += 1;
             }
         }
@@ -1757,7 +2241,10 @@ mod tests {
         // `Mission::from_chunks` reader needs to grow N-mission
         // support (see also TaskList #128).
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
         if !scenes.exists() {
             println!("Skipping: scenes dir not found");
@@ -1766,15 +2253,29 @@ mod tests {
         let mut total = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             if let Some(c) = parsed.chunks.iter().find(|c| c.name == "AUFTRAG4") {
-                assert_eq!(c.data.len(), 0x8C4,
+                assert_eq!(
+                    c.data.len(),
+                    0x8C4,
                     "{:?}: AUFTRAG4 chunk size {} ≠ 1 × 0x8C4",
-                    path.file_stem().unwrap(), c.data.len());
+                    path.file_stem().unwrap(),
+                    c.data.len()
+                );
                 total += 1;
             }
         }
@@ -1792,7 +2293,10 @@ mod tests {
         // PLAYER4 ordering. New scenarios that violate this
         // invariant should fail this test loudly.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
         if !scenes.exists() {
             println!("Skipping: scenes dir not found");
@@ -1802,15 +2306,30 @@ mod tests {
         let mut total = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let szs = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let szs = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             for (i, p) in szs.players.iter().enumerate().take(7) {
-                assert_eq!(p.state_byte, want[i],
+                assert_eq!(
+                    p.state_byte,
+                    want[i],
                     "{:?} slot {i} has state_byte 0x{:02X}, want 0x{:02X}",
-                    path.file_stem().unwrap(), p.state_byte, want[i]);
+                    path.file_stem().unwrap(),
+                    p.state_byte,
+                    want[i]
+                );
             }
             total += 1;
         }
@@ -1830,7 +2349,10 @@ mod tests {
             ("The Magnate2", [2, 5, 6, 6, 0, 0, 0]),
         ] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent().unwrap().parent().unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
                 .join(format!("extracted/Szenes/{scenario}.szs"));
             let data = match std::fs::read(&path) {
                 Ok(d) => d,
@@ -1841,8 +2363,10 @@ mod tests {
             };
             let szs = SzsFile::parse(&data).expect("parse");
             for slot in 0..7 {
-                assert_eq!(szs.players[slot].slot_u16_0x18, expected[slot],
-                    "{scenario} slot {slot} byte 0x18");
+                assert_eq!(
+                    szs.players[slot].slot_u16_0x18, expected[slot],
+                    "{scenario} slot {slot} byte 0x18"
+                );
             }
         }
     }
@@ -1852,7 +2376,10 @@ mod tests {
         // Tutorial0 / Plague / Atoll all share the canonical
         // diplomacy seed shown in `PlayerSlotInit::relationships`.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/Tutorial0.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -1865,9 +2392,11 @@ mod tests {
         // Active rows (player + AIs): zero against active slots,
         // 3 against trader/native/pirate.
         for slot in 0..=3 {
-            assert_eq!(szs.players[slot].relationships,
+            assert_eq!(
+                szs.players[slot].relationships,
                 [0, 0, 0, 0, 3, 3, 3],
-                "active slot {slot} relationship row");
+                "active slot {slot} relationship row"
+            );
         }
         // Trader: mirror image — 3 against actives, 0 against
         // specials.
@@ -1887,24 +2416,29 @@ mod tests {
         // carries N entries against rivals 1..=N.
         let load = |stem: &str| -> Option<SzsFile> {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent().unwrap().parent().unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
                 .join(format!("extracted/Szenes/{stem}.szs"));
-            std::fs::read(&path).ok().and_then(|d| SzsFile::parse(&d).ok())
+            std::fs::read(&path)
+                .ok()
+                .and_then(|d| SzsFile::parse(&d).ok())
         };
 
         if let Some(t) = load("Tutorial0") {
             // Tutorial0 leaves 0x1C0 entirely zero.
             for slot in 0..7 {
-                assert_eq!(t.players[slot].events_0x1c0, [0; 7],
-                    "Tutorial0 slot {slot} 0x1C0 array");
+                assert_eq!(
+                    t.players[slot].events_0x1c0, [0; 7],
+                    "Tutorial0 slot {slot} 0x1C0 array"
+                );
             }
             // 0xC0 array — slot 0 has 3s everywhere except
             // position 5 (natives).
-            assert_eq!(t.players[0].relations_0xc0,
-                [3, 3, 3, 3, 3, 0, 3]);
+            assert_eq!(t.players[0].relations_0xc0, [3, 3, 3, 3, 3, 0, 3]);
             // Slot 5 (natives) — only positions 4, 5 = 3.
-            assert_eq!(t.players[5].relations_0xc0,
-                [0, 0, 0, 0, 3, 3, 0]);
+            assert_eq!(t.players[5].relations_0xc0, [0, 0, 0, 0, 3, 3, 0]);
         }
 
         if let Some(m) = load("The Magnate0") {
@@ -1912,21 +2446,26 @@ mod tests {
             // carries N entries of `(N << 8) | 2` against rivals
             // 1..=N. Slots 0 / 4 / 5 stay empty; slot 6 (pirates)
             // carries a different encoding [0x301, 0x303, …].
-            assert_eq!(m.players[0].events_0x1c0, [0; 7],
-                "slot 0 (player) has no events");
-            assert_eq!(m.players[1].events_0x1c0,
-                [0x102, 0, 0, 0, 0, 0, 0]);
-            assert_eq!(m.players[2].events_0x1c0,
-                [0x102, 0x202, 0, 0, 0, 0, 0]);
-            assert_eq!(m.players[3].events_0x1c0,
-                [0x102, 0x202, 0x302, 0, 0, 0, 0]);
-            assert_eq!(m.players[4].events_0x1c0, [0; 7],
-                "slot 4 (trader) has no events");
-            assert_eq!(m.players[5].events_0x1c0, [0; 7],
-                "slot 5 (natives) has no events");
-            assert_eq!(m.players[6].events_0x1c0,
+            assert_eq!(
+                m.players[0].events_0x1c0, [0; 7],
+                "slot 0 (player) has no events"
+            );
+            assert_eq!(m.players[1].events_0x1c0, [0x102, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(m.players[2].events_0x1c0, [0x102, 0x202, 0, 0, 0, 0, 0]);
+            assert_eq!(m.players[3].events_0x1c0, [0x102, 0x202, 0x302, 0, 0, 0, 0]);
+            assert_eq!(
+                m.players[4].events_0x1c0, [0; 7],
+                "slot 4 (trader) has no events"
+            );
+            assert_eq!(
+                m.players[5].events_0x1c0, [0; 7],
+                "slot 5 (natives) has no events"
+            );
+            assert_eq!(
+                m.players[6].events_0x1c0,
                 [0x301, 0x303, 0, 0, 0, 0, 0],
-                "slot 6 (pirates) carries the distinct encoding");
+                "slot 6 (pirates) carries the distinct encoding"
+            );
         }
     }
 
@@ -1936,7 +2475,10 @@ mod tests {
         // byte 0x0d == 0x01. The audit run counts 21 such slots
         // across shipping content; Exile is one of them.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/Exile.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -1949,11 +2491,15 @@ mod tests {
         // Slots 1 and 3 carry `state_byte == 0x0c` (AI) but
         // byte 0x0d == 0x01, so the binary skips them.
         assert_eq!(szs.players[1].state_byte, 0x0c);
-        assert!(!szs.players[1].ai_active,
-            "Exile slot 1 has byte 0x0d == 0x01 → AI disabled");
+        assert!(
+            !szs.players[1].ai_active,
+            "Exile slot 1 has byte 0x0d == 0x01 → AI disabled"
+        );
         assert_eq!(szs.players[3].state_byte, 0x0c);
-        assert!(!szs.players[3].ai_active,
-            "Exile slot 3 has byte 0x0d == 0x01 → AI disabled");
+        assert!(
+            !szs.players[3].ai_active,
+            "Exile slot 3 has byte 0x0d == 0x01 → AI disabled"
+        );
     }
 
     #[test]
@@ -1963,7 +2509,10 @@ mod tests {
         // strongest cross-scenario signal that the field encodes
         // an AI feature/unlock mask.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/The Magnate0.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -1973,20 +2522,32 @@ mod tests {
             }
         };
         let szs = SzsFile::parse(&data).expect("parse Magnate0");
-        assert_eq!(szs.players[0].slot_u32_0x34, 0x0000_0003,
-            "slot 0 (player) baseline mask");
-        assert_eq!(szs.players[1].slot_u32_0x34, 0x003F_C00F,
-            "slot 1 (easy AI) mid-tier mask");
-        assert_eq!(szs.players[2].slot_u32_0x34, 0x0FFF_C33F,
-            "slot 2 (harder AI) wide mask");
-        assert_eq!(szs.players[3].slot_u32_0x34, 0x0FFF_C33F,
-            "slot 3 (harder AI) wide mask");
+        assert_eq!(
+            szs.players[0].slot_u32_0x34, 0x0000_0003,
+            "slot 0 (player) baseline mask"
+        );
+        assert_eq!(
+            szs.players[1].slot_u32_0x34, 0x003F_C00F,
+            "slot 1 (easy AI) mid-tier mask"
+        );
+        assert_eq!(
+            szs.players[2].slot_u32_0x34, 0x0FFF_C33F,
+            "slot 2 (harder AI) wide mask"
+        );
+        assert_eq!(
+            szs.players[3].slot_u32_0x34, 0x0FFF_C33F,
+            "slot 3 (harder AI) wide mask"
+        );
         // Strict monotone growth across rivals — 0 ⊂ 1 ⊂ 2.
         let masks: Vec<u32> = (0..4).map(|i| szs.players[i].slot_u32_0x34).collect();
-        assert!(masks[0] & masks[1] == masks[0],
-            "slot 1 mask is a superset of slot 0");
-        assert!(masks[1] & masks[2] == masks[1],
-            "slot 2 mask is a superset of slot 1");
+        assert!(
+            masks[0] & masks[1] == masks[0],
+            "slot 1 mask is a superset of slot 0"
+        );
+        assert!(
+            masks[1] & masks[2] == masks[1],
+            "slot 2 mask is a superset of slot 1"
+        );
     }
 
     #[test]
@@ -2013,7 +2574,10 @@ mod tests {
         // sentinel `[07; 8]` while a handful encode 1-2 active
         // fertility slots.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/Atoll.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -2025,12 +2589,19 @@ mod tests {
         let szs = SzsFile::parse(&data).expect("parse Atoll");
         // At least one island has the all-default `[07; 8]`
         // pattern, and at least one has a non-default slot.
-        let any_default = szs.islands.iter()
-            .any(|i| i.fertilities == [7; 8]);
-        let any_active = szs.islands.iter()
+        let any_default = szs.islands.iter().any(|i| i.fertilities == [7; 8]);
+        let any_active = szs
+            .islands
+            .iter()
             .any(|i| i.fertilities.iter().any(|&v| v != 7));
-        assert!(any_default, "Atoll should include at least one fertility-free island");
-        assert!(any_active, "Atoll should include at least one fertile island");
+        assert!(
+            any_default,
+            "Atoll should include at least one fertility-free island"
+        );
+        assert!(
+            any_active,
+            "Atoll should include at least one fertile island"
+        );
         // No fertility byte should exceed 7 (the binary's value
         // range is 0..=7 with 7 being the no-fertility sentinel).
         for i in &szs.islands {
@@ -2043,7 +2614,10 @@ mod tests {
     #[test]
     fn stadt4_extracts_city_name() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/A Plague of Pirates.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -2056,7 +2630,9 @@ mod tests {
         // The first island chunk in Plague is a sentinel with no
         // STADT4 attached; the player's city ("Larrach") sits on
         // a later island. Find any city record and verify the name.
-        let city = szs.islands.iter()
+        let city = szs
+            .islands
+            .iter()
             .find_map(|i| i.city.as_ref())
             .expect("at least one island has a STADT4 city");
         assert_eq!(city.name, "Larrach");
@@ -2065,10 +2641,14 @@ mod tests {
         // `owner == 1` against the byte at offset 0, which is
         // actually the island_index — Larrach sits on island 1
         // because Plague's island 0 is an unused sentinel.
-        assert_eq!(city.island_index, 1,
-            "Larrach is on Plague's island #1 (after the sentinel)");
-        assert_eq!(city.owner_slot, 0,
-            "Larrach is the player's main settlement");
+        assert_eq!(
+            city.island_index, 1,
+            "Larrach is on Plague's island #1 (after the sentinel)"
+        );
+        assert_eq!(
+            city.owner_slot, 0,
+            "Larrach is the player's main settlement"
+        );
     }
 
     #[test]
@@ -2078,7 +2658,10 @@ mod tests {
         // the audit; "Fraiburg" has [8, 596, 0, 0, 0].
         // Empty placeholders stay all-zero.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/Peaceful Reign.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -2088,9 +2671,12 @@ mod tests {
             }
         };
         let szs = SzsFile::parse(&data).expect("parse Peaceful Reign");
-        let by_name = |n: &str| szs.islands.iter()
-            .filter_map(|i| i.city.as_ref())
-            .find(|c| c.name == n);
+        let by_name = |n: &str| {
+            szs.islands
+                .iter()
+                .filter_map(|i| i.city.as_ref())
+                .find(|c| c.name == n)
+        };
         if let Some(c) = by_name("Falkenstain") {
             assert_eq!(c.tier_population, [0, 85, 800, 0, 0]);
         }
@@ -2100,11 +2686,16 @@ mod tests {
         // Total inhabitants across every populated city must be
         // strictly positive — sanity-check that the parser
         // captured at least one non-empty city.
-        let total: u64 = szs.islands.iter()
+        let total: u64 = szs
+            .islands
+            .iter()
             .filter_map(|i| i.city.as_ref())
             .flat_map(|c| c.tier_population.iter().map(|&v| v as u64))
             .sum();
-        assert!(total > 0, "Peaceful Reign should have non-empty city populations");
+        assert!(
+            total > 0,
+            "Peaceful Reign should have non-empty city populations"
+        );
     }
 
     #[test]
@@ -2113,7 +2704,10 @@ mod tests {
         // distinct owner_slots — this is the test that motivated
         // separating the two fields.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/New Horizons2.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -2123,18 +2717,17 @@ mod tests {
             }
         };
         let szs = SzsFile::parse(&data).expect("parse New Horizons2");
-        let cities: Vec<&City> = szs.islands.iter()
+        let cities: Vec<&City> = szs
+            .islands
+            .iter()
             .filter_map(|i| i.city.as_ref())
             .filter(|c| !c.name.is_empty())
             .collect();
-        let by_name = |n: &str| cities.iter()
-            .find(|c| c.name == n)
-            .copied();
+        let by_name = |n: &str| cities.iter().find(|c| c.name == n).copied();
         // "Jaricho" sits on island 21 with owner_slot 6 (pirate).
         if let Some(c) = by_name("Jaricho") {
             assert_eq!(c.island_index, 21);
-            assert_eq!(c.owner_slot, 6,
-                "Jaricho is the pirate stronghold (slot 6)");
+            assert_eq!(c.owner_slot, 6, "Jaricho is the pirate stronghold (slot 6)");
         }
         // "Radolfsell" — island 19, owner_slot 5 (natives).
         if let Some(c) = by_name("Radolfsell") {
@@ -2145,15 +2738,21 @@ mod tests {
         // exist), and we expect the corpus invariant that
         // island_index varies independently of owner_slot.
         for c in &cities {
-            assert!(c.owner_slot <= 6,
-                "owner_slot must be a valid PLAYER4 slot index, got {}", c.owner_slot);
+            assert!(
+                c.owner_slot <= 6,
+                "owner_slot must be a valid PLAYER4 slot index, got {}",
+                c.owner_slot
+            );
         }
     }
 
     #[test]
     fn scenario_meta_extracts_szene_chunks() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/A Plague of Pirates.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -2174,7 +2773,10 @@ mod tests {
     #[test]
     fn ship4_extracts_initial_ships() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/Tutorial0.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -2190,15 +2792,49 @@ mod tests {
         assert_eq!(szs.ships[0].name, "Seehind");
         assert_eq!(szs.ships[0].x, 0xd2);
         assert_eq!(szs.ships[0].y, 0x80);
+        let ship = &szs.ships[0];
+        assert_eq!(ship.raw_record.len(), SHIP4_RECORD_BYTES);
+        assert_eq!(
+            u16::from_le_bytes([ship.raw_record[28], ship.raw_record[29]]),
+            ship.x
+        );
+        assert_eq!(
+            u16::from_le_bytes([ship.raw_record[30], ship.raw_record[31]]),
+            ship.y
+        );
+        assert_eq!(ship.raw_record[0x42], ship.heading_byte);
+        assert_eq!(
+            u16::from_le_bytes([ship.raw_record[0x3c], ship.raw_record[0x3d]]),
+            ship.stored_energy
+        );
+        assert_eq!(
+            u16::from_le_bytes([ship.raw_record[0x46], ship.raw_record[0x47]]),
+            ship.runtime_slot
+        );
+        assert_eq!(
+            u16::from_le_bytes([ship.raw_record[0x48], ship.raw_record[0x49]]),
+            ship.figure_definition_id
+        );
+        assert_eq!(ship.figure_definition_id as u8, ship.ship_class);
+        assert_eq!(ship.raw_record[0x4a], ship.figure_kind);
+        assert_eq!(ship.raw_record[0x4e], ship.animation_state);
+        assert_eq!(ship.raw_record[0x4b], ship.owner);
+        assert_eq!(
+            u32::from_le_bytes(ship.raw_record[0x174..0x178].try_into().unwrap()),
+            ship.cargo_slots[0]
+        );
         // Tutorial0's lone ship is the human player's small
         // trader: owner = slot 0, ship_class one of the five
         // observed values {0x15, 0x17, 0x19, 0x1B, 0x1F}.
-        assert_eq!(szs.ships[0].owner, 0,
-            "Tutorial0 starting ship is owned by the human player");
-        assert!(matches!(szs.ships[0].ship_class,
-                         0x15 | 0x17 | 0x19 | 0x1B | 0x1F),
+        assert_eq!(
+            szs.ships[0].owner, 0,
+            "Tutorial0 starting ship is owned by the human player"
+        );
+        assert!(
+            matches!(szs.ships[0].ship_class, 0x15 | 0x17 | 0x19 | 0x1B | 0x1F),
             "ship_class falls within the observed shipping-corpus set, got 0x{:02X}",
-            szs.ships[0].ship_class);
+            szs.ships[0].ship_class
+        );
     }
 
     #[test]
@@ -2209,7 +2845,10 @@ mod tests {
         // SHIP4 record's cargo manifest (high16 = quantity,
         // low16 = good identifier of unknown encoding).
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/Tutorial0.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -2220,18 +2859,26 @@ mod tests {
         };
         let szs = SzsFile::parse(&data).expect("parse Tutorial0");
         assert_eq!(szs.ships.len(), 1);
-        assert_eq!(szs.ships[0].cargo_slots,
+        assert_eq!(
+            szs.ships[0].cargo_slots,
             [62915075, 62916561, 52429875, 0, 0, 0, 0],
-            "Tutorial0 starting cargo");
+            "Tutorial0 starting cargo"
+        );
         // The high 16 bits of each non-zero entry should be a
         // quantity-style multiple of 32 in the observed range.
         for slot in &szs.ships[0].cargo_slots {
-            if *slot == 0 { continue; }
+            if *slot == 0 {
+                continue;
+            }
             let high = (slot >> 16) as u16;
-            assert!(high % 32 == 0,
-                "high16 should be a multiple of 32, got 0x{high:04X}");
-            assert!(high > 0 && high <= 4000,
-                "high16 should fall within observed range, got {high}");
+            assert!(
+                high % 32 == 0,
+                "high16 should be a multiple of 32, got 0x{high:04X}"
+            );
+            assert!(
+                high > 0 && high <= 4000,
+                "high16 should fall within observed range, got {high}"
+            );
         }
     }
 
@@ -2245,6 +2892,11 @@ mod tests {
         assert_eq!(ShipClass::from_byte(0x19), Some(ShipClass::SmallWarship));
         assert_eq!(ShipClass::from_byte(0x1B), Some(ShipClass::LargeWarship));
         assert_eq!(ShipClass::from_byte(0x1F), Some(ShipClass::PirateShip));
+        assert_eq!(ShipClass::SmallTrader.source_figure_name(), "HANDEL1");
+        assert_eq!(ShipClass::LargeTrader.source_figure_name(), "HANDEL2");
+        assert_eq!(ShipClass::SmallWarship.source_figure_name(), "KRIEG1");
+        assert_eq!(ShipClass::LargeWarship.source_figure_name(), "KRIEG2");
+        assert_eq!(ShipClass::PirateShip.source_figure_name(), "PIRAT");
         // Anything outside the set is None.
         assert_eq!(ShipClass::from_byte(0x00), None);
         assert_eq!(ShipClass::from_byte(0x16), None);
@@ -2267,7 +2919,10 @@ mod tests {
         // by slot 5 (the hostile native faction, which uses
         // the PIRAT figure as its visual hull).
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
         if !scenes.exists() {
             println!("Skipping: scenes dir not found");
@@ -2277,28 +2932,45 @@ mod tests {
         let mut total = 0;
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let szs = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let szs = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             for s in &szs.ships {
                 total += 1;
-                assert_ne!(s.owner, 6,
+                assert_ne!(
+                    s.owner,
+                    6,
                     "{:?}: SHIP4 must not carry owner == 6 (pirates)",
-                    path.file_stem().unwrap());
+                    path.file_stem().unwrap()
+                );
                 if s.class() == Some(ShipClass::PirateShip) {
-                    assert_eq!(s.owner, 5,
+                    assert_eq!(
+                        s.owner,
+                        5,
                         "{:?}: PirateShip-class records must be owner 5",
-                        path.file_stem().unwrap());
+                        path.file_stem().unwrap()
+                    );
                     pirate_class_count += 1;
                 }
             }
         }
-        assert!(pirate_class_count > 0,
-            "corpus should include at least one PirateShip record");
-        assert!(total > 0,
-            "corpus should include at least one SHIP4 record");
+        assert!(
+            pirate_class_count > 0,
+            "corpus should include at least one PirateShip record"
+        );
+        assert!(total > 0, "corpus should include at least one SHIP4 record");
     }
 
     #[test]
@@ -2308,7 +2980,10 @@ mod tests {
         // here means a new ship-class byte appeared in the
         // corpus and the enum needs to grow.
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
         if !scenes.exists() {
             println!("Skipping: scenes dir not found");
@@ -2316,16 +2991,40 @@ mod tests {
         }
         for entry in std::fs::read_dir(&scenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) {
+            if !path
+                .extension()
+                .map(|s| s.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-            let szs = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let szs = match SzsFile::parse(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             for s in &szs.ships {
                 let stem = path.file_stem().unwrap().to_string_lossy();
-                assert!(s.class().is_some(),
+                assert_eq!(
+                    u16::from_le_bytes([s.raw_record[0x48], s.raw_record[0x49]]),
+                    s.figure_definition_id,
+                    "{stem}: ship \"{}\" has a detached figure-definition ID",
+                    s.name
+                );
+                assert_eq!(
+                    s.figure_definition_id as u8, s.ship_class,
+                    "{stem}: ship \"{}\" has a detached ship-class projection",
+                    s.name
+                );
+                assert!(
+                    s.class().is_some(),
                     "{stem}: ship \"{}\" has unknown ship_class byte 0x{:02X}",
-                    s.name, s.ship_class);
+                    s.name,
+                    s.ship_class
+                );
             }
         }
     }
@@ -2335,7 +3034,10 @@ mod tests {
         // Plague of Pirates has 19 ships across multiple owners,
         // so it's the best test of the owner-byte interpretation.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/A Plague of Pirates.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -2345,24 +3047,30 @@ mod tests {
             }
         };
         let szs = SzsFile::parse(&data).expect("parse Plague");
-        let mut owners: std::collections::BTreeSet<u8> =
-            std::collections::BTreeSet::new();
+        let mut owners: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
         for s in &szs.ships {
             owners.insert(s.owner);
         }
-        assert!(owners.contains(&0),
-            "Plague includes at least one human-owned ship");
+        assert!(
+            owners.contains(&0),
+            "Plague includes at least one human-owned ship"
+        );
         // The full surveyed set across the corpus is {0,1,2,3,5}
         // — Plague should cover at least 0 and one rival.
         let has_rival = owners.iter().any(|&o| matches!(o, 1 | 2 | 3 | 5));
-        assert!(has_rival,
-            "Plague should also include a non-player owner; got {owners:?}");
+        assert!(
+            has_rival,
+            "Plague should also include a non-player owner; got {owners:?}"
+        );
     }
 
     #[test]
     fn auftrag4_flag_bits_decode() {
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
         if !scenes.exists() {
             println!("Skipping: {scenes:?} not found");
@@ -2374,16 +3082,22 @@ mod tests {
         };
         // Plague of Pirates: pop goal AND pirate combat goal.
         let m = load("A Plague of Pirates.szs").expect("Plague present");
-        assert!(m.flags & MISSION_FLAG_POPULATION != 0,
-            "Plague must have population bit");
-        assert!(m.flags & MISSION_FLAG_PIRATE != 0,
-            "Plague must have pirate bit");
+        assert!(
+            m.flags & MISSION_FLAG_POPULATION != 0,
+            "Plague must have population bit"
+        );
+        assert!(
+            m.flags & MISSION_FLAG_PIRATE != 0,
+            "Plague must have pirate bit"
+        );
         // Good Neighbors: pop + cooperative neighbour goal.
         let m = load("Good Neighbors.szs").expect("Good Neighbors");
         assert!(m.flags & MISSION_FLAG_POPULATION != 0);
         assert!(m.flags & MISSION_FLAG_COOPERATIVE != 0);
-        assert!(m.flags & MISSION_FLAG_PIRATE == 0,
-            "Good Neighbors has no pirate combat");
+        assert!(
+            m.flags & MISSION_FLAG_PIRATE == 0,
+            "Good Neighbors has no pirate combat"
+        );
         // Tutorials carry no flags.
         let m = load("Tutorial0.szs").expect("Tutorial0");
         assert_eq!(m.flags, 0);
@@ -2392,11 +3106,18 @@ mod tests {
     #[test]
     fn mission_goals_decode_per_scenario() {
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let load = |name: &str| -> Option<Mission> {
-            SzsFile::parse(&std::fs::read(scenes.join(name)).ok()?).ok()?.mission
+            SzsFile::parse(&std::fs::read(scenes.join(name)).ok()?)
+                .ok()?
+                .mission
         };
         // Plague of Pirates: 5 000 inhabitants (tier left
         // unspecified — the briefing only names a number).
@@ -2428,11 +3149,18 @@ mod tests {
     #[test]
     fn mission_goals_decode_secondary_and_tertiary() {
         let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes");
-        if !scenes.exists() { return; }
+        if !scenes.exists() {
+            return;
+        }
         let load = |name: &str| -> Option<Mission> {
-            SzsFile::parse(&std::fs::read(scenes.join(name)).ok()?).ok()?.mission
+            SzsFile::parse(&std::fs::read(scenes.join(name)).ok()?)
+                .ok()?
+                .mission
         };
         // The Continent: flags 0x107 = POP + POP2 + POP3 + RANKING.
         // Three triples each [5000, 4, 5000] (5k Aristocrats per
@@ -2462,7 +3190,10 @@ mod tests {
     #[test]
     fn auftrag4_extracts_briefing_and_flags() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("extracted/Szenes/A Plague of Pirates.szs");
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -2480,15 +3211,22 @@ mod tests {
         // Spot-check that the briefing was decoded — full text begins
         // with "You have managed to lead..." and mentions the 5 000
         // population goal verbatim.
-        assert!(mission.briefing.starts_with("You have managed to lead"),
-            "briefing text wrong: {:?}", &mission.briefing);
-        assert!(mission.briefing.contains("5,000 inhabitants"),
-            "briefing should mention the 5 000 inhabitants goal");
+        assert!(
+            mission.briefing.starts_with("You have managed to lead"),
+            "briefing text wrong: {:?}",
+            &mission.briefing
+        );
+        assert!(
+            mission.briefing.contains("5,000 inhabitants"),
+            "briefing should mention the 5 000 inhabitants goal"
+        );
         // Primary pop threshold is the first u32 of the goals
         // region; for Plague this is 0x1388 = 5000.
         let pop = u32::from_le_bytes([
-            mission.goals_raw[0], mission.goals_raw[1],
-            mission.goals_raw[2], mission.goals_raw[3],
+            mission.goals_raw[0],
+            mission.goals_raw[1],
+            mission.goals_raw[2],
+            mission.goals_raw[3],
         ]);
         assert_eq!(pop, 5000, "goals_raw[0..4] should encode 5 000 pop");
     }

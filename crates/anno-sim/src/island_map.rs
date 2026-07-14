@@ -43,8 +43,8 @@ const WALKABLE_KINDS: &[&str] = &[
     "FLUSS",      // River
     "MAUER",      // Wall sections can be walked on
     "MAUERSTRAND",
-    "PLATZ",      // Plaza/square
-    "TOR",        // Gate
+    "PLATZ", // Plaza/square
+    "TOR",   // Gate
 ];
 
 impl IslandMap {
@@ -71,10 +71,12 @@ impl IslandMap {
 
             let idx = y as usize * width as usize + x as usize;
 
-            // Look up building definition
-            let building_id = tile.building_id as usize;
-            if building_id < cod_buildings.len() {
-                let def = &cod_buildings[building_id];
+            // The INSELHAUS loader adds 0x4e20 to this u16 and resolves the
+            // resulting haeuser.cod source ID, rather than a Gfx sprite.
+            if let Some(def) = cod_buildings
+                .iter()
+                .find(|def| def.source_id == tile.source_id())
+            {
                 let kind = def.kind.as_str();
 
                 if is_walkable_kind(kind) {
@@ -88,10 +90,6 @@ impl IslandMap {
                     warehouse_tiles.insert((tile.x, tile.y));
                 }
                 // Everything else (buildings, resources) stays blocked
-            } else {
-                // Unknown building_id — assume terrain is walkable if it has a tile record
-                // (islands only have records for land tiles, not water)
-                walkable[idx] = true;
             }
         }
 
@@ -110,7 +108,8 @@ impl IslandMap {
     /// but on the simulation-side map so callers don't need to
     /// keep the original `Island` around.
     pub fn active_fertilities(&self) -> Vec<anno_formats::szs::Fertility> {
-        self.fertilities.iter()
+        self.fertilities
+            .iter()
             .filter_map(|&b| anno_formats::szs::Fertility::from_byte(b))
             .collect()
     }
@@ -146,13 +145,13 @@ impl IslandMap {
     /// 4-neighbours is out of bounds — i.e. it sits on the perimeter of
     /// the island's walkable region. Fisheries can only go on coastal tiles.
     pub fn is_coastal(&self, x: i32, y: i32) -> bool {
-        if !self.is_walkable(x, y) { return false; }
+        if !self.is_walkable(x, y) {
+            return false;
+        }
         for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
             let nx = x + dx;
             let ny = y + dy;
-            if nx < 0 || ny < 0
-                || nx >= self.width as i32 || ny >= self.height as i32
-            {
+            if nx < 0 || ny < 0 || nx >= self.width as i32 || ny >= self.height as i32 {
                 return true;
             }
         }
@@ -161,9 +160,15 @@ impl IslandMap {
 
     /// True iff the entire `w × h` footprint anchored at `(x, y)` is walkable.
     pub fn can_fit(&self, x: i32, y: i32, w: u16, h: u16) -> bool {
-        if x < 0 || y < 0 { return false; }
-        if (x as u32) + w as u32 > self.width as u32 { return false; }
-        if (y as u32) + h as u32 > self.height as u32 { return false; }
+        if x < 0 || y < 0 {
+            return false;
+        }
+        if (x as u32) + w as u32 > self.width as u32 {
+            return false;
+        }
+        if (y as u32) + h as u32 > self.height as u32 {
+            return false;
+        }
         for dy in 0..h as i32 {
             for dx in 0..w as i32 {
                 if !self.is_walkable(x + dx, y + dy) {
@@ -177,13 +182,20 @@ impl IslandMap {
     /// Spiral search around `(cx, cy)` (warehouse, typically) for the first
     /// position where `w × h` fits. Returns top-left tile or None.
     pub fn find_open_spot(
-        &self, cx: u16, cy: u16, w: u16, h: u16, max_radius: u16,
+        &self,
+        cx: u16,
+        cy: u16,
+        w: u16,
+        h: u16,
+        max_radius: u16,
     ) -> Option<(u16, u16)> {
         for r in 0..=max_radius as i32 {
             for dy in -r..=r {
                 for dx in -r..=r {
                     // Only the ring at the current radius (skip interior).
-                    if dx.abs() != r && dy.abs() != r { continue; }
+                    if dx.abs() != r && dy.abs() != r {
+                        continue;
+                    }
                     let x = cx as i32 + dx;
                     let y = cy as i32 + dy;
                     if self.can_fit(x, y, w, h) {
@@ -200,20 +212,26 @@ impl IslandMap {
     /// `anchor` is normally the warehouse tile that will service the new
     /// building. Use this when placement requires a carrier route home.
     pub fn find_reachable_spot(
-        &self, cx: u16, cy: u16, w: u16, h: u16, max_radius: u16,
+        &self,
+        cx: u16,
+        cy: u16,
+        w: u16,
+        h: u16,
+        max_radius: u16,
         anchor: (u16, u16),
     ) -> Option<(u16, u16)> {
         for r in 0..=max_radius as i32 {
             for dy in -r..=r {
                 for dx in -r..=r {
-                    if dx.abs() != r && dy.abs() != r { continue; }
+                    if dx.abs() != r && dy.abs() != r {
+                        continue;
+                    }
                     let x = cx as i32 + dx;
                     let y = cy as i32 + dy;
-                    if !self.can_fit(x, y, w, h) { continue; }
-                    if self.reachable(
-                        (anchor.0 as i32, anchor.1 as i32),
-                        (x, y),
-                    ) {
+                    if !self.can_fit(x, y, w, h) {
+                        continue;
+                    }
+                    if self.reachable((anchor.0 as i32, anchor.1 as i32), (x, y)) {
                         return Some((x as u16, y as u16));
                     }
                 }
@@ -228,30 +246,48 @@ impl IslandMap {
     /// itself isn't walkable (e.g. it's a warehouse anchor whose footprint
     /// is non-walkable), falls back to the nearest walkable 4-neighbour.
     pub fn reachable(&self, start: (i32, i32), goal: (i32, i32)) -> bool {
-        if start == goal { return true; }
+        if start == goal {
+            return true;
+        }
         let start = if self.is_walkable(start.0, start.1) {
             start
         } else {
             let mut alt = None;
             for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                 let n = (start.0 + dx, start.1 + dy);
-                if self.is_walkable(n.0, n.1) { alt = Some(n); break; }
+                if self.is_walkable(n.0, n.1) {
+                    alt = Some(n);
+                    break;
+                }
             }
-            match alt { Some(p) => p, None => return false }
+            match alt {
+                Some(p) => p,
+                None => return false,
+            }
         };
-        if !self.is_walkable(goal.0, goal.1) { return false; }
+        if !self.is_walkable(goal.0, goal.1) {
+            return false;
+        }
         const NODE_BUDGET: usize = 4_096;
         let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         visited.insert(start);
         queue.push_back(start);
         while let Some((x, y)) = queue.pop_front() {
-            if visited.len() > NODE_BUDGET { return false; }
+            if visited.len() > NODE_BUDGET {
+                return false;
+            }
             for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
                 let n = (x + dx, y + dy);
-                if !self.is_walkable(n.0, n.1) { continue; }
-                if !visited.insert(n) { continue; }
-                if n == goal { return true; }
+                if !self.is_walkable(n.0, n.1) {
+                    continue;
+                }
+                if !visited.insert(n) {
+                    continue;
+                }
+                if n == goal {
+                    return true;
+                }
                 queue.push_back(n);
             }
         }
@@ -286,6 +322,79 @@ fn is_walkable_kind(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anno_formats::szs::IslandTile;
+
+    #[test]
+    fn from_island_resolves_tile_id_as_cod_source_id() {
+        let island = Island {
+            number: 3,
+            width: 2,
+            height: 1,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles: vec![
+                IslandTile {
+                    building_id: 77,
+                    x: 0,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                },
+                IslandTile {
+                    building_id: 88,
+                    x: 1,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                },
+            ],
+            city: None,
+        };
+        let road = CodBuilding {
+            source_id: 20_077,
+            kind: "STRASSE".to_owned(),
+            ..Default::default()
+        };
+        let blocker = CodBuilding {
+            source_id: 20_088,
+            kind: "HANDWERK".to_owned(),
+            ..Default::default()
+        };
+
+        let map = IslandMap::from_island(&island, &[road, blocker]);
+
+        assert!(map.is_walkable(0, 0));
+        assert!(map.is_road(0, 0));
+        assert!(!map.is_walkable(1, 0));
+    }
+
+    #[test]
+    fn from_island_leaves_unresolved_source_id_blocked() {
+        let island = Island {
+            number: 3,
+            width: 1,
+            height: 1,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles: vec![IslandTile {
+                building_id: 77,
+                x: 0,
+                y: 0,
+                orientation: 0,
+                anim_count: 0,
+                flags: 0,
+            }],
+            city: None,
+        };
+
+        let map = IslandMap::from_island(&island, &[]);
+
+        assert!(!map.is_walkable(0, 0));
+    }
 
     #[test]
     fn open_map_all_walkable() {
@@ -311,7 +420,7 @@ mod tests {
         assert!(!map.can_fit(8, 8, 3, 3)); // would overflow
         map.set_walkable(2, 2, false);
         assert!(!map.can_fit(0, 0, 3, 3)); // blocker hits the footprint
-        assert!(map.can_fit(3, 3, 3, 3));  // clear away from blocker
+        assert!(map.can_fit(3, 3, 3, 3)); // clear away from blocker
     }
 
     #[test]
@@ -346,7 +455,9 @@ mod tests {
     fn find_reachable_spot_avoids_isolated_island() {
         let mut map = IslandMap::new_open(0, 10, 10);
         // Cut off the right half so reachable spots only exist on the left.
-        for y in 0..10u16 { map.set_walkable(5, y, false); }
+        for y in 0..10u16 {
+            map.set_walkable(5, y, false);
+        }
         // Anchor at (1,1). Tile (8,8) is walkable but unreachable; the
         // reachable variant should pick a left-side spot instead.
         let spot = map.find_reachable_spot(8, 8, 1, 1, 9, (1, 1)).unwrap();
@@ -366,8 +477,10 @@ mod tests {
         // Picked footprint must be walkable.
         assert!(map.can_fit(pos.0 as i32, pos.1 as i32, 2, 2));
         // And must lie outside the blocked block.
-        let in_blocked = (pos.0 as i32) >= 3 && (pos.0 as i32) <= 6
-            && (pos.1 as i32) >= 3 && (pos.1 as i32) <= 6;
+        let in_blocked = (pos.0 as i32) >= 3
+            && (pos.0 as i32) <= 6
+            && (pos.1 as i32) >= 3
+            && (pos.1 as i32) <= 6;
         assert!(!in_blocked, "got {:?} which overlaps the 2x2 wall", pos);
     }
 }

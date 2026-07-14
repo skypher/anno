@@ -1,12 +1,38 @@
-//! Entity/figure action state machine.
+//! Local figure data used by carriers and civilians.
 //!
-//! Ported from FUN_00451890 (figure/unit movement and action system).
-//! Manages up to 2550 figures with 18+ action types.
+//! `SourceFigureRecordLayout` records the executable layout consumed by
+//! `FUN_00451890`; local `Figure` fields are not a byte-for-byte mirror.
 
 /// Maximum number of active figures.
 pub const MAX_FIGURES: usize = 2550;
 
-/// Figure action types (the 16-case switch from FUN_00451890).
+/// Layout of the executable's figure pool, read from
+/// `FUN_00451890` in `decompiled/1602_exe.c`.
+///
+/// The dispatcher iterates `0x9f6` records beginning at `DAT_004a2628`
+/// with a `0x48`-byte stride. It consumes the accumulator, velocity, and
+/// position fields before dispatching the record's state handler.
+pub struct SourceFigureRecordLayout;
+
+impl SourceFigureRecordLayout {
+    pub const CAPACITY: usize = 0x9f6;
+    pub const STRIDE_BYTES: usize = 0x48;
+    pub const KIND_OFFSET: usize = 0x00;
+    pub const DEFINITION_ID_OFFSET: usize = 0x04;
+    pub const STATE_OFFSET: usize = 0x0e;
+    pub const FLAGS_OFFSET: usize = 0x11;
+    pub const ACCUMULATOR_OFFSET: usize = 0x14;
+    pub const RATE_OFFSET: usize = 0x18;
+    pub const VELOCITY_X_OFFSET: usize = 0x1c;
+    pub const VELOCITY_Y_OFFSET: usize = 0x20;
+    pub const VELOCITY_Z_OFFSET: usize = 0x24;
+    pub const POSITION_X_OFFSET: usize = 0x28;
+    pub const POSITION_Y_OFFSET: usize = 0x2c;
+    pub const POSITION_Z_OFFSET: usize = 0x30;
+}
+
+/// Local simulation action tags. They are not the source record's state
+/// byte, which is represented by `SourceFigureRecordLayout::STATE_OFFSET`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum ActionType {
@@ -108,5 +134,17 @@ impl Figure {
 
     pub fn is_active(&self) -> bool {
         self.action != ActionType::None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceFigureRecordLayout as Layout;
+
+    #[test]
+    fn source_figure_record_layout_fits_dispatcher_stride() {
+        assert_eq!(Layout::CAPACITY, 2550);
+        assert_eq!(Layout::STRIDE_BYTES, 72);
+        assert!(Layout::POSITION_Z_OFFSET + std::mem::size_of::<f32>() <= Layout::STRIDE_BYTES);
     }
 }
