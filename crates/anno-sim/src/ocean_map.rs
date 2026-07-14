@@ -7,9 +7,17 @@
 //!
 //! The map is built once from scenario data and cached.
 
-use crate::source_route::{source_direction_delta, SourcePathGrid};
+use crate::source_route::{
+    source_direction_delta, SourcePathGrid, SourcePathSearchError, SourcePathTargetRect,
+    SourceResolvedStaticTarget, SourceShipRouteWindow, SourceShipTargetRouteBranch,
+    SourceTargetDescriptor,
+};
 use anno_formats::cod::BuildingDef as CodBuilding;
 use anno_formats::szs::SzsFile;
+
+/// World dimensions installed by `FUN_004860c0(500, 350)`.
+pub const SOURCE_WORLD_WIDTH: u16 = 500;
+pub const SOURCE_WORLD_HEIGHT: u16 = 350;
 
 /// World ocean navigability map.
 #[derive(Debug, Clone)]
@@ -22,6 +30,10 @@ pub struct OceanMap {
     /// present, ship routing uses the source fixed-cost expansion rather than
     /// the legacy A* implementation below.
     source_ship_route_grid: Option<SourcePathGrid>,
+    /// `FUN_0046eb20` acceptance for a source partial-route marker. A cell
+    /// with no resolved island is accepted; a resolved source cell is accepted
+    /// only when its kind code is `0x13`.
+    source_partial_marker_allowed: Option<Vec<bool>>,
 }
 
 impl OceanMap {
@@ -71,17 +83,42 @@ impl OceanMap {
             height,
             grid,
             source_ship_route_grid: None,
+            source_partial_marker_allowed: None,
         }
     }
 
     /// Build a ship navigation map from the source static-map cells and the
     /// `FUN_0046f6d0` direction-marker overlay.
     pub fn from_source_scenario(szs: &SzsFile, definitions: &[CodBuilding]) -> Self {
-        let mut map = Self::from_scenario(szs);
+        let mut map = Self {
+            width: SOURCE_WORLD_WIDTH,
+            height: SOURCE_WORLD_HEIGHT,
+            grid: vec![true; SOURCE_WORLD_WIDTH as usize * SOURCE_WORLD_HEIGHT as usize],
+            source_ship_route_grid: None,
+            source_partial_marker_allowed: Some(vec![
+                true;
+                SOURCE_WORLD_WIDTH as usize
+                    * SOURCE_WORLD_HEIGHT as usize
+            ]),
+        };
         let mut source_grid = SourcePathGrid::new((0, 0), map.width as usize, map.height as usize);
 
         for island in &szs.islands {
             source_grid.overlay_source_ship_route_blockers(island, definitions);
+            for tile in &island.tiles {
+                let x = i32::from(island.x_pos) + i32::from(tile.x);
+                let y = i32::from(island.y_pos) + i32::from(tile.y);
+                let Some(index) = map.index(x, y) else {
+                    continue;
+                };
+                let source_kind = definitions
+                    .iter()
+                    .find(|definition| definition.source_id == tile.source_id())
+                    .and_then(CodBuilding::source_kind_code);
+                map.source_partial_marker_allowed
+                    .as_mut()
+                    .expect("source marker map is initialized")[index] = source_kind == Some(0x13);
+            }
         }
 
         for y in 0..i32::from(map.height) {
@@ -108,7 +145,7 @@ impl OceanMap {
         goal: (i32, i32),
     ) -> Option<Vec<(i32, i32)>> {
         let grid = self.source_ship_route_grid.clone()?;
-        Self::source_path_from_grid(grid, start, goal)
+        self.source_path_from_grid(grid, start, goal, 0)
     }
 
     /// Run the source ship search in the centered `2r + 1` window used by
@@ -120,19 +157,172 @@ impl OceanMap {
         goal: (i32, i32),
         radius: usize,
     ) -> Option<Vec<(i32, i32)>> {
+        self.find_source_ship_path_in_radius_with_approach_radius(start, goal, radius, 0)
+    }
+
+    /// Run the direct `FUN_00455a20` route branch with the source figure's
+    /// `Shotradius >> 3` target-approach ray radius.
+    pub fn find_source_ship_path_in_radius_with_approach_radius(
+        &self,
+        start: (i32, i32),
+        goal: (i32, i32),
+        radius: usize,
+        approach_radius: i32,
+    ) -> Option<Vec<(i32, i32)>> {
         let grid = self
             .source_ship_route_grid
             .as_ref()?
             .source_window(start, radius)?;
-        Self::source_path_from_grid(grid, start, goal)
+        self.source_path_from_grid(grid, start, goal, approach_radius)
+    }
+
+    /// Run the source ship search with a caller-selected persisted route
+    /// window. This is the route-record value supplied to `FUN_00455a20` or
+    /// `FUN_00456920`, not a fallback chosen after a search failure.
+    pub fn find_source_ship_path_in_window(
+        &self,
+        start: (i32, i32),
+        goal: (i32, i32),
+        window: SourceShipRouteWindow,
+    ) -> Option<Vec<(i32, i32)>> {
+        self.find_source_ship_path_in_window_with_approach_radius(start, goal, window, 0)
+    }
+
+    /// As [`Self::find_source_ship_path_in_window`], with the direct source
+    /// target approach radius selected from the ship's figure definition.
+    pub fn find_source_ship_path_in_window_with_approach_radius(
+        &self,
+        start: (i32, i32),
+        goal: (i32, i32),
+        window: SourceShipRouteWindow,
+        approach_radius: i32,
+    ) -> Option<Vec<(i32, i32)>> {
+        self.find_source_ship_path_in_radius_with_approach_radius(
+            start,
+            goal,
+            window.radius(),
+            approach_radius,
+        )
+    }
+
+    /// Route a live kind-`0x37` source target descriptor through the
+    /// threshold branch selected by `FUN_00455a20`. Coordinate descriptors
+    /// use `FUN_0046e350` radius five and `LAB_0046c750` limit zero.
+    pub fn find_source_ship_path_in_window_for_target_descriptor(
+        &self,
+        start: (i32, i32),
+        target: SourceTargetDescriptor,
+        window: SourceShipRouteWindow,
+    ) -> Option<Vec<(i32, i32)>> {
+        let target_rect = target.target_rect()?;
+        let (approach_radius, limit) = target.threshold_route_parameters()?;
+        let grid = self
+            .source_ship_route_grid
+            .as_ref()?
+            .source_window(start, window.radius())?;
+        self.source_threshold_path_from_grid(grid, start, target_rect, approach_radius, limit)
+    }
+
+    /// Route any target rectangle already resolved from a source descriptor.
+    /// The caller supplies the exact `FUN_00455a20` branch after looking up
+    /// the target's live source owner and relation byte.
+    pub fn find_source_ship_path_in_window_for_resolved_target(
+        &self,
+        start: (i32, i32),
+        target: SourcePathTargetRect,
+        branch: SourceShipTargetRouteBranch,
+        window: SourceShipRouteWindow,
+    ) -> Option<Vec<(i32, i32)>> {
+        let grid = self
+            .source_ship_route_grid
+            .as_ref()?
+            .source_window(start, window.radius())?;
+        match branch {
+            SourceShipTargetRouteBranch::Direct { approach_radius } => {
+                self.source_direct_path_from_grid(grid, start, target, approach_radius)
+            }
+            SourceShipTargetRouteBranch::Threshold {
+                approach_radius,
+                limit,
+            } => self.source_threshold_path_from_grid(grid, start, target, approach_radius, limit),
+        }
+    }
+
+    /// Route a static target already resolved from a kind-`0x32` or `0x33`
+    /// descriptor. The static wrapper preserves the previous descriptor-level
+    /// API while dynamic `0x35`/`0x36` callers use the common rectangle path.
+    pub fn find_source_ship_path_in_window_for_resolved_static_target(
+        &self,
+        start: (i32, i32),
+        target: SourceResolvedStaticTarget,
+        branch: SourceShipTargetRouteBranch,
+        window: SourceShipRouteWindow,
+    ) -> Option<Vec<(i32, i32)>> {
+        self.find_source_ship_path_in_window_for_resolved_target(
+            start,
+            target.target,
+            branch,
+            window,
+        )
     }
 
     fn source_path_from_grid(
-        mut grid: SourcePathGrid,
+        &self,
+        grid: SourcePathGrid,
         start: (i32, i32),
         goal: (i32, i32),
+        approach_radius: i32,
     ) -> Option<Vec<(i32, i32)>> {
-        let steps = grid.route_to(start, goal).ok()?;
+        let target = SourcePathTargetRect::new(goal, 1, 1)?;
+        self.source_direct_path_from_grid(grid, start, target, approach_radius)
+    }
+
+    fn source_direct_path_from_grid(
+        &self,
+        mut grid: SourcePathGrid,
+        start: (i32, i32),
+        target: SourcePathTargetRect,
+        approach_radius: i32,
+    ) -> Option<Vec<(i32, i32)>> {
+        let result = grid.route_to_direct_target(start, target, approach_radius);
+        self.source_steps_to_path(grid, start, target, result)
+    }
+
+    fn source_threshold_path_from_grid(
+        &self,
+        mut grid: SourcePathGrid,
+        start: (i32, i32),
+        target: SourcePathTargetRect,
+        approach_radius: i32,
+        limit: u32,
+    ) -> Option<Vec<(i32, i32)>> {
+        let result = grid
+            .search_threshold_target(start, target, approach_radius, limit)
+            .map(|result| result.steps);
+        self.source_steps_to_path(grid, start, target, result)
+    }
+
+    fn source_steps_to_path(
+        &self,
+        grid: SourcePathGrid,
+        start: (i32, i32),
+        target: SourcePathTargetRect,
+        result: Result<Vec<crate::source_route::SourceRouteStep>, SourcePathSearchError>,
+    ) -> Option<Vec<(i32, i32)>> {
+        let steps = match result {
+            Ok(steps) => steps,
+            Err(SourcePathSearchError::NoRoute) => {
+                let marker = grid.nearest_reached_marker(
+                    target.nearest_point(start),
+                    i32::from(SOURCE_WORLD_WIDTH),
+                )?;
+                if !self.source_partial_marker_allowed(marker) {
+                    return None;
+                }
+                grid.steps_to_reached_marker(start, marker)?
+            }
+            Err(SourcePathSearchError::OutOfBounds) => return None,
+        };
         let mut position = start;
         let mut path = Vec::with_capacity(steps.len());
         for step in steps {
@@ -141,6 +331,20 @@ impl OceanMap {
             path.push(position);
         }
         Some(path)
+    }
+
+    fn source_partial_marker_allowed(&self, position: (i32, i32)) -> bool {
+        self.source_partial_marker_allowed
+            .as_ref()
+            .zip(self.index(position.0, position.1))
+            .is_some_and(|(allowed, index)| allowed[index])
+    }
+
+    fn index(&self, x: i32, y: i32) -> Option<usize> {
+        if x < 0 || y < 0 || x >= i32::from(self.width) || y >= i32::from(self.height) {
+            return None;
+        }
+        Some(y as usize * self.width as usize + x as usize)
     }
 
     /// Check if a world tile is navigable (ocean).
@@ -366,6 +570,7 @@ mod tests {
             height: 20,
             grid,
             source_ship_route_grid: None,
+            source_partial_marker_allowed: None,
         }
     }
 
@@ -508,11 +713,137 @@ mod tests {
         let path = ocean.find_source_ship_path((0, 1), (2, 1)).unwrap();
         assert_eq!(path.last(), Some(&(2, 1)));
         assert!(!path.contains(&(1, 1)));
-        assert!(ocean
+        let partial_path = ocean
             .find_source_ship_path_in_radius((0, 1), (2, 1), 1)
-            .is_none());
+            .unwrap();
+        assert_eq!(partial_path.last(), Some(&(1, 0)));
         assert!(ocean
             .find_source_ship_path_in_radius((0, 1), (2, 1), 2)
             .is_some());
+    }
+
+    #[test]
+    fn resolved_static_target_uses_selected_source_route_branch() {
+        let scenario = SzsFile {
+            chunks: Vec::new(),
+            islands: Vec::new(),
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let ocean = OceanMap::from_source_scenario(&scenario, &[]);
+        let target = SourceResolvedStaticTarget {
+            target: SourcePathTargetRect::new((5, 1), 1, 1).unwrap(),
+            owner: 4,
+        };
+
+        let direct = ocean
+            .find_source_ship_path_in_window_for_resolved_static_target(
+                (0, 1),
+                target,
+                SourceShipTargetRouteBranch::Direct { approach_radius: 0 },
+                SourceShipRouteWindow::Normal,
+            )
+            .unwrap();
+        assert_eq!(direct.last(), Some(&(5, 1)));
+
+        let threshold = ocean
+            .find_source_ship_path_in_window_for_resolved_static_target(
+                (0, 1),
+                target,
+                SourceShipTargetRouteBranch::Threshold {
+                    approach_radius: 5,
+                    limit: 2,
+                },
+                SourceShipRouteWindow::Normal,
+            )
+            .unwrap();
+        assert_eq!(threshold.last(), Some(&(3, 1)));
+    }
+
+    #[test]
+    fn resolved_dynamic_target_uses_the_common_source_descriptor_route() {
+        let scenario = SzsFile {
+            chunks: Vec::new(),
+            islands: Vec::new(),
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let ocean = OceanMap::from_source_scenario(&scenario, &[]);
+        let target = crate::source_route::SourceResolvedDynamicTarget {
+            target: SourcePathTargetRect::new((5, 1), 1, 1).unwrap(),
+            owner: 4,
+        };
+
+        let path = ocean
+            .find_source_ship_path_in_window_for_resolved_target(
+                (0, 1),
+                target.target,
+                SourceShipTargetRouteBranch::Threshold {
+                    approach_radius: 5,
+                    limit: 2,
+                },
+                SourceShipRouteWindow::Normal,
+            )
+            .unwrap();
+        assert_eq!(path.last(), Some(&(3, 1)));
+    }
+
+    #[test]
+    fn source_partial_marker_predicate_matches_fun_0046eb20() {
+        let scenario = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![anno_formats::szs::Island {
+                number: 0,
+                width: 2,
+                height: 1,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: vec![
+                    anno_formats::szs::IslandTile {
+                        building_id: 0,
+                        x: 0,
+                        y: 0,
+                        orientation: 0,
+                        anim_count: 0,
+                        flags: 0,
+                    },
+                    anno_formats::szs::IslandTile {
+                        building_id: 1,
+                        x: 1,
+                        y: 0,
+                        orientation: 0,
+                        anim_count: 0,
+                        flags: 0,
+                    },
+                ],
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let definitions = [
+            CodBuilding {
+                source_id: 0x4e20,
+                kind: "BODEN".to_string(),
+                ..Default::default()
+            },
+            CodBuilding {
+                source_id: 0x4e21,
+                kind: "MEER".to_string(),
+                ..Default::default()
+            },
+        ];
+        let ocean = OceanMap::from_source_scenario(&scenario, &definitions);
+
+        assert!(!ocean.source_partial_marker_allowed((0, 0)));
+        assert!(ocean.source_partial_marker_allowed((1, 0)));
+        assert!(ocean.source_partial_marker_allowed((2, 0)));
     }
 }

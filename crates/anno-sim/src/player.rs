@@ -190,8 +190,10 @@ mod tests {
         let aristo = mk(4);
         assert!(citizen > 0);
         // Aristocrat should out-earn Pioneer by ≥4× per 100 pop.
-        assert!(aristo >= pioneer * 4,
-            "Aristocrat income {aristo} should be ≥4× Pioneer {pioneer}");
+        assert!(
+            aristo >= pioneer * 4,
+            "Aristocrat income {aristo} should be ≥4× Pioneer {pioneer}"
+        );
         // Citizen ≈ legacy baseline (100 pop × full settings).
         // The TAX_TIER_MULTIPLIER_16 for Citizen is 16, so
         // the /16 division cancels and we recover the legacy

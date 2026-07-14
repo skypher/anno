@@ -24,7 +24,12 @@ pub const TIER_DEMANDS: &[&[Good]] = &[
     // Settler
     &[Good::Food, Good::Cloth],
     // Citizen
-    &[Good::Food, Good::Cloth, Good::Alcohol, Good::TobaccoProducts],
+    &[
+        Good::Food,
+        Good::Cloth,
+        Good::Alcohol,
+        Good::TobaccoProducts,
+    ],
     // Merchant
     &[
         Good::Food,
@@ -105,11 +110,7 @@ pub const DEMAND_GOODS: [Good; NUM_DEMAND_CATEGORIES] = [
 /// 2. Consume goods from warehouses
 /// 3. Update demand/supply ratios
 /// 4. Adjust satisfaction based on fulfillment
-pub fn update_population_demands(
-    player: &mut Player,
-    warehouses: &mut [Warehouse],
-    player_id: u8,
-) {
+pub fn update_population_demands(player: &mut Player, warehouses: &mut [Warehouse], player_id: u8) {
     // Reset demands
     for slot in &mut player.demands {
         slot.demand = 0;
@@ -230,7 +231,9 @@ fn demand_slot_for_good(good: Good) -> Option<usize> {
 ///   sat = 0   (none)   → -5.0% per tick
 /// Each step bounds the absolute change at most 50 people per tier.
 fn growth_delta(pop: u32, sat: u8) -> i32 {
-    if pop == 0 { return 0; }
+    if pop == 0 {
+        return 0;
+    }
     let s = sat as i32;
     // (s - 64) / 16 percent  →  per-mille = (s - 64) * 1000 / 1600
     let permille = (s - 64) * 50 / 64;
@@ -273,7 +276,8 @@ pub fn update_population_growth(player: &mut Player, housing_cap: u32) {
         }
         let cur_demands: &[Good] = TIER_DEMANDS[tier];
         let next_demands: &[Good] = TIER_DEMANDS[tier + 1];
-        let extra_goods: Vec<Good> = next_demands.iter()
+        let extra_goods: Vec<Good> = next_demands
+            .iter()
             .copied()
             .filter(|g| !cur_demands.contains(g))
             .collect();
@@ -309,8 +313,7 @@ pub fn update_population_growth(player: &mut Player, housing_cap: u32) {
     let total: u32 = new_pop.iter().sum();
     if housing_cap > 0 && total > housing_cap {
         for tier in 0..NUM_POP_TIERS {
-            new_pop[tier] = ((new_pop[tier] as u64 * housing_cap as u64)
-                / total as u64) as u32;
+            new_pop[tier] = ((new_pop[tier] as u64 * housing_cap as u64) / total as u64) as u32;
         }
     }
 
@@ -351,8 +354,10 @@ mod tests {
         update_population_growth(&mut p, 0);
         // Pioneers' next-tier extra demand is Cloth. Without Cloth
         // supply the gate stops promotion entirely.
-        assert_eq!(p.population[1], 0,
-            "promotion should be blocked without next-tier supply");
+        assert_eq!(
+            p.population[1], 0,
+            "promotion should be blocked without next-tier supply"
+        );
         let total_after = p.population.iter().sum::<u32>();
         assert!(total_after >= before_pioneer);
 
@@ -376,7 +381,9 @@ mod tests {
     fn housing_cap_clamps_total() {
         let mut p = Player::new_human(0);
         p.population = [200, 200, 200, 0, 0]; // total 600
-        for s in &mut p.satisfaction { *s = 64; } // par; no growth/decay
+        for s in &mut p.satisfaction {
+            *s = 64;
+        } // par; no growth/decay
         update_population_growth(&mut p, 300);
         let total: u32 = p.population.iter().sum();
         assert!(total <= 300, "got {total}");

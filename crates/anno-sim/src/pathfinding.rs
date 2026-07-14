@@ -7,8 +7,8 @@
 //! on roads, loaded carriers are slower on roads.
 
 use crate::island_map::IslandMap;
-use std::collections::BinaryHeap;
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 /// Empty-carrier speed on plain ground from the common haeuser.cod
 /// `Wegspeed` quad `145, 120, 170, 100`.
@@ -56,7 +56,9 @@ struct Node {
 impl Ord for Node {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap
-        other.f_cost.cmp(&self.f_cost)
+        other
+            .f_cost
+            .cmp(&self.f_cost)
             .then_with(|| other.g_cost.cmp(&self.g_cost))
     }
 }
@@ -70,11 +72,7 @@ impl PartialOrd for Node {
 /// Find a path from start to goal on the island map.
 /// Returns a list of tile positions (excluding start, including goal),
 /// or None if no path exists.
-pub fn find_path(
-    map: &IslandMap,
-    start: (i32, i32),
-    goal: (i32, i32),
-) -> Option<Vec<(i32, i32)>> {
+pub fn find_path(map: &IslandMap, start: (i32, i32), goal: (i32, i32)) -> Option<Vec<(i32, i32)>> {
     find_path_for_carrier(map, start, goal, CarrierLoad::Empty)
 }
 
@@ -311,7 +309,12 @@ mod tests {
         assert_eq!(*path.last().unwrap(), (7, 4));
         // Verify no step goes through the wall
         for &(x, y) in &path {
-            assert!(map.is_walkable(x, y), "Path goes through blocked tile ({}, {})", x, y);
+            assert!(
+                map.is_walkable(x, y),
+                "Path goes through blocked tile ({}, {})",
+                x,
+                y
+            );
         }
     }
 
@@ -346,8 +349,7 @@ mod tests {
         assert_eq!(carrier_speed(true, CarrierLoad::Empty), 170);
         assert_eq!(carrier_speed(true, CarrierLoad::Loaded), 100);
         assert!(
-            orthogonal_cost(true, CarrierLoad::Empty)
-                < orthogonal_cost(false, CarrierLoad::Empty)
+            orthogonal_cost(true, CarrierLoad::Empty) < orthogonal_cost(false, CarrierLoad::Empty)
         );
         assert!(
             orthogonal_cost(true, CarrierLoad::Loaded)
@@ -361,16 +363,14 @@ mod tests {
         for x in 1..=8 {
             short_road.set_road(x, 0, true);
         }
-        let path =
-            find_path_for_carrier(&short_road, (0, 1), (9, 1), CarrierLoad::Empty).unwrap();
+        let path = find_path_for_carrier(&short_road, (0, 1), (9, 1), CarrierLoad::Empty).unwrap();
         assert!(path.iter().any(|&(_, y)| y == 0));
 
         let mut long_detour = IslandMap::new_open(0, 10, 10);
         for x in 0..10 {
             long_detour.set_road(x, 5, true);
         }
-        let path =
-            find_path_for_carrier(&long_detour, (0, 0), (9, 0), CarrierLoad::Empty).unwrap();
+        let path = find_path_for_carrier(&long_detour, (0, 0), (9, 0), CarrierLoad::Empty).unwrap();
         assert!(path.iter().all(|&(_, y)| y == 0));
     }
 

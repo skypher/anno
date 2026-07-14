@@ -122,12 +122,7 @@ pub fn try_spawn_carrier(
         .iter()
         .find(|m| m.island_id == building.island_id)
     {
-        pathfinding::find_path_for_carrier(
-            map,
-            start,
-            goal,
-            pathfinding::CarrierLoad::Loaded,
-        )?
+        pathfinding::find_path_for_carrier(map, start, goal, pathfinding::CarrierLoad::Loaded)?
     } else {
         direct_path(start, goal)
     };
@@ -210,24 +205,29 @@ fn direction_from_delta(dx: i32, dy: i32) -> u8 {
 }
 
 /// Process a carrier that has arrived at its destination.
-/// Returns true if the carrier should be despawned.
+/// Returns `(should_despawn, delivered_amount)`.
 pub fn handle_arrival(
     figure: &mut Figure,
     warehouses: &mut [Warehouse],
     buildings: &[BuildingInstance],
     island_maps: &[IslandMap],
-) -> bool {
+) -> (bool, u16) {
     match figure.action {
         ActionType::CarryingGoods => {
+            let source_island = buildings
+                .get(figure.building_idx as usize)
+                .map(|building| building.island_id);
+            let mut delivered = 0;
             // Find the warehouse at the target location
-            if let Some(wh) = warehouses
-                .iter_mut()
-                .find(|w| w.tile_x == figure.target_x as u16 && w.tile_y == figure.target_y as u16)
-            {
+            if let Some(wh) = warehouses.iter_mut().find(|w| {
+                Some(w.island_id) == source_island
+                    && w.tile_x == figure.target_x as u16
+                    && w.tile_y == figure.target_y as u16
+            }) {
                 // Deposit goods
                 let good = good_from_u8(figure.carried_good);
-                let deposited = wh.deposit(good, figure.carried_amount);
-                figure.carried_amount -= deposited;
+                delivered = wh.deposit(good, figure.carried_amount);
+                figure.carried_amount -= delivered;
             }
 
             // Return to source building
@@ -248,7 +248,7 @@ pub fn handle_arrival(
                         pathfinding::CarrierLoad::Empty,
                     ) {
                         Some(path) => path,
-                        None => return true,
+                        None => return (true, delivered),
                     }
                 } else {
                     direct_path(start, goal)
@@ -261,16 +261,16 @@ pub fn handle_arrival(
                 figure.carried_amount = 0;
                 figure.path = path;
                 figure.path_idx = 0;
-                false
+                (false, delivered)
             } else {
-                true // No building to return to
+                (true, delivered) // No building to return to
             }
         }
         ActionType::Returning => {
             // Back at source building — despawn
-            true
+            (true, 0)
         }
-        _ => true,
+        _ => (true, 0),
     }
 }
 
@@ -392,17 +392,15 @@ mod tests {
         b.output_stock = 40; // > capacity / 2
         let warehouses = vec![Warehouse::new(0, 0, 1, 1)];
         let cov = CoverageMap::new(0, 60, 60); // empty: nothing covered
-        assert!(
-            try_spawn_carrier(
-                &mut b,
-                &def,
-                &warehouses,
-                &[],
-                &[cov],
-                CarrierConfig::default()
-            )
-            .is_none()
-        );
+        assert!(try_spawn_carrier(
+            &mut b,
+            &def,
+            &warehouses,
+            &[],
+            &[cov],
+            CarrierConfig::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -470,12 +468,7 @@ mod tests {
             map.set_walkable(5, y, false);
         }
 
-        assert!(handle_arrival(
-            &mut figure,
-            &mut warehouses,
-            &buildings,
-            &[map],
-        ));
+        assert!(handle_arrival(&mut figure, &mut warehouses, &buildings, &[map],).0);
         assert_eq!(warehouses[0].stock(Good::Tools), 4);
     }
 
@@ -537,16 +530,14 @@ mod tests {
         let mut b = BuildingInstance::new(0, 0, 5, 5, 0);
         b.output_stock = 40;
         let warehouses = vec![Warehouse::new(0, 0, 1, 1)];
-        assert!(
-            try_spawn_carrier(
-                &mut b,
-                &def,
-                &warehouses,
-                &[],
-                &[],
-                CarrierConfig::default()
-            )
-            .is_some()
-        );
+        assert!(try_spawn_carrier(
+            &mut b,
+            &def,
+            &warehouses,
+            &[],
+            &[],
+            CarrierConfig::default()
+        )
+        .is_some());
     }
 }

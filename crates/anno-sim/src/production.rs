@@ -41,9 +41,7 @@ pub fn tick_building(building: &mut BuildingInstance, def: &BuildingDef, dt_ms: 
     // is 0, production stops permanently. RE: haeuser.cod
     // `Erzbergnr` + Tim Howgego's resources appendix (small 80t /
     // large 240t). u16::MAX = uncapped (non-mine buildings).
-    if def.ore_deposit != crate::building::OreDeposit::None
-        && building.remaining_ore == 0
-    {
+    if def.ore_deposit != crate::building::OreDeposit::None && building.remaining_ore == 0 {
         return 0;
     }
 
@@ -65,10 +63,7 @@ pub fn tick_building(building: &mut BuildingInstance, def: &BuildingDef, dt_ms: 
         // stays idle for 3× the no-input window, the field dries
         // up entirely — deactivate the building so it stops
         // ticking. Player has to bulldoze and replace.
-        if def.can_dry_up
-            && building.idle_ticks as u32
-                >= def.max_no_input_ticks as u32 * 3
-        {
+        if def.can_dry_up && building.idle_ticks as u32 >= def.max_no_input_ticks as u32 * 3 {
             building.active = false;
         }
         return 0;
@@ -149,15 +144,26 @@ mod tests {
 
     fn test_def() -> BuildingDef {
         BuildingDef {
-            id: 1, category: 0, width: 1, height: 1,
+            id: 1,
+            category: 0,
+            width: 1,
+            height: 1,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(), prod_kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            prod_kind: "HANDWERK".into(),
             radius: 0,
-            output_good: Good::Tools, input_good_1: Good::Iron,
+            output_good: Good::Tools,
+            input_good_1: Good::Iron,
             input_good_2: Good::None,
-            output_rate: 1, input_1_rate: 1, input_2_rate: 0,
-            storage_capacity: 50, cycle_time_ms: 1000,
-            cost_gold: 100, cost_tools: 0, cost_wood: 0, cost_bricks: 0,
+            output_rate: 1,
+            input_1_rate: 1,
+            input_2_rate: 0,
+            storage_capacity: 50,
+            cycle_time_ms: 1000,
+            cost_gold: 100,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
             min_tier: 0,
@@ -209,26 +215,33 @@ mod tests {
         // First tick should reject production AND decay total_work.
         let produced = tick_building(&mut b, &def, 2_000);
         assert_eq!(produced, 0);
-        assert!(b.total_work < 32,
-            "total_work should decay during fatigue, was {}", b.total_work);
+        assert!(
+            b.total_work < 32,
+            "total_work should decay during fatigue, was {}",
+            b.total_work
+        );
         // Ticking until repair completes brings total_work back to 0.
         for _ in 0..200 {
             tick_building(&mut b, &def, 2_000);
-            if b.total_work == 0 { break; }
+            if b.total_work == 0 {
+                break;
+            }
         }
         // After repair, production can resume — a single tick
         // should bump total_work from 0 to a non-zero value.
         tick_building(&mut b, &def, 2_000);
-        assert!(b.total_work > 0,
+        assert!(
+            b.total_work > 0,
             "production should resume post-repair, total_work={}",
-            b.total_work);
+            b.total_work
+        );
     }
 
     #[test]
     fn plantation_drought_deactivates_after_prolonged_idle() {
         let mut def = test_def();
         def.can_dry_up = true;
-        def.max_no_input_ticks = 4;       // dries up after 4*3=12 ticks
+        def.max_no_input_ticks = 4; // dries up after 4*3=12 ticks
         let mut b = BuildingInstance::new(1, 0, 0, 0, 0);
         // No input stock → efficiency below MIN, idle_ticks grows.
         b.input_1_stock = 0;
@@ -241,7 +254,7 @@ mod tests {
     #[test]
     fn plantation_does_not_dry_when_flag_off() {
         let mut def = test_def();
-        def.can_dry_up = false;          // not a Doerrflg plantation
+        def.can_dry_up = false; // not a Doerrflg plantation
         def.max_no_input_ticks = 4;
         let mut b = BuildingInstance::new(1, 0, 0, 0, 0);
         b.input_1_stock = 0;
@@ -259,18 +272,20 @@ mod tests {
         def.input_good_1 = Good::None;
         def.input_1_rate = 0;
         def.output_good = Good::Ore;
-        def.ore_deposit = OreDeposit::Small;  // 80 tons
+        def.ore_deposit = OreDeposit::Small; // 80 tons
         def.output_rate = 5;
         def.storage_capacity = 200;
         def.cycle_time_ms = 100;
         let mut b = BuildingInstance::new(1, 0, 0, 0, 0);
-        b.remaining_ore = OreDeposit::Small.capacity();  // 80
-        // Run cycles until the deposit is exhausted.
+        b.remaining_ore = OreDeposit::Small.capacity(); // 80
+                                                        // Run cycles until the deposit is exhausted.
         let mut total = 0u32;
         for _ in 0..100 {
             let p = tick_building(&mut b, &def, 200);
             total += p as u32;
-            if b.remaining_ore == 0 { break; }
+            if b.remaining_ore == 0 {
+                break;
+            }
         }
         // Total produced should equal the deposit size (80).
         assert_eq!(total, 80);

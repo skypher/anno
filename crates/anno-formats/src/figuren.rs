@@ -126,6 +126,12 @@ impl FigureDef {
     /// `combat::cannon_capacity` table when figuren.cod is
     /// available.
     pub fn max_cannons(&self) -> i32 { self.prop_int("Maxkanon") }
+
+    /// Ship firing/approach radius (`Shotradius:`). The figure loader writes
+    /// this unsigned 16-bit value at runtime offset `+0x4a`; the ship-route
+    /// caller `FUN_00455a20` supplies `Shotradius >> 3` to
+    /// `FUN_0046dde0` when it marks target-approach rays.
+    pub fn shot_radius(&self) -> i32 { self.prop_int("Shotradius") }
 }
 
 impl FiguresFile {
@@ -431,6 +437,7 @@ Nummer: HANDEL1
   Preis: 600
   Worktime: 8
   Maxkanon: 8
+  Shotradius: 24
   Objekt: ANIM
     Nummer: 0
     Kind: ENDLESS
@@ -449,6 +456,7 @@ Nummer: HANDEL1
         assert_eq!(h.price(), 600);
         assert_eq!(h.worktime(), 8);
         assert_eq!(h.max_cannons(), 8);
+        assert_eq!(h.shot_radius(), 24);
     }
 
     #[test]

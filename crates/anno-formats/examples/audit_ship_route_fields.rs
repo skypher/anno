@@ -3,6 +3,7 @@
 //! Run with `cargo run --example audit_ship_route_fields -p anno-formats`.
 
 use anno_formats::cod::CodFile;
+use anno_formats::figuren::FiguresFile;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn main() {
@@ -103,5 +104,42 @@ fn main() {
             "  ({anim_anz}, {source_kind}): {} [{sample}]",
             definitions.len()
         );
+    }
+
+    let figures_path = format!("{root}/figuren.cod");
+    let figures = FiguresFile::parse(&std::fs::read(&figures_path).expect("read figuren.cod"));
+    println!("ship Shotradius values (FUN_00455a20 uses value >> 3):");
+    for figure in &figures.figures {
+        let shot_radius = figure.shot_radius();
+        if shot_radius != 0 {
+            println!(
+                "  {}: Shotradius={} approach_ray_radius={}",
+                figure.name,
+                shot_radius,
+                shot_radius >> 3
+            );
+        }
+    }
+
+    println!("HQ source IDs and GFX bases:");
+    for building in cod.buildings.iter().filter(|building| building.kind == "HQ") {
+        println!(
+            "  Nr{}: source_id={} source_offset={} gfx={} size={:?} rotate={}",
+            building.nummer,
+            building.source_id,
+            building.source_id - 0x4e20,
+            building.gfx,
+            building.size,
+            building.rotate,
+        );
+        let footprint_cells = (building.size.0 * building.size.1).max(1);
+        let cells = (0..footprint_cells)
+            .filter_map(|offset| {
+                cod.building_by_source_id(building.source_id + offset)
+                    .map(|cell| format!("+{offset}:{}@{}", cell.kind, cell.gfx))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("    source footprint cells: {cells}");
     }
 }

@@ -24,7 +24,9 @@ impl ExplorationMap {
     }
 
     pub fn is_explored(&self, x: u16, y: u16) -> bool {
-        if x >= self.width || y >= self.height { return false; }
+        if x >= self.width || y >= self.height {
+            return false;
+        }
         self.explored[y as usize * self.width as usize + x as usize]
     }
 
@@ -46,7 +48,9 @@ impl ExplorationMap {
 
     /// Fraction of the map explored, 0..=128 scale.
     pub fn coverage_128(&self) -> u8 {
-        if self.explored.is_empty() { return 0; }
+        if self.explored.is_empty() {
+            return 0;
+        }
         let n = self.explored.iter().filter(|&&v| v).count() as u64;
         ((n * 128) / self.explored.len() as u64).min(128) as u8
     }

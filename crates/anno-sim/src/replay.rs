@@ -30,7 +30,9 @@ pub enum ReplayError {
 }
 
 impl From<std::io::Error> for ReplayError {
-    fn from(e: std::io::Error) -> Self { ReplayError::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        ReplayError::Io(e)
+    }
 }
 
 impl std::fmt::Display for ReplayError {
@@ -47,8 +49,7 @@ impl std::fmt::Display for ReplayError {
 }
 
 pub fn save_recording(path: &Path, rec: &Recording) -> Result<(), ReplayError> {
-    let body = bincode::serialize(rec)
-        .map_err(|e| ReplayError::Codec(e.to_string()))?;
+    let body = bincode::serialize(rec).map_err(|e| ReplayError::Codec(e.to_string()))?;
     let mut buf = Vec::with_capacity(REPLAY_MAGIC.len() + body.len());
     buf.extend_from_slice(&REPLAY_MAGIC);
     buf.extend_from_slice(&body);
@@ -68,7 +69,8 @@ pub fn load_recording(path: &Path) -> Result<Recording, ReplayError> {
         .map_err(|e| ReplayError::Codec(e.to_string()))?;
     if rec.version != REPLAY_VERSION {
         return Err(ReplayError::VersionMismatch {
-            found: rec.version, expected: REPLAY_VERSION,
+            found: rec.version,
+            expected: REPLAY_VERSION,
         });
     }
     Ok(rec)
@@ -81,7 +83,9 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
     pub fn record(&mut self, game_clock: u32, cmd: Command) {
         self.entries.push((game_clock, cmd));
     }
@@ -113,7 +117,11 @@ mod tests {
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         let mut rec = Recorder::new();
-        let cmd = Command::SetTaxRate { player: 0, tier: 0, rate: 100 };
+        let cmd = Command::SetTaxRate {
+            player: 0,
+            tier: 0,
+            rate: 100,
+        };
         rec.record(10, cmd.clone());
         let recording = rec.finish(&sim);
 
@@ -127,8 +135,22 @@ mod tests {
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         let mut rec = Recorder::new();
-        rec.record(7, Command::SetTaxRate { player: 0, tier: 1, rate: 80 });
-        rec.record(15, Command::SetTaxRate { player: 0, tier: 2, rate: 32 });
+        rec.record(
+            7,
+            Command::SetTaxRate {
+                player: 0,
+                tier: 1,
+                rate: 80,
+            },
+        );
+        rec.record(
+            15,
+            Command::SetTaxRate {
+                player: 0,
+                tier: 2,
+                rate: 32,
+            },
+        );
         let recording = rec.finish(&sim);
 
         let path = std::env::temp_dir().join("anno_replay_test.bin");

@@ -16,6 +16,57 @@ pub const DEFAULT_MAX_BRAND_DAMAGE_TICKS: u16 = 4;
 /// Original `Ruinenr` sentinel for buildings that do not leave a ruin.
 pub const NO_RUIN_ID: u8 = 0xff;
 
+/// Source placement command fields emitted by `FUN_004631b0` for one live
+/// building placement. `definition_offset` is the on-disk INSELHAUS u16;
+/// the executable resolves it by adding `0x4e20` before looking up haeuser.
+///
+/// The remaining fields are the exact inputs packed into the record word:
+/// `orientation` is `param_3`, `variant` is `param_9`, `metadata` is
+/// `param_4`, `map_owner_slot` is `param_5`, and `dynamic_object_owner` is
+/// `param_6`. `random_seed` records the five random bits written at 17..=21.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceBuildingCommand {
+    pub definition_offset: u16,
+    pub orientation: u8,
+    pub variant: u8,
+    pub metadata: u8,
+    pub map_owner_slot: u8,
+    pub random_seed: u8,
+    pub dynamic_object_owner: u8,
+}
+
+impl SourceBuildingCommand {
+    /// Decode every source-command field from a parsed INSELHAUS record.
+    pub fn from_island_tile(tile: anno_formats::szs::IslandTile) -> Self {
+        Self {
+            definition_offset: tile.building_id,
+            orientation: tile.orientation & 3,
+            variant: (tile.orientation >> 2) & 0x0f,
+            metadata: (tile.orientation >> 6) | ((tile.anim_count & 0x3f) << 2),
+            map_owner_slot: tile.source_owner(),
+            random_seed: ((tile.flags >> 1) & 0x1f) as u8,
+            dynamic_object_owner: tile.source_dynamic_object_owner(),
+        }
+    }
+
+    /// Encode the command in the eight-byte INSELHAUS layout used by
+    /// `FUN_004631b0`. The position bytes are supplied by the instance.
+    pub fn to_island_tile(self, x: u8, y: u8) -> anno_formats::szs::IslandTile {
+        anno_formats::szs::IslandTile {
+            building_id: self.definition_offset,
+            x,
+            y,
+            orientation: (self.orientation & 3)
+                | ((self.variant & 0x0f) << 2)
+                | ((self.metadata & 3) << 6),
+            anim_count: ((self.metadata >> 2) & 0x3f) | ((self.map_owner_slot & 3) << 6),
+            flags: ((self.map_owner_slot as u16 >> 2) & 1)
+                | ((self.random_seed as u16 & 0x1f) << 1)
+                | ((self.dynamic_object_owner as u16 & 0x0f) << 6),
+        }
+    }
+}
+
 /// Building definition (loaded from haeuser.cod).
 #[derive(Debug, Clone)]
 pub struct BuildingDef {
@@ -159,6 +210,14 @@ pub struct BuildingInstance {
     pub tile_x: u16,
     pub tile_y: u16,
     pub owner: u8,
+    /// Source `island + 0xac` map-object slot for a live `Kind=HQ` building.
+    /// `None` means this building is addressed through its static map cell.
+    #[serde(default)]
+    pub source_dynamic_object_slot: Option<u8>,
+    /// The original placement command for player-created buildings. Scenario
+    /// buildings retain their authored INSELHAUS records instead.
+    #[serde(default)]
+    pub source_placement_command: Option<SourceBuildingCommand>,
     pub active: bool,
 
     /// Production efficiency (0-128 scale, 128 = 100%).
@@ -246,6 +305,8 @@ impl BuildingInstance {
             tile_x,
             tile_y,
             owner,
+            source_dynamic_object_slot: None,
+            source_placement_command: None,
             active: true,
             efficiency: 0,
             input_1_stock: 0,
@@ -281,5 +342,40 @@ impl BuildingInstance {
         }
         let done = self.construction_ms_total - self.construction_ms_remaining;
         ((done as u64 * 128) / self.construction_ms_total as u64).min(128) as u8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceBuildingCommand;
+    use anno_formats::szs::IslandTile;
+
+    #[test]
+    fn source_command_round_trips_every_fun_004631b0_field() {
+        let source = IslandTile {
+            building_id: 0x1234,
+            x: 0x56,
+            y: 0x78,
+            orientation: 0b1011_0110,
+            anim_count: 0b1101_1010,
+            flags: 0b0000_0011_0110_1011,
+        };
+
+        let command = SourceBuildingCommand::from_island_tile(source);
+
+        assert_eq!(command.definition_offset, 0x1234);
+        assert_eq!(command.orientation, 2);
+        assert_eq!(command.variant, 13);
+        assert_eq!(command.metadata, 106);
+        assert_eq!(command.map_owner_slot, 7);
+        assert_eq!(command.random_seed, 21);
+        assert_eq!(command.dynamic_object_owner, 13);
+        let encoded = command.to_island_tile(source.x, source.y);
+        assert_eq!(encoded.building_id, source.building_id);
+        assert_eq!(encoded.x, source.x);
+        assert_eq!(encoded.y, source.y);
+        assert_eq!(encoded.orientation, source.orientation);
+        assert_eq!(encoded.anim_count, source.anim_count);
+        assert_eq!(encoded.flags, source.flags);
     }
 }

@@ -98,9 +98,19 @@ impl CoverageMap {
             let is_market = matches!(def.prod_kind.as_str(), "MARKT" | "KONTOR");
             let is_public = matches!(
                 def.prod_kind.as_str(),
-                "KIRCHE" | "KAPELLE" | "WIRT" | "SCHULE" | "HOCHSCHULE"
-                    | "KLINIK" | "THEATER" | "BADEHAUS" | "BRUNNEN"
-                    | "GALGEN" | "DENKMAL" | "SCHLOSS" | "TRIUMPH"
+                "KIRCHE"
+                    | "KAPELLE"
+                    | "WIRT"
+                    | "SCHULE"
+                    | "HOCHSCHULE"
+                    | "KLINIK"
+                    | "THEATER"
+                    | "BADEHAUS"
+                    | "BRUNNEN"
+                    | "GALGEN"
+                    | "DENKMAL"
+                    | "SCHLOSS"
+                    | "TRIUMPH"
             );
 
             if is_market || is_public {
@@ -112,14 +122,7 @@ impl CoverageMap {
         }
     }
 
-    fn apply_radius(
-        &mut self,
-        cx: u16,
-        cy: u16,
-        radius: u16,
-        is_market: bool,
-        is_public: bool,
-    ) {
+    fn apply_radius(&mut self, cx: u16, cy: u16, radius: u16, is_market: bool, is_public: bool) {
         let r = radius as i32;
         let w = self.width as i32;
         let h = self.height as i32;

@@ -9,6 +9,8 @@ use crate::combat::{DiplomacyMatrix, MilitaryUnit};
 use crate::entity::Figure;
 use crate::player::Player;
 use crate::simulation::Simulation;
+use crate::source_cell::SourceMapCellState;
+use crate::source_route::SourceDynamicMapObject;
 use crate::trade::{TradeRoute, TradeShip};
 use crate::warehouse::Warehouse;
 use serde::{Deserialize, Serialize};
@@ -44,16 +46,32 @@ use std::path::Path;
 ///      honours haeuser.cod `Maxbrand: 4`.
 /// v22: `TradeShip` gained `name: String` so SHIP4-authored trade-ship
 ///      names survive into save files and the manual ships list.
-pub const SAVE_VERSION: u32 = 22;
+/// v23: `TradeShip` gained `source_route_window`, preserving the source
+///      caller's normal versus short target-retry search radius.
+/// v24: `TradeShip` gained `source_target_approach_radius`, preserving the
+///      source figure's direct-target `Shotradius >> 3` argument.
+/// v25: `TradeShip` gained `source_target_descriptor`, preserving the live
+///      four-byte target selected for source ship routing.
+/// v26: `BuildingInstance` gained `source_dynamic_object_slot`, preserving
+///      a live HQ's source island map-object-table entry across save/load.
+/// v27: scenario-created source dynamic-map objects are serialized separately
+///      from live player-built HQ instances.
+/// v28: player-created `BuildingInstance`s retain their source placement
+///      command identity instead of only their local definition index.
+/// v29: `SourceBuildingCommand` gained every packed `FUN_004631b0` field.
+/// v30: source command-root animation records persist their live frame state.
+/// v31: source command-root records retain their fixed-point production inputs.
+pub const SAVE_VERSION: u32 = 31;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
 /// index shift, struct field reorder) or a known data-corruption
 /// risk and is hard-rejected.
 ///
-/// v22 baseline: `TradeShip` includes its authored name, so earlier
+/// v31 baseline: source command-root records retain fixed-point production
+/// inputs and selector fields, so earlier
 /// payloads have a different bincode struct layout.
-pub const MIN_LOADABLE_VERSION: u32 = 22;
+pub const MIN_LOADABLE_VERSION: u32 = 31;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -67,6 +85,8 @@ pub struct SaveState {
     pub autosave_timer_ms: u32,
     pub players: Vec<Player>,
     pub buildings: Vec<BuildingInstance>,
+    pub source_dynamic_map_objects: Vec<SourceDynamicMapObject>,
+    pub source_map_cell_states: Vec<SourceMapCellState>,
     pub warehouses: Vec<Warehouse>,
     pub figures: Vec<Figure>,
     pub military_units: Vec<MilitaryUnit>,
@@ -117,6 +137,8 @@ impl Simulation {
             autosave_timer_ms: self.autosave_timer_ms,
             players: self.players.clone(),
             buildings: self.buildings.clone(),
+            source_dynamic_map_objects: self.source_dynamic_map_objects.clone(),
+            source_map_cell_states: self.source_map_cell_states.clone(),
             warehouses: self.warehouses.clone(),
             figures: self.figures.clone(),
             military_units: self.military_units.clone(),
@@ -137,6 +159,8 @@ impl Simulation {
         self.autosave_timer_ms = s.autosave_timer_ms;
         self.players = s.players;
         self.buildings = s.buildings;
+        self.source_dynamic_map_objects = s.source_dynamic_map_objects;
+        self.source_map_cell_states = s.source_map_cell_states;
         self.warehouses = s.warehouses;
         self.figures = s.figures;
         self.military_units = s.military_units;
@@ -197,6 +221,8 @@ mod tests {
             autosave_timer_ms: 0,
             players: vec![Player::new_human(0)],
             buildings: vec![],
+            source_dynamic_map_objects: vec![],
+            source_map_cell_states: vec![],
             warehouses: vec![],
             figures: vec![],
             military_units: vec![],
@@ -263,6 +289,43 @@ mod tests {
         sim.players.push(Player::new_human(0));
         sim.buildings.push(BuildingInstance::new(7, 1, 10, 20, 0));
         sim.buildings[0].output_stock = 12;
+        sim.buildings[0].source_dynamic_object_slot = Some(3);
+        sim.buildings[0].source_placement_command = Some(crate::building::SourceBuildingCommand {
+            definition_offset: 21,
+            orientation: 3,
+            variant: 8,
+            metadata: 1,
+            map_owner_slot: 6,
+            random_seed: 17,
+            dynamic_object_owner: 4,
+        });
+        sim.source_dynamic_map_objects.push(SourceDynamicMapObject {
+            island: 1,
+            slot: 0,
+            owner: 4,
+            local_position: (7, 8),
+        });
+        sim.source_map_cell_states
+            .push(crate::source_cell::SourceMapCellState {
+                island: 1,
+                x: 10,
+                y: 20,
+                phase: 3,
+                frame_selector: 12,
+                activity: 96,
+                work_material_stock: 64,
+                raw_material_stock: 128,
+                storage_fill: 128,
+                storage_animation_capacity: 160,
+                source_production_amount: 32,
+                source_raw_material_amount: 64,
+                source_work_material_amount: 16,
+                progress: 512,
+                animation_frame: 2,
+                animation_count: 4,
+                animation_continues: true,
+                kind_code: 7,
+            });
         let mut wh = Warehouse::new(1, 0, 5, 5);
         wh.set_capacity(Good::Wood, 100);
         wh.deposit(Good::Wood, 50);
@@ -278,6 +341,87 @@ mod tests {
         assert_eq!(sim2.buildings.len(), 1);
         assert_eq!(sim2.buildings[0].def_id, 7);
         assert_eq!(sim2.buildings[0].output_stock, 12);
+        assert_eq!(sim2.buildings[0].source_dynamic_object_slot, Some(3));
+        assert_eq!(
+            sim2.buildings[0].source_placement_command,
+            Some(crate::building::SourceBuildingCommand {
+                definition_offset: 21,
+                orientation: 3,
+                variant: 8,
+                metadata: 1,
+                map_owner_slot: 6,
+                random_seed: 17,
+                dynamic_object_owner: 4,
+            })
+        );
+        assert_eq!(sim2.source_dynamic_map_objects.len(), 1);
+        assert_eq!(sim2.source_dynamic_map_objects[0].owner, 4);
+        assert_eq!(
+            sim2.source_map_cell_states,
+            vec![crate::source_cell::SourceMapCellState {
+                island: 1,
+                x: 10,
+                y: 20,
+                phase: 3,
+                frame_selector: 12,
+                activity: 96,
+                work_material_stock: 64,
+                raw_material_stock: 128,
+                storage_fill: 128,
+                storage_animation_capacity: 160,
+                source_production_amount: 32,
+                source_raw_material_amount: 64,
+                source_work_material_amount: 16,
+                progress: 512,
+                animation_frame: 2,
+                animation_count: 4,
+                animation_continues: true,
+                kind_code: 7,
+            }]
+        );
+        assert_eq!(sim2.source_map_cell_states[0].market_frame_selector(4), 3);
+        assert_eq!(
+            sim2.source_dynamic_map_object_table(1).object(0),
+            Some(SourceDynamicMapObject {
+                island: 1,
+                slot: 0,
+                owner: 4,
+                local_position: (7, 8),
+            })
+        );
+        let island = anno_formats::szs::Island {
+            number: 1,
+            width: 32,
+            height: 32,
+            x_pos: 100,
+            y_pos: 200,
+            fertilities: [7; 8],
+            tiles: vec![anno_formats::szs::IslandTile {
+                building_id: 3,
+                x: 7,
+                y: 8,
+                orientation: 1,
+                anim_count: 0,
+                flags: 0,
+            }],
+            city: None,
+        };
+        let definitions = [anno_formats::cod::BuildingDef {
+            source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 3,
+            size: (2, 4),
+            ..Default::default()
+        }];
+        assert_eq!(
+            sim2.resolve_source_dynamic_map_object_target(
+                crate::source_route::SourceTargetDescriptor::from_bytes([0x35, 1, 0, 0]),
+                &[island],
+                &definitions,
+            ),
+            Some(crate::source_route::SourceResolvedDynamicTarget {
+                target: crate::source_route::SourcePathTargetRect::new((107, 208), 4, 2).unwrap(),
+                owner: 4,
+            })
+        );
         assert_eq!(sim2.warehouses.len(), 1);
         assert_eq!(sim2.warehouses[0].stock(Good::Wood), 50);
         assert_eq!(sim2.warehouses[0].stock(Good::Tools), 7);

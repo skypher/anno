@@ -10,6 +10,43 @@ use anno_formats::cod::BuildingDef as CodBuilding;
 use anno_formats::szs::{Island, IslandTile};
 use std::collections::HashMap;
 
+/// The normal caller radius stored by `FUN_00452370` and
+/// `FUN_004568b0` before they invoke the source ship-route builders.
+pub const SOURCE_SHIP_NORMAL_ROUTE_RADIUS: usize = 0x50;
+
+/// The short target-proximity retry radius stored by `FUN_00452370` before
+/// it invokes `FUN_00455a20`.
+pub const SOURCE_SHIP_SHORT_RETRY_ROUTE_RADIUS: usize = 0x28;
+
+/// Persisted source route-window selection for a ship route request.
+///
+/// The executable stores the selected radius in the caller-owned route
+/// record, then passes it unchanged as `param_4` to `FUN_00455a20` or
+/// `FUN_00456920`. The `ShortTargetRetry` transition is made by the timed
+/// target-proximity branch in `FUN_00452370`; a failed path search alone does
+/// not select it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SourceShipRouteWindow {
+    Normal,
+    ShortTargetRetry,
+}
+
+impl Default for SourceShipRouteWindow {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl SourceShipRouteWindow {
+    /// Radius passed to the local source path-grid constructor.
+    pub const fn radius(self) -> usize {
+        match self {
+            Self::Normal => SOURCE_SHIP_NORMAL_ROUTE_RADIUS,
+            Self::ShortTargetRetry => SOURCE_SHIP_SHORT_RETRY_ROUTE_RADIUS,
+        }
+    }
+}
+
 /// Source route terminator written by `FUN_0046cf70`.
 pub const SOURCE_ROUTE_TERMINATOR: u8 = 0xc1;
 
@@ -200,6 +237,456 @@ pub struct SourcePathSearchResult {
     pub steps: Vec<SourceRouteStep>,
 }
 
+/// A world-space target rectangle prepared by `FUN_004451a0` before a ship
+/// route callback runs. Its dimensions are positive source footprint sizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourcePathTargetRect {
+    pub origin: (i32, i32),
+    pub width: usize,
+    pub height: usize,
+}
+
+/// The four-byte live target descriptor passed to the source ship-route
+/// builders. `FUN_00445400` constructs kind `0x37` for a world-map cell;
+/// `FUN_00444900` decodes its two packed 12-bit coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceTargetDescriptor {
+    bytes: [u8; 4],
+}
+
+/// The two route preparations selected by `FUN_00455a20` after it resolves
+/// the target descriptor's owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceShipTargetRouteBranch {
+    /// `FUN_0046dde0` and `LAB_0046c670`.
+    Direct { approach_radius: i32 },
+    /// `FUN_0046e350` and `LAB_0046c750`.
+    Threshold { approach_radius: i32, limit: u32 },
+}
+
+/// A static island-map target resolved from a kind-`0x32` or kind-`0x33`
+/// descriptor. `FUN_004451a0` obtains the footprint from the target cell's
+/// oriented definition; `FUN_00444100` obtains the source owner from that
+/// same cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceResolvedStaticTarget {
+    pub target: SourcePathTargetRect,
+    pub owner: u8,
+}
+
+/// One active entry in an island's eight-slot map-object table. The source
+/// stores these records at `island + 0xac + slot * 4`; kinds `0x35` and
+/// `0x36` name an entry by its island and slot bytes.
+///
+/// The table is live state, not an `INSELHAUS` field. Callers must therefore
+/// supply entries extracted from the corresponding source map-object state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceDynamicMapObject {
+    pub island: u8,
+    pub slot: u8,
+    pub owner: u8,
+    pub local_position: (u8, u8),
+}
+
+/// The eight-entry dynamic map-object table attached to one source island.
+/// `FUN_00468ce0` selects the first zero entry; `FUN_00468ed0` clears an
+/// entry when its object is removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDynamicMapObjectTable {
+    island: u8,
+    slots: [Option<SourceDynamicMapObject>; Self::SLOT_COUNT],
+}
+
+impl SourceDynamicMapObjectTable {
+    /// Number of source map-object pointers at `island + 0xac`.
+    pub const SLOT_COUNT: usize = 8;
+
+    /// Create the initially empty table for one source island record.
+    pub const fn new(island: u8) -> Self {
+        Self {
+            island,
+            slots: [None; Self::SLOT_COUNT],
+        }
+    }
+
+    /// Allocate the first free source slot and retain its live object record.
+    pub fn allocate(
+        &mut self,
+        owner: u8,
+        local_position: (u8, u8),
+    ) -> Option<SourceDynamicMapObject> {
+        let slot = self.slots.iter().position(Option::is_none)? as u8;
+        let object = SourceDynamicMapObject {
+            island: self.island,
+            slot,
+            owner,
+            local_position,
+        };
+        self.slots[slot as usize] = Some(object);
+        Some(object)
+    }
+
+    /// Read one source slot without changing its allocation state.
+    pub fn object(&self, slot: u8) -> Option<SourceDynamicMapObject> {
+        self.slots.get(slot as usize).copied().flatten()
+    }
+
+    /// Restore one occupied source slot from persistent live-object state.
+    /// The record must belong to this island and may not overwrite an entry.
+    pub fn insert(&mut self, object: SourceDynamicMapObject) -> bool {
+        if object.island != self.island {
+            return false;
+        }
+        let Some(slot) = self.slots.get_mut(object.slot as usize) else {
+            return false;
+        };
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(object);
+        true
+    }
+
+    /// Clear a source slot and return the live record that occupied it.
+    pub fn release(&mut self, slot: u8) -> Option<SourceDynamicMapObject> {
+        self.slots.get_mut(slot as usize)?.take()
+    }
+
+    /// Iterate live objects in the source table's ascending slot order.
+    pub fn objects(&self) -> impl Iterator<Item = SourceDynamicMapObject> + '_ {
+        self.slots.iter().flatten().copied()
+    }
+}
+
+/// A kind-`0x35` or kind-`0x36` target resolved through a supplied live
+/// map-object entry. `0x35` expands to the static cell's oriented footprint;
+/// `0x36` uses the same origin and the source default `1 x 1` footprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceResolvedDynamicTarget {
+    pub target: SourcePathTargetRect,
+    pub owner: u8,
+}
+
+impl SourceTargetDescriptor {
+    /// The descriptor kind written by `FUN_00445400`.
+    pub const WORLD_COORDINATE_KIND: u8 = 0x37;
+
+    /// Construct the exact kind-`0x37` descriptor for a source world cell.
+    /// Each coordinate occupies twelve bits in the live descriptor.
+    pub fn from_world_coordinate(x: i32, y: i32) -> Option<Self> {
+        let x = u16::try_from(x).ok()?;
+        let y = u16::try_from(y).ok()?;
+        (x <= 0x0fff && y <= 0x0fff).then_some(Self {
+            bytes: [
+                Self::WORLD_COORDINATE_KIND,
+                ((y >> 8) as u8) << 4 | ((x >> 8) as u8 & 0x0f),
+                x as u8,
+                y as u8,
+            ],
+        })
+    }
+
+    /// Preserve a live descriptor read from a source route record. Resolution
+    /// of object-backed kinds is deliberately separate because it needs the
+    /// corresponding source object tables.
+    pub const fn from_bytes(bytes: [u8; 4]) -> Self {
+        Self { bytes }
+    }
+
+    /// Return the raw four-byte live descriptor without changing its
+    /// representation.
+    pub const fn bytes(self) -> [u8; 4] {
+        self.bytes
+    }
+
+    /// Return the descriptor kind stored in byte zero.
+    pub const fn kind(self) -> u8 {
+        self.bytes[0]
+    }
+
+    /// Decode a kind-`0x37` target through `FUN_00444900`'s coordinate
+    /// branch. Other descriptor kinds require their live object tables.
+    pub fn world_coordinate(self) -> Option<(i32, i32)> {
+        (self.kind() == Self::WORLD_COORDINATE_KIND).then(|| {
+            let x = (u16::from(self.bytes[1] & 0x0f) << 8) | u16::from(self.bytes[2]);
+            let y = (u16::from(self.bytes[1] >> 4) << 8) | u16::from(self.bytes[3]);
+            (i32::from(x), i32::from(y))
+        })
+    }
+
+    /// Resolve the source fallback `[x, y, 1, 1]` footprint used by
+    /// `FUN_004451a0` for a coordinate descriptor.
+    pub fn target_rect(self) -> Option<SourcePathTargetRect> {
+        self.world_coordinate()
+            .and_then(|position| SourcePathTargetRect::new(position, 1, 1))
+    }
+
+    /// Resolve the static island-map kinds `0x32` and `0x33` through the
+    /// scenario's preserved map cell. The descriptor's second byte is the
+    /// source island slot, followed by local x/y bytes. `FUN_00463830`
+    /// swaps the compiled definition's dimensions for odd orientations.
+    pub fn resolve_static_island_target(
+        self,
+        islands: &[Island],
+        definitions: &[CodBuilding],
+    ) -> Option<SourceResolvedStaticTarget> {
+        if !matches!(self.kind(), 0x32 | 0x33) {
+            return None;
+        }
+
+        let island = islands
+            .iter()
+            .find(|island| island.number == self.bytes[1])?;
+        let local_position = (self.bytes[2], self.bytes[3]);
+        let tile = island
+            .tiles
+            .iter()
+            .copied()
+            .find(|tile| (tile.x, tile.y) == local_position)?;
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.source_id == tile.source_id())?;
+        let (width, height) = source_footprint_size(definition.size, tile.orientation);
+        let origin = (
+            i32::from(island.x_pos) + i32::from(local_position.0),
+            i32::from(island.y_pos) + i32::from(local_position.1),
+        );
+        Some(SourceResolvedStaticTarget {
+            target: SourcePathTargetRect::new(origin, usize::from(width), usize::from(height))?,
+            owner: tile.source_owner(),
+        })
+    }
+
+    /// Resolve object-backed kinds `0x35` and `0x36` through their source
+    /// island-table entry. `FUN_00444900` reads the entry's local position;
+    /// `FUN_00444100` reads its owner. `FUN_004451a0` uses the corresponding
+    /// static cell's oriented footprint for `0x35`, while `0x36` falls through
+    /// to the default unit footprint.
+    pub fn resolve_dynamic_map_object_target(
+        self,
+        objects: &[SourceDynamicMapObject],
+        islands: &[Island],
+        definitions: &[CodBuilding],
+    ) -> Option<SourceResolvedDynamicTarget> {
+        if !matches!(self.kind(), 0x35 | 0x36) {
+            return None;
+        }
+
+        let object = objects
+            .iter()
+            .copied()
+            .find(|object| object.island == self.bytes[1] && object.slot == self.bytes[2])?;
+        let island = islands
+            .iter()
+            .find(|island| island.number == object.island)?;
+        let origin = (
+            i32::from(island.x_pos) + i32::from(object.local_position.0),
+            i32::from(island.y_pos) + i32::from(object.local_position.1),
+        );
+        let (width, height) = if self.kind() == 0x35 {
+            let tile = island
+                .tiles
+                .iter()
+                .copied()
+                .find(|tile| (tile.x, tile.y) == object.local_position)?;
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.source_id == tile.source_id())?;
+            source_footprint_size(definition.size, tile.orientation)
+        } else {
+            (1, 1)
+        };
+        Some(SourceResolvedDynamicTarget {
+            target: SourcePathTargetRect::new(origin, usize::from(width), usize::from(height))?,
+            owner: object.owner,
+        })
+    }
+
+    /// `FUN_00455a20` has no owner-resolution switch arm for kind `0x37`,
+    /// so it takes its threshold branch: `FUN_0046e350(..., 5)` followed by
+    /// `LAB_0046c750` with limit zero.
+    pub const fn threshold_route_parameters(self) -> Option<(i32, u32)> {
+        match self.kind() {
+            Self::WORLD_COORDINATE_KIND => Some((5, 0)),
+            _ => None,
+        }
+    }
+
+    /// Select the `FUN_00455a20` target branch after the caller has resolved
+    /// the descriptor owner through `FUN_00444100`. `nation_relation` is the
+    /// byte read from `DAT_005b7770[(current_owner * 0x50 + target_owner) *
+    /// 8]`; the executable tests precisely for value `3`.
+    ///
+    /// `direct_approach_radius` is the caller's `Shotradius >> 3` value. The
+    /// threshold branch has a fixed radius five and target-kind-specific
+    /// `LAB_0046c750` limit.
+    pub fn select_fun_00455a20_branch(
+        self,
+        current_owner: u8,
+        resolved_owner: Option<u8>,
+        nation_relation: Option<u8>,
+        direct_approach_radius: i32,
+    ) -> SourceShipTargetRouteBranch {
+        let owner_sensitive = matches!(self.kind(), 1..=6 | 0x32 | 0x33);
+        if owner_sensitive {
+            if let Some(target_owner) = resolved_owner {
+                if target_owner != current_owner && nation_relation != Some(3) {
+                    return SourceShipTargetRouteBranch::Direct {
+                        approach_radius: direct_approach_radius,
+                    };
+                }
+            }
+        }
+
+        let limit = match self.kind() {
+            1 | 2 | 3 | 0x32 | 0x33 | 0x34 | 0x35 => 2,
+            _ => 0,
+        };
+        SourceShipTargetRouteBranch::Threshold {
+            approach_radius: 5,
+            limit,
+        }
+    }
+}
+
+/// Mutable target callback state laid out beside the local target point in
+/// the ship-route callers. The executable stores a selected point, a best
+/// candidate, and the weighted metric used to compare candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourcePathTargetCallbackState {
+    pub selected: (i32, i32),
+    pub candidate: (i32, i32),
+    pub best_distance: u32,
+}
+
+impl SourcePathTargetCallbackState {
+    /// Initialize the state with the caller's pre-search weighted distance.
+    pub const fn new(selected: (i32, i32), initial_best_distance: u32) -> Self {
+        Self {
+            selected,
+            candidate: selected,
+            best_distance: initial_best_distance,
+        }
+    }
+}
+
+/// Source ship target callback behavior selected by the two caller branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePathTargetCallback {
+    /// `LAB_0046c670`: record the reached callback cell and stop the grid.
+    Direct,
+    /// `LAB_0046c750`: keep expanding high-metadata cells, recording closer
+    /// candidates, until the callback metric is within this source threshold.
+    Threshold { limit: u32 },
+}
+
+/// The two target-approach ray variants selected by the source ship callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceTargetApproachRayMode {
+    /// `FUN_0046dde0`: skip the ray origin and stop before a `0x0d`
+    /// direction marker.
+    StopAtDirection13,
+    /// `FUN_0046e350`: mark every rasterized cell, including the origin.
+    MarkWholeRay,
+}
+
+impl SourcePathTargetCallback {
+    /// Evaluate one high-metadata callback cell exactly as the selected source
+    /// callback does. `elapsed_cost` is `FUN_0046c7d0`'s `local_2c`; neither
+    /// source target callback uses it in its distance metric.
+    pub fn decide(
+        self,
+        position: (i32, i32),
+        elapsed_cost: u32,
+        state: &mut SourcePathTargetCallbackState,
+    ) -> SourcePathBlockedCellDecision {
+        match self {
+            Self::Direct => {
+                state.candidate = position;
+                state.best_distance = source_target_metric(position, state.selected);
+                SourcePathBlockedCellDecision::Complete
+            }
+            Self::Threshold { limit } => {
+                let _ = elapsed_cost;
+                let distance = source_target_metric(position, state.selected);
+                if distance <= limit {
+                    state.candidate = position;
+                    state.best_distance = distance;
+                    SourcePathBlockedCellDecision::Complete
+                } else {
+                    if distance < state.best_distance {
+                        state.candidate = position;
+                        state.best_distance = distance;
+                    }
+                    SourcePathBlockedCellDecision::Expand
+                }
+            }
+        }
+    }
+}
+
+/// The `max(Δx, Δy) + floor(min(Δx, Δy) / 4)` metric written by both target
+/// callbacks at runtime context offset `+0x20`.
+pub fn source_target_metric(position: (i32, i32), selected: (i32, i32)) -> u32 {
+    let dx = position.0.abs_diff(selected.0);
+    let dy = position.1.abs_diff(selected.1);
+    dx.max(dy) + dx.min(dy) / 4
+}
+
+impl SourcePathTargetRect {
+    /// Construct a source target rectangle. Empty source footprints do not
+    /// reach either `FUN_00443380` or `FUN_0046d680`.
+    pub fn new(origin: (i32, i32), width: usize, height: usize) -> Option<Self> {
+        (width != 0 && height != 0 && i32::try_from(width).is_ok() && i32::try_from(height).is_ok())
+            .then_some(Self {
+                origin,
+                width,
+                height,
+            })
+    }
+
+    /// Select the target point clamped to this rectangle, exactly as
+    /// `FUN_00443380` does before the `LAB_0046c670` callback path.
+    pub fn nearest_point(self, position: (i32, i32)) -> (i32, i32) {
+        let max_x = self.origin.0.saturating_add(self.width as i32 - 1);
+        let max_y = self.origin.1.saturating_add(self.height as i32 - 1);
+        (
+            position.0.clamp(self.origin.0, max_x),
+            position.1.clamp(self.origin.1, max_y),
+        )
+    }
+
+    /// Whether a world-space cell belongs to this source footprint.
+    pub fn contains(self, position: (i32, i32)) -> bool {
+        position.0 >= self.origin.0
+            && position.1 >= self.origin.1
+            && position.0 < self.origin.0.saturating_add(self.width as i32)
+            && position.1 < self.origin.1.saturating_add(self.height as i32)
+    }
+
+    /// Select the central target cell on the side facing `position`, exactly
+    /// as `FUN_004433d0` does before the `LAB_0046c750` callback path.
+    pub fn center_point_toward(self, position: (i32, i32)) -> (i32, i32) {
+        let x = self.center_axis_toward(self.origin.0, self.width, position.0, false);
+        let y = self.center_axis_toward(self.origin.1, self.height, position.1, true);
+        (x, y)
+    }
+
+    fn center_axis_toward(self, origin: i32, length: usize, position: i32, y_axis: bool) -> i32 {
+        let lower_center = origin.saturating_add((length as i32 - 1) / 2);
+        let upper_center = lower_center + (length as i32 - 1) % 2;
+        if if y_axis {
+            position > lower_center
+        } else {
+            lower_center < position
+        } {
+            upper_center
+        } else {
+            lower_center
+        }
+    }
+}
+
 /// Input failure while projecting static INSELHAUS records into the source
 /// path grid used by `FUN_0046f230`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +834,223 @@ impl SourcePathGrid {
         };
         self.cells[index].direction = 0x0c;
         true
+    }
+
+    /// Mark a target rectangle as high-metadata callback cells. This is the
+    /// clipped cell loop of `FUN_0046d680`: it clears predecessor directions
+    /// inside the target footprint and sets metadata bit `0x80`, preserving
+    /// the source path-cost class in the low seven bits.
+    pub fn mark_target_region(&mut self, target: SourcePathTargetRect) -> bool {
+        let max_x = target.origin.0.saturating_add(target.width as i32);
+        let max_y = target.origin.1.saturating_add(target.height as i32);
+        let start_x = target.origin.0.max(self.origin.0);
+        let start_y = target.origin.1.max(self.origin.1);
+        let end_x = max_x.min(self.origin.0 + self.width as i32);
+        let end_y = max_y.min(self.origin.1 + self.height as i32);
+        if start_x >= end_x || start_y >= end_y {
+            return false;
+        }
+
+        for y in start_y..end_y {
+            for x in start_x..end_x {
+                let index = self.index((x, y)).expect("target clip is in bounds");
+                self.cells[index].direction = 0;
+                self.cells[index].metadata |= 0x80;
+            }
+        }
+        true
+    }
+
+    /// Mark the target-approach rays generated by `FUN_0046dde0` or
+    /// `FUN_0046e350`. Both routines fan four side rays and twelve diagonal
+    /// rays from the target footprint; their only difference is the raster
+    /// policy selected by `mode`.
+    pub fn mark_target_approach_rays(
+        &mut self,
+        target: SourcePathTargetRect,
+        radius: i32,
+        mode: SourceTargetApproachRayMode,
+    ) {
+        let left = target.origin.0.saturating_sub(self.origin.0);
+        let top = target.origin.1.saturating_sub(self.origin.1);
+        let width = target.width as i32;
+        let height = target.height as i32;
+        let right = left.saturating_add(width - 1);
+        let bottom = top.saturating_add(height - 1);
+
+        for x in (left..=right).rev() {
+            self.mark_target_ray((x, top), (x, top - radius), mode);
+        }
+        for x in (left..=right).rev() {
+            self.mark_target_ray((x, bottom), (x, bottom + radius), mode);
+        }
+        for y in (top..=bottom).rev() {
+            self.mark_target_ray((left, y), (left - radius, y), mode);
+        }
+        for y in (top..=bottom).rev() {
+            self.mark_target_ray((right, y), (right + radius, y), mode);
+        }
+
+        let (near, diagonal, far) = if radius == 1 {
+            (0, 1, 1)
+        } else {
+            (
+                radius.saturating_mul(0x57) / 0x100,
+                radius.saturating_mul(0xc2) / 0x100,
+                radius.saturating_mul(0xf0) / 0x100,
+            )
+        };
+        for (start, end) in [
+            ((left, top), (left - near, top - far)),
+            ((left, top), (left - diagonal, top - diagonal)),
+            ((left, top), (left - far, top - near)),
+            ((right, top), (left + near, top - far)),
+            ((right, top), (left + diagonal, top - diagonal)),
+            ((right, top), (left + far, top - near)),
+            ((right, bottom), (left + near, top + far)),
+            ((right, bottom), (left + diagonal, top + diagonal)),
+            ((right, bottom), (left + far, top + near)),
+            ((left, bottom), (left - near, top + far)),
+            ((left, bottom), (left - diagonal, top + diagonal)),
+            ((left, bottom), (left - far, top + near)),
+        ] {
+            self.mark_target_ray(start, end, mode);
+        }
+    }
+
+    fn mark_target_ray(
+        &mut self,
+        start: (i32, i32),
+        end: (i32, i32),
+        mode: SourceTargetApproachRayMode,
+    ) {
+        let max_x = self.width as i32 - 1;
+        let max_y = self.height as i32 - 1;
+        let start_code = source_ray_outcode(start, max_x, max_y);
+        let end_code = source_ray_outcode(end, max_x, max_y);
+        if start_code + end_code == 0 {
+            self.raster_target_ray(start, end, mode);
+            return;
+        }
+        if start_code & end_code != 0 {
+            return;
+        }
+
+        let (mut x0, mut y0) = start;
+        let (mut x1, mut y1) = end;
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+
+        if start_code & 1 != 0 {
+            let previous_x = x0;
+            x0 = 0;
+            y0 -= dy * previous_x / dx;
+        } else if start_code & 2 != 0 {
+            let overflow = x0 - max_x;
+            x0 = max_x;
+            y0 -= dy * overflow / dx;
+        }
+        if y0 < 0 {
+            let previous_y = y0;
+            y0 = 0;
+            x0 -= dx * previous_y / dy;
+        } else if y0 > max_y {
+            let overflow = y0 - max_y;
+            y0 = max_y;
+            x0 -= dx * overflow / dy;
+        }
+
+        if end_code & 1 != 0 {
+            let previous_x = x1;
+            x1 = 0;
+            y1 -= dy * previous_x / dx;
+        } else if end_code & 2 != 0 {
+            let overflow = x1 - max_x;
+            x1 = max_x;
+            y1 -= dy * overflow / dx;
+        }
+        if y1 < 0 {
+            let previous_y = y1;
+            y1 = 0;
+            x1 -= dx * previous_y / dy;
+        } else if y1 > max_y {
+            let overflow = y1 - max_y;
+            y1 = max_y;
+            x1 -= dx * overflow / dy;
+        }
+
+        if (x0, y0) != (x1, y1) && (0..=max_x).contains(&x0) && (0..=max_x).contains(&x1) {
+            self.raster_target_ray((x0, y0), (x1, y1), mode);
+        }
+    }
+
+    fn raster_target_ray(
+        &mut self,
+        start: (i32, i32),
+        end: (i32, i32),
+        mode: SourceTargetApproachRayMode,
+    ) {
+        let (mut x, mut y) = start;
+        if mode == SourceTargetApproachRayMode::MarkWholeRay {
+            self.mark_high_metadata_local(x, y);
+        }
+
+        let dx = (end.0 - x).abs();
+        let dy = (end.1 - y).abs();
+        let step_x = if x <= end.0 { 1 } else { -1 };
+        let step_y = if y <= end.1 { 1 } else { -1 };
+        if dy < dx {
+            let mut error = dx / 2;
+            for _ in 0..dx {
+                x += step_x;
+                error -= dy;
+                if error < 0 {
+                    error += dx;
+                    y += step_y;
+                }
+                if mode == SourceTargetApproachRayMode::StopAtDirection13
+                    && self.direction_local(x, y) == Some(0x0d)
+                {
+                    break;
+                }
+                self.mark_high_metadata_local(x, y);
+            }
+        } else {
+            let mut error = dy / 2;
+            for _ in 0..dy {
+                y += step_y;
+                error -= dx;
+                if error < 0 {
+                    error += dy;
+                    x += step_x;
+                }
+                if mode == SourceTargetApproachRayMode::StopAtDirection13
+                    && self.direction_local(x, y) == Some(0x0d)
+                {
+                    break;
+                }
+                self.mark_high_metadata_local(x, y);
+            }
+        }
+    }
+
+    fn mark_high_metadata_local(&mut self, x: i32, y: i32) {
+        let position = (self.origin.0 + x, self.origin.1 + y);
+        let index = self.index(position).expect("clipped ray cell is in bounds");
+        self.cells[index].metadata |= 0x80;
+    }
+
+    fn direction_local(&self, x: i32, y: i32) -> Option<u8> {
+        let position = (self.origin.0 + x, self.origin.1 + y);
+        self.index(position)
+            .map(|index| self.cells[index].direction)
+    }
+
+    fn is_reached_predecessor_marker(&self, position: (i32, i32)) -> bool {
+        self.index(position).is_some_and(|index| {
+            let direction = self.cells[index].direction;
+            direction != 0 && !(0x0b..=0x0d).contains(&direction)
+        })
     }
 
     /// Return whether a cell has no source direction marker. A nonzero marker
@@ -507,6 +1211,167 @@ impl SourcePathGrid {
         result
     }
 
+    /// Route a source target region through the high-metadata callback
+    /// mechanism used by `FUN_0046d680`: target cells become callback cells
+    /// and the first reached target cell terminates the fixed-cost wave.
+    ///
+    /// The source ship callers use a `[x, y, 1, 1]` fallback footprint when
+    /// target-map resolution fails, which is the form consumed by the ocean
+    /// adapter. The caller-specific `LAB_0046c750` acceptance threshold is
+    /// intentionally not inferred by this generic fallback helper.
+    pub fn route_to_target_region(
+        &mut self,
+        start: (i32, i32),
+        target: SourcePathTargetRect,
+    ) -> Result<Vec<SourceRouteStep>, SourcePathSearchError> {
+        self.route_to_direct_target(start, target, 0)
+    }
+
+    /// Route through the direct source target callback branch in
+    /// `FUN_00455a20`: `FUN_0046d680`, then `FUN_0046dde0` with
+    /// `Shotradius >> 3`, then `LAB_0046c670`.
+    ///
+    /// The direct callback completes on the first high-metadata cell it
+    /// reaches, including an approach-ray cell outside the target footprint.
+    pub fn route_to_direct_target(
+        &mut self,
+        start: (i32, i32),
+        target: SourcePathTargetRect,
+        approach_radius: i32,
+    ) -> Result<Vec<SourceRouteStep>, SourcePathSearchError> {
+        if self.index(start).is_none() {
+            return Err(SourcePathSearchError::OutOfBounds);
+        }
+        if target.contains(start) {
+            return Ok(Vec::new());
+        }
+        self.mark_target_region(target);
+        self.mark_target_approach_rays(
+            target,
+            approach_radius,
+            SourceTargetApproachRayMode::StopAtDirection13,
+        );
+
+        let selected = target.nearest_point(start);
+        let initial_best_distance = source_target_metric(start, selected);
+        let mut callback_state =
+            SourcePathTargetCallbackState::new(selected, initial_best_distance);
+
+        self.search_with_blocked_cell_callback(start, |position, elapsed_cost| {
+            SourcePathTargetCallback::Direct.decide(position, elapsed_cost, &mut callback_state)
+        })
+        .map(|result| result.steps)
+    }
+
+    /// Run the threshold source target branch used by `FUN_00455a20` and
+    /// `FUN_00456920`: target-region marking, `FUN_0046e350`, center-point
+    /// selection, then `LAB_0046c750`.
+    ///
+    /// The caller owns both `approach_radius` and `limit`; those values vary
+    /// by target descriptor kind in the executable.
+    pub fn search_threshold_target(
+        &mut self,
+        start: (i32, i32),
+        target: SourcePathTargetRect,
+        approach_radius: i32,
+        limit: u32,
+    ) -> Result<SourcePathSearchResult, SourcePathSearchError> {
+        if self.index(start).is_none() {
+            return Err(SourcePathSearchError::OutOfBounds);
+        }
+        self.mark_target_region(target);
+        self.mark_target_approach_rays(
+            target,
+            approach_radius,
+            SourceTargetApproachRayMode::MarkWholeRay,
+        );
+
+        let selected = target.center_point_toward(start);
+        let mut callback_state =
+            SourcePathTargetCallbackState::new(selected, source_target_metric(start, selected));
+        self.search_with_blocked_cell_callback(start, |position, elapsed_cost| {
+            SourcePathTargetCallback::Threshold { limit }.decide(
+                position,
+                elapsed_cost,
+                &mut callback_state,
+            )
+        })
+    }
+
+    /// Select the nearest reached predecessor marker for an out-of-window
+    /// target, exactly as `FUN_0046d1e0` does before the caller consults
+    /// `FUN_0046eb20`. `source_world_width` is runtime `DAT_005b6128`; the
+    /// source initializes its strict best-distance bound to twice this value.
+    ///
+    /// A target already inside this local grid returns `None`, matching the
+    /// source's early exit. The caller must still apply the source
+    /// island-object predicate before turning the selected marker into a
+    /// route endpoint.
+    pub fn nearest_reached_marker(
+        &self,
+        target: (i32, i32),
+        source_world_width: i32,
+    ) -> Option<(i32, i32)> {
+        let local_target_x = target.0.checked_sub(self.origin.0)?;
+        let local_target_y = target.1.checked_sub(self.origin.1)?;
+        let width = i32::try_from(self.width).ok()?;
+        let height = i32::try_from(self.height).ok()?;
+
+        let (boundary_x, target_inside_x) = if local_target_x < 0 {
+            (0, false)
+        } else if local_target_x < width {
+            (local_target_x, true)
+        } else {
+            (width - 1, false)
+        };
+        let (boundary_y, target_inside_y) = if local_target_y < 0 {
+            (0, false)
+        } else if local_target_y < height {
+            (local_target_y, true)
+        } else {
+            (height - 1, false)
+        };
+        if target_inside_x && target_inside_y {
+            return None;
+        }
+
+        let mut best_distance = u32::try_from(source_world_width).ok()?.saturating_mul(2);
+        let mut best = None;
+        for y in 0..height {
+            let position = (self.origin.0 + boundary_x, self.origin.1 + y);
+            if self.is_reached_predecessor_marker(position) {
+                let distance = source_target_metric(position, target);
+                if distance < best_distance {
+                    best_distance = distance;
+                    best = Some(position);
+                }
+            }
+        }
+        for x in 0..width {
+            let position = (self.origin.0 + x, self.origin.1 + boundary_y);
+            if self.is_reached_predecessor_marker(position) {
+                let distance = source_target_metric(position, target);
+                if distance < best_distance {
+                    best_distance = distance;
+                    best = Some(position);
+                }
+            }
+        }
+        best
+    }
+
+    /// Trace the predecessor program to a marker selected by
+    /// [`Self::nearest_reached_marker`]. The source only invokes its route
+    /// encoder after `FUN_0046eb20` accepts this marker.
+    pub fn steps_to_reached_marker(
+        &self,
+        start: (i32, i32),
+        marker: (i32, i32),
+    ) -> Option<Vec<SourceRouteStep>> {
+        (self.index(start).is_some() && self.is_reached_predecessor_marker(marker))
+            .then(|| self.trace_steps(start, marker))
+    }
+
     fn enqueue_neighbours(
         &mut self,
         position: (i32, i32),
@@ -601,6 +1466,23 @@ fn source_footprint_size(size: (i32, i32), orientation: u8) -> (u8, u8) {
     }
 }
 
+/// Cohen-Sutherland-style source outcode used by `FUN_0046e0e0` and
+/// `FUN_0046e650` before they rasterize an approach ray.
+fn source_ray_outcode(position: (i32, i32), max_x: i32, max_y: i32) -> u8 {
+    let mut code = 0;
+    if position.0 < 0 {
+        code |= 1;
+    } else if position.0 > max_x {
+        code |= 2;
+    }
+    if position.1 < 0 {
+        code |= 4;
+    } else if position.1 > max_y {
+        code |= 8;
+    }
+    code
+}
+
 fn source_fixed_path_kind(definition: &CodBuilding) -> bool {
     matches!(
         definition.source_kind_code(),
@@ -637,6 +1519,380 @@ fn source_ship_route_direction(definition: &CodBuilding, tile: IslandTile) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_ship_route_window_exposes_the_two_caller_radii() {
+        assert_eq!(SourceShipRouteWindow::Normal.radius(), 0x50);
+        assert_eq!(SourceShipRouteWindow::ShortTargetRetry.radius(), 0x28);
+        assert_eq!(
+            SourceShipRouteWindow::default(),
+            SourceShipRouteWindow::Normal
+        );
+    }
+
+    #[test]
+    fn coordinate_target_descriptor_matches_fun_00445400_and_fun_00444900() {
+        let descriptor = SourceTargetDescriptor::from_world_coordinate(0x345, 0xabc).unwrap();
+        assert_eq!(descriptor.bytes(), [0x37, 0xa3, 0x45, 0xbc]);
+        assert_eq!(descriptor.kind(), 0x37);
+        assert_eq!(descriptor.world_coordinate(), Some((0x345, 0xabc)));
+        assert_eq!(
+            descriptor.target_rect(),
+            SourcePathTargetRect::new((0x345, 0xabc), 1, 1)
+        );
+        assert_eq!(descriptor.threshold_route_parameters(), Some((5, 0)));
+        assert_eq!(
+            descriptor.select_fun_00455a20_branch(2, None, None, 9),
+            SourceShipTargetRouteBranch::Threshold {
+                approach_radius: 5,
+                limit: 0,
+            }
+        );
+        assert!(SourceTargetDescriptor::from_world_coordinate(0x1000, 0).is_none());
+        assert!(SourceTargetDescriptor::from_world_coordinate(-1, 0).is_none());
+    }
+
+    #[test]
+    fn target_descriptor_branch_matches_fun_00455a20_owner_cases() {
+        let island_target = SourceTargetDescriptor::from_bytes([0x32, 4, 9, 7]);
+        assert_eq!(
+            island_target.select_fun_00455a20_branch(2, Some(4), Some(1), 3),
+            SourceShipTargetRouteBranch::Direct { approach_radius: 3 }
+        );
+        assert_eq!(
+            island_target.select_fun_00455a20_branch(2, Some(4), Some(3), 3),
+            SourceShipTargetRouteBranch::Threshold {
+                approach_radius: 5,
+                limit: 2,
+            }
+        );
+        assert_eq!(
+            island_target.select_fun_00455a20_branch(2, Some(2), Some(1), 3),
+            SourceShipTargetRouteBranch::Threshold {
+                approach_radius: 5,
+                limit: 2,
+            }
+        );
+
+        let unresolvable_target = SourceTargetDescriptor::from_bytes([0x39, 0, 0, 0]);
+        assert_eq!(
+            unresolvable_target.select_fun_00455a20_branch(2, None, None, 3),
+            SourceShipTargetRouteBranch::Threshold {
+                approach_radius: 5,
+                limit: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn static_island_target_descriptor_resolves_source_footprint_and_owner() {
+        let island = Island {
+            number: 4,
+            width: 32,
+            height: 32,
+            x_pos: 100,
+            y_pos: 200,
+            fertilities: [7; 8],
+            tiles: vec![IslandTile {
+                building_id: 3,
+                x: 9,
+                y: 7,
+                orientation: 1,
+                anim_count: 0x80,
+                flags: 1,
+            }],
+            city: None,
+        };
+        let definitions = [CodBuilding {
+            source_id: 0x4e23,
+            size: (2, 4),
+            ..Default::default()
+        }];
+        let descriptor = SourceTargetDescriptor::from_bytes([0x32, 4, 9, 7]);
+
+        assert_eq!(
+            descriptor.resolve_static_island_target(&[island], &definitions),
+            Some(SourceResolvedStaticTarget {
+                target: SourcePathTargetRect::new((109, 207), 4, 2).unwrap(),
+                owner: 6,
+            })
+        );
+        assert!(SourceTargetDescriptor::from_bytes([0x35, 4, 9, 7])
+            .resolve_static_island_target(&[], &definitions)
+            .is_none());
+    }
+
+    #[test]
+    fn dynamic_map_object_target_descriptor_uses_live_slot_position_and_kind_footprint() {
+        let island = Island {
+            number: 4,
+            width: 32,
+            height: 32,
+            x_pos: 100,
+            y_pos: 200,
+            fertilities: [7; 8],
+            tiles: vec![IslandTile {
+                building_id: 3,
+                x: 9,
+                y: 7,
+                orientation: 1,
+                anim_count: 0,
+                flags: 0,
+            }],
+            city: None,
+        };
+        let definitions = [CodBuilding {
+            source_id: 0x4e23,
+            size: (2, 4),
+            ..Default::default()
+        }];
+        let object = SourceDynamicMapObject {
+            island: 4,
+            slot: 6,
+            owner: 2,
+            local_position: (9, 7),
+        };
+
+        assert_eq!(
+            SourceTargetDescriptor::from_bytes([0x35, 4, 6, 0]).resolve_dynamic_map_object_target(
+                &[object],
+                &[island.clone()],
+                &definitions
+            ),
+            Some(SourceResolvedDynamicTarget {
+                target: SourcePathTargetRect::new((109, 207), 4, 2).unwrap(),
+                owner: 2,
+            })
+        );
+        assert_eq!(
+            SourceTargetDescriptor::from_bytes([0x36, 4, 6, 0]).resolve_dynamic_map_object_target(
+                &[object],
+                &[island],
+                &[]
+            ),
+            Some(SourceResolvedDynamicTarget {
+                target: SourcePathTargetRect::new((109, 207), 1, 1).unwrap(),
+                owner: 2,
+            })
+        );
+        assert!(SourceTargetDescriptor::from_bytes([0x35, 4, 7, 0])
+            .resolve_dynamic_map_object_target(&[object], &[], &definitions)
+            .is_none());
+    }
+
+    #[test]
+    fn dynamic_map_object_table_reuses_the_first_released_source_slot() {
+        let mut table = SourceDynamicMapObjectTable::new(4);
+        let first = table.allocate(2, (9, 7)).unwrap();
+        let second = table.allocate(3, (5, 6)).unwrap();
+
+        assert_eq!(first.slot, 0);
+        assert_eq!(second.slot, 1);
+        assert_eq!(table.object(0), Some(first));
+        assert_eq!(table.release(0), Some(first));
+
+        let replacement = table.allocate(6, (11, 12)).unwrap();
+        assert_eq!(replacement.slot, 0);
+        assert_eq!(
+            table.objects().collect::<Vec<_>>(),
+            vec![replacement, second]
+        );
+    }
+
+    #[test]
+    fn dynamic_map_object_table_fills_all_eight_source_slots() {
+        let mut table = SourceDynamicMapObjectTable::new(4);
+        for slot in 0..SourceDynamicMapObjectTable::SLOT_COUNT {
+            let object = table.allocate(2, (slot as u8, 0)).unwrap();
+            assert_eq!(object.slot, slot as u8);
+            assert_eq!(object.island, 4);
+        }
+
+        assert!(table.allocate(2, (9, 7)).is_none());
+        assert_eq!(
+            table.objects().count(),
+            SourceDynamicMapObjectTable::SLOT_COUNT
+        );
+    }
+
+    #[test]
+    fn target_rectangle_helpers_match_source_callback_setup() {
+        let target = SourcePathTargetRect::new((10, 20), 4, 3).unwrap();
+        assert_eq!(target.nearest_point((8, 22)), (10, 22));
+        assert_eq!(target.nearest_point((20, 30)), (13, 22));
+        assert_eq!(target.center_point_toward((8, 20)), (11, 21));
+        assert_eq!(target.center_point_toward((20, 30)), (12, 21));
+
+        let mut grid = SourcePathGrid::new((9, 19), 5, 5);
+        grid.set_metadata((10, 20), 0x2a);
+        grid.mark_direction_blocker((10, 20));
+        assert!(grid.mark_target_region(target));
+        assert_eq!(grid.metadata((10, 20)), Some(0xaa));
+        assert_eq!(grid.is_direction_clear((10, 20)), Some(true));
+        assert_eq!(grid.metadata((13, 22)), Some(0x80));
+        assert_eq!(grid.metadata((9, 19)), Some(0));
+    }
+
+    #[test]
+    fn target_region_callback_completes_on_first_reached_target_cell() {
+        let mut grid = SourcePathGrid::new((0, 0), 5, 1);
+        let target = SourcePathTargetRect::new((2, 0), 2, 1).unwrap();
+
+        let steps = grid.route_to_target_region((0, 0), target).unwrap();
+        assert_eq!(
+            steps.iter().map(|step| step.direction).collect::<Vec<_>>(),
+            vec![3, 3]
+        );
+        assert_eq!(grid.metadata((2, 0)), Some(0x80));
+        assert_eq!(grid.metadata((3, 0)), Some(0x80));
+    }
+
+    #[test]
+    fn direct_target_callback_completes_on_the_first_approach_ray_cell() {
+        let target = SourcePathTargetRect::new((5, 1), 1, 1).unwrap();
+
+        let mut no_approach = SourcePathGrid::new((0, 0), 7, 3);
+        let direct_steps = no_approach
+            .route_to_direct_target((0, 1), target, 0)
+            .unwrap();
+        assert_eq!(direct_steps.len(), 5);
+
+        let mut with_approach = SourcePathGrid::new((0, 0), 7, 3);
+        let approach_steps = with_approach
+            .route_to_direct_target((0, 1), target, 2)
+            .unwrap();
+        assert_eq!(approach_steps.len(), 3);
+        assert_eq!(with_approach.metadata((3, 1)), Some(0x80));
+    }
+
+    #[test]
+    fn threshold_target_search_uses_whole_rays_and_the_center_callback() {
+        let target = SourcePathTargetRect::new((5, 1), 1, 1).unwrap();
+
+        let mut grid = SourcePathGrid::new((0, 0), 7, 3);
+        let result = grid.search_threshold_target((0, 1), target, 2, 2).unwrap();
+        assert_eq!(result.position, (3, 1));
+        assert_eq!(result.steps.len(), 3);
+        assert_eq!(grid.metadata((5, 1)), Some(0x80));
+
+        let mut target_only = SourcePathGrid::new((0, 0), 7, 3);
+        let result = target_only
+            .search_threshold_target((0, 1), target, 2, 0)
+            .unwrap();
+        assert_eq!(result.position, (5, 1));
+        assert_eq!(result.steps.len(), 5);
+    }
+
+    #[test]
+    fn nearest_reached_marker_matches_fun_0046d1e0_boundary_scan() {
+        let mut grid = SourcePathGrid::new((10, 20), 5, 4);
+        for (position, direction) in [
+            ((14, 20), 3),
+            ((14, 23), 3),
+            ((12, 20), 3),
+            ((12, 21), 3),
+            ((11, 21), 0x0b),
+        ] {
+            let index = grid.index(position).unwrap();
+            grid.cells[index].direction = direction;
+        }
+
+        // The vertical boundary scan precedes the horizontal scan, so the
+        // equal-cost top-right marker wins the source's strict comparison.
+        assert_eq!(grid.nearest_reached_marker((20, 21), 100), Some((14, 20)));
+        assert_eq!(grid.nearest_reached_marker((12, 21), 100), None);
+        assert_eq!(grid.nearest_reached_marker((12, 15), 100), Some((12, 20)));
+    }
+
+    #[test]
+    fn reached_marker_trace_requires_a_source_predecessor_direction() {
+        let mut grid = SourcePathGrid::new((0, 0), 3, 1);
+        for position in [(1, 0), (2, 0)] {
+            let index = grid.index(position).unwrap();
+            grid.cells[index].direction = 3;
+        }
+
+        assert_eq!(
+            grid.steps_to_reached_marker((0, 0), (2, 0)),
+            Some(vec![
+                SourceRouteStep {
+                    direction: 3,
+                    metadata: 0,
+                },
+                SourceRouteStep {
+                    direction: 3,
+                    metadata: 0,
+                },
+            ])
+        );
+        assert_eq!(grid.steps_to_reached_marker((0, 0), (0, 0)), None);
+    }
+
+    #[test]
+    fn target_callbacks_match_lab_0046c670_and_lab_0046c750() {
+        let mut direct = SourcePathTargetCallbackState::new((10, 20), 999);
+        assert_eq!(
+            SourcePathTargetCallback::Direct.decide((13, 24), 0, &mut direct),
+            SourcePathBlockedCellDecision::Complete
+        );
+        assert_eq!(direct.candidate, (13, 24));
+        assert_eq!(direct.best_distance, 4);
+
+        let mut threshold = SourcePathTargetCallbackState::new((50, 10), 60);
+        assert_eq!(
+            SourcePathTargetCallback::Threshold { limit: 3 }.decide((99, 20), 0, &mut threshold),
+            SourcePathBlockedCellDecision::Expand
+        );
+        assert_eq!(threshold.candidate, (99, 20));
+        assert_eq!(threshold.best_distance, 51);
+        assert_eq!(
+            SourcePathTargetCallback::Threshold { limit: 3 }.decide((48, 11), 48, &mut threshold),
+            SourcePathBlockedCellDecision::Complete
+        );
+        assert_eq!(threshold.candidate, (48, 11));
+        assert_eq!(threshold.best_distance, 2);
+    }
+
+    #[test]
+    fn target_approach_rays_preserve_the_two_source_raster_policies() {
+        let target = SourcePathTargetRect::new((3, 3), 1, 1).unwrap();
+
+        let mut stop_at_direction_13 = SourcePathGrid::new((0, 0), 7, 7);
+        let stop_index = stop_at_direction_13.index((2, 3)).unwrap();
+        stop_at_direction_13.cells[stop_index].direction = 0x0d;
+        stop_at_direction_13.mark_target_approach_rays(
+            target,
+            1,
+            SourceTargetApproachRayMode::StopAtDirection13,
+        );
+        assert_eq!(stop_at_direction_13.metadata((3, 3)), Some(0));
+        assert_eq!(stop_at_direction_13.metadata((2, 3)), Some(0));
+        assert_eq!(stop_at_direction_13.metadata((3, 2)), Some(0x80));
+
+        let mut mark_whole_ray = SourcePathGrid::new((0, 0), 7, 7);
+        let mark_index = mark_whole_ray.index((2, 3)).unwrap();
+        mark_whole_ray.cells[mark_index].direction = 0x0d;
+        mark_whole_ray.mark_target_approach_rays(
+            target,
+            1,
+            SourceTargetApproachRayMode::MarkWholeRay,
+        );
+        assert_eq!(mark_whole_ray.metadata((3, 3)), Some(0x80));
+        assert_eq!(mark_whole_ray.metadata((2, 3)), Some(0x80));
+    }
+
+    #[test]
+    fn target_approach_rays_clip_against_the_path_grid() {
+        let mut grid = SourcePathGrid::new((0, 0), 4, 4);
+        let target = SourcePathTargetRect::new((0, 0), 1, 1).unwrap();
+
+        grid.mark_target_approach_rays(target, 5, SourceTargetApproachRayMode::MarkWholeRay);
+
+        assert_eq!(grid.metadata((0, 0)), Some(0x80));
+        assert_eq!(grid.metadata((1, 0)), Some(0x80));
+        assert_eq!(grid.metadata((0, 1)), Some(0x80));
+        assert_eq!(grid.metadata((3, 3)), Some(0x80));
+    }
 
     #[test]
     fn source_directions_match_fun_00456270() {

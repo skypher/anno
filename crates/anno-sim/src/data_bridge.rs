@@ -9,6 +9,8 @@ use anno_formats::cod::{BuildingDef as CodBuilding, CodFile};
 use anno_formats::szs::SzsFile;
 
 use crate::building::{BuildingDef, BuildingInstance};
+use crate::source_cell::SourceMapCellState;
+use crate::source_route::{SourceDynamicMapObject, SourceDynamicMapObjectTable};
 use crate::types::Good;
 
 /// Map COD good names to simulation Good enum.
@@ -547,22 +549,24 @@ fn is_production_building(cod_building: &CodBuilding) -> bool {
 /// Load building instances from a parsed SZS scenario file.
 ///
 /// Maps each INSELHAUS tile that has a matching building definition
-/// (via sprite index → COD gfx lookup) into a BuildingInstance.
+/// (via source definition ID) into a BuildingInstance.
 /// Only creates instances for production buildings (those with production ProdKind).
 pub fn load_building_instances(
     szs: &SzsFile,
     cod: &CodFile,
     building_defs: &[BuildingDef],
 ) -> Vec<BuildingInstance> {
-    let gfx_map = gfx_to_def_index(cod);
+    let source_id_map: HashMap<i32, usize> = cod
+        .buildings
+        .iter()
+        .enumerate()
+        .map(|(index, building)| (building.source_id, index))
+        .collect();
     let mut instances = Vec::new();
 
     for island in &szs.islands {
         for tile in &island.tiles {
-            let sprite_idx = tile.building_id as i32;
-
-            // Look up which building def this sprite belongs to
-            if let Some(&def_idx) = gfx_map.get(&sprite_idx) {
+            if let Some(&def_idx) = source_id_map.get(&tile.source_id()) {
                 let cod_building = &cod.buildings[def_idx];
 
                 // Only create instances for actual production buildings
@@ -573,12 +577,6 @@ pub fn load_building_instances(
                 let def = &building_defs[def_idx];
                 // Skip terrain/decoration tiles (GRAS, NOWARE, BAUM, etc.)
                 if def.output_good == Good::None {
-                    continue;
-                }
-
-                // Skip duplicate tiles for multi-tile buildings
-                // (only the base tile at the building's gfx index creates an instance)
-                if sprite_idx != cod_building.gfx {
                     continue;
                 }
 
@@ -606,6 +604,116 @@ pub fn load_building_instances(
     instances
 }
 
+/// Replay INSELHAUS overwrite order into the renderer-relevant subset of the
+/// source map-cell records. `FUN_00481450` removes records whose command
+/// roots are overwritten before `FUN_00481fc0` creates the new root record;
+/// this bridge retains the selector-bearing source kinds 1 through 7.
+pub fn source_map_cell_states_from_scenario(
+    szs: &SzsFile,
+    cod: &CodFile,
+) -> Vec<SourceMapCellState> {
+    let mut states = Vec::new();
+
+    for island in &szs.islands {
+        for tile in &island.tiles {
+            let Some(definition) = cod.building_by_source_id(tile.source_id()) else {
+                continue;
+            };
+            let (width, height) = if matches!(tile.orientation & 3, 1 | 3) {
+                (definition.size.1, definition.size.0)
+            } else {
+                definition.size
+            };
+            if width <= 0 || height <= 0 {
+                continue;
+            }
+            let right = i32::from(tile.x) + width;
+            let bottom = i32::from(tile.y) + height;
+            states.retain(|state: &SourceMapCellState| {
+                state.island != island.number
+                    || i32::from(state.x) < i32::from(tile.x)
+                    || i32::from(state.x) >= right
+                    || i32::from(state.y) < i32::from(tile.y)
+                    || i32::from(state.y) >= bottom
+            });
+
+            if !matches!(definition.source_kind_code(), Some(1..=7)) {
+                continue;
+            }
+            if let Some(state) =
+                SourceMapCellState::new(island.number, tile.x, tile.y, definition, 0)
+            {
+                states.push(state);
+            }
+        }
+    }
+
+    states
+}
+
+/// Reconstruct the source island map-object tables that the INSELHAUS loader
+/// creates for `Kind=HQ` definitions.
+///
+/// `FUN_00465170` allocates the first free slot when the tile's current
+/// three-bit map-owner value does not already name a live object. It then
+/// writes that slot across the definition's oriented footprint via
+/// `FUN_0046ae20`. INSELHAUS stores the definition offset, so the lookup here
+/// must use `IslandTile::source_id`, not the definition's GFX value.
+pub fn source_dynamic_map_objects_from_scenario(
+    szs: &SzsFile,
+    cod: &CodFile,
+) -> Vec<SourceDynamicMapObject> {
+    let mut objects = Vec::new();
+
+    for island in &szs.islands {
+        let mut table = SourceDynamicMapObjectTable::new(island.number);
+        let mut slot_overlay = HashMap::<(u8, u8), u8>::new();
+
+        for tile in &island.tiles {
+            let Some(definition) = cod.building_by_source_id(tile.source_id()) else {
+                continue;
+            };
+            if definition.source_kind_code() != Some(0x23) {
+                continue;
+            }
+
+            let current_slot = slot_overlay
+                .get(&(tile.x, tile.y))
+                .copied()
+                .unwrap_or_else(|| tile.source_owner());
+            if table.object(current_slot).is_some() {
+                continue;
+            }
+
+            let Some(object) = table.allocate(tile.source_dynamic_object_owner(), (tile.x, tile.y))
+            else {
+                continue;
+            };
+
+            let (width, height) = if matches!(tile.orientation, 1 | 3) {
+                (definition.size.1, definition.size.0)
+            } else {
+                definition.size
+            };
+            if width <= 0 || height <= 0 {
+                continue;
+            }
+
+            for y in i32::from(tile.y)..i32::from(tile.y) + height {
+                for x in i32::from(tile.x)..i32::from(tile.x) + width {
+                    if x < i32::from(island.width) && y < i32::from(island.height) {
+                        slot_overlay.insert((x as u8, y as u8), object.slot);
+                    }
+                }
+            }
+        }
+
+        objects.extend(table.objects());
+    }
+
+    objects
+}
+
 /// Locate KONTOR (warehouse) tiles in INSELHAUS data and
 /// emit a `Warehouse` per occurrence, anchored on the actual
 /// tile position rather than an averaged centroid. This is
@@ -624,15 +732,17 @@ pub fn kontor_warehouses_from_szs(
     building_defs: &[BuildingDef],
 ) -> Vec<crate::warehouse::Warehouse> {
     use crate::warehouse::Warehouse;
-    // INSELHAUS tile.building_id is a sprite index, so use the
-    // gfx → def lookup (not the Nummer-keyed one).
-    let gfx_map = gfx_to_def_index(cod);
+    let source_id_map: HashMap<i32, usize> = cod
+        .buildings
+        .iter()
+        .enumerate()
+        .map(|(index, building)| (building.source_id, index))
+        .collect();
     let mut out = Vec::new();
     for island in &szs.islands {
         let owner = island.city.as_ref().map(|c| c.owner_slot).unwrap_or(0);
         for tile in &island.tiles {
-            let sprite_idx = tile.building_id as i32;
-            let Some(&def_idx) = gfx_map.get(&sprite_idx) else {
+            let Some(&def_idx) = source_id_map.get(&tile.source_id()) else {
                 continue;
             };
             let Some(def) = building_defs.get(def_idx) else {
@@ -640,10 +750,6 @@ pub fn kontor_warehouses_from_szs(
             };
             // ProdKind=KONTOR identifies warehouse tiles.
             if def.prod_kind != "KONTOR" {
-                continue;
-            }
-            // Only the base tile of a multi-tile Kontor counts.
-            if sprite_idx != cod.buildings[def_idx].gfx {
                 continue;
             }
             // Carry the Kontor's authored storage capacity (50/
@@ -826,6 +932,7 @@ pub fn traders_from_ships(
             // Carry the authored heading so the renderer
             // shows the ship facing the right direction.
             t.heading = s.heading();
+            t.source_target_approach_radius = cargo_config.target_approach_radius_for(class);
             t
         })
         .collect()
@@ -923,7 +1030,10 @@ mod tests {
             mk(0, 0x1F, 50, 50), // PirateShip   → skip
             mk(0, 0xFE, 0, 0),   // unknown     → skip
         ];
-        let traders = traders_from_ships(&ships, crate::trade::ShipCargoConfig::default());
+        let mut cargo_config = crate::trade::ShipCargoConfig::default();
+        cargo_config.small_trader_target_approach_radius = 4;
+        cargo_config.large_trader_target_approach_radius = 2;
+        let traders = traders_from_ships(&ships, cargo_config);
         assert_eq!(traders.len(), 2);
         for t in &traders {
             assert_eq!(
@@ -937,10 +1047,209 @@ mod tests {
         assert_eq!(traders[0].world_x, 10);
         assert_eq!(traders[0].class, crate::trade::TradeShipClass::SmallTrader);
         assert_eq!(traders[0].cargo_capacity(), 40);
+        assert_eq!(traders[0].source_target_approach_radius, 4);
         assert_eq!(traders[1].owner, 2);
         assert_eq!(traders[1].world_x, 30);
         assert_eq!(traders[1].class, crate::trade::TradeShipClass::LargeTrader);
         assert_eq!(traders[1].cargo_capacity(), 60);
+        assert_eq!(traders[1].source_target_approach_radius, 2);
+    }
+
+    #[test]
+    fn scenario_hq_tiles_reconstruct_one_oriented_dynamic_map_object() {
+        use anno_formats::szs::{Island, IslandTile, ScenarioMeta};
+
+        let source_id = anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 3;
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![CodBuilding {
+                source_id,
+                kind: "HQ".into(),
+                size: (2, 4),
+                ..Default::default()
+            }],
+        };
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![Island {
+                number: 4,
+                width: 16,
+                height: 16,
+                x_pos: 100,
+                y_pos: 200,
+                fertilities: [7; 8],
+                tiles: vec![
+                    IslandTile {
+                        building_id: 3,
+                        x: 2,
+                        y: 3,
+                        orientation: 1,
+                        anim_count: 0,
+                        flags: 6 << 6,
+                    },
+                    // `FUN_0046ae20` has already overlaid slot 0 at this
+                    // cell of the rotated 4 x 2 footprint, so the second
+                    // HQ record must not allocate another object.
+                    IslandTile {
+                        building_id: 3,
+                        x: 3,
+                        y: 3,
+                        orientation: 1,
+                        anim_count: 0,
+                        flags: 0,
+                    },
+                ],
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: ScenarioMeta::default(),
+            ships: Vec::new(),
+        };
+
+        assert_eq!(
+            source_dynamic_map_objects_from_scenario(&szs, &cod),
+            vec![SourceDynamicMapObject {
+                island: 4,
+                slot: 0,
+                owner: 6,
+                local_position: (2, 3),
+            }]
+        );
+    }
+
+    #[test]
+    fn source_cell_seeder_replays_oriented_command_overwrites() {
+        use anno_formats::szs::{Island, IslandTile, ScenarioMeta};
+
+        let base = anno_formats::szs::INSELHAUS_SOURCE_ID_BASE;
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![
+                CodBuilding {
+                    source_id: base + 1,
+                    kind: "HANDWERK".into(),
+                    size: (1, 1),
+                    ..Default::default()
+                },
+                CodBuilding {
+                    source_id: base + 2,
+                    kind: "MARKT".into(),
+                    size: (1, 1),
+                    ..Default::default()
+                },
+                CodBuilding {
+                    source_id: base + 3,
+                    kind: "GEBAEUDE".into(),
+                    // Rotating this 1 x 2 command makes it cover (3, 4),
+                    // the earlier market root, while creating no cell state.
+                    size: (1, 2),
+                    ..Default::default()
+                },
+            ],
+        };
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![Island {
+                number: 6,
+                width: 16,
+                height: 16,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: vec![
+                    IslandTile {
+                        building_id: 1,
+                        x: 1,
+                        y: 1,
+                        orientation: 0,
+                        anim_count: 0,
+                        flags: 0,
+                    },
+                    IslandTile {
+                        building_id: 2,
+                        x: 3,
+                        y: 4,
+                        orientation: 0,
+                        anim_count: 0,
+                        flags: 0,
+                    },
+                    IslandTile {
+                        building_id: 3,
+                        x: 2,
+                        y: 4,
+                        orientation: 1,
+                        anim_count: 0,
+                        flags: 0,
+                    },
+                    IslandTile {
+                        building_id: 1,
+                        x: 8,
+                        y: 9,
+                        orientation: 0,
+                        anim_count: 0,
+                        flags: 0,
+                    },
+                ],
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: ScenarioMeta::default(),
+            ships: Vec::new(),
+        };
+
+        let states = source_map_cell_states_from_scenario(&szs, &cod);
+        assert_eq!(states.len(), 2);
+        assert!(states.iter().any(|state| state.matches(6, 1, 1)));
+        assert!(states.iter().any(|state| state.matches(6, 8, 9)));
+        assert!(!states.iter().any(|state| state.matches(6, 3, 4)));
+    }
+
+    #[test]
+    fn production_loader_resolves_inselhaus_source_ids_not_gfx() {
+        use anno_formats::szs::{Island, IslandTile, ScenarioMeta};
+
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![CodBuilding {
+                source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 3,
+                gfx: 9000,
+                kind: "GEBAEUDE".into(),
+                properties: HashMap::from([
+                    ("ProdKind".into(), "HANDWERK".into()),
+                    ("Ware".into(), "HOLZ".into()),
+                ]),
+                ..Default::default()
+            }],
+        };
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![Island {
+                number: 2,
+                width: 1,
+                height: 1,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: vec![IslandTile {
+                    building_id: 3,
+                    x: 0,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                }],
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: ScenarioMeta::default(),
+            ships: Vec::new(),
+        };
+
+        let defs = load_building_defs(&cod);
+        assert_eq!(load_building_instances(&szs, &cod, &defs).len(), 1);
     }
 
     #[test]
@@ -1003,16 +1312,11 @@ mod tests {
     }
 
     #[test]
-    fn shipping_scenarios_do_not_pre_place_kontors() {
-        // Audit finding: every shipping `.szs` in the corpus has
-        // INSELHAUS tile sprite indices ≤ 2822, but Kontor
-        // building gfx values start at 3416. So the original
-        // engine doesn't write Kontor tiles into INSELHAUS —
-        // Kontors get placed dynamically when a player first
-        // lands on an island. `kontor_warehouses_from_szs`
-        // therefore returns an empty Vec for every shipping
-        // scenario; the centroid fallback in the game-side
-        // init does the real placement.
+    fn shipping_scenarios_expose_authored_kontors_by_source_id() {
+        // INSELHAUS records are source-definition offsets, not GFX values.
+        // The source-ID lookup exposes authored Kontors that the former GFX
+        // lookup missed, including the native and pirate settlements in the
+        // shipping corpus.
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -1032,7 +1336,8 @@ mod tests {
             println!("Skipping: scenes dir not found");
             return;
         }
-        let mut total = 0;
+        let mut scenarios = 0;
+        let mut kontors = 0;
         for entry in std::fs::read_dir(&szenes).unwrap().filter_map(|e| e.ok()) {
             let path = entry.path();
             if !path
@@ -1051,14 +1356,21 @@ mod tests {
                 Err(_) => continue,
             };
             let whs = kontor_warehouses_from_szs(&szs, &cod, &defs);
-            assert!(
-                whs.is_empty(),
-                "{:?} unexpectedly has pre-placed Kontors",
-                path.file_stem().unwrap()
-            );
-            total += 1;
+            for warehouse in &whs {
+                assert!(
+                    szs.islands
+                        .iter()
+                        .any(|island| island.number == warehouse.island_id),
+                    "{:?} yielded a Kontor on an unknown island {}",
+                    path.file_stem().unwrap(),
+                    warehouse.island_id
+                );
+            }
+            kontors += whs.len();
+            scenarios += 1;
         }
-        assert!(total > 0, "audit must cover at least one scenario");
+        assert!(scenarios > 0, "audit must cover at least one scenario");
+        assert!(kontors > 0, "source-ID audit must recover authored Kontors");
     }
 
     #[test]
@@ -1315,14 +1627,14 @@ mod tests {
             "converted definitions should inherit haeuser.cod Maxbrand: 4",
         );
         let ruin_cases = [
-            (270, 8), // RUINE_KONTOR_1
-            (271, 9), // ObjFill: BASE, then @Ruinenr: +1
+            (270, 8),  // RUINE_KONTOR_1
+            (271, 9),  // ObjFill: BASE, then @Ruinenr: +1
             (272, 10), // next @Ruinenr: +1 directive value
             (273, 11), // next @Ruinenr: +1 directive value
-            (274, 0), // RUINE_HOLZ
-            (275, 0), // RUINE_HOLZ
-            (276, 2), // RUINE_STEIN
-            (277, 2), // RUINE_STEIN
+            (274, 0),  // RUINE_HOLZ
+            (275, 0),  // RUINE_HOLZ
+            (276, 2),  // RUINE_STEIN
+            (277, 2),  // RUINE_STEIN
             (359, crate::building::NO_RUIN_ID),
         ];
         for (nummer, ruin_id) in ruin_cases {

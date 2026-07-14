@@ -12,6 +12,7 @@
 //!   3. Arrives at warehouse, loads/unloads goods
 //!   4. Advances to next stop in route (loops back to first)
 
+use crate::source_route::{SourceShipRouteWindow, SourceTargetDescriptor};
 use crate::types::Good;
 use crate::warehouse::Warehouse;
 
@@ -44,12 +45,17 @@ impl Default for TradeShipClass {
     }
 }
 
-/// Source-derived trade-ship cargo capacities.
+/// Source-derived trade-ship cargo capacities and direct-route target approach
+/// radii.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShipCargoConfig {
     pub small_trader_capacity: u16,
     pub large_trader_capacity: u16,
     pub free_trader_capacity: u16,
+    /// `HANDEL1` `Shotradius >> 3`, supplied to `FUN_0046dde0`.
+    pub small_trader_target_approach_radius: i32,
+    /// `HANDEL2` `Shotradius >> 3`, supplied to `FUN_0046dde0`.
+    pub large_trader_target_approach_radius: i32,
 }
 
 impl Default for ShipCargoConfig {
@@ -58,6 +64,8 @@ impl Default for ShipCargoConfig {
             small_trader_capacity: DEFAULT_SMALL_TRADER_CARGO_CAPACITY,
             large_trader_capacity: DEFAULT_LARGE_TRADER_CARGO_CAPACITY,
             free_trader_capacity: DEFAULT_LARGE_TRADER_CARGO_CAPACITY,
+            small_trader_target_approach_radius: 0,
+            large_trader_target_approach_radius: 0,
         }
     }
 }
@@ -81,6 +89,16 @@ impl ShipCargoConfig {
                 "HANDLER",
                 default.free_trader_capacity,
             ),
+            small_trader_target_approach_radius: approach_radius_from_figure(
+                figures,
+                "HANDEL1",
+                default.small_trader_target_approach_radius,
+            ),
+            large_trader_target_approach_radius: approach_radius_from_figure(
+                figures,
+                "HANDEL2",
+                default.large_trader_target_approach_radius,
+            ),
         }
     }
 
@@ -88,6 +106,13 @@ impl ShipCargoConfig {
         match class {
             TradeShipClass::SmallTrader => self.small_trader_capacity,
             TradeShipClass::LargeTrader => self.large_trader_capacity,
+        }
+    }
+
+    pub fn target_approach_radius_for(self, class: TradeShipClass) -> i32 {
+        match class {
+            TradeShipClass::SmallTrader => self.small_trader_target_approach_radius,
+            TradeShipClass::LargeTrader => self.large_trader_target_approach_radius,
         }
     }
 }
@@ -102,6 +127,17 @@ fn capacity_from_figure(
         .and_then(|def| u16::try_from(def.max_ware()).ok())
         .filter(|&maxware| maxware > 0)
         .and_then(|maxware| maxware.checked_mul(CARGO_TONS_PER_MAXWARE))
+        .unwrap_or(fallback)
+}
+
+fn approach_radius_from_figure(
+    figures: &anno_formats::figuren::FiguresFile,
+    name: &str,
+    fallback: i32,
+) -> i32 {
+    figures
+        .find(name)
+        .map(|def| def.shot_radius().max(0) >> 3)
         .unwrap_or(fallback)
 }
 
@@ -197,6 +233,20 @@ pub struct TradeShip {
     pub path: Vec<(i32, i32)>,
     /// Current index into path.
     pub path_idx: usize,
+    /// Caller-selected source local-grid radius. `FUN_00452370` stores this
+    /// route-record field before calling `FUN_00455a20`; the short window is
+    /// selected by its timed target-proximity retry branch, not by a failed
+    /// path search.
+    #[serde(default)]
+    pub source_route_window: SourceShipRouteWindow,
+    /// Source figure `Shotradius >> 3` passed to `FUN_0046dde0` by the direct
+    /// target route branch.
+    #[serde(default)]
+    pub source_target_approach_radius: i32,
+    /// Live four-byte target state selected for the active source route.
+    /// Coordinate route stops use the `FUN_00445400` kind-`0x37` codec.
+    #[serde(default)]
+    pub source_target_descriptor: Option<SourceTargetDescriptor>,
 }
 
 /// Ship operating states.
@@ -266,6 +316,9 @@ impl TradeShip {
             active: true,
             path: Vec::new(),
             path_idx: 0,
+            source_route_window: SourceShipRouteWindow::Normal,
+            source_target_approach_radius: 0,
+            source_target_descriptor: None,
         }
     }
 
@@ -515,24 +568,31 @@ fn compute_path_to_stop(
     let stop = &route.stops[ship.current_stop];
     let target_x = stop.warehouse_x as i32;
     let target_y = stop.warehouse_y as i32;
+    let target_descriptor = SourceTargetDescriptor::from_world_coordinate(target_x, target_y);
+    ship.source_target_descriptor = target_descriptor;
 
     // Find nearest navigable tiles to start and end
     let start = match ocean.nearest_navigable(ship.world_x, ship.world_y) {
         Some(p) => p,
         None => return RoutePathStatus::Blocked,
     };
-    let goal = match ocean.nearest_navigable(target_x, target_y) {
-        Some(p) => p,
-        None => return RoutePathStatus::Blocked,
-    };
-
-    if start == goal {
-        return RoutePathStatus::AlreadyAtStop;
-    }
-
     let path = if ocean.has_source_ship_route_grid() {
-        ocean.find_source_ship_path(start, goal)
+        let Some(target_descriptor) = target_descriptor else {
+            return RoutePathStatus::Blocked;
+        };
+        ocean.find_source_ship_path_in_window_for_target_descriptor(
+            start,
+            target_descriptor,
+            ship.source_route_window,
+        )
     } else {
+        let goal = match ocean.nearest_navigable(target_x, target_y) {
+            Some(p) => p,
+            None => return RoutePathStatus::Blocked,
+        };
+        if start == goal {
+            return RoutePathStatus::AlreadyAtStop;
+        }
         crate::ocean_map::find_ocean_path(ocean, start, goal)
     };
     if let Some(path) = path {
@@ -610,9 +670,11 @@ mod tests {
         let mut small = anno_formats::figuren::FigureDef::default();
         small.name = "HANDEL1".into();
         small.properties.insert("Maxware".into(), "4".into());
+        small.properties.insert("Shotradius".into(), "39".into());
         let mut large = anno_formats::figuren::FigureDef::default();
         large.name = "HANDEL2".into();
         large.properties.insert("Maxware".into(), "6".into());
+        large.properties.insert("Shotradius".into(), "7".into());
         let mut handler = anno_formats::figuren::FigureDef::default();
         handler.name = "HANDLER".into();
         handler.properties.insert("Maxware".into(), "6".into());
@@ -626,6 +688,14 @@ mod tests {
         assert_eq!(config.small_trader_capacity, 40);
         assert_eq!(config.large_trader_capacity, 60);
         assert_eq!(config.free_trader_capacity, 60);
+        assert_eq!(
+            config.target_approach_radius_for(TradeShipClass::SmallTrader),
+            4
+        );
+        assert_eq!(
+            config.target_approach_radius_for(TradeShipClass::LargeTrader),
+            0
+        );
     }
 
     #[test]
@@ -859,6 +929,111 @@ mod tests {
         );
         assert_eq!(ship.path.last(), Some(&(2, 1)));
         assert!(!ship.path.contains(&(1, 1)));
+    }
+
+    #[test]
+    fn source_ocean_trade_path_uses_the_persisted_caller_window() {
+        let scenario = anno_formats::szs::SzsFile {
+            chunks: Vec::new(),
+            islands: vec![anno_formats::szs::Island {
+                number: 0,
+                width: 100,
+                height: 1,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: Vec::new(),
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let ocean = crate::ocean_map::OceanMap::from_source_scenario(&scenario, &[]);
+        let mut route = TradeRoute::new(0, 0);
+        route.add_stop(RouteStop {
+            island_id: 0,
+            warehouse_x: 60,
+            warehouse_y: 1,
+            load_goods: vec![],
+            unload_goods: vec![],
+        });
+        route.add_stop(RouteStop {
+            island_id: 0,
+            warehouse_x: 0,
+            warehouse_y: 1,
+            load_goods: vec![],
+            unload_goods: vec![],
+        });
+        route.activate();
+
+        let mut normal = TradeShip::new(0, 0, 0, 1);
+        assert_eq!(
+            compute_path_to_stop(&mut normal, &route, Some(&ocean)),
+            RoutePathStatus::PathReady
+        );
+        assert_eq!(normal.path.last(), Some(&(60, 1)));
+
+        let mut short_retry = TradeShip::new(0, 0, 0, 1);
+        short_retry.source_route_window = SourceShipRouteWindow::ShortTargetRetry;
+        assert_eq!(
+            compute_path_to_stop(&mut short_retry, &route, Some(&ocean)),
+            RoutePathStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn source_coordinate_stop_uses_live_threshold_target_descriptor() {
+        let scenario = anno_formats::szs::SzsFile {
+            chunks: Vec::new(),
+            islands: vec![anno_formats::szs::Island {
+                number: 0,
+                width: 100,
+                height: 1,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: Vec::new(),
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+        };
+        let ocean = crate::ocean_map::OceanMap::from_source_scenario(&scenario, &[]);
+        let mut route = TradeRoute::new(0, 0);
+        route.add_stop(RouteStop {
+            island_id: 0,
+            warehouse_x: 60,
+            warehouse_y: 1,
+            load_goods: vec![],
+            unload_goods: vec![],
+        });
+        route.add_stop(RouteStop {
+            island_id: 0,
+            warehouse_x: 0,
+            warehouse_y: 1,
+            load_goods: vec![],
+            unload_goods: vec![],
+        });
+        route.activate();
+
+        let mut ship = TradeShip::new(0, 0, 0, 1);
+        // This is the direct-branch field; a kind-0x37 stop instead uses
+        // `FUN_0046e350(..., 5)` and the zero-limit threshold callback.
+        ship.source_target_approach_radius = 2;
+        assert_eq!(
+            compute_path_to_stop(&mut ship, &route, Some(&ocean)),
+            RoutePathStatus::PathReady
+        );
+        assert_eq!(
+            ship.source_target_descriptor
+                .map(|descriptor| descriptor.bytes()),
+            Some([0x37, 0x00, 60, 1])
+        );
+        assert_eq!(ship.path.last(), Some(&(60, 1)));
     }
 
     #[test]

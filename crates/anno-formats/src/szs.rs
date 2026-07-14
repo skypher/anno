@@ -427,6 +427,13 @@ impl IslandTile {
     pub fn source_owner(self) -> u8 {
         (self.anim_count >> 6) | ((self.flags as u8 & 1) << 2)
     }
+
+    /// Object owner passed as `param_7` to `FUN_00465170` by the
+    /// INSELHAUS loader. It reads bits 22..=25 of the record word, which
+    /// correspond to bits 6..=9 of the parsed flags field.
+    pub fn source_dynamic_object_owner(self) -> u8 {
+        ((self.flags >> 6) & 0x0f) as u8
+    }
 }
 
 /// Parsed save/scenario file.
@@ -1309,6 +1316,12 @@ mod tests {
             ..tile
         };
         assert_eq!(owned.source_owner(), 6);
+
+        let dynamic_owner = IslandTile {
+            flags: 6 << 6,
+            ..tile
+        };
+        assert_eq!(dynamic_owner.source_dynamic_object_owner(), 6);
     }
 
     #[test]

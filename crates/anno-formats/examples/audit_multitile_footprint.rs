@@ -1,106 +1,95 @@
-//! Verify multi-tile buildings have the right INSELHAUS tile
-//! count. Each W×H building should appear as W*H tiles in
-//! INSELHAUS — base tile at (x,y) carries the building's gfx,
-//! adjacent tiles carry gfx+1, gfx+2, etc.
+//! Survey multi-tile INSELHAUS commands in the source-definition namespace.
+//!
+//! INSELHAUS `building_id` is an offset from `0x4e20`, not a STADTFLD GFX
+//! index. The executable loads each command through `FUN_00465170` and
+//! `FUN_004653a0`, which reconstruct a rotated live-map footprint. This audit
+//! measures the authored command records and the coordinate overlap that the
+//! loader must resolve; it makes no GFX-based footprint claim.
 
-use anno_formats::szs::SzsFile;
 use anno_formats::cod::CodFile;
-use std::collections::BTreeMap;
+use anno_formats::szs::SzsFile;
+use std::collections::HashMap;
 
 fn main() {
-    let cod_bytes = std::fs::read("/home/sky/anno/extracted/haeuser.cod").unwrap();
-    let cod = CodFile::parse(&cod_bytes).unwrap();
+    let root = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/home/sky/anno/extracted".to_owned());
+    let cod = CodFile::parse(&std::fs::read(format!("{root}/haeuser.cod")).expect("read COD"))
+        .expect("parse COD");
+    let scenes = format!("{root}/Szenes");
 
-    // Build per-Nummer (size, gfx) lookup.
-    let mut sizes: BTreeMap<i32, ((i32, i32), i32)> = BTreeMap::new();
-    for b in &cod.buildings {
-        sizes.insert(b.nummer, (b.size, b.gfx));
-    }
+    let mut records = 0_u64;
+    let mut multi_tile_records = 0_u64;
+    let mut occupied_footprint_cells = 0_u64;
+    let mut duplicate_coordinate_records = 0_u64;
 
-    // Audit each scenario for footprint anomalies.
-    let dir = "/home/sky/anno/extracted/Szenes";
-    let mut total_tiles = 0;
-    let mut multi_tile_anomalies = 0;
-    let mut all_correct = 0;
-
-    for entry in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+    for entry in std::fs::read_dir(scenes)
+        .expect("read scenarios")
+        .filter_map(Result::ok)
+    {
         let path = entry.path();
-        if !path.extension().map(|s| s.eq_ignore_ascii_case("szs")).unwrap_or(false) { continue; }
-        let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => continue };
-        let parsed = match SzsFile::parse(&bytes) { Ok(p) => p, Err(_) => continue };
-        for island in &parsed.islands {
-            // Map (x, y) → tile gfx for fast lookup.
-            let mut grid: std::collections::HashMap<(u8, u8), i32> = Default::default();
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("szs"))
+        {
+            continue;
+        }
+        let szs = SzsFile::parse(&std::fs::read(&path).expect("read scenario"))
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        for island in &szs.islands {
+            let mut records_at = HashMap::<(u8, u8), usize>::new();
             for tile in &island.tiles {
-                grid.insert((tile.x, tile.y), tile.building_id as i32);
-                total_tiles += 1;
+                *records_at.entry((tile.x, tile.y)).or_default() += 1;
             }
-            // Find each building base tile (where building_id ==
-            // its def's gfx) and verify the W*H footprint.
+            duplicate_coordinate_records += records_at
+                .values()
+                .map(|count| count.saturating_sub(1) as u64)
+                .sum::<u64>();
+
             for tile in &island.tiles {
-                let building_gfx = tile.building_id as i32;
-                // Find def with matching gfx.
-                let Some((nummer, &(size, _))) = sizes.iter()
-                    .find(|(_, (_, g))| *g == building_gfx)
-                    .map(|(n, info)| (*n, info))
-                else { continue };
-                let (w, h) = size;
-                if w <= 1 && h <= 1 { continue; }
-                // Verify W*H tile slots starting at (x, y) all
-                // have *some* tile. The exact gfx-per-quadrant
-                // depends on rotation + animation variants
-                // (haeuser.cod's Rotate × AnimAdd × AnimAnz)
-                // and isn't trivially `base + offset`, so we
-                // just check tile presence.
-                let mut footprint_ok = true;
-                for dy in 0..h {
-                    for dx in 0..w {
-                        let cx = tile.x.wrapping_add(dx as u8);
-                        let cy = tile.y.wrapping_add(dy as u8);
-                        if !grid.contains_key(&(cx, cy)) {
-                            footprint_ok = false;
-                            break;
+                records += 1;
+                let definition = cod
+                    .building_by_source_id(tile.source_id())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "unresolved source definition {} in {} island {} at ({}, {})",
+                            tile.source_id(),
+                            path.display(),
+                            island.number,
+                            tile.x,
+                            tile.y,
+                        )
+                    });
+                let (width, height) = if matches!(tile.orientation & 3, 1 | 3) {
+                    (definition.size.1, definition.size.0)
+                } else {
+                    definition.size
+                };
+                if width <= 1 && height <= 1 {
+                    continue;
+                }
+                multi_tile_records += 1;
+                for dy in 0..height {
+                    for dx in 0..width {
+                        let Some(x) = tile.x.checked_add(dx as u8) else {
+                            continue;
+                        };
+                        let Some(y) = tile.y.checked_add(dy as u8) else {
+                            continue;
+                        };
+                        if records_at.contains_key(&(x, y)) {
+                            occupied_footprint_cells += 1;
                         }
                     }
-                    if !footprint_ok { break; }
-                }
-                if footprint_ok {
-                    all_correct += 1;
-                } else {
-                    multi_tile_anomalies += 1;
-                    if multi_tile_anomalies <= 5 {
-                        println!("Anomaly: {:?} island {} Nr={} (W×H={}×{}) at ({}, {})",
-                            path.file_stem().unwrap(), island.number, nummer, w, h,
-                            tile.x, tile.y);
-                    }
                 }
             }
         }
     }
 
-    // Probe specific anomalies — show actual gfx in footprint.
-    println!();
-    println!("Sample footprint dump for first anomaly (New Horizons2 island 0 Nr=409 at 41,7):");
-    let path = std::path::Path::new("/home/sky/anno/extracted/Szenes/New Horizons2.szs");
-    if let Ok(data) = std::fs::read(path) {
-        if let Ok(parsed) = SzsFile::parse(&data) {
-            if let Some(island) = parsed.islands.iter().find(|i| i.number == 0) {
-                let mut grid: std::collections::HashMap<(u8, u8), i32> = Default::default();
-                for t in &island.tiles {
-                    grid.insert((t.x, t.y), t.building_id as i32);
-                }
-                for &(cx, cy) in &[(41, 7), (42, 7), (41, 8), (42, 8)] {
-                    let g = grid.get(&(cx, cy)).copied().unwrap_or(-1);
-                    println!("  ({cx},{cy}) gfx = {g}");
-                }
-            }
-        }
-    }
-
-    println!();
-    println!("Total tiles: {total_tiles}");
-    println!("Multi-tile bases checked: {}",
-        all_correct + multi_tile_anomalies);
-    println!("All-correct footprints: {all_correct}");
-    println!("Anomalies: {multi_tile_anomalies}");
+    println!("INSELHAUS command records: {records}");
+    println!("multi-tile source commands: {multi_tile_records}");
+    println!(
+        "authored records lying in their oriented footprint cells: {occupied_footprint_cells}"
+    );
+    println!("duplicate records at one island coordinate: {duplicate_coordinate_records}");
 }

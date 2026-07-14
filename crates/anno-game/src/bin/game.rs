@@ -64,87 +64,6 @@ const DIPLOMACY_PANEL_HELP: &str = "Up/Dn pick  Lt/Rt cycle";
 const ZOOM_TILE_W: [i32; 3] = [64, 32, 16];
 const ZOOM_TILE_H: [i32; 3] = [31, 15, 7];
 
-/// Animation state for building sprites.
-/// Maps sprite indices to their animation parameters.
-struct AnimationState {
-    /// For each base sprite index: (anim_anz, anim_add, anim_time_ms)
-    /// anim_anz = number of frames, anim_add = sprite offset per frame
-    entries: Vec<AnimEntry>,
-    /// Elapsed time in ms (wraps at u32::MAX)
-    elapsed_ms: u32,
-}
-
-struct AnimEntry {
-    /// Base sprite index (COD gfx field)
-    base_gfx: i32,
-    /// Number of animation frames
-    anim_anz: i32,
-    /// Sprite offset per frame
-    anim_add: i32,
-    /// Milliseconds per frame (default 200)
-    anim_time: i32,
-    /// Total sprite range occupied by this building (for all rotations)
-    total_sprites: i32,
-}
-
-impl AnimationState {
-    fn new(cod: &CodFile) -> Self {
-        let mut entries = Vec::new();
-        for b in &cod.buildings {
-            if b.gfx >= 0 && b.anim_anz > 1 && b.anim_add > 0 {
-                let total = b.rotate.max(1) * b.anim_anz * b.anim_add;
-                entries.push(AnimEntry {
-                    base_gfx: b.gfx,
-                    anim_anz: b.anim_anz,
-                    anim_add: b.anim_add,
-                    anim_time: if b.anim_time > 0 { b.anim_time } else { 200 },
-                    total_sprites: total,
-                });
-            }
-        }
-        // Sort by base_gfx for binary search
-        entries.sort_by_key(|e| e.base_gfx);
-        Self {
-            entries,
-            elapsed_ms: 0,
-        }
-    }
-
-    fn tick(&mut self, dt_ms: u32) {
-        self.elapsed_ms = self.elapsed_ms.wrapping_add(dt_ms);
-    }
-
-    /// Given a static sprite index, return the animated sprite index.
-    fn animate(&self, sprite_idx: u16) -> u16 {
-        let idx = sprite_idx as i32;
-        // Find which building owns this sprite via binary search
-        let pos = self.entries.partition_point(|e| e.base_gfx <= idx);
-        if pos == 0 {
-            return sprite_idx;
-        }
-        let entry = &self.entries[pos - 1];
-        // Check if this sprite is within the building's sprite range
-        if idx >= entry.base_gfx && idx < entry.base_gfx + entry.total_sprites {
-            let offset_from_base = idx - entry.base_gfx;
-            // Which rotation variant is this tile in?
-            let sprites_per_rotation = entry.anim_anz * entry.anim_add;
-            if sprites_per_rotation <= 0 {
-                return sprite_idx;
-            }
-            let rotation_offset = offset_from_base % sprites_per_rotation;
-            let rotation_base = idx - rotation_offset;
-            // The tile's position within the rotation (which sub-tile)
-            let tile_in_frame = rotation_offset % entry.anim_add;
-            // Current animation frame based on time
-            let frame = ((self.elapsed_ms / entry.anim_time as u32) % entry.anim_anz as u32) as i32;
-            let animated = rotation_base + frame * entry.anim_add + tile_in_frame;
-            animated as u16
-        } else {
-            sprite_idx
-        }
-    }
-}
-
 /// Networking role chosen at startup.
 enum NetRole {
     Solo,
@@ -874,7 +793,6 @@ fn try_place_building(
         None => return PlaceOutcome::NoBuildingSelected,
     };
     let def_idx = bb.def_idx;
-    let sprite_idx = bb.sprite_idx;
     let def = &defs[def_idx];
     let island_number = islands[current_island].number;
     let bld_w = def.width;
@@ -952,22 +870,20 @@ fn try_place_building(
     let cod_b = &cod.buildings[def_idx];
     let rot_count = cod_b.rotate.max(1) as u8;
     let orient = placer.orientation % rot_count;
-    let stride = (cod_b.anim_anz.max(1) * cod_b.anim_add.max(1)) as usize;
-    let rot_offset = orient as usize * stride;
-
+    let source_definition_offset = (cod_b.source_id - anno_formats::szs::INSELHAUS_SOURCE_ID_BASE)
+        .try_into()
+        .ok();
+    let source_map_owner_slot = islands[current_island]
+        .tiles
+        .iter()
+        .find(|tile| tile.x as i32 == tile_x && tile.y as i32 == tile_y)
+        .map(|tile| tile.source_owner())
+        .unwrap_or(7);
+    let source_random_seed = (sim.next_source_rand() & 0x1f) as u8;
     for dy in 0..bld_h as u8 {
         for dx in 0..bld_w as u8 {
             let tx = tile_x as u8 + dx;
             let ty = tile_y as u8 + dy;
-            let tile_sprite = sprite_idx + rot_offset + dy as usize * bld_w as usize + dx as usize;
-            islands[current_island].tiles.push(IslandTile {
-                x: tx,
-                y: ty,
-                building_id: tile_sprite as u16,
-                orientation: orient,
-                anim_count: 0,
-                flags: 0,
-            });
             sim.island_maps[map_idx].set_walkable(tx as u16, ty as u16, false);
         }
     }
@@ -979,6 +895,23 @@ fn try_place_building(
         tile_y as u16,
         owner,
     );
+    instance.source_placement_command = source_definition_offset.map(|definition_offset| {
+        anno_sim::building::SourceBuildingCommand {
+            definition_offset,
+            orientation: orient,
+            // `DAT_006c2f10 = *DAT_0049f790` in `FUN_0040a190`; the
+            // low byte is the selected island record identifier.
+            metadata: island_number,
+            // The player command path explicitly clears `DAT_0049e6f8` for
+            // definitions without a source-selected variant. This placement
+            // path has no variant selector yet, so it carries that zero form.
+            variant: 0,
+            map_owner_slot: source_map_owner_slot,
+            // `FUN_004631b0` itself writes `rand() & 31` into bits 17..=21.
+            random_seed: source_random_seed,
+            dynamic_object_owner: owner,
+        }
+    });
     // Mines tap a finite ore deposit (RE: haeuser.cod Erzbergnr).
     // Non-mine buildings keep the u16::MAX uncapped default.
     let cap = def.ore_deposit.capacity();
@@ -992,7 +925,23 @@ fn try_place_building(
     instance.wood_needed = def.cost_wood;
     instance.tools_needed = def.cost_tools;
     instance.bricks_needed = def.cost_bricks;
+    let source_cell_state = instance.source_placement_command.and_then(|_| {
+        anno_sim::source_cell::SourceMapCellState::new(
+            island_number,
+            tile_x as u8,
+            tile_y as u8,
+            cod_b,
+            ((sim.game_clock / 10) & 7) as u8,
+        )
+    });
     sim.buildings.push(instance);
+    if let Some(state) = source_cell_state {
+        sim.source_map_cell_states.push(state);
+    }
+    let building_index = sim.buildings.len() - 1;
+    if def.kind == "HQ" {
+        let _ = sim.allocate_source_dynamic_map_object_for_building(building_index);
+    }
     PlaceOutcome::Placed
 }
 
@@ -1426,6 +1375,7 @@ fn main() {
     // Initialize simulation
     let mut sim = init_simulation(&szs, &cod, &defs, ship_cargo_config);
     sim.seed_source_rand_from_get_tick_count();
+    let mut last_source_map_cell_revision = sim.source_map_cell_revision;
     if let Some(traeger) = traeger_def.as_ref() {
         sim.carrier_config = anno_sim::carrier::CarrierConfig::from_figure_def(traeger);
     }
@@ -1452,9 +1402,10 @@ fn main() {
         placer.buildable.len()
     );
 
-    // Initialize animation state
-    let mut anim_state = AnimationState::new(&cod);
-    let mut last_anim_gen: u32 = 0; // tracks when animation frames change
+    // Entity walk cycles are visual-only. Map-cell sprites take their frame
+    // directly from the source cell-state selector in the STADTFLD draw loop.
+    let mut entity_visual_elapsed_ms = 0u32;
+    let mut last_entity_visual_gen = 0u32;
 
     // Mutable copy of islands for adding placed building tiles
     let mut islands = szs.islands.clone();
@@ -2600,15 +2551,6 @@ fn main() {
                                 // Refund half of construction cost
                                 sim.players[0].gold += refund as i32;
 
-                                // Remove building tiles from island
-                                islands[current_island].tiles.retain(|t| {
-                                    let in_footprint = t.x as u16 >= bx
-                                        && t.x as u16 - bx < bw as u16
-                                        && t.y as u16 >= by
-                                        && t.y as u16 - by < bh as u16;
-                                    !in_footprint
-                                });
-
                                 // Restore walkability
                                 let island_map_idx = sim
                                     .island_maps
@@ -2627,6 +2569,7 @@ fn main() {
                                 }
 
                                 // Remove building from simulation
+                                let _ = sim.release_source_dynamic_map_object_for_building(bi);
                                 sim.buildings.remove(bi);
 
                                 println!(
@@ -2926,7 +2869,7 @@ fn main() {
                                     .iter()
                                     .find(|t| t.x as i32 == tile_x && t.y as i32 == tile_y)
                                 {
-                                    info.push_str(&format!("| sprite#{}", tile.building_id));
+                                    info.push_str(&format!("| definition#{}", tile.source_id()));
                                 } else {
                                     info.push_str("| (empty)");
                                 }
@@ -3167,6 +3110,16 @@ fn main() {
             if net_client.is_none() {
                 sim.tick(dt_ms);
             }
+            if sim.source_map_cell_revision != last_source_map_cell_revision {
+                last_source_map_cell_revision = sim.source_map_cell_revision;
+                needs_redraw = true;
+            }
+            entity_visual_elapsed_ms = entity_visual_elapsed_ms.wrapping_add(dt_ms);
+            let entity_visual_gen = entity_visual_elapsed_ms / 100;
+            if entity_visual_gen != last_entity_visual_gen {
+                last_entity_visual_gen = entity_visual_gen;
+                needs_redraw = true;
+            }
             // Auto-save: matches `1602_exe.c:98061` —
             //   if (DAT_005bafc8 != 0 && (DAT_005b1b68 += DAT_005b315c, 599999 < DAT_005b1b68))
             //     FUN_00488b50("lastgame", path); reset counter
@@ -3268,13 +3221,6 @@ fn main() {
                 }
                 needs_redraw = true;
             }
-            // Animation cycles regardless of net role so visuals don't freeze.
-            anim_state.tick(dt_ms);
-            let anim_gen = anim_state.elapsed_ms / 100;
-            if anim_gen != last_anim_gen {
-                last_anim_gen = anim_gen;
-                needs_redraw = true;
-            }
         }
 
         // Audio tick: cleanup finished sounds, auto-advance music
@@ -3303,8 +3249,16 @@ fn main() {
             let tile_w = ZOOM_TILE_W[sprite_zoom];
             let tile_h = ZOOM_TILE_H[sprite_zoom];
             if world_mode {
-                let (rgba, w, h, ox, oy) =
-                    render_world(&islands, sprites, num_sprites, tile_w, tile_h, &anim_state);
+                let (rgba, w, h, ox, oy) = render_world(
+                    &islands,
+                    sprites,
+                    num_sprites,
+                    tile_w,
+                    tile_h,
+                    &sim.buildings,
+                    &sim.source_map_cell_states,
+                    &cod,
+                );
                 rendered = Some(RenderState {
                     rgba,
                     width: w,
@@ -3316,8 +3270,16 @@ fn main() {
                 });
             } else {
                 let island = &islands[current_island];
-                let (rgba, w, h, ox, oy) =
-                    render_island(island, sprites, num_sprites, tile_w, tile_h, &anim_state);
+                let (rgba, w, h, ox, oy) = render_island(
+                    island,
+                    sprites,
+                    num_sprites,
+                    tile_w,
+                    tile_h,
+                    &sim.buildings,
+                    &sim.source_map_cell_states,
+                    &cod,
+                );
                 rendered = Some(RenderState {
                     rgba,
                     width: w,
@@ -3370,7 +3332,7 @@ fn main() {
                     civilian_walk_anz,
                     ship_sprite_layout,
                     soldier_sprite_layout,
-                    anim_state.elapsed_ms,
+                    entity_visual_elapsed_ms,
                 );
 
                 // Selected-building service-radius preview. Anno
@@ -3497,8 +3459,7 @@ fn main() {
                                         + rot_offset
                                         + dy as usize * def.width as usize
                                         + dx as usize;
-                                    let anim_idx = anim_state.animate(static_idx as u16) as usize;
-                                    if let Some(sp) = sprites.get(anim_idx) {
+                                    if let Some(sp) = sprites.get(static_idx) {
                                         let bw = sp.0 as i32;
                                         let bh = sp.1 as i32;
                                         let data = &sp.2;
@@ -5517,6 +5478,404 @@ mod tests {
         building
     }
 
+    fn test_hq_def() -> anno_sim::building::BuildingDef {
+        let mut def = test_building_def(None);
+        def.kind = "HQ".into();
+        def.prod_kind = "KONTOR".into();
+        def.output_good = Good::None;
+        def
+    }
+
+    fn test_cod_hq_building(gfx: i32) -> anno_formats::cod::BuildingDef {
+        let mut building = test_cod_processing_building(gfx);
+        building.kind = "HQ".into();
+        building
+            .properties
+            .insert("ProdKind".into(), "KONTOR".into());
+        building.properties.insert("Name".into(), "Kontor".into());
+        building
+    }
+
+    #[test]
+    fn source_command_resolves_inselhaus_definition_ids_before_rendering() {
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![anno_formats::cod::BuildingDef {
+                source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 3,
+                gfx: 123,
+                ..Default::default()
+            }],
+        };
+        let source_tile = IslandTile {
+            building_id: 3,
+            x: 0,
+            y: 0,
+            orientation: 0,
+            anim_count: 0,
+            flags: 0,
+        };
+
+        assert_eq!(
+            source_command_gfx_tiles(
+                0,
+                0,
+                0,
+                anno_sim::building::SourceBuildingCommand::from_island_tile(source_tile),
+                &cod,
+            ),
+            vec![(0, 0, 0, 123)]
+        );
+        assert_eq!(
+            source_command_gfx_tiles(
+                0,
+                0,
+                0,
+                anno_sim::building::SourceBuildingCommand::from_island_tile(IslandTile {
+                    building_id: 7,
+                    ..source_tile
+                }),
+                &cod,
+            ),
+            vec![(0, 0, 0, 7)]
+        );
+    }
+
+    #[test]
+    fn source_command_applies_authored_variant_before_orientation() {
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![anno_formats::cod::BuildingDef {
+                source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 3,
+                gfx: 100,
+                anim_anz: 2,
+                anim_add: 3,
+                ..Default::default()
+            }],
+        };
+        let source_tile = IslandTile {
+            building_id: 3,
+            orientation: 0b0001_0110,
+            x: 0,
+            y: 0,
+            anim_count: 0,
+            flags: 0,
+        };
+
+        assert_eq!(
+            source_command_gfx_tiles(
+                0,
+                0,
+                0,
+                anno_sim::building::SourceBuildingCommand::from_island_tile(source_tile),
+                &cod,
+            ),
+            vec![(0, 0, 0, 115)]
+        );
+    }
+
+    #[test]
+    fn source_command_adds_definition_anim_frame_to_the_packed_variant() {
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![anno_formats::cod::BuildingDef {
+                source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 3,
+                gfx: 100,
+                anim_anz: 4,
+                anim_add: 3,
+                anim_frame: 2,
+                ..Default::default()
+            }],
+        };
+        let command = anno_sim::building::SourceBuildingCommand {
+            definition_offset: 3,
+            orientation: 1,
+            variant: 3,
+            metadata: 0,
+            map_owner_slot: 7,
+            random_seed: 0,
+            dynamic_object_owner: 0,
+        };
+
+        assert_eq!(
+            source_command_gfx_tiles(0, 0, 0, command, &cod),
+            vec![(0, 0, 0, 115)]
+        );
+    }
+
+    #[test]
+    fn source_command_initial_selector_matches_kind_specific_draw_branches() {
+        let command = anno_sim::building::SourceBuildingCommand {
+            definition_offset: 3,
+            orientation: 1,
+            variant: 3,
+            metadata: 0,
+            map_owner_slot: 7,
+            random_seed: 0,
+            dynamic_object_owner: 0,
+        };
+        let building = |kind: &str, anim_time| anno_formats::cod::BuildingDef {
+            source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 3,
+            gfx: 100,
+            kind: kind.into(),
+            anim_anz: 4,
+            anim_add: 3,
+            anim_frame: 2,
+            anim_time,
+            ..Default::default()
+        };
+
+        let render = |definition| {
+            source_command_gfx_tiles(
+                0,
+                0,
+                0,
+                command,
+                &CodFile {
+                    constants: Default::default(),
+                    buildings: vec![definition],
+                },
+            )
+        };
+        assert_eq!(render(building("HANDWERK", 0)), vec![(0, 0, 0, 112)]);
+        assert_eq!(render(building("MARKT", 0)), vec![(0, 0, 0, 112)]);
+        assert_eq!(render(building("WALD", 0)), vec![(0, 0, 0, 121)]);
+        assert_eq!(render(building("WALD", 100)), vec![(0, 0, 0, 115)]);
+        assert_eq!(render(building("HQ", 0)), vec![(0, 0, 0, 115)]);
+    }
+
+    #[test]
+    fn source_command_uses_live_source_cell_frame_selectors() {
+        let command = anno_sim::building::SourceBuildingCommand {
+            definition_offset: 3,
+            orientation: 0,
+            variant: 0,
+            metadata: 0,
+            map_owner_slot: 7,
+            random_seed: 0,
+            dynamic_object_owner: 0,
+        };
+        let definition = |kind: &str| anno_formats::cod::BuildingDef {
+            source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 3,
+            gfx: 100,
+            kind: kind.into(),
+            anim_anz: 3,
+            anim_add: 4,
+            ..Default::default()
+        };
+
+        let craft = definition("HANDWERK");
+        let mut craft_state = anno_sim::source_cell::SourceMapCellState::new(0, 0, 0, &craft, 0)
+            .expect("kind one source state");
+        craft_state.frame_selector = 2;
+        let craft_cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![craft],
+        };
+        assert_eq!(
+            source_command_gfx_tiles_with_state(0, 0, 0, command, Some(&craft_state), &craft_cod),
+            vec![(0, 0, 0, 108)]
+        );
+
+        let mut storage_craft = definition("HANDWERK");
+        storage_craft.storage_animation = true;
+        storage_craft.storage_animation_capacity = 160;
+        let storage_state = anno_sim::source_cell::SourceMapCellState {
+            storage_fill: 80,
+            ..anno_sim::source_cell::SourceMapCellState::new(0, 0, 0, &storage_craft, 0)
+                .expect("kind one source state")
+        };
+        let storage_cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![storage_craft],
+        };
+        assert_eq!(
+            source_command_gfx_tiles_with_state(
+                0,
+                0,
+                0,
+                command,
+                Some(&storage_state),
+                &storage_cod,
+            ),
+            vec![(0, 0, 0, 104)]
+        );
+
+        let market = definition("MARKT");
+        let mut market_state = anno_sim::source_cell::SourceMapCellState::new(0, 0, 0, &market, 0)
+            .expect("kind seven source state");
+        market_state.progress = 512;
+        let market_cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![market],
+        };
+        assert_eq!(
+            source_command_gfx_tiles_with_state(0, 0, 0, command, Some(&market_state), &market_cod),
+            vec![(0, 0, 0, 108)]
+        );
+    }
+
+    #[test]
+    fn runtime_building_tiles_apply_source_variant_before_rotation() {
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![anno_formats::cod::BuildingDef {
+                source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 7,
+                gfx: 100,
+                size: (2, 1),
+                rotate: 4,
+                anim_anz: 2,
+                anim_add: 3,
+                ..Default::default()
+            }],
+        };
+        let mut building = BuildingInstance::new(0, 5, 12, 13, 0);
+        building.source_placement_command = Some(anno_sim::building::SourceBuildingCommand {
+            definition_offset: 7,
+            orientation: 2,
+            variant: 5,
+            metadata: 5,
+            map_owner_slot: 7,
+            random_seed: 0,
+            dynamic_object_owner: 0,
+        });
+
+        assert_eq!(
+            runtime_building_gfx_tiles(&[building], &cod, &[]),
+            vec![(5, 13, 13, 115), (5, 12, 13, 116)]
+        );
+    }
+
+    #[test]
+    fn source_command_uses_fun_00463b10_cell_order_for_all_orientations() {
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![anno_formats::cod::BuildingDef {
+                source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 3,
+                gfx: 100,
+                size: (2, 3),
+                ..Default::default()
+            }],
+        };
+        let command = anno_sim::building::SourceBuildingCommand {
+            definition_offset: 3,
+            orientation: 0,
+            variant: 0,
+            metadata: 0,
+            map_owner_slot: 7,
+            random_seed: 0,
+            dynamic_object_owner: 0,
+        };
+
+        let tiles = |orientation| {
+            source_command_gfx_tiles(
+                0,
+                10,
+                20,
+                anno_sim::building::SourceBuildingCommand {
+                    orientation,
+                    ..command
+                },
+                &cod,
+            )
+        };
+        assert_eq!(
+            tiles(0),
+            vec![
+                (0, 10, 20, 100),
+                (0, 11, 20, 101),
+                (0, 10, 21, 102),
+                (0, 11, 21, 103),
+                (0, 10, 22, 104),
+                (0, 11, 22, 105),
+            ]
+        );
+        assert_eq!(
+            tiles(1),
+            vec![
+                (0, 12, 20, 100),
+                (0, 12, 21, 101),
+                (0, 11, 20, 102),
+                (0, 11, 21, 103),
+                (0, 10, 20, 104),
+                (0, 10, 21, 105),
+            ]
+        );
+        assert_eq!(
+            tiles(2),
+            vec![
+                (0, 11, 22, 100),
+                (0, 10, 22, 101),
+                (0, 11, 21, 102),
+                (0, 10, 21, 103),
+                (0, 11, 20, 104),
+                (0, 10, 20, 105),
+            ]
+        );
+        assert_eq!(
+            tiles(3),
+            vec![
+                (0, 10, 21, 100),
+                (0, 10, 20, 101),
+                (0, 11, 21, 102),
+                (0, 11, 20, 103),
+                (0, 12, 21, 104),
+                (0, 12, 20, 105),
+            ]
+        );
+    }
+
+    #[test]
+    fn authored_tiles_expand_source_footprints_with_later_command_overwrite() {
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![
+                anno_formats::cod::BuildingDef {
+                    source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 1,
+                    gfx: 100,
+                    size: (2, 1),
+                    ..Default::default()
+                },
+                anno_formats::cod::BuildingDef {
+                    source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 2,
+                    gfx: 200,
+                    ..Default::default()
+                },
+            ],
+        };
+        let island = Island {
+            number: 3,
+            width: 3,
+            height: 1,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles: vec![
+                IslandTile {
+                    building_id: 1,
+                    x: 0,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                },
+                IslandTile {
+                    building_id: 2,
+                    x: 1,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                },
+            ],
+            city: None,
+        };
+
+        assert_eq!(
+            authored_island_gfx_tiles(&island, &cod, &[]),
+            vec![(0, 0, 100), (1, 0, 200)]
+        );
+    }
+
     fn flat_test_island(number: u8) -> Island {
         let mut tiles = Vec::new();
         for y in 0..4 {
@@ -5998,7 +6357,10 @@ mod tests {
         };
         let cod = CodFile {
             constants: Default::default(),
-            buildings: vec![test_cod_processing_building(0)],
+            buildings: vec![anno_formats::cod::BuildingDef {
+                source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE,
+                ..test_cod_processing_building(0)
+            }],
         };
         let defs = vec![test_processing_def()];
 
@@ -6043,6 +6405,63 @@ mod tests {
         assert_eq!(sim.buildings.len(), 1);
         assert_eq!(sim.buildings[0].input_1_stock, 0);
         assert_eq!(sim.buildings[0].input_2_stock, 0);
+    }
+
+    #[test]
+    fn placement_allocates_a_source_dynamic_slot_for_hq() {
+        let defs = vec![test_hq_def()];
+        let ground = anno_formats::cod::BuildingDef {
+            source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE,
+            kind: "BODEN".into(),
+            ..Default::default()
+        };
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![
+                anno_formats::cod::BuildingDef {
+                    source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 9,
+                    ..test_cod_hq_building(0)
+                },
+                ground,
+            ],
+        };
+        let mut islands = vec![flat_test_island(4)];
+        for tile in &mut islands[0].tiles {
+            tile.building_id = 0;
+        }
+        let island_map = IslandMap::from_island(&islands[0], &cod.buildings);
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.building_defs = defs.clone();
+        sim.island_maps.push(island_map);
+        let mut placer = BuildingPlacer::new(&cod, &defs);
+        placer.active = true;
+
+        let outcome = try_place_building(&mut sim, &mut islands, 0, &defs, &cod, &placer, 1, 1);
+
+        assert!(matches!(outcome, PlaceOutcome::Placed));
+        assert_eq!(sim.buildings[0].source_dynamic_object_slot, Some(0));
+        assert_eq!(
+            sim.buildings[0].source_placement_command,
+            Some(anno_sim::building::SourceBuildingCommand {
+                definition_offset: 9,
+                orientation: 0,
+                variant: 0,
+                metadata: 4,
+                map_owner_slot: 0,
+                random_seed: 9,
+                dynamic_object_owner: 0,
+            })
+        );
+        assert_eq!(
+            sim.source_dynamic_map_object_table(4).object(0),
+            Some(anno_sim::source_route::SourceDynamicMapObject {
+                island: 4,
+                slot: 0,
+                owner: 0,
+                local_position: (1, 1),
+            })
+        );
     }
 
     #[test]
@@ -6932,6 +7351,10 @@ fn init_simulation(
     let mut sim = Simulation::new();
     sim.diplomacy = anno_sim::data_bridge::diplomacy_from_player4_relationships(&szs.players);
     sim.building_defs = defs.to_vec();
+    sim.source_dynamic_map_objects =
+        anno_sim::data_bridge::source_dynamic_map_objects_from_scenario(szs, cod);
+    sim.source_map_cell_states =
+        anno_sim::data_bridge::source_map_cell_states_from_scenario(szs, cod);
     sim.buildings = instances;
     sim.warehouses = warehouses;
     sim.island_maps = island_maps;
@@ -7079,14 +7502,210 @@ fn decode_entity_sprites(
     }
 }
 
+/// Expand one source command into the STADTFLD cells that the original live
+/// map writer creates before the draw loop consumes them.
+fn source_command_gfx_tiles(
+    island_id: u8,
+    tile_x: u16,
+    tile_y: u16,
+    command: anno_sim::building::SourceBuildingCommand,
+    cod: &CodFile,
+) -> Vec<(u8, u16, u16, u16)> {
+    source_command_gfx_tiles_with_state(island_id, tile_x, tile_y, command, None, cod)
+}
+
+fn source_command_gfx_tiles_with_state(
+    island_id: u8,
+    tile_x: u16,
+    tile_y: u16,
+    command: anno_sim::building::SourceBuildingCommand,
+    state: Option<&anno_sim::source_cell::SourceMapCellState>,
+    cod: &CodFile,
+) -> Vec<(u8, u16, u16, u16)> {
+    let source_id =
+        anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + i32::from(command.definition_offset);
+    let Some(definition) = cod.building_by_source_id(source_id) else {
+        return vec![(island_id, tile_x, tile_y, command.definition_offset)];
+    };
+    let (source_width, source_height) = definition.size;
+    if source_width <= 0 || source_height <= 0 {
+        return Vec::new();
+    }
+    let animation_frame_offset = if definition.anim_anz > 1 {
+        source_command_frame_selector(definition, command.variant, state) * definition.anim_add
+    } else {
+        0
+    };
+    let rotation_stride = definition.anim_anz * definition.anim_add;
+    let rotation_offset = i32::from(command.orientation & 3) * rotation_stride;
+    let mut tiles = Vec::new();
+    for (dx, dy, source_cell) in
+        source_command_cell_order(source_width, source_height, command.orientation)
+    {
+        let sprite = definition.gfx + animation_frame_offset + rotation_offset + source_cell;
+        let (Ok(x), Ok(y), Ok(sprite)) = (
+            u16::try_from(i32::from(tile_x) + dx),
+            u16::try_from(i32::from(tile_y) + dy),
+            u16::try_from(sprite),
+        ) else {
+            continue;
+        };
+        tiles.push((island_id, x, y, sprite));
+    }
+    tiles
+}
+
+/// Select the frame consumed by the STADTFLD draw loop for one source command.
+/// A missing record is the fresh INSELHAUS-load path; live records are keyed by
+/// the command root and supply the kind-specific activity/progress selectors.
+fn source_command_frame_selector(
+    definition: &anno_formats::cod::BuildingDef,
+    packed_variant: u8,
+    state: Option<&anno_sim::source_cell::SourceMapCellState>,
+) -> i32 {
+    if let Some(state) = state {
+        match definition.source_kind_code() {
+            Some(1..=6) if definition.storage_animation => {
+                return state.storage_frame_selector(definition.anim_anz);
+            }
+            Some(1..=6) => return state.activity_frame_selector(definition.anim_anz),
+            Some(7) => return state.market_frame_selector(definition.anim_anz),
+            _ => {}
+        }
+    }
+    source_command_initial_frame_selector(definition, packed_variant)
+}
+
+/// Reproduce the selector value used by the STADTFLD draw loop immediately
+/// after an INSELHAUS command creates its live cell record. `FUN_00481fc0`
+/// clears that record, so source kinds 1 through 7 start at frame zero;
+/// their later state-machine transitions are handled by separate routines.
+fn source_command_initial_frame_selector(
+    definition: &anno_formats::cod::BuildingDef,
+    packed_variant: u8,
+) -> i32 {
+    match definition.source_kind_code() {
+        Some(1..=7) => 0,
+        Some(10) if definition.anim_time == 0 => i32::from(packed_variant),
+        _ => i32::from(packed_variant) + definition.anim_frame,
+    }
+    .rem_euclid(definition.anim_anz)
+}
+
+/// Enumerate map cells in the order `FUN_00463b10` assigns consecutive GFX
+/// indices while writing an oriented source command into the live map.
+fn source_command_cell_order(width: i32, height: i32, orientation: u8) -> Vec<(i32, i32, i32)> {
+    let mut cells = Vec::with_capacity(usize::try_from(width * height).unwrap_or(0));
+    let mut source_cell = 0;
+    let mut push = |dx, dy| {
+        cells.push((dx, dy, source_cell));
+        source_cell += 1;
+    };
+    match orientation & 3 {
+        0 => {
+            for dy in 0..height {
+                for dx in 0..width {
+                    push(dx, dy);
+                }
+            }
+        }
+        1 => {
+            for dx in (0..height).rev() {
+                for dy in 0..width {
+                    push(dx, dy);
+                }
+            }
+        }
+        2 => {
+            for dy in (0..height).rev() {
+                for dx in (0..width).rev() {
+                    push(dx, dy);
+                }
+            }
+        }
+        3 => {
+            for dx in 0..height {
+                for dy in (0..width).rev() {
+                    push(dx, dy);
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    cells
+}
+
+/// Materialize an authored INSELHAUS command stream in source order. Later
+/// commands replace earlier cells, matching the mutable map written by
+/// `FUN_004653a0`.
+fn authored_island_gfx_tiles(
+    island: &Island,
+    cod: &CodFile,
+    states: &[anno_sim::source_cell::SourceMapCellState],
+) -> Vec<(u16, u16, u16)> {
+    let mut cells = std::collections::BTreeMap::new();
+    for tile in &island.tiles {
+        let command = anno_sim::building::SourceBuildingCommand::from_island_tile(*tile);
+        let state = states
+            .iter()
+            .find(|state| state.matches(island.number, u16::from(tile.x), u16::from(tile.y)));
+        for (_, x, y, sprite) in source_command_gfx_tiles_with_state(
+            island.number,
+            u16::from(tile.x),
+            u16::from(tile.y),
+            command,
+            state,
+            cod,
+        ) {
+            if x < u16::from(island.width) && y < u16::from(island.height) {
+                cells.insert((x, y), sprite);
+            }
+        }
+    }
+    cells
+        .into_iter()
+        .map(|((x, y), sprite)| (x, y, sprite))
+        .collect()
+}
+
 /// Render all islands; returns (rgba, width, height, origin_x, origin_y).
+fn runtime_building_gfx_tiles(
+    buildings: &[BuildingInstance],
+    cod: &CodFile,
+    states: &[anno_sim::source_cell::SourceMapCellState],
+) -> Vec<(u8, u16, u16, u16)> {
+    buildings
+        .iter()
+        .filter(|building| building.active)
+        .filter_map(|building| {
+            building
+                .source_placement_command
+                .map(|command| (building, command))
+        })
+        .flat_map(|(building, command)| {
+            source_command_gfx_tiles_with_state(
+                building.island_id,
+                building.tile_x,
+                building.tile_y,
+                command,
+                states.iter().find(|state| {
+                    state.matches(building.island_id, building.tile_x, building.tile_y)
+                }),
+                cod,
+            )
+        })
+        .collect()
+}
+
 fn render_world(
     islands: &[Island],
     sprites: &[(u32, u32, Vec<u8>)],
     num_sprites: usize,
     tile_w: i32,
     tile_h: i32,
-    anim: &AnimationState,
+    buildings: &[BuildingInstance],
+    source_map_cell_states: &[anno_sim::source_cell::SourceMapCellState],
+    cod: &CodFile,
 ) -> (Vec<u8>, u32, u32, i32, i32) {
     let max_world_x = islands
         .iter()
@@ -7117,6 +7736,24 @@ fn render_world(
 
     let origin_x;
     let origin_y;
+    let runtime_tiles = runtime_building_gfx_tiles(buildings, cod, source_map_cell_states);
+    let mut world_tiles = Vec::new();
+    for island in islands {
+        for (x, y, sprite) in authored_island_gfx_tiles(island, cod, source_map_cell_states) {
+            let wx = island.x_pos as i32 + i32::from(x);
+            let wy = island.y_pos as i32 + i32::from(y);
+            world_tiles.push((wx, wy, sprite));
+        }
+    }
+    for (island_id, x, y, sprite) in &runtime_tiles {
+        let Some(island) = islands.iter().find(|island| island.number == *island_id) else {
+            continue;
+        };
+        let wx = island.x_pos as i32 + i32::from(*x);
+        let wy = island.y_pos as i32 + i32::from(*y);
+        world_tiles.push((wx, wy, *sprite));
+    }
+    world_tiles.sort_by_key(|&(x, y, _)| (x + y, y));
 
     if scale < 1.0 {
         let s_half_tw = (half_tw as f64 * scale) as i32;
@@ -7127,43 +7764,36 @@ fn render_world(
         origin_x = (max_world_y as f64 * s_half_tw as f64) as i32;
         origin_y = (100.0 * scale) as i32;
 
-        for island in islands {
-            if island.tiles.is_empty() {
-                continue;
-            }
-            for tile in &island.tiles {
-                let wx = island.x_pos as i32 + tile.x as i32;
-                let wy = island.y_pos as i32 + tile.y as i32;
-                let sx = origin_x + (wx - wy) * s_half_tw;
-                let sy = origin_y + (wx + wy) * s_half_th;
+        for &(wx, wy, sprite) in &world_tiles {
+            let sx = origin_x + (wx - wy) * s_half_tw;
+            let sy = origin_y + (wx + wy) * s_half_th;
 
-                let sprite_idx = anim.animate(tile.building_id) as usize;
-                if sprite_idx < num_sprites {
-                    let (sw, sh, ref sdata) = sprites[sprite_idx];
-                    if sw > 0 && sh > 0 {
-                        let cx = sw / 2;
-                        let cy = sh / 2;
-                        let off = ((cy * sw + cx) * 4) as usize;
-                        if off + 3 < sdata.len() && sdata[off + 3] > 0 {
-                            let r = sdata[off];
-                            let g = sdata[off + 1];
-                            let b = sdata[off + 2];
-                            for dy in 0..s_half_th.max(1) {
-                                for dx in 0..s_half_tw.max(1) {
-                                    let px = sx + dx;
-                                    let py = sy + dy;
-                                    if px >= 0
-                                        && py >= 0
-                                        && (px as u32) < final_w
-                                        && (py as u32) < final_h
-                                    {
-                                        let doff = ((py as u32 * final_w + px as u32) * 4) as usize;
-                                        if doff + 3 < rgba.len() {
-                                            rgba[doff] = r;
-                                            rgba[doff + 1] = g;
-                                            rgba[doff + 2] = b;
-                                            rgba[doff + 3] = 255;
-                                        }
+            let sprite_idx = sprite as usize;
+            if sprite_idx < num_sprites {
+                let (sw, sh, ref sdata) = sprites[sprite_idx];
+                if sw > 0 && sh > 0 {
+                    let cx = sw / 2;
+                    let cy = sh / 2;
+                    let off = ((cy * sw + cx) * 4) as usize;
+                    if off + 3 < sdata.len() && sdata[off + 3] > 0 {
+                        let r = sdata[off];
+                        let g = sdata[off + 1];
+                        let b = sdata[off + 2];
+                        for dy in 0..s_half_th.max(1) {
+                            for dx in 0..s_half_tw.max(1) {
+                                let px = sx + dx;
+                                let py = sy + dy;
+                                if px >= 0
+                                    && py >= 0
+                                    && (px as u32) < final_w
+                                    && (py as u32) < final_h
+                                {
+                                    let doff = ((py as u32 * final_w + px as u32) * 4) as usize;
+                                    if doff + 3 < rgba.len() {
+                                        rgba[doff] = r;
+                                        rgba[doff + 1] = g;
+                                        rgba[doff + 2] = b;
+                                        rgba[doff + 3] = 255;
                                     }
                                 }
                             }
@@ -7181,21 +7811,11 @@ fn render_world(
     origin_x = max_world_y * half_tw;
     origin_y = 300;
 
-    let mut world_tiles: Vec<(i32, i32, u16)> = Vec::new();
-    for island in islands {
-        for tile in &island.tiles {
-            let wx = island.x_pos as i32 + tile.x as i32;
-            let wy = island.y_pos as i32 + tile.y as i32;
-            world_tiles.push((wx, wy, tile.building_id));
-        }
-    }
-    world_tiles.sort_by_key(|&(x, y, _)| (x + y, y));
-
-    for &(wx, wy, building_id) in &world_tiles {
+    for &(wx, wy, sprite) in &world_tiles {
         let sx = origin_x + (wx - wy) * half_tw;
         let sy = origin_y + (wx + wy) * half_th;
 
-        let sprite_idx = anim.animate(building_id) as usize;
+        let sprite_idx = sprite as usize;
         if sprite_idx >= num_sprites {
             continue;
         }
@@ -7227,7 +7847,9 @@ fn render_island(
     num_sprites: usize,
     tile_w: i32,
     tile_h: i32,
-    anim: &AnimationState,
+    buildings: &[BuildingInstance],
+    source_map_cell_states: &[anno_sim::source_cell::SourceMapCellState],
+    cod: &CodFile,
 ) -> (Vec<u8>, u32, u32, i32, i32) {
     let iw = island.width as i32;
     let ih = island.height as i32;
@@ -7243,17 +7865,23 @@ fn render_island(
     let origin_x = ih * half_tw;
     let origin_y = 300;
 
-    let mut sorted_tiles: Vec<_> = island.tiles.iter().collect();
-    sorted_tiles.sort_by_key(|t| (t.y as i32 + t.x as i32, t.y as i32));
+    let mut sorted_tiles = authored_island_gfx_tiles(island, cod, source_map_cell_states)
+        .into_iter()
+        .map(|(x, y, sprite)| (i32::from(x), i32::from(y), sprite))
+        .collect::<Vec<_>>();
+    sorted_tiles.extend(
+        runtime_building_gfx_tiles(buildings, cod, source_map_cell_states)
+            .into_iter()
+            .filter(|(island_id, _, _, _)| *island_id == island.number)
+            .map(|(_, x, y, sprite)| (i32::from(x), i32::from(y), sprite)),
+    );
+    sorted_tiles.sort_by_key(|(x, y, _)| (x + y, *y));
 
-    for tile in &sorted_tiles {
-        let tx = tile.x as i32;
-        let ty = tile.y as i32;
-
+    for &(tx, ty, sprite) in &sorted_tiles {
         let sx = origin_x + (tx - ty) * half_tw;
         let sy = origin_y + (tx + ty) * half_th;
 
-        let sprite_idx = anim.animate(tile.building_id) as usize;
+        let sprite_idx = sprite as usize;
         if sprite_idx >= num_sprites {
             continue;
         }

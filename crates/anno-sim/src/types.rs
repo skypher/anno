@@ -4,7 +4,9 @@
 //! in the decompiled binary.
 
 /// Population tiers (5 levels).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum PopTier {
     Pioneer = 0,
@@ -54,27 +56,27 @@ pub enum Good {
     TobaccoProducts = 18,
     Spices = 19,
     Cocoa = 20,
-    Grapes = 21,     // WEINTRAUBEN — raw material for wine/alcohol
-    Stone = 22,      // STEINE — quarried stone
-    Ore = 23,        // EISENERZ — iron ore (before smelting)
+    Grapes = 21, // WEINTRAUBEN — raw material for wine/alcohol
+    Stone = 22,  // STEINE — quarried stone
+    Ore = 23,    // EISENERZ — iron ore (before smelting)
     // Discriminant 24 was Good::GoldOre, but no GOLDERZ string
     // appears in any COD file — gold mines emit GOLD directly
     // (haeuser.cod has only the bare "GOLD" identifier). Slot
     // left vacant to preserve numeric ordering for the later
     // variants below.
-    WildGame = 25,   // WILD — wild game from hunting lodges
-                     // (not "HAEUTE"/hides — that string never
-                     // appears in any COD file; the actual
-                     // huntable raw material is `WILD`)
-    Cotton = 26,     // BAUMWOLLE — cotton (alternative to wool)
-    Silk = 27,       // SEIDE — silk
-    Jewelry = 28,    // SCHMUCK — jewelry
-    Clothing = 29,   // KLEIDUNG — clothing
-    Fish = 30,       // FISCHE — fish
-    Meat = 31,       // FLEISCH — butcher's output, distinct from
-                     // raw cattle / hunted game
-    SugarCane = 32,  // ZUCKERROHR — plantation raw, separate
-                     // good from the refined ZUCKER (Sugar)
+    WildGame = 25, // WILD — wild game from hunting lodges
+    // (not "HAEUTE"/hides — that string never
+    // appears in any COD file; the actual
+    // huntable raw material is `WILD`)
+    Cotton = 26,   // BAUMWOLLE — cotton (alternative to wool)
+    Silk = 27,     // SEIDE — silk
+    Jewelry = 28,  // SCHMUCK — jewelry
+    Clothing = 29, // KLEIDUNG — clothing
+    Fish = 30,     // FISCHE — fish
+    Meat = 31,     // FLEISCH — butcher's output, distinct from
+    // raw cattle / hunted game
+    SugarCane = 32, // ZUCKERROHR — plantation raw, separate
+                    // good from the refined ZUCKER (Sugar)
 }
 
 /// Military unit types — mirrors the four `FIGTYP_*` land entries

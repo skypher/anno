@@ -17,6 +17,11 @@ use crate::ocean_map::OceanMap;
 use crate::player::Player;
 use crate::population;
 use crate::production;
+use crate::source_cell::SourceMapCellState;
+use crate::source_route::{
+    SourceDynamicMapObject, SourceDynamicMapObjectTable, SourceResolvedDynamicTarget,
+    SourceTargetDescriptor,
+};
 use crate::trade::{self, TradeRoute, TradeShip};
 use crate::types::TICKS_PER_MINUTE;
 use crate::warehouse::Warehouse;
@@ -91,6 +96,13 @@ pub struct Simulation {
     // Game state
     pub players: Vec<Player>,
     pub buildings: Vec<BuildingInstance>,
+    /// Dynamic map objects reconstructed from scenario INSELHAUS loading.
+    /// These occupy the same eight source slots as player-built HQ objects.
+    pub source_dynamic_map_objects: Vec<SourceDynamicMapObject>,
+    /// Renderer-relevant state for source INSELHAUS command roots.
+    pub source_map_cell_states: Vec<SourceMapCellState>,
+    /// Monotone revision of the renderer-relevant source map-cell table.
+    pub source_map_cell_revision: u64,
     pub building_defs: Vec<BuildingDef>,
     pub figures: Vec<Figure>,
     pub warehouses: Vec<Warehouse>,
@@ -367,6 +379,9 @@ impl Simulation {
 
             players: Vec::new(),
             buildings: Vec::new(),
+            source_dynamic_map_objects: Vec::new(),
+            source_map_cell_states: Vec::new(),
+            source_map_cell_revision: 0,
             building_defs: Vec::new(),
             figures: Vec::new(),
             warehouses: Vec::new(),
@@ -400,6 +415,111 @@ impl Simulation {
             outcome: GameOutcome::Pending,
             native_villages: Vec::new(),
         }
+    }
+
+    /// Reconstruct one source island's dynamic map-object table from scenario
+    /// records and active `Kind=HQ` building instances carrying source slots.
+    pub fn source_dynamic_map_object_table(&self, island: u8) -> SourceDynamicMapObjectTable {
+        let mut table = SourceDynamicMapObjectTable::new(island);
+        for object in self
+            .source_dynamic_map_objects
+            .iter()
+            .copied()
+            .filter(|object| object.island == island)
+        {
+            debug_assert!(
+                table.insert(object),
+                "scenario dynamic HQ slots are unique per island"
+            );
+        }
+        for building in &self.buildings {
+            if !building.active || building.island_id != island {
+                continue;
+            }
+            let Some(slot) = building.source_dynamic_object_slot else {
+                continue;
+            };
+            let Some(definition) = self.building_defs.get(building.def_id as usize) else {
+                continue;
+            };
+            if definition.kind != "HQ" {
+                continue;
+            }
+            let (Ok(x), Ok(y)) = (u8::try_from(building.tile_x), u8::try_from(building.tile_y))
+            else {
+                continue;
+            };
+            let inserted = table.insert(SourceDynamicMapObject {
+                island,
+                slot,
+                owner: building.owner,
+                local_position: (x, y),
+            });
+            debug_assert!(inserted, "dynamic HQ slots are unique per island");
+        }
+        table
+    }
+
+    /// Resolve a `0x35` or `0x36` descriptor against the live HQ objects
+    /// currently represented by this simulation's building state.
+    pub fn resolve_source_dynamic_map_object_target(
+        &self,
+        descriptor: SourceTargetDescriptor,
+        islands: &[anno_formats::szs::Island],
+        definitions: &[anno_formats::cod::BuildingDef],
+    ) -> Option<SourceResolvedDynamicTarget> {
+        let table = self.source_dynamic_map_object_table(descriptor.bytes()[1]);
+        let objects = table.objects().collect::<Vec<_>>();
+        descriptor.resolve_dynamic_map_object_target(&objects, islands, definitions)
+    }
+
+    /// Allocate the first free source dynamic-object slot for one live HQ
+    /// building. The persisted slot later reconstructs the route target's
+    /// island, owner, and local position from that building.
+    pub fn allocate_source_dynamic_map_object_for_building(
+        &mut self,
+        building_index: usize,
+    ) -> Option<SourceDynamicMapObject> {
+        let building = self.buildings.get(building_index)?;
+        if !building.active || building.source_dynamic_object_slot.is_some() {
+            return None;
+        }
+        let definition = self.building_defs.get(building.def_id as usize)?;
+        if definition.kind != "HQ" {
+            return None;
+        }
+        let local_position = (
+            u8::try_from(building.tile_x).ok()?,
+            u8::try_from(building.tile_y).ok()?,
+        );
+        let island = building.island_id;
+        let owner = building.owner;
+
+        let object = self
+            .source_dynamic_map_object_table(island)
+            .allocate(owner, local_position)?;
+        self.buildings[building_index].source_dynamic_object_slot = Some(object.slot);
+        Some(object)
+    }
+
+    /// Release a building's source dynamic-object slot before it is removed
+    /// or otherwise ceases to be a live map object.
+    pub fn release_source_dynamic_map_object_for_building(
+        &mut self,
+        building_index: usize,
+    ) -> Option<SourceDynamicMapObject> {
+        let building = self.buildings.get_mut(building_index)?;
+        let slot = building.source_dynamic_object_slot.take()?;
+        let local_position = (
+            u8::try_from(building.tile_x).ok()?,
+            u8::try_from(building.tile_y).ok()?,
+        );
+        Some(SourceDynamicMapObject {
+            island: building.island_id,
+            slot,
+            owner: building.owner,
+            local_position,
+        })
     }
 
     /// Anno 1602 uses fixed per-good prices — no supply/demand drift.
@@ -544,11 +664,38 @@ impl Simulation {
                 continue;
             }
             let def = self.building_defs[def_id as usize].clone();
+            let source_raw_material_stock = self.buildings[i].input_1_stock.saturating_mul(32);
+            let source_work_material_stock = self.buildings[i].input_2_stock.saturating_mul(32);
+            let source_storage_fill = self.buildings[i].output_stock.saturating_mul(32);
             let produced = production::tick_building(
                 &mut self.buildings[i],
                 &def,
                 self.timer_production.interval_ms,
             );
+            let state_changed = if let Some(state) =
+                self.source_map_cell_states.iter_mut().find(|state| {
+                    state.matches(
+                        self.buildings[i].island_id,
+                        self.buildings[i].tile_x,
+                        self.buildings[i].tile_y,
+                    )
+                }) {
+                let before = *state;
+                if produced != 0 {
+                    state.raw_material_stock = source_raw_material_stock;
+                    state.work_material_stock = source_work_material_stock;
+                    state.storage_fill = source_storage_fill;
+                    state.advance_source_scheduler(self.buildings[i].efficiency);
+                } else {
+                    state.set_activity(self.buildings[i].efficiency);
+                }
+                *state != before
+            } else {
+                false
+            };
+            if state_changed {
+                self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+            }
 
             if produced > 0 && production::needs_carrier(&self.buildings[i], &def) {
                 // Check if this building already has an active carrier
@@ -1220,12 +1367,29 @@ impl Simulation {
                     ActionType::CarryingGoods | ActionType::Returning => {
                         let arrived = carrier::step_carrier(figure);
                         if arrived {
-                            let should_despawn = carrier::handle_arrival(
+                            let delivery_island = self
+                                .buildings
+                                .get(figure.building_idx as usize)
+                                .map(|building| building.island_id);
+                            let delivery_target = (figure.target_x as u16, figure.target_y as u16);
+                            let (should_despawn, delivered) = carrier::handle_arrival(
                                 figure,
                                 &mut self.warehouses,
                                 &self.buildings,
                                 &self.island_maps,
                             );
+                            if let Some(island) = delivery_island {
+                                if let Some(state) =
+                                    self.source_map_cell_states.iter_mut().find(|state| {
+                                        state.matches(island, delivery_target.0, delivery_target.1)
+                                    })
+                                {
+                                    if state.accept_market_transfer(delivered) {
+                                        self.source_map_cell_revision =
+                                            self.source_map_cell_revision.wrapping_add(1);
+                                    }
+                                }
+                            }
                             if should_despawn {
                                 despawn_indices.push(idx);
                             }
@@ -1832,6 +1996,88 @@ impl Simulation {
 mod tests {
     use super::*;
     use crate::ai::{AiController, AiPersonality, Difficulty};
+
+    #[test]
+    fn production_completion_advances_matching_source_cell_in_fixed_point() {
+        use anno_formats::cod::{BuildingDef as CodBuilding, CodFile};
+        use std::collections::HashMap;
+
+        let cod_building = CodBuilding {
+            kind: "HANDWERK".into(),
+            source_production_amount: 16,
+            source_raw_material_amount: 64,
+            storage_animation_capacity: 160,
+            properties: HashMap::from([
+                ("ProdKind".into(), "HANDWERK".into()),
+                ("Ware".into(), "WERKZEUG".into()),
+                ("Rohstoff".into(), "EISEN".into()),
+                ("Rohmenge".into(), "2".into()),
+                ("Interval".into(), "1".into()),
+                ("Maxlager".into(), "5".into()),
+            ]),
+            ..Default::default()
+        };
+        let cod = CodFile {
+            constants: HashMap::new(),
+            buildings: vec![cod_building.clone()],
+        };
+        let mut sim = Simulation::new();
+        sim.building_defs = crate::data_bridge::load_building_defs(&cod);
+        let mut building = BuildingInstance::new(0, 2, 7, 9, 0);
+        building.input_1_stock = 5;
+        sim.buildings.push(building);
+        sim.source_map_cell_states
+            .push(SourceMapCellState::new(2, 7, 9, &cod_building, 0).unwrap());
+
+        sim.tick_production();
+
+        let state = sim.source_map_cell_states[0];
+        assert_eq!(state.raw_material_stock, 96);
+        assert_eq!(state.storage_fill, 16);
+        assert_eq!(state.progress, 16);
+        assert_eq!(state.activity, 128);
+        assert_eq!(sim.source_map_cell_revision, 1);
+    }
+
+    #[test]
+    fn carrier_delivery_advances_matching_market_source_cell() {
+        use crate::types::Good;
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let mut sim = Simulation::new();
+        sim.buildings.push(BuildingInstance::new(0, 4, 1, 1, 0));
+        sim.warehouses.push(Warehouse::new(4, 0, 3, 2));
+        sim.source_map_cell_states.push(
+            SourceMapCellState::new(
+                4,
+                3,
+                2,
+                &CodBuilding {
+                    kind: "MARKT".into(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap(),
+        );
+        let mut carrier = Figure::new();
+        carrier.action = ActionType::CarryingGoods;
+        carrier.speed = 4;
+        carrier.tile_x = 3;
+        carrier.tile_y = 2;
+        carrier.target_x = 3;
+        carrier.target_y = 2;
+        carrier.building_idx = 0;
+        carrier.carried_good = Good::Tools as u8;
+        carrier.carried_amount = 5;
+        sim.figures.push(carrier);
+
+        sim.tick_entities(100);
+
+        assert_eq!(sim.warehouses[0].stock(Good::Tools), 5);
+        assert_eq!(sim.source_map_cell_states[0].progress, 5);
+        assert_eq!(sim.source_map_cell_revision, 1);
+    }
 
     #[test]
     fn ai_request_build_places_building() {
@@ -2933,6 +3179,187 @@ mod tests {
 
         assert!(sim.buildings.is_empty());
         assert_eq!(sim.players[1].gold, gold_before);
+    }
+
+    #[test]
+    fn dynamic_map_object_slots_follow_live_hq_buildings() {
+        use crate::building::{BuildingDef, BuildingInstance, OreDeposit};
+        use crate::types::{Good, ProductionType};
+        use anno_formats::cod::BuildingDef as CodBuilding;
+        use anno_formats::szs::{Island, IslandTile};
+
+        let mut sim = Simulation::new();
+        sim.building_defs.push(BuildingDef {
+            id: 0,
+            category: 0,
+            width: 2,
+            height: 2,
+            production_type: ProductionType::Craft,
+            kind: "HQ".into(),
+            prod_kind: "KONTOR".into(),
+            radius: 0,
+            output_good: Good::None,
+            input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 0,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
+            maintenance_cost: 0,
+            native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
+            has_door: false,
+            upgradeable: false,
+            max_energy: 0,
+            ore_deposit: OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
+            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: crate::building::NO_RUIN_ID,
+            required_fertility: None,
+        });
+        sim.buildings.push(BuildingInstance::new(0, 4, 9, 7, 2));
+        sim.buildings.push(BuildingInstance::new(0, 4, 5, 6, 3));
+        sim.buildings.push(BuildingInstance::new(0, 4, 11, 12, 6));
+
+        assert_eq!(
+            sim.allocate_source_dynamic_map_object_for_building(0),
+            Some(SourceDynamicMapObject {
+                island: 4,
+                slot: 0,
+                owner: 2,
+                local_position: (9, 7),
+            })
+        );
+        assert_eq!(
+            sim.allocate_source_dynamic_map_object_for_building(1),
+            Some(SourceDynamicMapObject {
+                island: 4,
+                slot: 1,
+                owner: 3,
+                local_position: (5, 6),
+            })
+        );
+        assert_eq!(sim.source_dynamic_map_object_table(4).objects().count(), 2);
+
+        assert_eq!(
+            sim.release_source_dynamic_map_object_for_building(0),
+            Some(SourceDynamicMapObject {
+                island: 4,
+                slot: 0,
+                owner: 2,
+                local_position: (9, 7),
+            })
+        );
+        assert_eq!(
+            sim.allocate_source_dynamic_map_object_for_building(2),
+            Some(SourceDynamicMapObject {
+                island: 4,
+                slot: 0,
+                owner: 6,
+                local_position: (11, 12),
+            })
+        );
+        assert_eq!(
+            sim.source_dynamic_map_object_table(4)
+                .objects()
+                .collect::<Vec<_>>(),
+            vec![
+                SourceDynamicMapObject {
+                    island: 4,
+                    slot: 0,
+                    owner: 6,
+                    local_position: (11, 12),
+                },
+                SourceDynamicMapObject {
+                    island: 4,
+                    slot: 1,
+                    owner: 3,
+                    local_position: (5, 6),
+                },
+            ]
+        );
+
+        let island = Island {
+            number: 4,
+            width: 32,
+            height: 32,
+            x_pos: 100,
+            y_pos: 200,
+            fertilities: [7; 8],
+            tiles: vec![IslandTile {
+                building_id: 3,
+                x: 11,
+                y: 12,
+                orientation: 1,
+                anim_count: 0,
+                flags: 0,
+            }],
+            city: None,
+        };
+        let definitions = [CodBuilding {
+            source_id: 0x4e23,
+            size: (2, 4),
+            ..Default::default()
+        }];
+        assert_eq!(
+            sim.resolve_source_dynamic_map_object_target(
+                SourceTargetDescriptor::from_bytes([0x35, 4, 0, 0]),
+                &[island.clone()],
+                &definitions,
+            ),
+            Some(SourceResolvedDynamicTarget {
+                target: crate::source_route::SourcePathTargetRect::new((111, 212), 4, 2).unwrap(),
+                owner: 6,
+            })
+        );
+        assert_eq!(
+            sim.resolve_source_dynamic_map_object_target(
+                SourceTargetDescriptor::from_bytes([0x36, 4, 0, 0]),
+                &[island],
+                &[],
+            ),
+            Some(SourceResolvedDynamicTarget {
+                target: crate::source_route::SourcePathTargetRect::new((111, 212), 1, 1).unwrap(),
+                owner: 6,
+            })
+        );
+    }
+
+    #[test]
+    fn source_dynamic_table_retains_scenario_hq_slots() {
+        let mut sim = Simulation::new();
+        sim.source_dynamic_map_objects.push(SourceDynamicMapObject {
+            island: 4,
+            slot: 3,
+            owner: 6,
+            local_position: (9, 7),
+        });
+
+        assert_eq!(
+            sim.source_dynamic_map_object_table(4)
+                .objects()
+                .collect::<Vec<_>>(),
+            vec![SourceDynamicMapObject {
+                island: 4,
+                slot: 3,
+                owner: 6,
+                local_position: (9, 7),
+            }]
+        );
+        assert!(sim
+            .source_dynamic_map_object_table(5)
+            .objects()
+            .next()
+            .is_none());
     }
 
     #[test]

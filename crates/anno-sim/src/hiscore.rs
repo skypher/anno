@@ -26,11 +26,7 @@ pub struct HiscoreEntry {
 /// "Score:" line on the evaluation screen — a weighted sum of
 /// inhabitants, treasury, and elapsed time. We use a simplified
 /// formula `population * 10 + max(gold, 0) / 10 + buildings * 5`.
-pub fn compute_score(
-    population: u32,
-    gold: i32,
-    buildings: u32,
-) -> u32 {
+pub fn compute_score(population: u32, gold: i32, buildings: u32) -> u32 {
     let pop_score = population.saturating_mul(10);
     let gold_score = gold.max(0) as u32 / 10;
     let bld_score = buildings.saturating_mul(5);
@@ -52,7 +48,10 @@ pub fn insert_entry(table: &mut Vec<HiscoreEntry>, entry: HiscoreEntry) -> Optio
     // entry whose score equals our new one (the most recently
     // inserted will sort to the head of any tie).
     let target = table.last().map(|e| e.score);
-    table.iter().position(|e| Some(e.score) == target).map(|i| i + 1)
+    table
+        .iter()
+        .position(|e| Some(e.score) == target)
+        .map(|i| i + 1)
 }
 
 #[cfg(test)]

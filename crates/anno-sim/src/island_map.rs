@@ -61,16 +61,10 @@ impl IslandMap {
         // Warehouse positions — always walkable
         let mut warehouse_tiles: HashSet<(u8, u8)> = HashSet::new();
 
-        // Process each tile record
+        // Replay INSELHAUS commands in source order. The loader expands each
+        // source definition over its oriented footprint before later commands
+        // can overwrite those live-map cells.
         for tile in &island.tiles {
-            let x = tile.x as u16;
-            let y = tile.y as u16;
-            if x >= width || y >= height {
-                continue;
-            }
-
-            let idx = y as usize * width as usize + x as usize;
-
             // The INSELHAUS loader adds 0x4e20 to this u16 and resolves the
             // resulting haeuser.cod source ID, rather than a Gfx sprite.
             if let Some(def) = cod_buildings
@@ -78,18 +72,31 @@ impl IslandMap {
                 .find(|def| def.source_id == tile.source_id())
             {
                 let kind = def.kind.as_str();
-
-                if is_walkable_kind(kind) {
-                    walkable[idx] = true;
-                    if kind == "STRASSE" {
-                        road[idx] = true;
-                    }
-                } else if kind == "KONTOR" {
-                    // Warehouses: mark walkable so carriers can reach them
-                    walkable[idx] = true;
-                    warehouse_tiles.insert((tile.x, tile.y));
+                let (footprint_width, footprint_height) = if matches!(tile.orientation & 3, 1 | 3) {
+                    (def.size.1, def.size.0)
+                } else {
+                    def.size
+                };
+                if footprint_width <= 0 || footprint_height <= 0 {
+                    continue;
                 }
-                // Everything else (buildings, resources) stays blocked
+                let is_walkable = is_walkable_kind(kind) || kind == "KONTOR";
+                let is_road = kind == "STRASSE";
+                for dy in 0..footprint_height {
+                    for dx in 0..footprint_width {
+                        let x = i32::from(tile.x) + dx;
+                        let y = i32::from(tile.y) + dy;
+                        if x < 0 || y < 0 || x >= i32::from(width) || y >= i32::from(height) {
+                            continue;
+                        }
+                        let idx = y as usize * width as usize + x as usize;
+                        walkable[idx] = is_walkable;
+                        road[idx] = is_road;
+                        if kind == "KONTOR" {
+                            warehouse_tiles.insert((x as u8, y as u8));
+                        }
+                    }
+                }
             }
         }
 
@@ -369,6 +376,56 @@ mod tests {
         assert!(map.is_walkable(0, 0));
         assert!(map.is_road(0, 0));
         assert!(!map.is_walkable(1, 0));
+    }
+
+    #[test]
+    fn from_island_blocks_the_full_rotated_source_footprint() {
+        let island = Island {
+            number: 3,
+            width: 3,
+            height: 2,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles: vec![
+                IslandTile {
+                    building_id: 1,
+                    x: 0,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                },
+                IslandTile {
+                    building_id: 2,
+                    x: 1,
+                    y: 0,
+                    orientation: 1,
+                    anim_count: 0,
+                    flags: 0,
+                },
+            ],
+            city: None,
+        };
+        let ground = CodBuilding {
+            source_id: 20_001,
+            kind: "BODEN".to_owned(),
+            size: (3, 2),
+            ..Default::default()
+        };
+        let blocker = CodBuilding {
+            source_id: 20_002,
+            kind: "HANDWERK".to_owned(),
+            size: (2, 1),
+            ..Default::default()
+        };
+
+        let map = IslandMap::from_island(&island, &[ground, blocker]);
+
+        assert!(map.is_walkable(0, 0));
+        assert!(!map.is_walkable(1, 0));
+        assert!(!map.is_walkable(1, 1));
+        assert!(map.is_walkable(2, 1));
     }
 
     #[test]

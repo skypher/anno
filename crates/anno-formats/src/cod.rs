@@ -54,8 +54,30 @@ pub struct BuildingDef {
     pub anim_anz: i32,
     /// Animation sprite offset per frame
     pub anim_add: i32,
+    /// Source animation-frame phase (`AnimFrame`, compiled offset `0x7c`).
+    /// The renderer adds this phase to an INSELHAUS command's packed frame
+    /// selector before multiplying by [`Self::anim_add`].
+    pub anim_frame: i32,
     /// Animation speed in milliseconds per frame (0 = use default 200ms)
     pub anim_time: i32,
+    /// Source `Anicontflg` bit at compiled definition offset `0x47`, bit 0.
+    /// `FUN_004638c0` uses it when a dynamic map cell changes activity.
+    pub animation_continues: bool,
+    /// Source `LagAniFlg` bit at compiled definition offset `0x47`, bit 2.
+    /// The STADTFLD draw loop selects the storage-ratio frame branch when set.
+    pub storage_animation: bool,
+    /// Compiled `Maxlager` at definition offset `0x30`. The source parser
+    /// stores the COD amount in its 1/32-unit map-cell scale.
+    pub storage_animation_capacity: u16,
+    /// Compiled `Prodmenge` at definition offset `0x24`, in 1/32-unit
+    /// map-cell production scale.
+    pub source_production_amount: u16,
+    /// Compiled `Rohmenge` at definition offset `0x26`, in 1/32-unit
+    /// map-cell storage scale.
+    pub source_raw_material_amount: u16,
+    /// Compiled `Workmenge` at definition offset `0x28`, in 1/32-unit
+    /// map-cell storage scale.
+    pub source_work_material_amount: u16,
     /// Source `NoShotFlg` bit consumed by `FUN_0046f6d0` when it constructs
     /// the ship-route obstacle overlay.
     pub no_shot: bool,
@@ -82,7 +104,14 @@ impl Default for BuildingDef {
             rand_add: 0,
             anim_anz: 1,
             anim_add: 0,
+            anim_frame: 0,
             anim_time: 0,
+            animation_continues: false,
+            storage_animation: false,
+            storage_animation_capacity: 0,
+            source_production_amount: 0,
+            source_raw_material_amount: 0,
+            source_work_material_amount: 0,
             no_shot: false,
             ruinenr: 255,
             properties: HashMap::new(),
@@ -371,9 +400,70 @@ impl CodFile {
                 continue;
             }
 
+            // `FUN_00460750` stores AnimFrame at compiled definition offset
+            // 0x7c. The STADTFLD draw loop combines it with the map command's
+            // four-bit frame selector before applying AnimAdd.
+            if let Some(val_str) = line.strip_prefix("AnimFrame:") {
+                current.anim_frame = Self::eval(&constants, val_str.trim());
+                continue;
+            }
+
             // Parse AnimTime (ms per animation frame)
             if let Some(val_str) = line.strip_prefix("AnimTime:") {
                 current.anim_time = Self::eval(&constants, val_str.trim());
+                continue;
+            }
+
+            // `FUN_00460750` packs Anicontflg and LagAniFlg into byte 0x47
+            // of the compiled definition. The map-cell frame state machine
+            // reads bit 0 on activity transitions, while the draw loop reads
+            // bit 2 for its storage-ratio selector branch.
+            if let Some(val_str) = line.strip_prefix("Anicontflg:") {
+                current.animation_continues = Self::eval(&constants, val_str.trim()) & 1 != 0;
+                continue;
+            }
+            if let Some(val_str) = line.strip_prefix("LagAniFlg:") {
+                current.storage_animation = Self::eval(&constants, val_str.trim()) & 1 != 0;
+                continue;
+            }
+
+            // `FUN_00460750` stores Maxlager in map-cell units at compiled
+            // definition offset 0x30: one authored unit equals 32 cells.
+            if let Some(val_str) = line.strip_prefix("Maxlager:") {
+                let authored = Self::eval(&constants, val_str.trim()).clamp(0, 0x7ff);
+                current.storage_animation_capacity = (authored as u16) << 5;
+                current
+                    .properties
+                    .insert("Maxlager".to_string(), authored.to_string());
+                continue;
+            }
+
+            // The production parser multiplies each decimal amount by 32
+            // before writing the three u16 map-cell scalars. `0.5` and
+            // `0.75` therefore remain representable as 16 and 24 rather
+            // than being truncated by the simulation's integer good units.
+            if let Some(val_str) = line.strip_prefix("Prodmenge:") {
+                current.source_production_amount = Self::eval_scaled_32(&constants, val_str);
+                current.properties.insert(
+                    "Prodmenge".to_string(),
+                    (current.source_production_amount as f64 / 32.0).to_string(),
+                );
+                continue;
+            }
+            if let Some(val_str) = line.strip_prefix("Rohmenge:") {
+                current.source_raw_material_amount = Self::eval_scaled_32(&constants, val_str);
+                current.properties.insert(
+                    "Rohmenge".to_string(),
+                    (current.source_raw_material_amount as f64 / 32.0).to_string(),
+                );
+                continue;
+            }
+            if let Some(val_str) = line.strip_prefix("Workmenge:") {
+                current.source_work_material_amount = Self::eval_scaled_32(&constants, val_str);
+                current.properties.insert(
+                    "Workmenge".to_string(),
+                    (current.source_work_material_amount as f64 / 32.0).to_string(),
+                );
                 continue;
             }
 
@@ -499,6 +589,17 @@ impl CodFile {
         }
 
         0
+    }
+
+    /// Evaluate a COD decimal in the source map-cell's 1/32-unit scale.
+    fn eval_scaled_32(constants: &HashMap<String, i32>, expr: &str) -> u16 {
+        let expr = expr.trim();
+        let value = if let Ok(value) = expr.parse::<f64>() {
+            value
+        } else {
+            Self::eval(constants, expr) as f64
+        };
+        (value * 32.0).round().clamp(0.0, f64::from(u16::MAX)) as u16
     }
 
     fn eval_directive(
@@ -648,6 +749,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_anim_frame_for_source_sprite_selection() {
+        let cod = CodFile::parse(
+            b"@Nummer: 1\nId: 20001\nGfx: 120\nAnimAnz: 4\nAnimAdd: 6\nAnimFrame: 3\n",
+        )
+        .expect("parse plaintext COD");
+
+        assert_eq!(cod.buildings.len(), 1);
+        assert_eq!(cod.buildings[0].anim_anz, 4);
+        assert_eq!(cod.buildings[0].anim_add, 6);
+        assert_eq!(cod.buildings[0].anim_frame, 3);
+    }
+
+    #[test]
+    fn parses_source_cell_animation_flags() {
+        let cod = CodFile::parse(
+            b"@Nummer: 1\nId: 20001\nAnicontflg: 1\nLagAniFlg: 1\nMaxlager: 5\nProdmenge: 0.75\nRohmenge: 0.5\nWorkmenge: 2\n",
+        )
+        .expect("parse plaintext COD");
+
+        assert!(cod.buildings[0].animation_continues);
+        assert!(cod.buildings[0].storage_animation);
+        assert_eq!(cod.buildings[0].storage_animation_capacity, 160);
+        assert_eq!(cod.buildings[0].source_production_amount, 24);
+        assert_eq!(cod.buildings[0].source_raw_material_amount, 16);
+        assert_eq!(cod.buildings[0].source_work_material_amount, 64);
+    }
+
+    #[test]
     fn parse_haeuser_cod() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -719,6 +848,18 @@ mod tests {
         assert!(
             cod.buildings.iter().any(|building| building.no_shot),
             "NoShotFlg definitions retain the source bit used by ship routing"
+        );
+        assert!(
+            cod.buildings
+                .iter()
+                .all(|building| building.anim_frame == 0),
+            "the shipped haeuser.cod corpus keeps AnimFrame at its inherited zero phase"
+        );
+        assert!(
+            cod.buildings
+                .iter()
+                .all(|building| !building.storage_animation),
+            "the shipped haeuser.cod corpus declares no LagAniFlg definitions"
         );
 
         // Should have ~500 buildings
