@@ -14,10 +14,25 @@ use anno_formats::cod::BuildingDef as CodBuilding;
 use anno_formats::szs::Island;
 use std::collections::HashSet;
 
+use crate::source_route::{SourcePathGrid, SourcePathTargetRect, SourceTargetDescriptor};
+
+/// Static source-map data needed to rebuild the short type-3 civilian route
+/// window around a kind-13 location anchor.
+#[derive(Debug, Clone, Copy)]
+struct SourceCivilianPathCell {
+    kind_code: u8,
+    owner: u8,
+    path_class: u8,
+}
+
 /// Walkability grid for a single island.
 #[derive(Debug, Clone)]
 pub struct IslandMap {
     pub island_id: u8,
+    /// Source-world coordinate of local grid cell `(0, 0)`. INSEL5 stores
+    /// this origin in half-world units; type-4 figure positions use the
+    /// doubled coordinate system consumed by `FUN_00444af0`.
+    pub source_world_origin: (i32, i32),
     pub width: u16,
     pub height: u16,
     /// Flat grid: true = walkable. Index = y * width + x.
@@ -27,6 +42,34 @@ pub struct IslandMap {
     /// they're available — RE: haeuser.cod `Wegspeed: 145, 120,
     /// 170, 100` (plain ground vs road quad).
     road: Vec<bool>,
+    /// Static source path overlay for KARREN `Speedtyp: 2`. Runtime cart
+    /// searches clone this and mark same-owner producer roots as callback
+    /// cells before running the source weighted wave.
+    city_cart_path_template: SourcePathGrid,
+    /// Static source path overlay for TRAEGER's inherited `Speedtyp: 0`.
+    /// Runtime type-8 dispatch clones this before applying its owner-specific
+    /// supplier markers.
+    carrier_path_template: SourcePathGrid,
+    /// Live-map kind, owner, and type-3 path class replayed from the
+    /// scenario's oriented INSELHAUS commands. `FUN_0044b140` samples an
+    /// 11 x 11 window from this state for its kind-12 civilian route.
+    civilian_path_cells: Vec<Option<SourceCivilianPathCell>>,
+    /// Raw type-2 `Wegspeed` values used by KARREN movement.
+    city_cart_movement_speeds: Vec<u16>,
+    /// Raw type-0 `Wegspeed` values used by TRAEGER movement.
+    carrier_movement_speeds: Vec<u16>,
+    /// Raw type-1 `Wegspeed` values used by cavalry type-4 movement.
+    cavalry_movement_speeds: Vec<u16>,
+    /// Raw type-3 `Wegspeed` values used by kind-12 civilian movement.
+    civilian_movement_speeds: Vec<u16>,
+    /// Per-cell `Posoffs × 0.028` source terrain elevation. INSELHAUS
+    /// commands overwrite this grid in the same oriented-footprint order as
+    /// the live map-object table used by source figure constructors.
+    source_terrain_heights: Vec<f32>,
+    /// Doubled source-grid dimensions returned by `FUN_00463880` for a
+    /// static map cell. `FUN_00444fe0` combines these with the descriptor's
+    /// local cell coordinate when building a type-4 target rectangle.
+    source_land_target_sizes: Vec<Option<(u16, u16)>>,
     /// Eight raw INSEL5 fertility bytes carried over from the
     /// scenario file. Use `active_fertilities()` to iterate the
     /// non-sentinel typed values.
@@ -57,6 +100,13 @@ impl IslandMap {
         // Start with all tiles as non-walkable (water/empty)
         let mut walkable = vec![false; size];
         let mut road = vec![false; size];
+        let mut city_cart_movement_speeds = vec![100; size];
+        let mut carrier_movement_speeds = vec![100; size];
+        let mut cavalry_movement_speeds = vec![100; size];
+        let mut civilian_movement_speeds = vec![100; size];
+        let mut civilian_path_cells = vec![None; size];
+        let mut source_terrain_heights = vec![0.0; size];
+        let mut source_land_target_sizes = vec![None; size];
 
         // Warehouse positions — always walkable
         let mut warehouse_tiles: HashSet<(u8, u8)> = HashSet::new();
@@ -80,8 +130,17 @@ impl IslandMap {
                 if footprint_width <= 0 || footprint_height <= 0 {
                     continue;
                 }
+                let source_land_target_size = u16::try_from(footprint_width)
+                    .ok()
+                    .and_then(|width| width.checked_mul(2))
+                    .zip(
+                        u16::try_from(footprint_height)
+                            .ok()
+                            .and_then(|height| height.checked_mul(2)),
+                    );
                 let is_walkable = is_walkable_kind(kind) || kind == "KONTOR";
                 let is_road = kind == "STRASSE";
+                let movement_speeds = def.source_path_speeds();
                 for dy in 0..footprint_height {
                     for dx in 0..footprint_width {
                         let x = i32::from(tile.x) + dx;
@@ -92,6 +151,23 @@ impl IslandMap {
                         let idx = y as usize * width as usize + x as usize;
                         walkable[idx] = is_walkable;
                         road[idx] = is_road;
+                        if let Some(speeds) = movement_speeds {
+                            carrier_movement_speeds[idx] = u16::from(speeds[0].max(1));
+                            cavalry_movement_speeds[idx] = u16::from(speeds[1].max(1));
+                            city_cart_movement_speeds[idx] = u16::from(speeds[2].max(1));
+                            civilian_movement_speeds[idx] = u16::from(speeds[3].max(1));
+                        }
+                        if let Some(path_classes) = def.source_path_classes() {
+                            civilian_path_cells[idx] = Some(SourceCivilianPathCell {
+                                kind_code: def.source_kind_code().unwrap_or(u8::MAX),
+                                owner: tile.source_owner(),
+                                path_class: path_classes[3],
+                            });
+                        } else {
+                            civilian_path_cells[idx] = None;
+                        }
+                        source_terrain_heights[idx] = def.source_position_offset as f32 * 0.028;
+                        source_land_target_sizes[idx] = source_land_target_size;
                         if kind == "KONTOR" {
                             warehouse_tiles.insert((x as u8, y as u8));
                         }
@@ -100,12 +176,33 @@ impl IslandMap {
             }
         }
 
+        let mut city_cart_path_template =
+            SourcePathGrid::new((0, 0), usize::from(width), usize::from(height));
+        city_cart_path_template
+            .populate_static_island_cells(island, cod_buildings, 2, |_, _| false)
+            .expect("KARREN Speedtyp is within the four Wegspeed classes");
+        let mut carrier_path_template =
+            SourcePathGrid::new((0, 0), usize::from(width), usize::from(height));
+        carrier_path_template
+            .populate_static_island_cells(island, cod_buildings, 0, |_, _| false)
+            .expect("TRAEGER Speedtyp is within the four Wegspeed classes");
+
         Self {
             island_id: island.number,
+            source_world_origin: (i32::from(island.x_pos) * 2, i32::from(island.y_pos) * 2),
             width,
             height,
             walkable,
             road,
+            city_cart_path_template,
+            carrier_path_template,
+            civilian_path_cells,
+            city_cart_movement_speeds,
+            carrier_movement_speeds,
+            cavalry_movement_speeds,
+            civilian_movement_speeds,
+            source_terrain_heights,
+            source_land_target_sizes,
             fertilities: island.fertilities,
         }
     }
@@ -121,10 +218,92 @@ impl IslandMap {
             .collect()
     }
 
+    /// Whether a local island-grid cell lies within this INSEL5 map.
+    #[inline]
+    pub fn contains_local(&self, x: i32, y: i32) -> bool {
+        x >= 0 && y >= 0 && x < i32::from(self.width) && y < i32::from(self.height)
+    }
+
+    /// Convert a type-4 source-world position to the corresponding local
+    /// INSEL5 grid cell. `FUN_00444af0` doubles local coordinates when it
+    /// resolves static island descriptors, so figure coordinates are divided
+    /// by two relative to the island origin before grid routing.
+    #[inline]
+    pub fn source_world_to_local(&self, world: (i32, i32)) -> Option<(i32, i32)> {
+        let local = (
+            (world.0 - self.source_world_origin.0).div_euclid(2),
+            (world.1 - self.source_world_origin.1).div_euclid(2),
+        );
+        self.contains_local(local.0, local.1).then_some(local)
+    }
+
+    /// Convert a local INSEL5 grid cell to its doubled source-world waypoint.
+    /// Type-4 movement advances toward this waypoint in raw world units, so
+    /// callers must retain an existing odd coordinate until it naturally
+    /// crosses the local-cell boundary.
+    #[inline]
+    pub fn local_to_source_world(&self, local: (i32, i32)) -> Option<(i32, i32)> {
+        self.contains_local(local.0, local.1).then_some((
+            self.source_world_origin.0 + local.0 * 2,
+            self.source_world_origin.1 + local.1 * 2,
+        ))
+    }
+
+    /// Resolve a type-4 idle anchor into its raw source-world position.
+    /// Static kinds `0x33`/`0x34` address one local cell on the descriptor's
+    /// island. `FUN_00444af0` doubles a kind-`0x37` world cell and retains a
+    /// kind-`0x38` raw figure coordinate.
+    pub fn source_land_idle_anchor(
+        &self,
+        descriptor: SourceTargetDescriptor,
+    ) -> Option<(i32, i32)> {
+        match descriptor.kind() {
+            0x33 | 0x34 if descriptor.bytes()[1] == self.island_id => self.local_to_source_world((
+                i32::from(descriptor.bytes()[2]),
+                i32::from(descriptor.bytes()[3]),
+            )),
+            SourceTargetDescriptor::WORLD_COORDINATE_KIND
+            | SourceTargetDescriptor::FIXED_POINT_COORDINATE_KIND => descriptor
+                .source_land_route_coordinate()
+                .filter(|&world| self.source_world_to_local(world).is_some()),
+            _ => None,
+        }
+    }
+
+    /// Resolve a type-4 descriptor into the raw target rectangle returned by
+    /// `FUN_00444fe0`. Static `0x32`/`0x33`/`0x34` descriptors use the
+    /// selected cell's retained oriented footprint; packed coordinates retain
+    /// the source fallback `1 × 1` rectangle.
+    pub fn source_land_target_rect(
+        &self,
+        descriptor: SourceTargetDescriptor,
+    ) -> Option<SourcePathTargetRect> {
+        match descriptor.kind() {
+            0x32 | 0x33 | 0x34 if descriptor.bytes()[1] == self.island_id => {
+                let local = (
+                    i32::from(descriptor.bytes()[2]),
+                    i32::from(descriptor.bytes()[3]),
+                );
+                let index = self.local_index(local)?;
+                let (width, height) = *self.source_land_target_sizes.get(index)?.as_ref()?;
+                SourcePathTargetRect::new(
+                    self.local_to_source_world(local)?,
+                    usize::from(width),
+                    usize::from(height),
+                )
+            }
+            SourceTargetDescriptor::WORLD_COORDINATE_KIND
+            | SourceTargetDescriptor::FIXED_POINT_COORDINATE_KIND => descriptor
+                .source_land_route_coordinate()
+                .and_then(|origin| SourcePathTargetRect::new(origin, 1, 1)),
+            _ => None,
+        }
+    }
+
     /// Check if a tile is walkable.
     #[inline]
     pub fn is_walkable(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+        if !self.contains_local(x, y) {
             return false;
         }
         self.walkable[y as usize * self.width as usize + x as usize]
@@ -139,6 +318,174 @@ impl IslandMap {
             return false;
         }
         self.road[y as usize * self.width as usize + x as usize]
+    }
+
+    /// Clone the static type-2 source-grid overlay for a type-11 city-cart
+    /// search. The caller supplies its live owner-specific root markers.
+    pub fn city_cart_path_grid(&self) -> SourcePathGrid {
+        self.city_cart_path_template.clone()
+    }
+
+    /// Clone the static type-0 source-grid overlay for a type-8 TRAEGER
+    /// search. The caller supplies the live owner-specific supplier markers.
+    pub fn carrier_path_grid(&self) -> SourcePathGrid {
+        self.carrier_path_template.clone()
+    }
+
+    /// Rebuild the `11 x 11` type-3 path window passed to
+    /// `FUN_0046c7d0` by `FUN_0044b140`. The source first blocks every cell,
+    /// then permits fixed terrain kinds 1, 13, 18, and 30 plus the selected
+    /// permission-mask kinds owned by the spawning root's player.
+    pub fn civilian_path_grid(
+        &self,
+        center: (i32, i32),
+        source_owner: u8,
+        permission_branch: u8,
+    ) -> SourcePathGrid {
+        const RADIUS: i32 = 5;
+        let origin = (center.0 - RADIUS, center.1 - RADIUS);
+        let mut grid = SourcePathGrid::new(origin, 11, 11);
+        for y in origin.1..=origin.1 + RADIUS * 2 {
+            for x in origin.0..=origin.0 + RADIUS * 2 {
+                grid.mark_direction_blocker((x, y));
+                let Some(cell) = self.civilian_path_cell((x, y)) else {
+                    continue;
+                };
+                let permission_matched = cell.owner == source_owner
+                    && crate::civilian::source_civilian_path_kind_permitted(
+                        permission_branch,
+                        cell.kind_code,
+                    );
+                let fixed = matches!(cell.kind_code, 1 | 13 | 18 | 30);
+                if fixed || permission_matched {
+                    grid.set_traversable_cell(
+                        (x, y),
+                        cell.path_class | (u8::from(permission_matched) << 7),
+                    );
+                }
+            }
+        }
+        grid
+    }
+
+    /// Raw type-0 terrain speed for `FUN_0044a690` TRAEGER movement.
+    pub fn carrier_movement_speed(&self, position: (i32, i32)) -> Option<u16> {
+        self.movement_speed(&self.carrier_movement_speeds, position)
+    }
+
+    /// Raw type-2 terrain speed for `FUN_0044a690` KARREN movement.
+    pub fn city_cart_movement_speed(&self, position: (i32, i32)) -> Option<u16> {
+        self.movement_speed(&self.city_cart_movement_speeds, position)
+    }
+
+    /// Raw source terrain speed for a type-4 `Speedtyp` class.
+    pub fn source_land_movement_speed(&self, speed_type: u8, position: (i32, i32)) -> Option<u16> {
+        match speed_type {
+            0 => self.carrier_movement_speed(position),
+            1 => self.movement_speed(&self.cavalry_movement_speeds, position),
+            2 => self.city_cart_movement_speed(position),
+            3 => self.civilian_movement_speed(position),
+            _ => None,
+        }
+    }
+
+    /// Rebuild the doubled-coordinate type-4 terrain grid used by
+    /// `FUN_004581f0` and `FUN_0046f460`. Each INSEL5 cell becomes four raw
+    /// route cells. The native builder permits only its fixed terrain kinds;
+    /// all building kinds remain direction-blocked for a land-figure route.
+    pub fn source_land_path_grid(&self, speed_type: u8) -> Option<SourcePathGrid> {
+        if speed_type >= 4 {
+            return None;
+        }
+        let width = usize::from(self.width).checked_mul(2)?;
+        let height = usize::from(self.height).checked_mul(2)?;
+        let mut grid = SourcePathGrid::new(self.source_world_origin, width, height);
+
+        for y in 0..i32::from(self.height) {
+            for x in 0..i32::from(self.width) {
+                let local = (x, y);
+                let raw_origin = self.local_to_source_world(local)?;
+                for raw_y in raw_origin.1..=raw_origin.1 + 1 {
+                    for raw_x in raw_origin.0..=raw_origin.0 + 1 {
+                        grid.mark_direction_blocker((raw_x, raw_y));
+                    }
+                }
+
+                let fixed_terrain = matches!(
+                    self.civilian_path_kind(local),
+                    Some(1 | 11 | 12 | 13 | 18 | 29 | 30)
+                );
+                if !fixed_terrain {
+                    continue;
+                }
+                let speed = self.source_land_movement_speed(speed_type, local)?;
+                let metadata = crate::carrier::source_path_class(speed);
+                for raw_y in raw_origin.1..=raw_origin.1 + 1 {
+                    for raw_x in raw_origin.0..=raw_origin.0 + 1 {
+                        grid.set_traversable_cell((raw_x, raw_y), metadata);
+                    }
+                }
+            }
+        }
+        Some(grid)
+    }
+
+    /// `FUN_0046ea40` acceptance for a type-4 partial-route endpoint. The
+    /// executable resolves the raw coordinate back to its INSEL5 cell and
+    /// accepts only the fixed terrain kinds used by `FUN_0046f460`.
+    pub fn source_land_partial_marker_allowed(&self, position: (i32, i32)) -> bool {
+        self.source_world_to_local(position)
+            .is_some_and(|local| {
+                matches!(
+                    self.civilian_path_kind(local),
+                    Some(1 | 11 | 12 | 13 | 18 | 29 | 30)
+                )
+            })
+    }
+
+    /// Raw type-3 terrain speed for kind-12 civilian movement.
+    pub fn civilian_movement_speed(&self, position: (i32, i32)) -> Option<u16> {
+        self.movement_speed(&self.civilian_movement_speeds, position)
+    }
+
+    /// Live source map-object kind at a type-3 civilian route endpoint.
+    pub fn civilian_path_kind(&self, position: (i32, i32)) -> Option<u8> {
+        self.civilian_path_cell(position).map(|cell| cell.kind_code)
+    }
+
+    /// Target-cell predicate used by the type-4 native idle branch. Its
+    /// source check accepts runtime kind codes `1` and `11`; kind `1` covers
+    /// the executable's road and production-label aliases.
+    pub fn source_native_idle_target_allowed(&self, position: (i32, i32)) -> bool {
+        matches!(self.civilian_path_kind(position), Some(1 | 11))
+    }
+
+    /// Source map-cell terrain elevation used to initialise a figure's Z
+    /// coordinate. This is `Posoffs × 0.028` after INSELHAUS replay.
+    pub fn source_terrain_height(&self, position: (i32, i32)) -> Option<f32> {
+        let (x, y) = position;
+        if x < 0 || y < 0 || x >= i32::from(self.width) || y >= i32::from(self.height) {
+            return None;
+        }
+        self.source_terrain_heights
+            .get(y as usize * self.width as usize + x as usize)
+            .copied()
+    }
+
+    fn movement_speed(&self, speeds: &[u16], position: (i32, i32)) -> Option<u16> {
+        let (x, y) = position;
+        if x < 0 || y < 0 || x >= i32::from(self.width) || y >= i32::from(self.height) {
+            return None;
+        }
+        speeds
+            .get(y as usize * self.width as usize + x as usize)
+            .copied()
+            .filter(|speed| *speed != 0)
+    }
+
+    fn local_index(&self, position: (i32, i32)) -> Option<usize> {
+        self.contains_local(position.0, position.1)
+            .then_some(position.1 as usize * self.width as usize + position.0 as usize)
     }
 
     /// Mark a tile as walkable (e.g., for warehouse placement after map creation).
@@ -306,10 +653,35 @@ impl IslandMap {
         let size = width as usize * height as usize;
         Self {
             island_id,
+            source_world_origin: (0, 0),
             width,
             height,
             walkable: vec![true; size],
             road: vec![false; size],
+            city_cart_path_template: SourcePathGrid::new(
+                (0, 0),
+                usize::from(width),
+                usize::from(height),
+            ),
+            carrier_path_template: SourcePathGrid::new(
+                (0, 0),
+                usize::from(width),
+                usize::from(height),
+            ),
+            civilian_path_cells: vec![
+                Some(SourceCivilianPathCell {
+                    kind_code: 11,
+                    owner: 0,
+                    path_class: 32,
+                });
+                size
+            ],
+            city_cart_movement_speeds: vec![100; size],
+            carrier_movement_speeds: vec![100; size],
+            cavalry_movement_speeds: vec![100; size],
+            civilian_movement_speeds: vec![100; size],
+            source_terrain_heights: vec![0.0; size],
+            source_land_target_sizes: vec![Some((2, 2)); size],
             fertilities: [7; 8],
         }
     }
@@ -376,6 +748,256 @@ mod tests {
         assert!(map.is_walkable(0, 0));
         assert!(map.is_road(0, 0));
         assert!(!map.is_walkable(1, 0));
+    }
+
+    #[test]
+    fn source_world_coordinates_use_the_doubled_insel5_origin() {
+        let island = Island {
+            number: 10,
+            width: 64,
+            height: 64,
+            x_pos: 110,
+            y_pos: 130,
+            fertilities: [7; 8],
+            tiles: vec![],
+            city: None,
+        };
+        let map = IslandMap::from_island(&island, &[]);
+
+        assert_eq!(map.source_world_origin, (220, 260));
+        assert_eq!(map.local_to_source_world((24, 21)), Some((268, 302)));
+        assert_eq!(map.source_world_to_local((274, 312)), Some((27, 26)));
+        assert_eq!(map.source_world_to_local((269, 303)), Some((24, 21)));
+        assert_eq!(map.source_world_to_local((348, 260)), None);
+    }
+
+    #[test]
+    fn source_land_idle_anchors_resolve_static_and_packed_forms() {
+        let mut static_map = IslandMap::new_open(10, 64, 64);
+        static_map.source_world_origin = (220, 260);
+        assert_eq!(
+            static_map
+                .source_land_idle_anchor(SourceTargetDescriptor::from_bytes([0x33, 10, 24, 21,])),
+            Some((268, 302))
+        );
+        assert_eq!(
+            static_map
+                .source_land_idle_anchor(SourceTargetDescriptor::from_bytes([0x34, 10, 24, 21,])),
+            Some((268, 302))
+        );
+
+        let mut packed_map = IslandMap::new_open(3, 30, 30);
+        packed_map.source_world_origin = (530, 230);
+        assert_eq!(
+            packed_map.source_land_idle_anchor(SourceTargetDescriptor::from_bytes([
+                0x38, 0x12, 0x34, 0x00,
+            ])),
+            Some((564, 256))
+        );
+        assert_eq!(
+            packed_map.source_land_idle_anchor(
+                SourceTargetDescriptor::from_source_land_route_coordinate(564, 256).unwrap(),
+            ),
+            Some((564, 256))
+        );
+    }
+
+    #[test]
+    fn source_land_target_rect_matches_fun_00444fe0_static_and_packed_forms() {
+        let island = Island {
+            number: 10,
+            width: 8,
+            height: 6,
+            x_pos: 110,
+            y_pos: 130,
+            fertilities: [7; 8],
+            tiles: vec![IslandTile {
+                building_id: 77,
+                x: 1,
+                y: 2,
+                orientation: 1,
+                anim_count: 0,
+                flags: 0,
+            }],
+            city: None,
+        };
+        let building = CodBuilding {
+            source_id: 20_077,
+            kind: "HANDWERK".to_owned(),
+            size: (2, 4),
+            ..Default::default()
+        };
+        let map = IslandMap::from_island(&island, &[building]);
+
+        assert_eq!(
+            map.source_land_target_rect(
+                SourceTargetDescriptor::from_source_kind34_island_cell(10, 1, 2)
+            ),
+            SourcePathTargetRect::new((222, 264), 8, 4)
+        );
+        assert_eq!(
+            map.source_land_target_rect(SourceTargetDescriptor::from_bytes([
+                0x38, 0x22, 0xec, 0x4c,
+            ])),
+            SourcePathTargetRect::new((0x2ec, 0x24c), 1, 1)
+        );
+    }
+
+    #[test]
+    fn source_land_path_grid_expands_fixed_terrain_and_blocks_kontor_cells() {
+        let island = Island {
+            number: 3,
+            width: 3,
+            height: 1,
+            x_pos: 10,
+            y_pos: 20,
+            fertilities: [7; 8],
+            tiles: vec![
+                IslandTile {
+                    building_id: 1,
+                    x: 0,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                },
+                IslandTile {
+                    building_id: 2,
+                    x: 1,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                },
+                IslandTile {
+                    building_id: 1,
+                    x: 2,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                },
+            ],
+            city: None,
+        };
+        let mut ground = CodBuilding {
+            source_id: 20_001,
+            kind: "BODEN".into(),
+            ..Default::default()
+        };
+        ground
+            .properties
+            .insert("Wegspeed".into(), "100,100,100,100".into());
+        let mut kontor = CodBuilding {
+            source_id: 20_002,
+            kind: "KONTOR".into(),
+            ..Default::default()
+        };
+        kontor
+            .properties
+            .insert("Wegspeed".into(), "100,100,100,100".into());
+        let map = IslandMap::from_island(&island, &[ground, kontor]);
+        let grid = map.source_land_path_grid(0).unwrap();
+
+        assert_eq!(grid.is_direction_clear((20, 40)), Some(true));
+        assert_eq!(grid.is_direction_clear((21, 41)), Some(true));
+        assert_eq!(grid.is_direction_clear((22, 40)), Some(false));
+        assert_eq!(grid.is_direction_clear((23, 41)), Some(false));
+        assert_eq!(grid.metadata((20, 40)), Some(32));
+    }
+
+    #[test]
+    fn native_idle_targets_accept_only_source_ground_or_roads() {
+        let island = Island {
+            number: 3,
+            width: 2,
+            height: 1,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles: vec![
+                IslandTile {
+                    building_id: 77,
+                    x: 0,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                },
+                IslandTile {
+                    building_id: 88,
+                    x: 1,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                },
+            ],
+            city: None,
+        };
+        let road = CodBuilding {
+            source_id: 20_077,
+            kind: "STRASSE".to_owned(),
+            properties: std::collections::HashMap::from([(
+                "Wegspeed".to_owned(),
+                "100,100,100,100".to_owned(),
+            )]),
+            ..Default::default()
+        };
+        let building = CodBuilding {
+            source_id: 20_088,
+            kind: "HANDWERK".to_owned(),
+            properties: std::collections::HashMap::from([(
+                "Wegspeed".to_owned(),
+                "100,100,100,100".to_owned(),
+            )]),
+            ..Default::default()
+        };
+        let map = IslandMap::from_island(&island, &[road, building]);
+
+        assert!(map.source_native_idle_target_allowed((0, 0)));
+        assert!(map.source_native_idle_target_allowed((1, 0)));
+        assert!(IslandMap::new_open(3, 1, 1).source_native_idle_target_allowed((0, 0)));
+    }
+
+    #[test]
+    fn source_carrier_template_uses_speedtyp_zero() {
+        let island = Island {
+            number: 3,
+            width: 1,
+            height: 1,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles: vec![IslandTile {
+                building_id: 77,
+                x: 0,
+                y: 0,
+                orientation: 0,
+                anim_count: 0,
+                flags: 0,
+            }],
+            city: None,
+        };
+        let ground = CodBuilding {
+            source_id: 20_077,
+            kind: "BODEN".to_owned(),
+            size: (1, 1),
+            source_position_offset: 10,
+            properties: std::collections::HashMap::from([(
+                "Wegspeed".to_owned(),
+                "100,125,150,175".to_owned(),
+            )]),
+            ..Default::default()
+        };
+
+        let map = IslandMap::from_island(&island, &[ground]);
+
+        assert_eq!(map.carrier_path_grid().metadata((0, 0)), Some(32));
+        assert_eq!(map.city_cart_path_grid().metadata((0, 0)), Some(48));
+        assert_eq!(map.carrier_movement_speed((0, 0)), Some(100));
+        assert_eq!(map.city_cart_movement_speed((0, 0)), Some(150));
+        assert!((map.source_terrain_height((0, 0)).unwrap() - 0.28).abs() < f32::EPSILON);
     }
 
     #[test]

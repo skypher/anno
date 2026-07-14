@@ -301,6 +301,250 @@ pub struct Ship {
     pub cargo_slots: [u32; 7],
 }
 
+/// One source land figure from a `SOLDAT3` record.
+///
+/// `FUN_0045fac0` loads 68-byte `SOLDAT3` records into the source's
+/// 400-entry land-figure pool. Its `0x44`-byte branch passes byte `0x16`
+/// to `FUN_00446ca0` as the figure kind, then restores the island, owner,
+/// and direction from bytes `0x17`, `0x18`, and `0x1b` respectively.
+#[derive(Debug, Clone)]
+pub struct LandFigure {
+    /// Full source record retained for later state extraction.
+    pub raw_record: [u8; SOLDAT3_RECORD_BYTES],
+    /// World x coordinate at record offset 0x00.
+    pub x: u16,
+    /// World y coordinate at record offset 0x02.
+    pub y: u16,
+    /// Current source energy at record offset 0x04. `FUN_0045fac0` copies
+    /// this word to the type-4 runtime slot at `+0x0a`; `FUN_00454250`
+    /// reads it when scoring combat candidates.
+    pub source_energy: u16,
+    /// Compiled source figure-definition ID at record offset 0x06.
+    pub figure_definition_id: u16,
+    /// Type-4 runtime slot at record offset 0x08. `FUN_0045fac0` stores
+    /// the allocated source figure at this slot in its 400-entry table.
+    pub runtime_slot: u16,
+    /// Four-byte type-4 origin descriptor copied by `FUN_0045fac0` from
+    /// record offsets 0x0a..0x0d. `FUN_00456d00` uses it as the native
+    /// idle-branch anchor.
+    pub origin_descriptor: [u8; 4],
+    /// Type-4 route-search radius at record offset 0x0b. `FUN_0045fac0`
+    /// writes this byte to the first field of the live per-slot record;
+    /// `FUN_00456d00` passes it to `FUN_004581f0`, which builds a centered
+    /// `2r + 1` raw-coordinate route grid.
+    pub route_radius: u8,
+    /// Source figure kind at record offset 0x16.
+    pub figure_kind: u8,
+    /// Source island record at offset 0x17.
+    pub island_id: u8,
+    /// Owning player slot at offset 0x18.
+    pub owner: u8,
+    /// Source movement direction at record offset 0x1b.
+    pub direction: u8,
+    /// Initial animation state passed to `FUN_00446d90` at record offset
+    /// 0x19.
+    pub animation_state: u8,
+    /// Four-byte type-4 descriptor copied by `FUN_0045fac0` from record
+    /// offsets 0x12..0x15 into the live per-slot state read by
+    /// `FUN_00456d00`.
+    pub state_descriptor: [u8; 4],
+    /// Low two source state bits loaded at record offset 0x1d.
+    pub state_flags: u8,
+    /// Type-4 per-slot state copied by `FUN_0045fac0` from record offsets
+    /// 0x1e..0x25 into `DAT_0051c7a0`.
+    pub state_payload: [u8; 8],
+}
+
+/// Bytes per source `SOLDAT3` record. `FUN_0045fac0` selects this format
+/// by the `SOLDAT3` chunk name and advances its input cursor by 0x44 bytes.
+pub const SOLDAT3_RECORD_BYTES: usize = 0x44;
+
+/// Authored figure family selected by a type-4 `SOLDAT3` definition ID.
+///
+/// `FUN_00441210` registers the executable's figure-name table at
+/// `DAT_00498b98`: IDs 1..=16 name the four player soldier ladders and
+/// IDs 33..=36 name the native `SPEER` ladder. `SOLDAT3` stores one of
+/// those compiled IDs at record offset 0x06.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LandFigureFamily {
+    Infantry,
+    Cavalry,
+    Musketeer,
+    Cannoneer,
+    NativeSpearman,
+}
+
+/// Resolved type-4 `SOLDAT3` figure definition.
+///
+/// `variant` is the one-based suffix of the source `figuren.cod` name:
+/// for example, definition ID 3 is `SOLDAT3`, and definition ID 33 is
+/// `SPEER1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LandFigureDefinition {
+    pub id: u16,
+    pub family: LandFigureFamily,
+    pub variant: u8,
+}
+
+impl LandFigureDefinition {
+    /// Decode a compiled type-4 figure-definition ID from the executable's
+    /// `DAT_00498b98` name table.
+    pub const fn from_id(id: u16) -> Option<Self> {
+        let (family, first_id) = match id {
+            1..=4 => (LandFigureFamily::Infantry, 1),
+            5..=8 => (LandFigureFamily::Cavalry, 5),
+            9..=12 => (LandFigureFamily::Musketeer, 9),
+            13..=16 => (LandFigureFamily::Cannoneer, 13),
+            33..=36 => (LandFigureFamily::NativeSpearman, 33),
+            _ => return None,
+        };
+        Some(Self {
+            id,
+            family,
+            variant: (id - first_id + 1) as u8,
+        })
+    }
+
+    /// Symbolic `figuren.cod` definition named by this compiled ID.
+    pub const fn source_figure_name(self) -> &'static str {
+        match (self.family, self.variant) {
+            (LandFigureFamily::Infantry, 1) => "SOLDAT1",
+            (LandFigureFamily::Infantry, 2) => "SOLDAT2",
+            (LandFigureFamily::Infantry, 3) => "SOLDAT3",
+            (LandFigureFamily::Infantry, 4) => "SOLDAT4",
+            (LandFigureFamily::Cavalry, 1) => "KAVALERIE1",
+            (LandFigureFamily::Cavalry, 2) => "KAVALERIE2",
+            (LandFigureFamily::Cavalry, 3) => "KAVALERIE3",
+            (LandFigureFamily::Cavalry, 4) => "KAVALERIE4",
+            (LandFigureFamily::Musketeer, 1) => "MUSKETIER1",
+            (LandFigureFamily::Musketeer, 2) => "MUSKETIER2",
+            (LandFigureFamily::Musketeer, 3) => "MUSKETIER3",
+            (LandFigureFamily::Musketeer, 4) => "MUSKETIER4",
+            (LandFigureFamily::Cannoneer, 1) => "KANONIER1",
+            (LandFigureFamily::Cannoneer, 2) => "KANONIER2",
+            (LandFigureFamily::Cannoneer, 3) => "KANONIER3",
+            (LandFigureFamily::Cannoneer, 4) => "KANONIER4",
+            (LandFigureFamily::NativeSpearman, 1) => "SPEER1",
+            (LandFigureFamily::NativeSpearman, 2) => "SPEER2",
+            (LandFigureFamily::NativeSpearman, 3) => "SPEER3",
+            (LandFigureFamily::NativeSpearman, 4) => "SPEER4",
+            _ => unreachable!("valid LandFigureDefinition has variant 1 through 4"),
+        }
+    }
+
+    /// Authored `Speed:` compiled into the type-4 figure record at `+0x10`
+    /// after multiplication by 0.0001. The four visual variants inherit the
+    /// movement properties from their numbered base definition.
+    pub const fn source_move_speed(self) -> u16 {
+        match self.family {
+            LandFigureFamily::Infantry => 260,
+            LandFigureFamily::Cavalry => 400,
+            LandFigureFamily::Musketeer => 210,
+            LandFigureFamily::Cannoneer => 230,
+            LandFigureFamily::NativeSpearman => 280,
+        }
+    }
+
+    /// `Speedtyp:` index used to select the terrain `Wegspeed` divisor.
+    /// Infantry, musketeers, and native spearmen inherit the base value 0;
+    /// cavalry supplies 1 and cannon 2 in `figuren.cod`.
+    pub const fn source_speed_type(self) -> u8 {
+        match self.family {
+            LandFigureFamily::Cavalry => 1,
+            LandFigureFamily::Cannoneer => 2,
+            LandFigureFamily::Infantry
+            | LandFigureFamily::Musketeer
+            | LandFigureFamily::NativeSpearman => 0,
+        }
+    }
+
+    /// Authored `Maxstepcnt:` passed as the `FUN_0046cf70` run-compression
+    /// limit by `FUN_004581f0`. This counts raw doubled route-grid cells,
+    /// not INSEL5 cells.
+    pub const fn source_max_step_count(self) -> u8 {
+        match self.family {
+            LandFigureFamily::Cannoneer => 3,
+            LandFigureFamily::Musketeer => 2,
+            LandFigureFamily::Infantry
+            | LandFigureFamily::Cavalry
+            | LandFigureFamily::NativeSpearman => 1,
+        }
+    }
+
+    /// Authored `Maxenergy:` compiled by `FUN_00441210` at definition offset
+    /// `+0x3c`. `FUN_00454250` reads this field while scoring a live type-4
+    /// candidate; visual variants inherit the numbered base value.
+    pub const fn source_max_energy(self) -> u16 {
+        match self.family {
+            LandFigureFamily::Infantry => 20,
+            LandFigureFamily::Cavalry | LandFigureFamily::NativeSpearman => 18,
+            LandFigureFamily::Musketeer => 15,
+            LandFigureFamily::Cannoneer => 12,
+        }
+    }
+
+    /// `Maxenergy:` in the source runtime's fixed-point energy units. The
+    /// `SOLDAT3 +0x04` corpus stores full energy as this cap, and
+    /// `FUN_00454250` divides one raw energy value by another.
+    pub const fn source_runtime_energy_cap(self) -> u16 {
+        self.source_max_energy() * 32
+    }
+
+    /// Authored `Shotradius:` compiled by `FUN_00441210` at definition
+    /// offset `+0x4a`. `FUN_00454250` uses it as the candidate approach
+    /// threshold and `FUN_00453e50` uses the corresponding route radius.
+    /// The source records fractional melee radii, so this remains a float.
+    pub const fn source_shot_radius(self) -> f32 {
+        match self.family {
+            LandFigureFamily::Infantry | LandFigureFamily::Cavalry => 0.75,
+            LandFigureFamily::Musketeer => 4.0,
+            LandFigureFamily::Cannoneer => 7.0,
+            LandFigureFamily::NativeSpearman => 1.0,
+        }
+    }
+
+    /// `Shotradius:` in the source runtime's fixed-point units. The figure
+    /// loader and candidate scorer use this representation, not the textual
+    /// tile value exposed by [`Self::source_shot_radius`].
+    pub const fn source_runtime_shot_radius(self) -> u16 {
+        match self.family {
+            LandFigureFamily::Infantry | LandFigureFamily::Cavalry => 24,
+            LandFigureFamily::Musketeer => 128,
+            LandFigureFamily::Cannoneer => 224,
+            LandFigureFamily::NativeSpearman => 32,
+        }
+    }
+
+    /// `Hitpoint:` in the runtime fixed-point units consumed by
+    /// `FUN_00454250`. The parser multiplies the authored value by 32 and
+    /// converts toward zero before storing the unsigned definition field.
+    pub const fn source_runtime_hit_points(self) -> u16 {
+        match self.family {
+            LandFigureFamily::Infantry => 32,
+            LandFigureFamily::Cavalry => 51,
+            LandFigureFamily::Musketeer => 76,
+            LandFigureFamily::Cannoneer => 224,
+            LandFigureFamily::NativeSpearman => 38,
+        }
+    }
+
+    /// `Drehtime:` at runtime record offset `+0x18`. None of the five
+    /// type-4 land families declares this field in `figuren.cod`, so the
+    /// loader retains its zero-initialized value. `FUN_00457ce0` consequently
+    /// starts their route command without a turn-only update.
+    pub const fn source_turn_time(self) -> f32 {
+        let _ = self;
+        0.0
+    }
+}
+
+impl LandFigure {
+    /// Resolve this type-4 figure's executable definition ID.
+    pub const fn definition(&self) -> Option<LandFigureDefinition> {
+        LandFigureDefinition::from_id(self.figure_definition_id)
+    }
+}
+
 impl Ship {
     /// Decode the raw `ship_class` byte into a typed `ShipClass`.
     /// Returns `None` if the byte falls outside the observed
@@ -456,6 +700,9 @@ pub struct SzsFile {
     /// Initial ship layout parsed from the SHIP4 chunk. Empty
     /// when the scenario contains no ships.
     pub ships: Vec<Ship>,
+    /// Initial land figures parsed from the SOLDAT3 chunk. Source shipping
+    /// scenarios use kind-4 entries for their authored land soldiers.
+    pub land_figures: Vec<LandFigure>,
 }
 
 /// Scenario-level metadata (mission #, player range, difficulty
@@ -996,6 +1243,12 @@ impl SzsFile {
             .map(|c| Self::parse_ship4(&c.data))
             .unwrap_or_default();
 
+        let land_figures = chunks
+            .iter()
+            .find(|c| c.name == "SOLDAT3")
+            .map(|c| Self::parse_soldat3(&c.data))
+            .unwrap_or_default();
+
         Ok(SzsFile {
             chunks,
             islands,
@@ -1003,7 +1256,41 @@ impl SzsFile {
             mission,
             scenario,
             ships,
+            land_figures,
         })
+    }
+
+    fn parse_soldat3(data: &[u8]) -> Vec<LandFigure> {
+        data.chunks_exact(SOLDAT3_RECORD_BYTES)
+            .map(|record| {
+                let mut raw_record = [0u8; SOLDAT3_RECORD_BYTES];
+                raw_record.copy_from_slice(record);
+                LandFigure {
+                    raw_record,
+                    x: u16::from_le_bytes([record[0x00], record[0x01]]),
+                    y: u16::from_le_bytes([record[0x02], record[0x03]]),
+                    source_energy: u16::from_le_bytes([record[0x04], record[0x05]]),
+                    figure_definition_id: u16::from_le_bytes([record[0x06], record[0x07]]),
+                    runtime_slot: u16::from_le_bytes([record[0x08], record[0x09]]),
+                    origin_descriptor: record[0x0a..0x0e]
+                        .try_into()
+                        .expect("SOLDAT3 origin descriptor has fixed width"),
+                    route_radius: record[0x0b],
+                    figure_kind: record[0x16],
+                    island_id: record[0x17],
+                    owner: record[0x18],
+                    direction: record[0x1b],
+                    animation_state: record[0x19],
+                    state_descriptor: record[0x12..0x16]
+                        .try_into()
+                        .expect("SOLDAT3 state descriptor has fixed width"),
+                    state_flags: record[0x1d] & 3,
+                    state_payload: record[0x1e..0x26]
+                        .try_into()
+                        .expect("SOLDAT3 state payload has fixed width"),
+                }
+            })
+            .collect()
     }
 
     fn parse_ship4(data: &[u8]) -> Vec<Ship> {
@@ -1297,6 +1584,294 @@ mod tests {
     use super::*;
 
     #[test]
+    fn soldat3_records_preserve_source_kind_owner_and_island() {
+        let mut record = [0u8; SOLDAT3_RECORD_BYTES];
+        record[0x00..0x02].copy_from_slice(&0x1234u16.to_le_bytes());
+        record[0x02..0x04].copy_from_slice(&0x5678u16.to_le_bytes());
+        record[0x04..0x06].copy_from_slice(&0x0011u16.to_le_bytes());
+        record[0x06..0x08].copy_from_slice(&0x1f0au16.to_le_bytes());
+        record[0x08..0x0a].copy_from_slice(&0x0042u16.to_le_bytes());
+        record[0x0a..0x0e].copy_from_slice(&[0x33, 9, 8, 7]);
+        record[0x16] = 4;
+        record[0x17] = 9;
+        record[0x18] = 3;
+        record[0x19] = 5;
+        record[0x12..0x16].copy_from_slice(&[9, 8, 7, 6]);
+        record[0x1b] = 7;
+        record[0x1d] = 0xfe;
+        record[0x1e..0x26].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let mut bytes = Vec::new();
+        write_chunk(&mut bytes, "SOLDAT3", &record);
+        let parsed = SzsFile::parse(&bytes).expect("SOLDAT3 chunk parses");
+
+        assert_eq!(parsed.land_figures.len(), 1);
+        let figure = &parsed.land_figures[0];
+        assert_eq!((figure.x, figure.y), (0x1234, 0x5678));
+        assert_eq!(figure.source_energy, 0x0011);
+        assert_eq!(figure.figure_definition_id, 0x1f0a);
+        assert_eq!(figure.runtime_slot, 0x0042);
+        assert_eq!(figure.origin_descriptor, [0x33, 9, 8, 7]);
+        assert_eq!(figure.route_radius, 9);
+        assert_eq!(figure.figure_kind, 4);
+        assert_eq!(figure.island_id, 9);
+        assert_eq!(figure.owner, 3);
+        assert_eq!(figure.direction, 7);
+        assert_eq!(figure.animation_state, 5);
+        assert_eq!(figure.state_descriptor, [9, 8, 7, 6]);
+        assert_eq!(figure.state_flags, 2);
+        assert_eq!(figure.state_payload, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(figure.raw_record, record);
+    }
+
+    #[test]
+    fn land_figure_definition_decodes_executable_type_four_table() {
+        let cases = [
+            (1, LandFigureFamily::Infantry, 1, "SOLDAT1"),
+            (2, LandFigureFamily::Infantry, 2, "SOLDAT2"),
+            (3, LandFigureFamily::Infantry, 3, "SOLDAT3"),
+            (4, LandFigureFamily::Infantry, 4, "SOLDAT4"),
+            (5, LandFigureFamily::Cavalry, 1, "KAVALERIE1"),
+            (6, LandFigureFamily::Cavalry, 2, "KAVALERIE2"),
+            (7, LandFigureFamily::Cavalry, 3, "KAVALERIE3"),
+            (8, LandFigureFamily::Cavalry, 4, "KAVALERIE4"),
+            (9, LandFigureFamily::Musketeer, 1, "MUSKETIER1"),
+            (10, LandFigureFamily::Musketeer, 2, "MUSKETIER2"),
+            (11, LandFigureFamily::Musketeer, 3, "MUSKETIER3"),
+            (12, LandFigureFamily::Musketeer, 4, "MUSKETIER4"),
+            (13, LandFigureFamily::Cannoneer, 1, "KANONIER1"),
+            (14, LandFigureFamily::Cannoneer, 2, "KANONIER2"),
+            (15, LandFigureFamily::Cannoneer, 3, "KANONIER3"),
+            (16, LandFigureFamily::Cannoneer, 4, "KANONIER4"),
+            (33, LandFigureFamily::NativeSpearman, 1, "SPEER1"),
+            (34, LandFigureFamily::NativeSpearman, 2, "SPEER2"),
+            (35, LandFigureFamily::NativeSpearman, 3, "SPEER3"),
+            (36, LandFigureFamily::NativeSpearman, 4, "SPEER4"),
+        ];
+
+        for (id, family, variant, name) in cases {
+            let definition = LandFigureDefinition::from_id(id).expect("known type-4 ID");
+            assert_eq!(definition.id, id);
+            assert_eq!(definition.family, family);
+            assert_eq!(definition.variant, variant);
+            assert_eq!(definition.source_figure_name(), name);
+        }
+        assert_eq!(LandFigureDefinition::from_id(0), None);
+        assert_eq!(LandFigureDefinition::from_id(17), None);
+        assert_eq!(LandFigureDefinition::from_id(32), None);
+        assert_eq!(LandFigureDefinition::from_id(37), None);
+    }
+
+    #[test]
+    fn land_figure_motion_properties_match_authored_bases() {
+        let cases = [
+            (1, 260, 0, 1, 20, 0.75, 0.0),
+            (5, 400, 1, 1, 18, 0.75, 0.0),
+            (9, 210, 0, 2, 15, 4.0, 0.0),
+            (13, 230, 2, 3, 12, 7.0, 0.0),
+            (33, 280, 0, 1, 18, 1.0, 0.0),
+        ];
+        for (id, speed, speed_type, max_step_count, max_energy, shot_radius, turn_time) in cases {
+            let definition = LandFigureDefinition::from_id(id).unwrap();
+            assert_eq!(definition.source_move_speed(), speed);
+            assert_eq!(definition.source_speed_type(), speed_type);
+            assert_eq!(definition.source_max_step_count(), max_step_count);
+            assert_eq!(definition.source_max_energy(), max_energy);
+            assert_eq!(definition.source_shot_radius(), shot_radius);
+            assert_eq!(definition.source_turn_time(), turn_time);
+        }
+    }
+
+    #[test]
+    fn soldat3_world_positions_and_fixed_targets_stay_on_declared_islands() {
+        let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("extracted/Szenes");
+        if !scenes.exists() {
+            println!("Skipping: scenes dir not found");
+            return;
+        }
+
+        let mut scenarios = 0;
+        let mut figures = 0;
+        let mut fixed_targets = 0;
+        let mut fixed_target_rows = Vec::new();
+        let mut native_idle_anchors = 0;
+        for entry in std::fs::read_dir(&scenes)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            if !path
+                .extension()
+                .map(|extension| extension.eq_ignore_ascii_case("szs"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let parsed = match SzsFile::parse(&bytes) {
+                Ok(parsed) => parsed,
+                Err(_) => continue,
+            };
+            if parsed.land_figures.is_empty() {
+                continue;
+            }
+            scenarios += 1;
+            for figure in &parsed.land_figures {
+                figures += 1;
+                let island = parsed
+                    .islands
+                    .iter()
+                    .find(|island| island.number == figure.island_id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{:?}: type-4 figure slot {} references missing island {}",
+                            path.file_name(),
+                            figure.runtime_slot,
+                            figure.island_id
+                        )
+                    });
+                let local_x = i32::from(figure.x) / 2 - i32::from(island.x_pos);
+                let local_y = i32::from(figure.y) / 2 - i32::from(island.y_pos);
+                assert!(
+                    (0..i32::from(island.width)).contains(&local_x)
+                        && (0..i32::from(island.height)).contains(&local_y),
+                    "{:?}: type-4 slot {} world ({}, {}) is outside island {} local {}x{} at ({}, {})",
+                    path.file_name(),
+                    figure.runtime_slot,
+                    figure.x,
+                    figure.y,
+                    island.number,
+                    island.width,
+                    island.height,
+                    local_x,
+                    local_y
+                );
+
+                if figure.state_descriptor[0] == 0x38 {
+                    fixed_targets += 1;
+                    fixed_target_rows.push((
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .expect("scenario filename is UTF-8")
+                            .to_owned(),
+                        figure.runtime_slot,
+                        figure.figure_definition_id,
+                        figure.owner,
+                        figure.direction,
+                        figure.state_descriptor,
+                    ));
+                    let target_x = i32::from(
+                        (u16::from(figure.state_descriptor[1] & 0x0f) << 8)
+                            | u16::from(figure.state_descriptor[2]),
+                    );
+                    let target_y = i32::from(
+                        (u16::from(figure.state_descriptor[1] >> 4) << 8)
+                            | u16::from(figure.state_descriptor[3]),
+                    );
+                    let target_local_x = target_x / 2 - i32::from(island.x_pos);
+                    let target_local_y = target_y / 2 - i32::from(island.y_pos);
+                    assert!(
+                        (0..i32::from(island.width)).contains(&target_local_x)
+                            && (0..i32::from(island.height)).contains(&target_local_y),
+                        "{:?}: type-4 slot {} fixed target ({target_x}, {target_y}) is outside island {} local ({target_local_x}, {target_local_y})",
+                        path.file_name(),
+                        figure.runtime_slot,
+                        island.number,
+                    );
+                }
+
+                if matches!(
+                    figure.definition().map(|definition| definition.family),
+                    Some(LandFigureFamily::NativeSpearman)
+                ) {
+                    native_idle_anchors += 1;
+                    match figure.origin_descriptor[0] {
+                        0x33 | 0x34 => {
+                            assert_eq!(
+                                figure.origin_descriptor[1],
+                                island.number,
+                                "{:?}: native slot {} static anchor island differs from figure island",
+                                path.file_name(),
+                                figure.runtime_slot,
+                            );
+                            assert!(
+                                figure.origin_descriptor[2] < island.width
+                                    && figure.origin_descriptor[3] < island.height,
+                                "{:?}: native slot {} static anchor ({}, {}) is outside island {}",
+                                path.file_name(),
+                                figure.runtime_slot,
+                                figure.origin_descriptor[2],
+                                figure.origin_descriptor[3],
+                                island.number,
+                            );
+                        }
+                        0x38 => {
+                            let anchor_x = i32::from(
+                                (u16::from(figure.origin_descriptor[1] & 0x0f) << 8)
+                                    | u16::from(figure.origin_descriptor[2]),
+                            );
+                            let anchor_y = i32::from(
+                                (u16::from(figure.origin_descriptor[1] >> 4) << 8)
+                                    | u16::from(figure.origin_descriptor[3]),
+                            );
+                            let anchor_local_x = anchor_x / 2 - i32::from(island.x_pos);
+                            let anchor_local_y = anchor_y / 2 - i32::from(island.y_pos);
+                            assert!(
+                                (0..i32::from(island.width)).contains(&anchor_local_x)
+                                    && (0..i32::from(island.height)).contains(&anchor_local_y),
+                                "{:?}: native slot {} packed anchor ({anchor_x}, {anchor_y}) is outside island {} local ({anchor_local_x}, {anchor_local_y})",
+                                path.file_name(),
+                                figure.runtime_slot,
+                                island.number,
+                            );
+                        }
+                        kind => panic!(
+                            "{:?}: native slot {} uses unsupported idle-anchor kind {kind:#x}",
+                            path.file_name(),
+                            figure.runtime_slot,
+                        ),
+                    }
+                }
+            }
+        }
+
+        assert_eq!(scenarios, 23, "SOLDAT3 corpus scenario count changed");
+        assert_eq!(figures, 972, "SOLDAT3 corpus figure count changed");
+        assert_eq!(fixed_targets, 2, "fixed-point target count changed");
+        fixed_target_rows.sort_unstable();
+        assert_eq!(
+            fixed_target_rows,
+            vec![
+                (
+                    "On His Majesty's Service0.szs".to_owned(),
+                    119,
+                    14,
+                    1,
+                    1,
+                    [0x38, 0x22, 0xec, 0x4c],
+                ),
+                (
+                    "On His Majesty's Service0.szs".to_owned(),
+                    129,
+                    14,
+                    1,
+                    6,
+                    [0x38, 0x22, 0xea, 0x42],
+                ),
+            ]
+        );
+        assert_eq!(native_idle_anchors, 67, "native idle-anchor count changed");
+    }
+
+    #[test]
     fn inselhaus_id_uses_executable_definition_base() {
         let tile = IslandTile {
             building_id: 0x01ab,
@@ -1549,9 +2124,13 @@ mod tests {
                 if off >= p4.data.len() {
                     continue;
                 }
-                assert_eq!(p4.data[off], 0,
+                assert_eq!(
+                    p4.data[off],
+                    0,
                     "{:?} slot {slot}: PLAYER4 byte 0x400 should be NUL (empty string), got 0x{:02X}",
-                    path.file_stem().unwrap(), p4.data[off]);
+                    path.file_stem().unwrap(),
+                    p4.data[off]
+                );
                 scanned_slots += 1;
             }
         }

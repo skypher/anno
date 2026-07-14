@@ -13,6 +13,14 @@ fn default_capacity_fallback() -> u16 {
     30
 }
 
+const fn default_source_footprint() -> (u8, u8) {
+    (1, 1)
+}
+
+const fn default_source_path_class() -> u8 {
+    32
+}
+
 /// Source storage capacity for the first player-built Kontor.
 /// `haeuser.cod` Nr=271 (`Bauinfra: INFRA_KONTOR_1`,
 /// `ProdKind: KONTOR`) carries `Maxlager: 50`.
@@ -32,6 +40,18 @@ pub struct Warehouse {
     pub tile_y: u16,
     pub active: bool,
 
+    /// Oriented source-map footprint of this warehouse root. Scenario
+    /// loading derives it from the KONTOR definition and INSELHAUS command;
+    /// player-created roots retain the unit fallback until their command
+    /// definition is attached.
+    #[serde(default = "default_source_footprint")]
+    pub source_footprint: (u8, u8),
+
+    /// Low-seven-bit `Wegspeed[Speedtyp: 0]` class of this KONTOR root.
+    /// The type-8 overlay writes this class below its callback bit.
+    #[serde(default = "default_source_path_class")]
+    pub source_path_class: u8,
+
     /// Default per-good cap when a good has no entry yet in
     /// `inventory`. New warehouses use the base Kontor `Maxlager`;
     /// loaded scenario Kontors can override this with their authored
@@ -40,8 +60,27 @@ pub struct Warehouse {
     #[serde(default = "default_capacity_fallback")]
     pub default_capacity: u16,
 
+    /// Population of the city represented by this warehouse, ordered by the
+    /// five source BGRUPPE tiers. STADT4 seeds this for authored settlements;
+    /// player-created settlements begin at zero and update through their
+    /// local city record.
+    #[serde(default)]
+    pub city_population: [u32; 5],
+
     /// Inventory: good → (current_stock, max_capacity)
     inventory: HashMap<Good, (u16, u16)>,
+
+    /// Goods reserved by in-flight generic carriers. The executable keeps
+    /// this accounting in the per-city, per-good transfer table used by
+    /// `FUN_0047d810` and `FUN_0047d640`.
+    #[serde(default)]
+    reservations: HashMap<Good, u16>,
+
+    /// Exact 1/32-good city-store balances written by type-11 transfers.
+    /// Ordinary warehouse stock remains integral and initializes a balance
+    /// when a good has not yet been delivered by a city cart.
+    #[serde(default)]
+    city_fixed_inventory: HashMap<Good, u16>,
 
     /// Per-good buy/sell sliders (Anno 1602 manual section 8.1).
     /// `Sell` = "everything left of the mark stays, everything right
@@ -105,10 +144,49 @@ impl Warehouse {
             tile_x,
             tile_y,
             active: true,
+            source_footprint: default_source_footprint(),
+            source_path_class: default_source_path_class(),
             default_capacity,
+            city_population: [0; 5],
             inventory: HashMap::new(),
+            reservations: HashMap::new(),
+            city_fixed_inventory: HashMap::new(),
             sliders: HashMap::new(),
         }
+    }
+
+    /// Construct a source city store with its authored STADT4 population.
+    pub fn with_capacity_and_population(
+        island_id: u8,
+        owner: u8,
+        tile_x: u16,
+        tile_y: u16,
+        default_capacity: u16,
+        city_population: [u32; 5],
+    ) -> Self {
+        let mut warehouse = Self::with_capacity(island_id, owner, tile_x, tile_y, default_capacity);
+        warehouse.city_population = city_population;
+        warehouse
+    }
+
+    /// Preserve the source command's oriented KONTOR footprint.
+    pub fn set_source_footprint(&mut self, footprint: (u8, u8)) {
+        self.source_footprint = (footprint.0.max(1), footprint.1.max(1));
+    }
+
+    /// Preserve the source command's compiled TRAEGER path class.
+    pub fn set_source_path_class(&mut self, path_class: u8) {
+        self.source_path_class = path_class & 0x7f;
+    }
+
+    /// Source-city shared storage capacity in the fixed 1/32-good scale.
+    /// FUN_0047ab00 starts from the city's Kontor capacity and adds 320 for
+    /// every additional active MARKT/KONTOR root after the first.
+    pub fn city_storage_capacity_fixed(&self, transfer_root_count: usize) -> u32 {
+        let additional_roots = transfer_root_count.saturating_sub(1) as u32;
+        u32::from(self.default_capacity)
+            .saturating_mul(32)
+            .saturating_add(additional_roots.saturating_mul(320))
     }
 
     /// Slider configuration for a good (default = no trade).
@@ -167,6 +245,14 @@ impl Warehouse {
         self.inventory.get(&good).map(|&(s, _)| s).unwrap_or(0)
     }
 
+    /// Exact city-store balance for one good, in 1/32-good units.
+    pub fn city_stock_fixed(&self, good: Good) -> u16 {
+        self.city_fixed_inventory
+            .get(&good)
+            .copied()
+            .unwrap_or_else(|| self.stock(good).saturating_mul(32))
+    }
+
     /// Get maximum capacity for a good.
     pub fn capacity(&self, good: Good) -> u16 {
         self.inventory
@@ -182,6 +268,38 @@ impl Warehouse {
         let space = entry.1.saturating_sub(entry.0);
         let deposited = amount.min(space);
         entry.0 += deposited;
+        if let Some(fixed) = self.city_fixed_inventory.get_mut(&good) {
+            *fixed = fixed.saturating_add(deposited.saturating_mul(32));
+        }
+        deposited
+    }
+
+    /// Store a city-cart delivery using FUN_0047aac0's shared city capacity.
+    /// The source limit is common to every good slot rather than the
+    /// warehouse UI's independent per-good slider ceiling.
+    pub fn deposit_city_good(&mut self, good: Good, amount: u16, city_capacity_fixed: u32) -> u16 {
+        (self.deposit_city_good_fixed(good, amount.saturating_mul(32), city_capacity_fixed) / 32)
+            as u16
+    }
+
+    /// Store an exact type-11 cart delivery. The public stock value remains
+    /// the floor of this source fixed-point balance.
+    pub fn deposit_city_good_fixed(
+        &mut self,
+        good: Good,
+        amount_fixed: u16,
+        city_capacity_fixed: u32,
+    ) -> u16 {
+        let capacity_fixed = city_capacity_fixed.min(u32::from(u16::MAX)) as u16;
+        let current_fixed = self.city_stock_fixed(good);
+        let deposited = amount_fixed.min(capacity_fixed.saturating_sub(current_fixed));
+        let updated_fixed = current_fixed.saturating_add(deposited);
+        self.city_fixed_inventory.insert(good, updated_fixed);
+
+        let city_capacity = capacity_fixed / 32;
+        let entry = self.inventory.entry(good).or_insert((0, city_capacity));
+        entry.1 = entry.1.max(city_capacity);
+        entry.0 = updated_fixed / 32;
         deposited
     }
 
@@ -190,10 +308,43 @@ impl Warehouse {
         if let Some(entry) = self.inventory.get_mut(&good) {
             let withdrawn = amount.min(entry.0);
             entry.0 -= withdrawn;
+            if let Some(fixed) = self.city_fixed_inventory.get_mut(&good) {
+                *fixed = fixed.saturating_sub(withdrawn.saturating_mul(32));
+            }
             withdrawn
         } else {
             0
         }
+    }
+
+    /// Reserve available stock for an in-flight carrier without withdrawing it.
+    pub fn reserve(&mut self, good: Good, amount: u16) -> bool {
+        if amount == 0 || self.stock(good).saturating_sub(self.reserved(good)) < amount {
+            return false;
+        }
+        *self.reservations.entry(good).or_default() += amount;
+        true
+    }
+
+    /// Withdraw a previously reserved quantity at the supplier arrival.
+    pub fn collect_reserved(&mut self, good: Good, amount: u16) -> bool {
+        if amount == 0 || self.reserved(good) < amount || self.stock(good) < amount {
+            return false;
+        }
+        *self.reservations.entry(good).or_default() -= amount;
+        self.withdraw(good, amount) == amount
+    }
+
+    /// Release a reservation when the outbound leg cannot return to its root.
+    pub fn release_reservation(&mut self, good: Good, amount: u16) {
+        if let Some(reserved) = self.reservations.get_mut(&good) {
+            *reserved = reserved.saturating_sub(amount);
+        }
+    }
+
+    /// Current reservation for one good.
+    pub fn reserved(&self, good: Good) -> u16 {
+        self.reservations.get(&good).copied().unwrap_or(0)
     }
 
     /// Set the capacity for a specific good.
@@ -256,6 +407,24 @@ mod tests {
         assert_eq!(wh.capacity(Good::Wood), BASE_KONTOR_CAPACITY);
         assert_eq!(wh.deposit(Good::Wood, 99), BASE_KONTOR_CAPACITY);
         assert_eq!(wh.stock(Good::Wood), BASE_KONTOR_CAPACITY);
+        assert_eq!(wh.source_footprint, (1, 1));
+        assert_eq!(wh.source_path_class, 32);
+    }
+
+    #[test]
+    fn source_footprint_preserves_oriented_nonzero_dimensions() {
+        let mut wh = Warehouse::new(0, 0, 10, 10);
+        wh.set_source_footprint((3, 2));
+        assert_eq!(wh.source_footprint, (3, 2));
+        wh.set_source_footprint((0, 0));
+        assert_eq!(wh.source_footprint, (1, 1));
+    }
+
+    #[test]
+    fn source_path_class_retains_only_the_source_grid_cost_bits() {
+        let mut wh = Warehouse::new(0, 0, 10, 10);
+        wh.set_source_path_class(0xff);
+        assert_eq!(wh.source_path_class, 0x7f);
     }
 
     #[test]
@@ -266,5 +435,46 @@ mod tests {
         assert_eq!(wh.deposit(Good::Wood, 99), BASE_KONTOR_CAPACITY);
         assert_eq!(wh.stock(Good::Wood), BASE_KONTOR_CAPACITY);
         assert_eq!(wh.capacity(Good::Wood), BASE_KONTOR_CAPACITY);
+    }
+
+    #[test]
+    fn city_delivery_uses_shared_city_capacity_not_ui_per_good_cap() {
+        let mut wh = Warehouse::with_capacity(0, 0, 10, 10, 50);
+        let city_capacity = wh.city_storage_capacity_fixed(2);
+
+        assert_eq!(wh.deposit_city_good(Good::Cloth, 60, city_capacity), 60);
+        assert_eq!(wh.stock(Good::Cloth), 60);
+        assert_eq!(wh.capacity(Good::Cloth), 60);
+    }
+
+    #[test]
+    fn city_delivery_retains_fractional_source_balance() {
+        let mut wh = Warehouse::with_capacity(0, 0, 10, 10, 50);
+        let city_capacity = wh.city_storage_capacity_fixed(1);
+
+        assert_eq!(
+            wh.deposit_city_good_fixed(Good::Cloth, 65, city_capacity),
+            65
+        );
+        assert_eq!(wh.city_stock_fixed(Good::Cloth), 65);
+        assert_eq!(wh.stock(Good::Cloth), 2);
+        assert_eq!(wh.deposit(Good::Cloth, 1), 1);
+        assert_eq!(wh.city_stock_fixed(Good::Cloth), 97);
+    }
+
+    #[test]
+    fn city_reservations_are_per_good_and_withdraw_only_on_collection() {
+        let mut wh = Warehouse::new(0, 0, 10, 10);
+        wh.deposit(Good::Wood, 4);
+        wh.deposit(Good::Iron, 4);
+
+        assert!(wh.reserve(Good::Wood, 4));
+        assert!(wh.reserve(Good::Iron, 4));
+        assert_eq!(wh.stock(Good::Wood), 4);
+        assert_eq!(wh.reserved(Good::Wood), 4);
+        assert!(wh.collect_reserved(Good::Wood, 4));
+        assert_eq!(wh.stock(Good::Wood), 0);
+        assert_eq!(wh.stock(Good::Iron), 4);
+        assert_eq!(wh.reserved(Good::Iron), 4);
     }
 }

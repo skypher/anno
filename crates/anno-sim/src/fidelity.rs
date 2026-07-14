@@ -18,6 +18,7 @@ pub const SHIP_TICK_MS: u32 = 1_000;
 pub const MARKET_TICK_MS: u32 = 1_000;
 pub const MILITARY_TICK_MS: u32 = 10_000;
 pub const DIPLOMACY_TICK_MS: u32 = 5_000;
+pub const BUILDING_CONTROL_TICK_MS: u32 = 4_999;
 
 pub const FREE_TRADER_TARGET_GATE_MASK: u64 = 3;
 pub const FREE_TRADER_TARGET_GATE_DENOMINATOR: u64 = 4;
@@ -53,7 +54,7 @@ pub struct SourceRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Subsystem {
     Production,
-    Civilians,
+    BuildingControl,
     Population,
     Diplomacy,
     MarketCoverage,
@@ -66,7 +67,7 @@ impl Subsystem {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Production => "production",
-            Self::Civilians => "civilians",
+            Self::BuildingControl => "building_control",
             Self::Population => "population",
             Self::Diplomacy => "diplomacy",
             Self::MarketCoverage => "market_coverage",
@@ -97,13 +98,13 @@ pub const TIMING_SPECS: [TimingSpec; 8] = [
         },
     },
     TimingSpec {
-        subsystem: Subsystem::Civilians,
-        interval_ms: crate::civilian::CIVILIAN_BUILDING_TICK_MS,
+        subsystem: Subsystem::BuildingControl,
+        interval_ms: BUILDING_CONTROL_TICK_MS,
         status: FidelityStatus::BinaryVerified,
         source: SourceRef {
             source: "decompiled/1602_exe.c",
             location: "84620-84666",
-            note: "building accumulator dispatches civilian figure spawns after 4999 ms",
+            note: "per-building 4999 ms command dispatch; subcommand 0x5a does not allocate a figure",
         },
     },
     TimingSpec {
@@ -153,7 +154,7 @@ pub const TIMING_SPECS: [TimingSpec; 8] = [
         source: SourceRef {
             source: "decompiled/1602_exe.c",
             location: "FUN_00451890 / main dispatcher:97979-97998",
-            note: "the executable advances entity state machines every engine update; the retained 10 s simulation timer is not its combat cadence",
+            note: "the executable advances entity state machines every engine update; the reported 10 s simulation value is not its combat cadence",
         },
     },
     TimingSpec {
@@ -285,11 +286,7 @@ impl TickScheduler {
 
 pub fn scaled_sim_ms(real_dt_ms: u32, speed_multiplier: u32) -> u32 {
     let scaled = real_dt_ms.saturating_mul(speed_multiplier);
-    if scaled > MAX_TOTAL_MS {
-        50
-    } else {
-        scaled
-    }
+    if scaled > MAX_TOTAL_MS { 50 } else { scaled }
 }
 
 pub fn unresolved_timing_specs() -> Vec<&'static TimingSpec> {
@@ -324,7 +321,7 @@ mod tests {
         }
 
         assert_eq!(count(&events, Subsystem::Production), 10);
-        assert_eq!(count(&events, Subsystem::Civilians), 2);
+        assert_eq!(count(&events, Subsystem::BuildingControl), 2);
         assert_eq!(count(&events, Subsystem::MarketCoverage), 10);
         assert_eq!(count(&events, Subsystem::Ships), 10);
         assert_eq!(count(&events, Subsystem::Diplomacy), 2);
@@ -345,7 +342,7 @@ mod tests {
                 },
                 TraceEvent {
                     at_ms: 10_000,
-                    subsystem: Subsystem::Civilians
+                    subsystem: Subsystem::BuildingControl
                 },
                 TraceEvent {
                     at_ms: 10_000,
@@ -443,12 +440,16 @@ mod tests {
 
         assert_eq!(target.status, FidelityStatus::BinaryVerified);
         assert_eq!(target.source.source, "decompiled/1602_exe.c");
-        assert!(PROBABILITY_SPECS
-            .iter()
-            .all(|spec| spec.name != "free_trader_spawn_gate"));
-        assert!(PROBABILITY_SPECS
-            .iter()
-            .all(|spec| spec.name != "pirate_event_spawn"));
+        assert!(
+            PROBABILITY_SPECS
+                .iter()
+                .all(|spec| spec.name != "free_trader_spawn_gate")
+        );
+        assert!(
+            PROBABILITY_SPECS
+                .iter()
+                .all(|spec| spec.name != "pirate_event_spawn")
+        );
     }
 
     #[test]

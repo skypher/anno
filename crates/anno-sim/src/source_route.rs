@@ -105,6 +105,23 @@ pub fn source_direction_delta(direction: u8) -> Option<(i32, i32)> {
     }
 }
 
+/// Expand predecessor-route steps into the successive source-grid positions.
+/// Returns `None` when a step contains an invalid source direction or would
+/// overflow the coordinate representation.
+pub fn source_route_positions(
+    start: (i32, i32),
+    steps: &[SourceRouteStep],
+) -> Option<Vec<(i32, i32)>> {
+    let mut position = start;
+    let mut positions = Vec::with_capacity(steps.len());
+    for step in steps {
+        let (dx, dy) = source_direction_delta(step.direction)?;
+        position = (position.0.checked_add(dx)?, position.1.checked_add(dy)?);
+        positions.push(position);
+    }
+    Some(positions)
+}
+
 /// Decode a `FUN_0046cf70` bytecode program into its individual directions.
 ///
 /// `FUN_00456270` stops on any `0xc?` byte. `FUN_0046cf70` itself writes
@@ -214,14 +231,15 @@ pub enum SourcePathSearchError {
 /// A blocked-cell callback decision from `FUN_0046c7d0`.
 ///
 /// The executable calls its callback only when a due frontier cell has the
-/// high metadata bit set. A nonzero callback return expands that cell; the
-/// caller separately clears a grid-state flag to stop the search. `Complete`
-/// represents that paired callback-and-stop action without exposing the
-/// executable's mutable grid header.
+/// high metadata bit set. `Block` leaves that cell unexpanded, `Expand`
+/// continues through it, and `AdvanceFrontier` discards the remaining current
+/// LIFO frontier while retaining cells already queued for the next one.
+/// `Complete` represents a callback that terminates the grid search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourcePathBlockedCellDecision {
     Block,
     Expand,
+    AdvanceFrontier,
     Complete,
 }
 
@@ -246,10 +264,10 @@ pub struct SourcePathTargetRect {
     pub height: usize,
 }
 
-/// The four-byte live target descriptor passed to the source ship-route
-/// builders. `FUN_00445400` constructs kind `0x37` for a world-map cell;
-/// `FUN_00444900` decodes its two packed 12-bit coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// The four-byte live target descriptor passed to source entity route and
+/// movement builders. `FUN_00445400` constructs kind `0x37` for a world-map
+/// cell; `FUN_00444900` and `FUN_00444af0` decode its packed coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SourceTargetDescriptor {
     bytes: [u8; 4],
 }
@@ -370,6 +388,8 @@ pub struct SourceResolvedDynamicTarget {
 impl SourceTargetDescriptor {
     /// The descriptor kind written by `FUN_00445400`.
     pub const WORLD_COORDINATE_KIND: u8 = 0x37;
+    /// The packed coordinate kind written by `FUN_004453d0`.
+    pub const FIXED_POINT_COORDINATE_KIND: u8 = 0x38;
 
     /// Construct the exact kind-`0x37` descriptor for a source world cell.
     /// Each coordinate occupies twelve bits in the live descriptor.
@@ -386,11 +406,26 @@ impl SourceTargetDescriptor {
         })
     }
 
+    /// Construct a kind-`0x37` descriptor for a type-4 figure's raw route
+    /// coordinate. `FUN_00444af0` doubles kind `0x37` coordinates before
+    /// handing them to the land route builder, so type-4 callers must pack
+    /// the underlying world cell rather than the raw doubled waypoint.
+    pub fn from_source_land_route_coordinate(x: i32, y: i32) -> Option<Self> {
+        (x % 2 == 0 && y % 2 == 0).then(|| Self::from_world_coordinate(x / 2, y / 2))?
+    }
+
     /// Preserve a live descriptor read from a source route record. Resolution
     /// of object-backed kinds is deliberately separate because it needs the
     /// corresponding source object tables.
     pub const fn from_bytes(bytes: [u8; 4]) -> Self {
         Self { bytes }
+    }
+
+    /// Construct the kind-`0x34` static island-cell descriptor written by
+    /// `FUN_004458f0`. The type-4 native idle branch stores the selected
+    /// local map cell in this form rather than as a packed coordinate.
+    pub const fn from_source_kind34_island_cell(island: u8, x: u8, y: u8) -> Self {
+        Self::from_bytes([0x34, island, x, y])
     }
 
     /// Return the raw four-byte live descriptor without changing its
@@ -408,10 +443,38 @@ impl SourceTargetDescriptor {
     /// branch. Other descriptor kinds require their live object tables.
     pub fn world_coordinate(self) -> Option<(i32, i32)> {
         (self.kind() == Self::WORLD_COORDINATE_KIND).then(|| {
+            self.packed_coordinate()
+                .expect("world coordinate descriptor has packed coordinates")
+        })
+    }
+
+    /// Decode either packed-coordinate form handled by `FUN_00444af0`.
+    ///
+    /// Kind `0x37` expands the coordinate to the route grid by a factor of
+    /// two; kind `0x38` retains this packed coordinate directly. The type-4
+    /// scenario loader preserves the latter form.
+    pub fn packed_coordinate(self) -> Option<(i32, i32)> {
+        matches!(
+            self.kind(),
+            Self::WORLD_COORDINATE_KIND | Self::FIXED_POINT_COORDINATE_KIND
+        )
+        .then(|| {
             let x = (u16::from(self.bytes[1] & 0x0f) << 8) | u16::from(self.bytes[2]);
             let y = (u16::from(self.bytes[1] >> 4) << 8) | u16::from(self.bytes[3]);
             (i32::from(x), i32::from(y))
         })
+    }
+
+    /// Resolve the raw type-4 route coordinate returned by
+    /// `FUN_00444af0`. Kind `0x37` doubles its packed world cell, while kind
+    /// `0x38` retains its packed raw figure coordinate.
+    pub fn source_land_route_coordinate(self) -> Option<(i32, i32)> {
+        let (x, y) = self.packed_coordinate()?;
+        match self.kind() {
+            Self::WORLD_COORDINATE_KIND => Some((x.checked_mul(2)?, y.checked_mul(2)?)),
+            Self::FIXED_POINT_COORDINATE_KIND => Some((x, y)),
+            _ => None,
+        }
     }
 
     /// Resolve the source fallback `[x, y, 1, 1]` footprint used by
@@ -421,16 +484,17 @@ impl SourceTargetDescriptor {
             .and_then(|position| SourcePathTargetRect::new(position, 1, 1))
     }
 
-    /// Resolve the static island-map kinds `0x32` and `0x33` through the
+    /// Resolve the static island-map kinds `0x32`, `0x33`, and `0x34` through the
     /// scenario's preserved map cell. The descriptor's second byte is the
     /// source island slot, followed by local x/y bytes. `FUN_00463830`
     /// swaps the compiled definition's dimensions for odd orientations.
+    /// This is the undoubled map-grid footprint returned by `FUN_004451a0`.
     pub fn resolve_static_island_target(
         self,
         islands: &[Island],
         definitions: &[CodBuilding],
     ) -> Option<SourceResolvedStaticTarget> {
-        if !matches!(self.kind(), 0x32 | 0x33) {
+        if !matches!(self.kind(), 0x32 | 0x33 | 0x34) {
             return None;
         }
 
@@ -454,6 +518,28 @@ impl SourceTargetDescriptor {
         Some(SourceResolvedStaticTarget {
             target: SourcePathTargetRect::new(origin, usize::from(width), usize::from(height))?,
             owner: tile.source_owner(),
+        })
+    }
+
+    /// Resolve the doubled raw-grid footprint returned by `FUN_00444fe0` for
+    /// a type-4 land route. Static kinds `0x32`, `0x33`, and `0x34` share
+    /// this conversion; the source doubles both the map-grid origin and the
+    /// oriented footprint dimensions.
+    pub fn resolve_static_island_land_target(
+        self,
+        islands: &[Island],
+        definitions: &[CodBuilding],
+    ) -> Option<SourceResolvedStaticTarget> {
+        let resolved = self.resolve_static_island_target(islands, definitions)?;
+        let origin = (
+            resolved.target.origin.0.checked_mul(2)?,
+            resolved.target.origin.1.checked_mul(2)?,
+        );
+        let width = resolved.target.width.checked_mul(2)?;
+        let height = resolved.target.height.checked_mul(2)?;
+        Some(SourceResolvedStaticTarget {
+            target: SourcePathTargetRect::new(origin, width, height)?,
+            owner: resolved.owner,
         })
     }
 
@@ -821,6 +907,20 @@ impl SourcePathGrid {
         true
     }
 
+    /// Set a path-grid cell selected by the static-map overlay. This clears
+    /// its `0x0c` direction blocker exactly as `FUN_0046f000` does after it
+    /// accepts a fixed or permission-matched source map object.
+    pub fn set_traversable_cell(&mut self, position: (i32, i32), metadata: u8) -> bool {
+        let Some(index) = self.index(position) else {
+            return false;
+        };
+        self.cells[index] = SourcePathCell {
+            direction: 0,
+            metadata,
+        };
+        true
+    }
+
     /// Read a cell's source path metadata.
     pub fn metadata(&self, position: (i32, i32)) -> Option<u8> {
         self.index(position).map(|index| self.cells[index].metadata)
@@ -856,6 +956,35 @@ impl SourcePathGrid {
                 let index = self.index((x, y)).expect("target clip is in bounds");
                 self.cells[index].direction = 0;
                 self.cells[index].metadata |= 0x80;
+            }
+        }
+        true
+    }
+
+    /// Assign one metadata byte to every clipped target cell. Like
+    /// `mark_target_region`, this clears predecessor directions first; callers
+    /// use it when the source object supplies both the callback bit and path
+    /// cost class for its entire oriented footprint.
+    pub fn set_target_region_metadata(
+        &mut self,
+        target: SourcePathTargetRect,
+        metadata: u8,
+    ) -> bool {
+        let max_x = target.origin.0.saturating_add(target.width as i32);
+        let max_y = target.origin.1.saturating_add(target.height as i32);
+        let start_x = target.origin.0.max(self.origin.0);
+        let start_y = target.origin.1.max(self.origin.1);
+        let end_x = max_x.min(self.origin.0 + self.width as i32);
+        let end_y = max_y.min(self.origin.1 + self.height as i32);
+        if start_x >= end_x || start_y >= end_y {
+            return false;
+        }
+
+        for y in start_y..end_y {
+            for x in start_x..end_x {
+                let index = self.index((x, y)).expect("target clip is in bounds");
+                self.cells[index].direction = 0;
+                self.cells[index].metadata = metadata;
             }
         }
         true
@@ -1061,8 +1190,8 @@ impl SourcePathGrid {
     }
 
     /// Construct the centered `2r + 1` square initialized by
-    /// `FUN_0046c630` in the ship-route callers. Cells outside this backing
-    /// static grid retain the source constructor's zero direction/metadata.
+    /// `FUN_0046c630`. Cells outside this backing static grid retain the
+    /// source constructor's zero direction/metadata.
     pub fn source_window(&self, center: (i32, i32), radius: usize) -> Option<Self> {
         let diameter = radius.checked_mul(2)?.checked_add(1)?;
         let radius = i32::try_from(radius).ok()?;
@@ -1160,6 +1289,7 @@ impl SourcePathGrid {
                                 steps: self.trace_steps(start, position),
                             });
                         }
+                        SourcePathBlockedCellDecision::AdvanceFrontier => break,
                         SourcePathBlockedCellDecision::Expand => {}
                     }
                 }
@@ -1360,9 +1490,10 @@ impl SourcePathGrid {
         best
     }
 
-    /// Trace the predecessor program to a marker selected by
-    /// [`Self::nearest_reached_marker`]. The source only invokes its route
-    /// encoder after `FUN_0046eb20` accepts this marker.
+    /// Trace the predecessor program to a caller-selected reached marker.
+    /// Source ship callers obtain such a marker through
+    /// [`Self::nearest_reached_marker`]; type-11 cart selection records its
+    /// accepted callback cell directly.
     pub fn steps_to_reached_marker(
         &self,
         start: (i32, i32),
@@ -1553,6 +1684,42 @@ mod tests {
     }
 
     #[test]
+    fn fixed_point_target_descriptor_matches_fun_004453d0_and_fun_00444af0() {
+        let descriptor = SourceTargetDescriptor::from_bytes([0x38, 0x22, 0xec, 0x4c]);
+        assert_eq!(
+            descriptor.kind(),
+            SourceTargetDescriptor::FIXED_POINT_COORDINATE_KIND
+        );
+        assert_eq!(descriptor.packed_coordinate(), Some((0x2ec, 0x24c)));
+        assert_eq!(
+            descriptor.source_land_route_coordinate(),
+            Some((0x2ec, 0x24c))
+        );
+        assert_eq!(descriptor.world_coordinate(), None);
+        assert_eq!(descriptor.target_rect(), None);
+    }
+
+    #[test]
+    fn land_route_coordinate_matches_fun_00444af0_kind_scaling() {
+        let descriptor =
+            SourceTargetDescriptor::from_source_land_route_coordinate(0x68a, 0x1578).unwrap();
+        assert_eq!(descriptor.bytes(), [0x37, 0xa3, 0x45, 0xbc]);
+        assert_eq!(
+            descriptor.source_land_route_coordinate(),
+            Some((0x68a, 0x1578))
+        );
+        assert!(SourceTargetDescriptor::from_source_land_route_coordinate(1, 0).is_none());
+    }
+
+    #[test]
+    fn kind34_island_cell_descriptor_matches_fun_004458f0() {
+        assert_eq!(
+            SourceTargetDescriptor::from_source_kind34_island_cell(10, 24, 21).bytes(),
+            [0x34, 10, 24, 21]
+        );
+    }
+
+    #[test]
     fn target_descriptor_branch_matches_fun_00455a20_owner_cases() {
         let island_target = SourceTargetDescriptor::from_bytes([0x32, 4, 9, 7]);
         assert_eq!(
@@ -1608,18 +1775,30 @@ mod tests {
             size: (2, 4),
             ..Default::default()
         }];
-        let descriptor = SourceTargetDescriptor::from_bytes([0x32, 4, 9, 7]);
-
-        assert_eq!(
-            descriptor.resolve_static_island_target(&[island], &definitions),
-            Some(SourceResolvedStaticTarget {
-                target: SourcePathTargetRect::new((109, 207), 4, 2).unwrap(),
-                owner: 6,
-            })
+        let expected = Some(SourceResolvedStaticTarget {
+            target: SourcePathTargetRect::new((109, 207), 4, 2).unwrap(),
+            owner: 6,
+        });
+        let expected_land = Some(SourceResolvedStaticTarget {
+            target: SourcePathTargetRect::new((218, 414), 8, 4).unwrap(),
+            owner: 6,
+        });
+        for kind in [0x32, 0x33, 0x34] {
+            let descriptor = SourceTargetDescriptor::from_bytes([kind, 4, 9, 7]);
+            assert_eq!(
+                descriptor.resolve_static_island_target(&[island.clone()], &definitions),
+                expected
+            );
+            assert_eq!(
+                descriptor.resolve_static_island_land_target(&[island.clone()], &definitions),
+                expected_land
+            );
+        }
+        assert!(
+            SourceTargetDescriptor::from_bytes([0x35, 4, 9, 7])
+                .resolve_static_island_target(&[], &definitions)
+                .is_none()
         );
-        assert!(SourceTargetDescriptor::from_bytes([0x35, 4, 9, 7])
-            .resolve_static_island_target(&[], &definitions)
-            .is_none());
     }
 
     #[test]
@@ -1675,9 +1854,11 @@ mod tests {
                 owner: 2,
             })
         );
-        assert!(SourceTargetDescriptor::from_bytes([0x35, 4, 7, 0])
-            .resolve_dynamic_map_object_target(&[object], &[], &definitions)
-            .is_none());
+        assert!(
+            SourceTargetDescriptor::from_bytes([0x35, 4, 7, 0])
+                .resolve_dynamic_map_object_target(&[object], &[], &definitions)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1731,6 +1912,19 @@ mod tests {
         assert_eq!(grid.is_direction_clear((10, 20)), Some(true));
         assert_eq!(grid.metadata((13, 22)), Some(0x80));
         assert_eq!(grid.metadata((9, 19)), Some(0));
+    }
+
+    #[test]
+    fn target_region_metadata_covers_the_entire_clipped_footprint() {
+        let mut grid = SourcePathGrid::new((9, 19), 5, 5);
+        let target = SourcePathTargetRect::new((8, 20), 3, 2).unwrap();
+
+        assert!(grid.set_target_region_metadata(target, 0xa6));
+        assert_eq!(grid.metadata((9, 20)), Some(0xa6));
+        assert_eq!(grid.metadata((10, 20)), Some(0xa6));
+        assert_eq!(grid.metadata((9, 21)), Some(0xa6));
+        assert_eq!(grid.metadata((10, 21)), Some(0xa6));
+        assert_eq!(grid.metadata((11, 20)), Some(0));
     }
 
     #[test]
@@ -1905,6 +2099,34 @@ mod tests {
         assert_eq!(source_direction_delta(7), Some((-1, 0)));
         assert_eq!(source_direction_delta(8), Some((-1, -1)));
         assert_eq!(source_direction_delta(0), None);
+    }
+
+    #[test]
+    fn source_route_positions_expand_predecessor_directions() {
+        let steps = [
+            SourceRouteStep {
+                direction: 3,
+                metadata: 32,
+            },
+            SourceRouteStep {
+                direction: 1,
+                metadata: 32,
+            },
+        ];
+        assert_eq!(
+            source_route_positions((10, 20), &steps),
+            Some(vec![(11, 20), (11, 19)])
+        );
+        assert_eq!(
+            source_route_positions(
+                (0, 0),
+                &[SourceRouteStep {
+                    direction: 0,
+                    metadata: 0,
+                }]
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2110,6 +2332,28 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn source_wave_advance_frontier_skips_current_cells_but_keeps_queued_work() {
+        let mut grid = SourcePathGrid::new((0, 0), 4, 3);
+        assert!(grid.set_metadata((1, 0), 0x80));
+        assert!(grid.set_metadata((3, 0), 0x80));
+        let mut visits = Vec::new();
+
+        let result = grid
+            .search_with_blocked_cell_callback((1, 1), |position, _| {
+                visits.push(position);
+                if position == (1, 0) {
+                    SourcePathBlockedCellDecision::AdvanceFrontier
+                } else {
+                    SourcePathBlockedCellDecision::Complete
+                }
+            })
+            .unwrap();
+
+        assert_eq!(visits, [(1, 0), (3, 0)]);
+        assert_eq!(result.position, (3, 0));
     }
 
     #[test]

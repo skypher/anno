@@ -10,7 +10,7 @@
 /// construction. The live game seeds from uptime milliseconds.
 pub const DEFAULT_SOURCE_RAND_SEED: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceRand {
     state: u32,
 }

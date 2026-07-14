@@ -59,6 +59,20 @@ pub enum ActionType {
     Idle = 0x22,
 }
 
+/// Distinguishes the two decoded producer-to-root transfer protocols.
+///
+/// Type 8 (`TRAEGER`) supplies one named production input. Type 11
+/// (`KARREN`) selects a filled supplier root and returns its output to a
+/// city root. Both use the walking action states, but their reservation and
+/// delivery accounting are different.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum CargoRoute {
+    #[default]
+    InputCarrier = 0,
+    CityCart = 1,
+}
+
 /// A figure/entity in the world.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Figure {
@@ -72,6 +86,38 @@ pub struct Figure {
     /// Movement speed (sub-tiles per tick).
     pub speed: u16,
 
+    /// Authored source figure `Speed` for type-8/type-11 route movement.
+    /// Zero retains the legacy one-cell step behavior for non-source figures
+    /// and save fixtures that predate the source movement state.
+    #[serde(default)]
+    pub source_move_speed: u16,
+
+    /// Remaining source-grid distance in the current route cell. Cardinal
+    /// cells start at one; diagonal cells start at √2, matching
+    /// `FUN_0044a690` and `FUN_00451890`.
+    #[serde(default)]
+    pub source_step_remaining: f32,
+
+    /// Continuous source-grid X position integrated by the source figure
+    /// dispatcher between route-cell boundaries.
+    #[serde(default)]
+    pub source_position_x: f32,
+
+    /// Continuous source-grid Y position integrated by the source figure
+    /// dispatcher between route-cell boundaries.
+    #[serde(default)]
+    pub source_position_y: f32,
+
+    /// Source-grid Z coordinate initialised from the live map cell's
+    /// `Posoffs × 0.028` terrain elevation.
+    #[serde(default)]
+    pub source_position_z: f32,
+
+    /// Distinguishes a saved/in-flight continuous position from the serde
+    /// zero default used by manually constructed figures.
+    #[serde(default)]
+    pub source_position_initialized: bool,
+
     /// Movement direction (0-7, compass directions).
     pub direction: u8,
 
@@ -79,18 +125,56 @@ pub struct Figure {
     pub target_x: i32,
     pub target_y: i32,
 
+    /// Source command-root kind selected as an in-flight carrier's supplier.
+    /// `0` means this figure has no source-routed supplier.
+    #[serde(default)]
+    pub destination_kind: u8,
+
+    /// Source command-root position selected for an in-flight carrier. This
+    /// remains the producer anchor when a type-11 cart navigates to an edge
+    /// cell of the root's oriented footprint.
+    #[serde(default)]
+    pub supplier_x: u16,
+    #[serde(default)]
+    pub supplier_y: u16,
+
+    /// Which source transfer handler owns this figure.
+    #[serde(default)]
+    pub cargo_route: CargoRoute,
+
+    /// Type-11 city-cart origin. Type-8 figures retain their requesting
+    /// building through `building_idx` and leave these fields at zero.
+    #[serde(default)]
+    pub origin_island: u8,
+    #[serde(default)]
+    pub origin_x: u16,
+    #[serde(default)]
+    pub origin_y: u16,
+    #[serde(default)]
+    pub origin_kind: u8,
+
     /// Linked building instance index.
     pub building_idx: u16,
 
     /// Carried good type and amount.
     pub carried_good: u8,
     pub carried_amount: u16,
+    /// Exact source-map quantity carried by a type-8 TRAEGER, in 1/32-good
+    /// units. `carried_amount` remains the whole-good display quantity.
+    #[serde(default)]
+    pub cargo_fixed: u16,
 
     /// Health/hitpoints (for military units).
     pub health: u16,
 
     /// Animation frame.
     pub anim_frame: u8,
+
+    /// Source animation-time remainder in milliseconds. `FUN_0045d0b0`
+    /// subtracts one authored frame duration whenever this accumulator reaches
+    /// it, so this is not a shared visual clock.
+    #[serde(default)]
+    pub source_animation_elapsed_ms: u32,
 
     /// Movement timer accumulator.
     pub move_timer_ms: u32,
@@ -116,14 +200,30 @@ impl Figure {
             tile_x: 0,
             tile_y: 0,
             speed: 0,
+            source_move_speed: 0,
+            source_step_remaining: 0.0,
+            source_position_x: 0.0,
+            source_position_y: 0.0,
+            source_position_z: 0.0,
+            source_position_initialized: false,
             direction: 0,
             target_x: 0,
             target_y: 0,
+            destination_kind: 0,
+            supplier_x: 0,
+            supplier_y: 0,
+            cargo_route: CargoRoute::InputCarrier,
+            origin_island: 0,
+            origin_x: 0,
+            origin_y: 0,
+            origin_kind: 0,
             building_idx: 0,
             carried_good: 0,
             carried_amount: 0,
+            cargo_fixed: 0,
             health: 0,
             anim_frame: 0,
+            source_animation_elapsed_ms: 0,
             move_timer_ms: 0,
             sprite_set: 0,
             base_sprite: 0,
@@ -134,6 +234,40 @@ impl Figure {
 
     pub fn is_active(&self) -> bool {
         self.action != ActionType::None
+    }
+
+    /// Match the `tile + 0.5` horizontal coordinates passed to
+    /// `FUN_00446ca0` by the source figure constructors.
+    pub fn initialize_source_position(&mut self) {
+        self.source_position_x = self.tile_x as f32 + 0.5;
+        self.source_position_y = self.tile_y as f32 + 0.5;
+        self.source_position_initialized = true;
+    }
+
+    /// Reset the per-figure animation counters when source dispatch selects
+    /// a new `ANIM` record, matching `FUN_00446d90` / `FUN_0045d0b0`.
+    pub fn reset_source_animation(&mut self) {
+        self.anim_frame = 0;
+        self.source_animation_elapsed_ms = 0;
+    }
+
+    /// Advance an `ENDLESS` source animation using the selected frame's
+    /// current duration. This mirrors the accumulator/frame loop in
+    /// `FUN_0045d0b0` for the animation kinds used by carriers.
+    pub fn advance_source_animation(
+        &mut self,
+        elapsed_ms: u32,
+        frame_duration_ms: u32,
+        frames_per_direction: u8,
+    ) {
+        let duration = frame_duration_ms.max(1);
+        let frames = frames_per_direction.max(1);
+        self.source_animation_elapsed_ms =
+            self.source_animation_elapsed_ms.saturating_add(elapsed_ms);
+        while self.source_animation_elapsed_ms >= duration {
+            self.source_animation_elapsed_ms -= duration;
+            self.anim_frame = self.anim_frame.wrapping_add(1) % frames;
+        }
     }
 }
 
@@ -146,5 +280,44 @@ mod tests {
         assert_eq!(Layout::CAPACITY, 2550);
         assert_eq!(Layout::STRIDE_BYTES, 72);
         assert!(Layout::POSITION_Z_OFFSET + std::mem::size_of::<f32>() <= Layout::STRIDE_BYTES);
+    }
+
+    #[test]
+    fn new_figure_starts_with_zero_source_animation_time() {
+        assert_eq!(super::Figure::new().source_animation_elapsed_ms, 0);
+    }
+
+    #[test]
+    fn source_animation_reset_clears_frame_and_elapsed_time() {
+        let mut figure = super::Figure::new();
+        figure.anim_frame = 6;
+        figure.source_animation_elapsed_ms = 1_275;
+
+        figure.reset_source_animation();
+
+        assert_eq!(figure.anim_frame, 0);
+        assert_eq!(figure.source_animation_elapsed_ms, 0);
+    }
+
+    #[test]
+    fn source_animation_keeps_a_per_figure_frame_remainder() {
+        let mut figure = super::Figure::new();
+        figure.advance_source_animation(84, 85, 8);
+        assert_eq!(
+            (figure.anim_frame, figure.source_animation_elapsed_ms),
+            (0, 84)
+        );
+
+        figure.advance_source_animation(1, 85, 8);
+        assert_eq!(
+            (figure.anim_frame, figure.source_animation_elapsed_ms),
+            (1, 0)
+        );
+
+        figure.advance_source_animation(180, 60, 8);
+        assert_eq!(
+            (figure.anim_frame, figure.source_animation_elapsed_ms),
+            (4, 0)
+        );
     }
 }

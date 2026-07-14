@@ -44,6 +44,10 @@ pub struct BuildingDef {
     pub kind: String,
     /// Tile dimensions (width, height)
     pub size: (i32, i32),
+    /// Source terrain elevation compiled from `Posoffs` at runtime
+    /// definition offset `0x0c`. Figure constructors multiply this integer
+    /// by `0.028` before writing their Z coordinate.
+    pub source_position_offset: i32,
     /// Number of rotations
     pub rotate: i32,
     /// Random variant count (`RandAnz`, ushort at building-definition offset 0x60).
@@ -99,6 +103,7 @@ impl Default for BuildingDef {
             baugfx: -1,
             kind: String::new(),
             size: (1, 1),
+            source_position_offset: 0,
             rotate: 0,
             rand_anz: 1,
             rand_add: 0,
@@ -174,16 +179,25 @@ impl BuildingDef {
     /// `FUN_0046f230` later copies one selected class into path-grid
     /// metadata. `None` preserves an absent or malformed source property.
     pub fn source_path_classes(&self) -> Option<[u8; 4]> {
-        let speeds: Vec<i32> = self
+        let speeds = self.source_path_speeds()?;
+        Some(speeds.map(|speed| ((u16::from(speed) * 32 / 100).min(126)) as u8))
+    }
+
+    /// The authored four-entry nonzero byte `Wegspeed` table retained without
+    /// the path-grid class conversion. Figure movement divides its runtime
+    /// `Speed` by this selected raw value in `FUN_0044a690`.
+    pub fn source_path_speeds(&self) -> Option<[u8; 4]> {
+        let speeds: [u8; 4] = self
             .properties
             .get("Wegspeed")?
             .split(',')
             .map(str::trim)
-            .map(str::parse)
-            .collect::<Result<_, _>>()
+            .map(str::parse::<u8>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?
+            .try_into()
             .ok()?;
-        let speeds: [i32; 4] = speeds.try_into().ok()?;
-        Some(speeds.map(|speed| (speed.saturating_mul(32) / 100).clamp(0, 126) as u8))
+        speeds.into_iter().all(|speed| speed != 0).then_some(speeds)
     }
 }
 
@@ -435,6 +449,18 @@ impl CodFile {
                 current
                     .properties
                     .insert("Maxlager".to_string(), authored.to_string());
+                continue;
+            }
+
+            // `FUN_00460750` writes Posoffs directly to definition offset
+            // 0x0c. `FUN_00451180` and the figure constructors then use that
+            // field as the source map-cell terrain height.
+            if let Some(val_str) = line.strip_prefix("Posoffs:") {
+                current.source_position_offset = Self::eval(&constants, val_str.trim());
+                current.properties.insert(
+                    "Posoffs".to_string(),
+                    current.source_position_offset.to_string(),
+                );
                 continue;
             }
 
@@ -749,6 +775,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_path_speeds_require_four_nonzero_bytes() {
+        let mut building = BuildingDef::default();
+        building
+            .properties
+            .insert("Wegspeed".into(), "100,120,170,100".into());
+        assert_eq!(building.source_path_speeds(), Some([100, 120, 170, 100]));
+
+        building
+            .properties
+            .insert("Wegspeed".into(), "100,0,170,100".into());
+        assert_eq!(building.source_path_speeds(), None);
+    }
+
+    #[test]
     fn parses_anim_frame_for_source_sprite_selection() {
         let cod = CodFile::parse(
             b"@Nummer: 1\nId: 20001\nGfx: 120\nAnimAnz: 4\nAnimAdd: 6\nAnimFrame: 3\n",
@@ -764,12 +804,13 @@ mod tests {
     #[test]
     fn parses_source_cell_animation_flags() {
         let cod = CodFile::parse(
-            b"@Nummer: 1\nId: 20001\nAnicontflg: 1\nLagAniFlg: 1\nMaxlager: 5\nProdmenge: 0.75\nRohmenge: 0.5\nWorkmenge: 2\n",
+            b"HIGHBODEN = 20\n@Nummer: 1\nId: 20001\nPosoffs: HIGHBODEN\nAnicontflg: 1\nLagAniFlg: 1\nMaxlager: 5\nProdmenge: 0.75\nRohmenge: 0.5\nWorkmenge: 2\n",
         )
         .expect("parse plaintext COD");
 
         assert!(cod.buildings[0].animation_continues);
         assert!(cod.buildings[0].storage_animation);
+        assert_eq!(cod.buildings[0].source_position_offset, 20);
         assert_eq!(cod.buildings[0].storage_animation_capacity, 160);
         assert_eq!(cod.buildings[0].source_production_amount, 24);
         assert_eq!(cod.buildings[0].source_raw_material_amount, 16);
@@ -813,6 +854,7 @@ mod tests {
         assert_eq!(cod.buildings[1].kind, "BODEN");
         assert_eq!(cod.buildings[1].source_kind_code(), Some(11));
         assert_eq!(cod.buildings[1].source_id, 0);
+        assert_eq!(cod.buildings[1].source_position_offset, 20);
         assert_eq!(
             cod.buildings[1].source_path_classes(),
             Some([38, 38, 38, 32]),

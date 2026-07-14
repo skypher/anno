@@ -1,26 +1,20 @@
-//! Civilian wanderers: cosmetic figures that emerge from residences,
-//! walk a short distance, then despawn.
+//! Civilian figure definitions and rendering metadata.
 //!
-//! RE references for the spawn dispatcher:
-//!
-//! - `decompiled/1602_exe.c:84620-84666` — the per-building 4999 ms
-//!   tick (`if (4999 < DAT_005491c8) { DAT_005491c8 = 0; ... }`),
-//!   which inside the building loop calls
-//!   `FUN_00443a90(0x5a, 0x39, island, tile_y)` when
-//!   `DAT_005b701c != 0 && DAT_005b701c <= DAT_005b6040 &&
-//!   DAT_005bafc8 != 0`. Figure type `0x5a` is `ALTER` — the
-//!   "alter Mann" civilian (figuren.cod definition order index 90).
-//! - `decompiled/1602_exe.c:94389` — `FUN_00443a90(0x5c, 1, sVar11, 1)`
-//!   spawns figure type `0x5c = PASSANT` (passerby) when a market /
-//!   coverage condition is met.
-//! - `decompiled/1602_exe.c:11856,11873` — `FUN_00443a90(0x59, 0, 0, 0)`
-//!   spawns `0x59 = ADEL` (nobleman) on player init.
-//! - `decompiled/1602_exe.c:46943-46955` — `FUN_00443a90(figtype,
-//!   x_or_action, island, flag)` allocates a figure slot and
-//!   activates it via `FUN_0045e1f0(slot, 1)`.
+//! `figuren.cod` contains the eight civilian and five worker definitions
+//! selected by the source kind-12 allocator. Their sprite layouts and
+//! authored walking animation cadences are decoded here.
+//! The 4,999 ms per-building command dispatch at
+//! `1602_exe.c:84620-84666` is deliberately not used as a spawn rule:
+//! its `0x5a` value is a class-`0x39` command subcode handled by
+//! `FUN_004766a0`, rather than a call to the figure allocator
+//! `FUN_00446ca0`.
+//! `FUN_00476350` does invoke `FUN_0044a200` every 5,000 ms, but that
+//! allocator samples its own `[0x66, 0x67, 0x66, 0x66, 0x65, 0x66, 0x65,
+//! 0x66]` definition table rather than this civilian range. It is therefore
+//! not used as a civilian spawn rule.
 //!
 //! Figure types live in `figuren.cod` at definition-order indices
-//! `0x58..=0x5f`:
+//! `0x58..=0x64`:
 //!
 //! | idx  | name      | sprite base       |
 //! |------|-----------|-------------------|
@@ -39,18 +33,6 @@
 //! sub-block — both anim 0 and anim 1 sit at `AnimOffs:0`, so
 //! civilians do not have a loaded/empty distinction).
 //!
-//! Spawn selection:
-//!
-//! - The building tick gates spawning on `DAT_005bafc8` (a global
-//!   "civilians enabled" flag) and on a population counter range
-//!   `DAT_005b701c <= DAT_005b6040` — both mapped here to "spawn
-//!   only from active residences (`Kind: WOHN`) on owned islands".
-//! - The variant chosen by the dispatcher uses an LCG-style index
-//!   (the `0x39` action seed in the ALTER call); this implementation
-//!   uses the simulation's `next_rand()` to pick a variant from the
-//!   eight-entry table above.
-
-use crate::building::{BuildingDef, BuildingInstance};
 use crate::entity::{ActionType, Figure};
 
 pub const CIVILIAN_VARIANT_COUNT: usize = 8;
@@ -70,10 +52,25 @@ pub const CIVILIAN_FIRST_INDEX: u8 = 0x58;
 /// Number of consecutive civilian figure variants.
 pub const CIVILIAN_COUNT: u8 = 8;
 
-/// Residence/civilian building ticker. RE: `1602_exe.c:84620`
-/// compares the building accumulator against 4999 ms before
-/// dispatching the per-building figure spawn loop.
-pub const CIVILIAN_BUILDING_TICK_MS: u32 = 4_999;
+/// First definition-order index selected by the source kind-12 allocator.
+pub const KIND12_FIRST_INDEX: u8 = CIVILIAN_FIRST_INDEX;
+/// Number of consecutive civilian and worker definitions selected by kind 12.
+pub const KIND12_FIGURE_COUNT: u8 = 13;
+pub const KIND12_FIGURE_NAMES: [&str; KIND12_FIGURE_COUNT as usize] = [
+    "ADELWEIBL",
+    "ADEL",
+    "ALTER",
+    "FRAU",
+    "PASSANT",
+    "VETERAN",
+    "KINDREIF",
+    "PILGER",
+    "MAEHER",
+    "STEINKLOPFER",
+    "HOLZFAELLER",
+    "PFLUECKER",
+    "PFLUECKER2",
+];
 
 /// Sprite base for civilians inside `TRAEGER.BSH` — `GFXZIVIL` resolves
 /// to 1272 by walking the `GFX… = previous + N` chain at the top of
@@ -86,21 +83,92 @@ pub const GFX_ZIVIL_BASE: u16 = 1272;
 /// (`figuren.cod` ANIM sub-blocks for `ADELWEIBL` and siblings).
 pub const SPRITES_PER_VARIANT: u16 = 64;
 
+/// Fallback `AnimSpeed` values for civilian `ANIM 0` walk cycles in the
+/// `ADELWEIBL` through `PILGER` definition order.
+pub const CIVILIAN_WALK_ANIM_SPEEDS_MS: [u16; CIVILIAN_VARIANT_COUNT] =
+    [85, 85, 105, 85, 85, 100, 85, 85];
+
+const KIND12_WALK_ANIM_SPEEDS_MS: [u16; KIND12_FIGURE_COUNT as usize] =
+    [85, 85, 105, 85, 85, 100, 85, 85, 85, 85, 85, 85, 85];
+const KIND12_MOVEMENT_SPEEDS: [u16; KIND12_FIGURE_COUNT as usize] = [
+    200, 230, 160, 200, 220, 200, 250, 200, 220, 220, 220, 220, 220,
+];
+const KIND12_SPRITE_BASES: [u16; KIND12_FIGURE_COUNT as usize] = [
+    GFX_ZIVIL_BASE,
+    GFX_ZIVIL_BASE + 64,
+    GFX_ZIVIL_BASE + 128,
+    GFX_ZIVIL_BASE + 192,
+    GFX_ZIVIL_BASE + 256,
+    GFX_ZIVIL_BASE + 320,
+    GFX_ZIVIL_BASE + 384,
+    GFX_ZIVIL_BASE + 448,
+    0,
+    352,
+    224,
+    608,
+    1120,
+];
+
+/// Resolve the kind-12 figure definition selected after `FUN_0044b140`
+/// reaches a type-3 route target.
+///
+/// `FUN_00442a90` initializes all 33 four-entry rows at `DAT_004e857c` to
+/// `0x60` (`MAEHER`), then writes the nine rows below. `FUN_0044b140` uses
+/// `table[target_kind * 4 + (rand() & 3)]`; a failed route keeps its separate
+/// initial `[0x5f, 0x5e, 0x64, 0x5d]` selection instead.
+pub const fn source_kind12_definition(target_kind: u8, random: u16) -> u8 {
+    let row = match target_kind {
+        7 => [0x5f, 0x60, 0x63, 0x5d],
+        17 => [0x5f, 0x5e, 0x64, 0x5d],
+        18 => [0x5e, 0x5f, 0x60, 0x64],
+        19 => [0x5e, 0x61, 0x64, 0x5d],
+        20 | 21 => [0x5e, 0x61, 0x60, 0x5d],
+        22 => [0x5f, 0x60, 0x62, 0x61],
+        23 => [0x60, 0x63, 0x61, 0x5d],
+        24 => [0x61, 0x5e, 0x61, 0x60],
+        _ => [0x60; 4],
+    };
+    row[(random & 3) as usize]
+}
+
+/// Initial kind-12 figure selection before `FUN_0044b140` either writes a
+/// route-specific definition or leaves the source route terminator in place.
+pub const fn source_kind12_initial_definition(random: u16) -> u8 {
+    [0x5f, 0x5e, 0x64, 0x5d][(random & 3) as usize]
+}
+
+/// Return whether the selected `FUN_0044b140` permission branch admits a
+/// source map-object kind into its type-3 civilian route grid.
+///
+/// Every branch admits kind 13. The remaining permissions come from the
+/// four stack masks prepared by `FUN_00480370` immediately before it calls
+/// `FUN_0044b140`.
+pub const fn source_civilian_path_kind_permitted(branch: u8, kind_code: u8) -> bool {
+    match kind_code {
+        13 => true,
+        17 | 22 => branch & 3 == 0,
+        7 | 24 => branch & 3 == 1 || branch & 3 == 3 && kind_code == 24,
+        18 | 19 | 21 => branch & 3 == 2,
+        20 | 23 => branch & 3 == 3,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CivilianConfig {
-    pub sprite_bases: [u16; CIVILIAN_VARIANT_COUNT],
+    pub sprite_bases: [u16; KIND12_FIGURE_COUNT as usize],
     pub frames_per_dir: u8,
+    pub frame_speeds_ms: [u16; KIND12_FIGURE_COUNT as usize],
+    pub movement_speeds: [u16; KIND12_FIGURE_COUNT as usize],
 }
 
 impl Default for CivilianConfig {
     fn default() -> Self {
-        let mut sprite_bases = [0; CIVILIAN_VARIANT_COUNT];
-        for (idx, base) in sprite_bases.iter_mut().enumerate() {
-            *base = GFX_ZIVIL_BASE + (idx as u16) * SPRITES_PER_VARIANT;
-        }
         Self {
-            sprite_bases,
+            sprite_bases: KIND12_SPRITE_BASES,
             frames_per_dir: 8,
+            frame_speeds_ms: KIND12_WALK_ANIM_SPEEDS_MS,
+            movement_speeds: KIND12_MOVEMENT_SPEEDS,
         }
     }
 }
@@ -108,7 +176,7 @@ impl Default for CivilianConfig {
 impl CivilianConfig {
     pub fn from_figures(figures: &anno_formats::figuren::FiguresFile) -> Self {
         let mut config = Self::default();
-        for (idx, name) in CIVILIAN_FIGURE_NAMES.iter().enumerate() {
+        for (idx, name) in KIND12_FIGURE_NAMES.iter().enumerate() {
             let Some(def) = figures.find(name) else {
                 continue;
             };
@@ -123,12 +191,67 @@ impl CivilianConfig {
             {
                 config.frames_per_dir = frames;
             }
+            if let Some(speed) = def
+                .walk_anim()
+                .and_then(|anim| u16::try_from(anim.anim_speed).ok())
+                .filter(|&speed| speed > 0)
+            {
+                config.frame_speeds_ms[idx] = speed;
+            }
+            if let Ok(speed) = u16::try_from(def.speed()) {
+                if speed > 0 {
+                    config.movement_speeds[idx] = speed;
+                }
+            }
         }
         config
     }
 
+    /// Resolved BSH sprite base for a source kind-12 definition.
+    pub fn sprite_base_for_definition(&self, definition: u8) -> u16 {
+        definition
+            .checked_sub(KIND12_FIRST_INDEX)
+            .filter(|&idx| idx < KIND12_FIGURE_COUNT)
+            .map(usize::from)
+            .map(|idx| self.sprite_bases[idx])
+            .unwrap_or(self.sprite_bases[0])
+    }
+
     pub fn sprite_base_for(&self, variant: u8) -> u16 {
-        self.sprite_bases[usize::from(variant.min(CIVILIAN_COUNT - 1))]
+        self.sprite_base_for_definition(CIVILIAN_FIRST_INDEX + variant.min(CIVILIAN_COUNT - 1))
+    }
+
+    pub fn frame_speed_for(&self, fig: &Figure) -> u32 {
+        let variant = fig
+            .sprite_set
+            .checked_sub(KIND12_FIRST_INDEX)
+            .filter(|&idx| idx < KIND12_FIGURE_COUNT)
+            .map(usize::from)
+            .or_else(|| {
+                self.sprite_bases
+                    .iter()
+                    .position(|&base| base == fig.base_sprite)
+            })
+            .unwrap_or(0);
+        u32::from(self.frame_speeds_ms[variant].max(1))
+    }
+
+    pub fn movement_speed_for(&self, fig: &Figure) -> u16 {
+        fig.sprite_set
+            .checked_sub(KIND12_FIRST_INDEX)
+            .filter(|&idx| idx < KIND12_FIGURE_COUNT)
+            .map(usize::from)
+            .map(|idx| self.movement_speeds[idx])
+            .unwrap_or(KIND12_MOVEMENT_SPEEDS[0])
+    }
+
+    pub fn movement_speed_for_definition(&self, definition: u8) -> u16 {
+        definition
+            .checked_sub(KIND12_FIRST_INDEX)
+            .filter(|&idx| idx < KIND12_FIGURE_COUNT)
+            .map(usize::from)
+            .map(|idx| self.movement_speeds[idx])
+            .unwrap_or(KIND12_MOVEMENT_SPEEDS[0])
     }
 
     pub fn is_civilian(&self, fig: &Figure) -> bool {
@@ -137,15 +260,21 @@ impl CivilianConfig {
         }
         let has_source_figtype = fig.sprite_set >= CIVILIAN_FIRST_INDEX
             && fig.sprite_set < CIVILIAN_FIRST_INDEX + CIVILIAN_COUNT;
-        has_source_figtype || self.sprite_bases.contains(&fig.base_sprite)
+        has_source_figtype || self.sprite_bases[..CIVILIAN_VARIANT_COUNT].contains(&fig.base_sprite)
     }
-}
 
-/// Pick a civilian figure variant deterministically from a 64-bit
-/// random word. Uses 8 variants (ADELWEIBL .. PILGER, indices
-/// `0x58..=0x5f`).
-pub fn pick_variant(rand: u64) -> u8 {
-    (rand & 0x07) as u8
+    /// Kind-12 also selects five plantation-worker figures. They share the
+    /// type-3 route state machine but render from `MAEHER.BSH`, not
+    /// `TRAEGER.BSH`.
+    pub fn is_worker(&self, fig: &Figure) -> bool {
+        fig.action == ActionType::Walking
+            && (CIVILIAN_FIRST_INDEX + CIVILIAN_COUNT..KIND12_FIRST_INDEX + KIND12_FIGURE_COUNT)
+                .contains(&fig.sprite_set)
+    }
+
+    pub fn is_kind12(&self, fig: &Figure) -> bool {
+        self.is_civilian(fig) || self.is_worker(fig)
+    }
 }
 
 /// Resolve a civilian variant index (0..8) to the sprite base in
@@ -154,167 +283,27 @@ pub fn sprite_base_for(variant: u8) -> u16 {
     CivilianConfig::default().sprite_base_for(variant)
 }
 
-/// Try to spawn a civilian figure from a residence. Returns the new
-/// figure when one is created. Mirrors `1602_exe.c:84666` per-building
-/// tick: gates on the building being a residence on the player's
-/// island; picks an exit tile next to the building footprint and
-/// targets a tile a few steps away. The figure walks one cycle and
-/// despawns when its TTL expires.
-///
-/// `rand` is two 32-bit randoms from the simulation RNG packed into a
-/// u64 (low word: variant seed, high word: walk-direction).
-pub fn try_spawn_civilian(
-    building: &BuildingInstance,
-    def: &BuildingDef,
-    building_idx: u16,
-    rand: u64,
-) -> Option<Figure> {
-    try_spawn_civilian_with_config(building, def, building_idx, rand, CivilianConfig::default())
-}
-
-pub fn try_spawn_civilian_with_config(
-    building: &BuildingInstance,
-    def: &BuildingDef,
-    building_idx: u16,
-    rand: u64,
-    config: CivilianConfig,
-) -> Option<Figure> {
-    if !building.active {
-        return None;
-    }
-    if def.prod_kind != "WOHN" {
-        return None;
-    }
-    // Civilians only emerge from buildings with a `Tuerflg: 1`
-    // door (RE: haeuser.cod). Residence shells without a door
-    // (construction-phase placeholders, upgraded variants) don't
-    // host civilians.
-    if !def.has_door {
-        return None;
-    }
-    // Skip residences still under construction; civilians only walk
-    // out of finished houses.
-    if building.construction_ms_remaining > 0 {
-        return None;
-    }
-    let variant = pick_variant(rand >> 8);
-    let dir_seed = (rand >> 32) as u32;
-    let dir = (dir_seed & 0x07) as u8;
-
-    // Pick an exit tile one step from the building footprint in the
-    // chosen direction (8-way compass).
-    let bx = building.tile_x as i32;
-    let by = building.tile_y as i32;
-    let bw = def.width.max(1) as i32;
-    let bh = def.height.max(1) as i32;
-    let (sx, sy) = exit_tile(bx, by, bw, bh, dir);
-
-    // Walk target: 3 tiles further in the same direction. Civilians
-    // wander, they don't pathfind to a destination.
-    let (tx, ty) = step_in_direction(sx, sy, dir, 3);
-
-    let mut fig = Figure::new();
-    fig.action = ActionType::Walking;
-    fig.owner = building.owner;
-    fig.tile_x = sx;
-    fig.tile_y = sy;
-    fig.target_x = tx;
-    fig.target_y = ty;
-    fig.direction = dir;
-    fig.speed = 2;
-    fig.building_idx = building_idx;
-    fig.sprite_set = CIVILIAN_FIRST_INDEX + variant;
-    fig.base_sprite = config.sprite_base_for(variant);
-    // Health field is repurposed as TTL ticks for civilians (despawn
-    // after walking one short cycle). Reasonable default lifetime
-    // since the original despawns when the wander animation completes.
-    fig.health = 80;
-    Some(fig)
-}
-
-fn exit_tile(bx: i32, by: i32, bw: i32, bh: i32, dir: u8) -> (i32, i32) {
-    match dir % 8 {
-        0 => (bx + bw / 2, by - 1),  // N
-        1 => (bx + bw, by - 1),      // NE
-        2 => (bx + bw, by + bh / 2), // E
-        3 => (bx + bw, by + bh),     // SE
-        4 => (bx + bw / 2, by + bh), // S
-        5 => (bx - 1, by + bh),      // SW
-        6 => (bx - 1, by + bh / 2),  // W
-        _ => (bx - 1, by - 1),       // NW
-    }
-}
-
-fn step_in_direction(x: i32, y: i32, dir: u8, n: i32) -> (i32, i32) {
-    let (dx, dy) = match dir % 8 {
-        0 => (0, -1),
-        1 => (1, -1),
-        2 => (1, 0),
-        3 => (1, 1),
-        4 => (0, 1),
-        5 => (-1, 1),
-        6 => (-1, 0),
-        _ => (-1, -1),
-    };
-    (x + dx * n, y + dy * n)
-}
-
-/// Identifies a figure as a civilian wanderer: civilians sit on
+/// Identifies a figure as a civilian: civilians sit on
 /// `Walking` action with a sprite base inside the GFXZIVIL block.
 pub fn is_civilian(fig: &Figure) -> bool {
     CivilianConfig::default().is_civilian(fig)
 }
 
+/// Whether a walking figure uses the source kind-12 route state machine.
+pub fn is_kind12(fig: &Figure) -> bool {
+    CivilianConfig::default().is_kind12(fig)
+}
+
+/// Whether a kind-12 definition renders from `MAEHER.BSH`.
+pub const fn source_kind12_is_worker(definition: u8) -> bool {
+    definition >= CIVILIAN_FIRST_INDEX + CIVILIAN_COUNT
+        && definition < KIND12_FIRST_INDEX + KIND12_FIGURE_COUNT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::building::BuildingInstance;
     use anno_formats::figuren::{FigureAnim, FigureDef, FiguresFile};
-
-    fn mk_def(kind: &str, w: u8, h: u8) -> BuildingDef {
-        BuildingDef {
-            id: 0,
-            category: 0,
-            width: w,
-            height: h,
-            production_type: crate::types::ProductionType::Residence,
-            kind: "GEBAEUDE".into(),
-            prod_kind: kind.into(),
-            radius: 0,
-            output_good: crate::types::Good::None,
-            input_good_1: crate::types::Good::None,
-            input_good_2: crate::types::Good::None,
-            output_rate: 0,
-            input_1_rate: 0,
-            input_2_rate: 0,
-            storage_capacity: 0,
-            cycle_time_ms: 0,
-
-            cost_gold: 0,
-            cost_tools: 0,
-            cost_wood: 0,
-            cost_bricks: 0,
-            maintenance_cost: 0,
-            native: false,
-            min_tier: 0,
-            max_no_input_ticks: 6,
-            can_dry_up: false,
-            wegspeed: [100; 4],
-            has_door: true, // residences in tests have doors
-            upgradeable: true,
-            max_energy: 0,
-            ore_deposit: crate::building::OreDeposit::None,
-            pirate_owned: false,
-            defensive_cannons: 0,
-            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
-            ruin_id: crate::building::NO_RUIN_ID,
-            required_fertility: None,
-        }
-    }
-
-    fn mk_building(island: u8, x: u16, y: u16) -> BuildingInstance {
-        BuildingInstance::new(0, island, x, y, 0)
-    }
 
     #[test]
     fn variant_table_indices_match_figuren_cod() {
@@ -332,44 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn no_spawn_outside_residence() {
-        let def = mk_def("HANDWERK", 2, 2);
-        let b = mk_building(0, 10, 10);
-        let fig = try_spawn_civilian(&b, &def, 0, 0);
-        assert!(fig.is_none());
-    }
-
-    #[test]
-    fn no_spawn_under_construction() {
-        let def = mk_def("WOHN", 2, 2);
-        let mut b = mk_building(0, 10, 10);
-        b.construction_ms_remaining = 5000;
-        let fig = try_spawn_civilian(&b, &def, 0, 0);
-        assert!(fig.is_none());
-    }
-
-    #[test]
-    fn no_spawn_from_inactive_residence() {
-        let def = mk_def("WOHN", 2, 2);
-        let mut b = mk_building(0, 10, 10);
-        b.active = false;
-        let fig = try_spawn_civilian(&b, &def, 0, 0);
-        assert!(fig.is_none());
-    }
-
-    #[test]
-    fn spawn_succeeds_for_finished_residence() {
-        let def = mk_def("WOHN", 2, 2);
-        let b = mk_building(0, 10, 10);
-        let fig = try_spawn_civilian(&b, &def, 7, 0);
-        let fig = fig.expect("should spawn when gate fires");
-        assert_eq!(fig.action, ActionType::Walking);
-        assert_eq!(fig.building_idx, 7);
-        assert!(is_civilian(&fig));
-    }
-
-    #[test]
-    fn civilian_config_uses_figuren_sprite_bases_and_frames() {
+    fn civilian_config_uses_figuren_sprite_bases_frames_and_speeds() {
         let figures = FiguresFile {
             constants: Default::default(),
             figures: vec![
@@ -380,6 +332,7 @@ mod tests {
                         nummer: 0,
                         anim_offs: 3,
                         anim_anz: 6,
+                        anim_speed: 91,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -391,6 +344,7 @@ mod tests {
                         nummer: 0,
                         anim_offs: 5,
                         anim_anz: 7,
+                        anim_speed: 73,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -404,37 +358,86 @@ mod tests {
         assert_eq!(config.sprite_base_for(4), 2205);
         assert_eq!(config.sprite_base_for(1), sprite_base_for(1));
         assert_eq!(config.frames_per_dir, 7);
+        assert_eq!(config.frame_speeds_ms[0], 91);
+        assert_eq!(config.frame_speeds_ms[4], 73);
+
+        let mut figure = Figure::new();
+        figure.sprite_set = CIVILIAN_FIRST_INDEX + 4;
+        assert_eq!(config.frame_speed_for(&figure), 73);
     }
 
     #[test]
-    fn spawned_civilian_uses_source_config_and_figtype_marker() {
-        let def = mk_def("WOHN", 2, 2);
-        let b = mk_building(0, 10, 10);
+    fn default_civilian_config_preserves_authored_variant_cadences() {
+        assert_eq!(
+            CivilianConfig::default().frame_speeds_ms[..CIVILIAN_VARIANT_COUNT],
+            [85, 85, 105, 85, 85, 100, 85, 85]
+        );
+    }
+
+    #[test]
+    fn kind12_worker_definitions_keep_their_maeher_bsh_layout() {
+        let config = CivilianConfig::default();
+        assert_eq!(config.sprite_base_for_definition(0x60), 0);
+        assert_eq!(config.sprite_base_for_definition(0x61), 352);
+        assert_eq!(config.sprite_base_for_definition(0x62), 224);
+        assert_eq!(config.sprite_base_for_definition(0x63), 608);
+        assert_eq!(config.sprite_base_for_definition(0x64), 1120);
+        assert_eq!(config.movement_speed_for_definition(0x60), 220);
+        assert!(source_kind12_is_worker(0x64));
+        assert!(!source_kind12_is_worker(0x5f));
+    }
+
+    #[test]
+    fn civilian_route_permission_masks_match_fun_00480370() {
+        let permitted: Vec<_> = (0..4)
+            .map(|branch| {
+                (0..=24)
+                    .filter(|&kind| source_civilian_path_kind_permitted(branch, kind))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(permitted[0], [13, 17, 22]);
+        assert_eq!(permitted[1], [7, 13, 24]);
+        assert_eq!(permitted[2], [13, 18, 19, 21]);
+        assert_eq!(permitted[3], [13, 20, 23, 24]);
+    }
+
+    #[test]
+    fn kind12_definition_table_matches_fun_00442a90_initializer() {
+        assert_eq!(
+            (0..4)
+                .map(|draw| source_kind12_initial_definition(draw))
+                .collect::<Vec<_>>(),
+            [0x5f, 0x5e, 0x64, 0x5d]
+        );
+        assert_eq!(
+            (0..4)
+                .map(|draw| source_kind12_definition(7, draw))
+                .collect::<Vec<_>>(),
+            [0x5f, 0x60, 0x63, 0x5d]
+        );
+        assert_eq!(
+            (0..4)
+                .map(|draw| source_kind12_definition(22, draw))
+                .collect::<Vec<_>>(),
+            [0x5f, 0x60, 0x62, 0x61]
+        );
+        assert_eq!(source_kind12_definition(13, 0), 0x60);
+        assert_eq!(source_kind12_definition(31, 3), 0x60);
+    }
+
+    #[test]
+    fn configured_civilian_uses_source_figtype_marker() {
         let mut config = CivilianConfig::default();
         config.sprite_bases[2] = 3000;
-        let fig = try_spawn_civilian_with_config(&b, &def, 0, 2 << 8, config)
-            .expect("should spawn when gate fires");
+        let mut fig = Figure::new();
+        fig.action = ActionType::Walking;
+        fig.base_sprite = 3000;
+        fig.sprite_set = CIVILIAN_FIRST_INDEX + 2;
 
         assert_eq!(fig.base_sprite, 3000);
         assert_eq!(fig.sprite_set, CIVILIAN_FIRST_INDEX + 2);
         assert!(config.is_civilian(&fig));
         assert!(is_civilian(&fig));
-    }
-
-    #[test]
-    fn variant_distribution_uses_low_three_bits() {
-        for r in 0..32u64 {
-            let v = pick_variant(r);
-            assert!(v < CIVILIAN_COUNT);
-        }
-    }
-
-    #[test]
-    fn random_word_does_not_gate_eligible_spawn() {
-        let def = mk_def("WOHN", 2, 2);
-        let b = mk_building(0, 10, 10);
-        for r in 0..32u64 {
-            assert!(try_spawn_civilian(&b, &def, 0, r).is_some());
-        }
     }
 }

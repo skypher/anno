@@ -24,6 +24,10 @@ pub struct SourceMapCellState {
     pub raw_material_stock: u16,
     /// Source u16 `+0x0c`, used by the `LagAniFlg` selector path.
     pub storage_fill: u16,
+    /// Source u16 `+0x06`, reserved by `FUN_0047d810` while an in-flight
+    /// type-8 or type-11 transfer figure travels to collect this root's
+    /// output.
+    pub reserved_storage: u16,
     /// Compiled definition `Maxlager` at offset `+0x30`, in the source
     /// record's 1/32-unit storage scale.
     pub storage_animation_capacity: u16,
@@ -51,7 +55,7 @@ impl SourceMapCellState {
     /// `FUN_00481fc0` map-cell record.
     pub fn new(island: u8, x: u8, y: u8, definition: &BuildingDef, phase: u8) -> Option<Self> {
         let kind_code = definition.source_kind_code()?;
-        if !matches!(kind_code, 1..=7) {
+        if !matches!(kind_code, 1..=8 | 30) {
             return None;
         }
         Some(Self {
@@ -64,6 +68,7 @@ impl SourceMapCellState {
             work_material_stock: 0,
             raw_material_stock: 0,
             storage_fill: 0,
+            reserved_storage: 0,
             storage_animation_capacity: definition.storage_animation_capacity,
             source_production_amount: definition.source_production_amount,
             source_raw_material_amount: definition.source_raw_material_amount,
@@ -79,6 +84,40 @@ impl SourceMapCellState {
     #[inline]
     pub fn matches(self, island: u8, x: u16, y: u16) -> bool {
         self.island == island && u16::from(self.x) == x && u16::from(self.y) == y
+    }
+
+    /// Reserve fixed-point output for a type-8 carrier. `FUN_0047d810`
+    /// records this separately from the source's live `+0x0c` stock.
+    pub fn reserve_storage(&mut self, amount: u16) -> bool {
+        if amount == 0 || self.storage_fill.saturating_sub(self.reserved_storage) < amount {
+            return false;
+        }
+        self.reserved_storage = self.reserved_storage.saturating_add(amount);
+        true
+    }
+
+    /// Complete the supplier-side half of a reserved transfer.
+    pub fn collect_reserved_storage(&mut self, amount: u16) -> bool {
+        if amount == 0 || self.reserved_storage < amount || self.storage_fill < amount {
+            return false;
+        }
+        self.reserved_storage -= amount;
+        self.storage_fill -= amount;
+        true
+    }
+
+    /// Undo a reservation when the figure cannot complete its pickup leg.
+    pub fn release_storage_reservation(&mut self, amount: u16) {
+        self.reserved_storage = self.reserved_storage.saturating_sub(amount);
+    }
+
+    /// `FUN_0047d910`'s source-storage ratio used by the type-11
+    /// `FUN_004717b0` selector. This is deliberately independent of the
+    /// type-8 supplier wave in `FUN_00471380`.
+    pub fn storage_fill_score(self) -> Option<u32> {
+        (self.storage_animation_capacity != 0).then_some(
+            (u32::from(self.storage_fill) << 7) / u32::from(self.storage_animation_capacity),
+        )
     }
 
     /// Apply the activity-edge rule from `FUN_0047daf0` / `FUN_004638c0`.
@@ -217,6 +256,53 @@ mod tests {
             .unwrap()
         };
         assert_eq!(state.market_frame_selector(3), 2);
+    }
+
+    #[test]
+    fn storage_reservation_tracks_fun_0047d810_before_collection() {
+        let state = SourceMapCellState {
+            storage_fill: 160,
+            ..SourceMapCellState::new(
+                0,
+                3,
+                5,
+                &BuildingDef {
+                    kind: "HANDWERK".into(),
+                    storage_animation_capacity: 320,
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        };
+
+        let mut state = state;
+        assert!(state.reserve_storage(128));
+        assert_eq!(state.reserved_storage, 128);
+        assert!(state.collect_reserved_storage(128));
+        assert_eq!(state.storage_fill, 32);
+        assert_eq!(state.reserved_storage, 0);
+    }
+
+    #[test]
+    fn storage_fill_score_matches_fun_0047d910() {
+        let state = SourceMapCellState {
+            storage_fill: 160,
+            ..SourceMapCellState::new(
+                0,
+                3,
+                5,
+                &BuildingDef {
+                    kind: "HANDWERK".into(),
+                    storage_animation_capacity: 320,
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(state.storage_fill_score(), Some(64));
     }
 
     #[test]

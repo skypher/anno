@@ -40,6 +40,8 @@ pub struct FigureDef {
     /// Number of separate rotation slices stored in BSH (1 if rotation is
     /// encoded inside the animation frames instead).
     pub rotate: i32,
+    /// Authored figure anchoring offsets from `Posoffs: x, y`.
+    pub position_offset: (i32, i32),
     /// All raw scalar properties (Speed, Maxware, etc.) — keep around so
     /// callers can reach values we haven't promoted to typed fields.
     pub properties: HashMap<String, String>,
@@ -75,7 +77,8 @@ impl FigureDef {
     /// Lookup a numeric property (Speed/Hitpoint/Maxtrag/etc.) from
     /// the property bag, returning 0 when absent.
     fn prop_int(&self, key: &str) -> i32 {
-        self.properties.get(key)
+        self.properties
+            .get(key)
             .and_then(|s| s.split(',').next().and_then(|t| t.trim().parse().ok()))
             .unwrap_or(0)
     }
@@ -83,21 +86,28 @@ impl FigureDef {
     /// Walking speed (`Speed:` in figuren.cod) in 1/100 tile-per-tick
     /// units. Common values: 200 (citizens), 220 (carrier), 230 (adel),
     /// 250 (child), 260 (soldier), 300 (cart), 400 (cavalry).
-    pub fn speed(&self) -> i32 { self.prop_int("Speed") }
+    pub fn speed(&self) -> i32 {
+        self.prop_int("Speed")
+    }
 
     /// Maximum cargo this figure carries in one trip (`Maxtrag:`).
     /// 4 for civilian/Träger figures, 6 for KARREN (cart).
-    pub fn max_load(&self) -> i32 { self.prop_int("Maxtrag") }
+    pub fn max_load(&self) -> i32 {
+        self.prop_int("Maxtrag")
+    }
 
     /// Ship cargo slots (`Maxware:`). Trade ship cargo capacity is
     /// `Maxware × 10` tons.
-    pub fn max_ware(&self) -> i32 { self.prop_int("Maxware") }
+    pub fn max_ware(&self) -> i32 {
+        self.prop_int("Maxware")
+    }
 
     /// Hit-points for combat figures (`Hitpoint:`) as a float.
     /// Naval ships carry fractional values (KRIEG1 = 2.0,
     /// KRIEG2 = 4.0 etc.); land units use whole numbers.
     pub fn hit_points_f32(&self) -> f32 {
-        self.properties.get("Hitpoint")
+        self.properties
+            .get("Hitpoint")
             .and_then(|s| s.split(',').next().and_then(|t| t.trim().parse().ok()))
             .unwrap_or(0.0)
     }
@@ -105,33 +115,45 @@ impl FigureDef {
     /// Hit-points truncated to i32 for callers that want
     /// integer HP. Use `hit_points_f32` if you need the
     /// authentic fractional value (KRIEG1 = 2.0, etc.).
-    pub fn hit_points(&self) -> i32 { self.hit_points_f32() as i32 }
+    pub fn hit_points(&self) -> i32 {
+        self.hit_points_f32() as i32
+    }
 
     /// Maximum energy (`Maxenergy:`) — legacy "stamina" cap
     /// that doubles as the ship's HP-for-display value
     /// (KRIEG1 = 65, KRIEG2 = 120 — matches Tim Howgego's
     /// military-data appendix).
-    pub fn max_energy(&self) -> i32 { self.prop_int("Maxenergy") }
+    pub fn max_energy(&self) -> i32 {
+        self.prop_int("Maxenergy")
+    }
 
     /// Build cost in gold (`Preis:`). Used for non-Soldat figures
     /// (ships, carts) that aren't gated through the SOLDAT lookup.
-    pub fn price(&self) -> i32 { self.prop_int("Preis") }
+    pub fn price(&self) -> i32 {
+        self.prop_int("Preis")
+    }
 
     /// Workload duration / cycle time (`Worktime:`). Plantation
     /// workers (MAEHER, HOLZFAELLER, etc.) have 8; civilians 3.
-    pub fn worktime(&self) -> i32 { self.prop_int("Worktime") }
+    pub fn worktime(&self) -> i32 {
+        self.prop_int("Worktime")
+    }
 
     /// Maximum cannons mountable on a naval figure (`Maxkanon:`).
     /// Used by ship-arming UI in lieu of the hard-coded
     /// `combat::cannon_capacity` table when figuren.cod is
     /// available.
-    pub fn max_cannons(&self) -> i32 { self.prop_int("Maxkanon") }
+    pub fn max_cannons(&self) -> i32 {
+        self.prop_int("Maxkanon")
+    }
 
     /// Ship firing/approach radius (`Shotradius:`). The figure loader writes
     /// this unsigned 16-bit value at runtime offset `+0x4a`; the ship-route
     /// caller `FUN_00455a20` supplies `Shotradius >> 3` to
     /// `FUN_0046dde0` when it marks target-approach rays.
-    pub fn shot_radius(&self) -> i32 { self.prop_int("Shotradius") }
+    pub fn shot_radius(&self) -> i32 {
+        self.prop_int("Shotradius")
+    }
 }
 
 impl FiguresFile {
@@ -152,9 +174,13 @@ impl FiguresFile {
 
         for line in text.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with(';') { continue; }
+            if line.is_empty() || line.starts_with(';') {
+                continue;
+            }
             let line = line.split(';').next().unwrap_or(line).trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
 
             // Sub-object boundaries. ANIM is the only nested form we model;
             // FIGUR / FORMATION are top-level containers whose contents
@@ -218,7 +244,8 @@ impl FiguresFile {
                     // Inside a non-ANIM Objekt: keep as raw property; don't
                     // treat as a figure boundary.
                     if let Some(fig) = current.as_mut() {
-                        fig.properties.insert("InnerNummer".to_string(), val.to_string());
+                        fig.properties
+                            .insert("InnerNummer".to_string(), val.to_string());
                     }
                 } else {
                     if let Some(fig) = current.take() {
@@ -249,6 +276,7 @@ impl FiguresFile {
                         fig.gfx = src.gfx;
                         fig.blocknr = src.blocknr;
                         fig.rotate = src.rotate;
+                        fig.position_offset = src.position_offset;
                         fig.anims = src.anims.clone();
                         for (k, v) in src.properties {
                             fig.properties.entry(k).or_insert(v);
@@ -329,12 +357,17 @@ impl FiguresFile {
                 }
                 continue;
             }
+            if let Some(rest) = line.strip_prefix("Posoffs:") {
+                let mut values = rest.split(',').map(|value| eval(&constants, value.trim()));
+                if let Some(fig) = current.as_mut() {
+                    fig.position_offset = (values.next().unwrap_or(0), values.next().unwrap_or(0));
+                }
+                continue;
+            }
             if let Some((key, value)) = line.split_once(':') {
                 if let Some(fig) = current.as_mut() {
-                    fig.properties.insert(
-                        key.trim().to_string(),
-                        value.trim().to_string(),
-                    );
+                    fig.properties
+                        .insert(key.trim().to_string(), value.trim().to_string());
                 }
                 continue;
             }
@@ -354,12 +387,13 @@ impl FiguresFile {
     pub fn find(&self, name: &str) -> Option<&FigureDef> {
         self.figures.iter().find(|f| f.name == name)
     }
-
 }
 
 fn decrypt(data: &[u8]) -> String {
     let raw: Vec<u8> = if data.len() > 4
-        && data[..4].iter().all(|&b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+        && data[..4]
+            .iter()
+            .all(|&b| b.is_ascii_graphic() || b.is_ascii_whitespace())
     {
         data.to_vec()
     } else {
@@ -371,14 +405,18 @@ fn decrypt(data: &[u8]) -> String {
 /// Evaluate `NUMBER`, `CONSTANT`, or `CONSTANT±NUMBER`.
 fn eval(constants: &HashMap<String, i32>, expr: &str) -> i32 {
     let expr = expr.trim();
-    if expr.is_empty() { return 0; }
+    if expr.is_empty() {
+        return 0;
+    }
 
     if let Ok(n) = expr.parse::<i32>() {
         return n;
     }
     for op in ['+', '-'] {
         if let Some(idx) = expr.rfind(op) {
-            if idx == 0 { continue; }
+            if idx == 0 {
+                continue;
+            }
             let (left, right) = expr.split_at(idx);
             let left = left.trim();
             let right = right[1..].trim();
@@ -526,12 +564,35 @@ Nummer: SOLDAT2
         assert_eq!(traeger.rotate, 8);
         assert_eq!(traeger.speed(), 220);
         assert_eq!(traeger.max_load(), 4);
+        assert_eq!(traeger.position_offset, (0, 5));
         let walk = traeger.walk_anim().expect("walk anim");
         assert_eq!(walk.anim_anz, 8);
         assert_eq!(walk.anim_offs, 0);
+        assert_eq!(walk.anim_speed, 85);
         let loaded = traeger.anim(1).expect("loaded carrier anim");
         assert_eq!(loaded.anim_anz, 8);
         assert_eq!(loaded.anim_offs, 64);
+        assert_eq!(loaded.anim_speed, 85);
+        let karren = f.find("KARREN").expect("KARREN must exist");
+        assert_eq!(karren.gfx, 496);
+        assert_eq!(karren.rotate, 8);
+        assert_eq!(karren.speed(), 300);
+        assert_eq!(karren.max_load(), 6);
+        assert_eq!(karren.position_offset, (0, 5));
+        let cart_walk = karren.walk_anim().expect("cart walk anim");
+        assert_eq!(cart_walk.anim_anz, 8);
+        assert_eq!(cart_walk.anim_offs, 0);
+        assert_eq!(cart_walk.anim_speed, 60);
+        let cart_loaded = karren.anim(1).expect("loaded cart anim");
+        assert_eq!(cart_loaded.anim_anz, 8);
+        assert_eq!(cart_loaded.anim_offs, 64);
+        assert_eq!(cart_loaded.anim_speed, 60);
+        let noblewoman = f.find("ADELWEIBL").expect("ADELWEIBL must exist");
+        assert_eq!(noblewoman.position_offset, (0, 5));
+        assert_eq!(
+            noblewoman.properties.get("Schatten").map(String::as_str),
+            Some("SCHATTEN")
+        );
         let handel1 = f.find("HANDEL1").expect("HANDEL1 must exist");
         assert_eq!(handel1.gfx, 0);
         assert_eq!(handel1.rotate, 1);
@@ -611,7 +672,9 @@ Nummer: SOLDAT2
         for (family, bases, anim_speed) in families {
             for (idx, base) in bases.into_iter().enumerate() {
                 let name = format!("{}{}", family, idx + 1);
-                let def = f.find(&name).unwrap_or_else(|| panic!("{name} in figuren.cod"));
+                let def = f
+                    .find(&name)
+                    .unwrap_or_else(|| panic!("{name} in figuren.cod"));
                 assert_eq!(def.gfx, base, "{name} gfx");
                 assert_eq!(def.rotate, 8, "{name} rotate");
                 assert_eq!(def.walk_anim().unwrap().anim_offs, 0, "{name} walk offset");

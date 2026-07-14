@@ -1,43 +1,171 @@
-//! Carrier dispatching and movement.
+//! Type-8 carrier dispatching and movement.
 //!
-//! Carriers transport goods between production buildings and warehouses.
-//! When a building's output stock exceeds half capacity, a carrier is
-//! spawned to pick up goods and deliver them to the nearest warehouse.
-//!
-//! Carrier lifecycle:
-//!   1. Spawned at production building (CarryingGoods action)
-//!   2. Walks A* path to nearest warehouse on same island
-//!   3. Deposits goods at warehouse
-//!   4. Walks A* path back to production building (Returning action)
-//!   5. Despawns when back at building
+//! The generic `TRAEGER` constructor (`FUN_0044ab60`) starts at a requesting
+//! source root. `FUN_00471380` then finds the first reachable producer of the
+//! requested good and reserves its fixed-point output through `FUN_0047d810`.
+//! The figure walks empty to that supplier, collects the reservation through
+//! `FUN_0047d640`, and returns loaded to the requesting root for
+//! `FUN_0047d940` delivery.
 
 use crate::building::{BuildingDef, BuildingInstance};
-use crate::coverage::CoverageMap;
-use crate::entity::{ActionType, Figure};
+use crate::entity::{ActionType, CargoRoute, Figure};
 use crate::island_map::IslandMap;
 use crate::pathfinding;
-use crate::types::Good;
-use crate::warehouse::{self, Warehouse};
+use crate::source_cell::SourceMapCellState;
+use crate::source_route::{
+    SourcePathBlockedCellDecision, SourcePathTargetRect, source_route_positions,
+};
+use crate::types::{Good, SOURCE_WARE_GOODS};
+use crate::warehouse::Warehouse;
 
 /// Carrier walking speed in sub-tiles per movement tick (100ms).
-/// Current normalized internal step; `figuren.cod` source speed is
-/// parsed and pinned separately.
-const CARRIER_SPEED: u16 = 4;
+pub const CARRIER_SPEED: u16 = 4;
+
+/// `FUN_00451890` converts a simulation delta to figure-motion time by
+/// multiplying it by this constant.
+const SOURCE_MOTION_TIME_SCALE: f32 = 0.05;
+
+/// The figure-definition loader stores `Speed × 0.0001` at runtime offset
+/// `+0x10` before `FUN_0044a690` applies the terrain `Wegspeed` divisor.
+const SOURCE_FIGURE_SPEED_SCALE: f32 = 0.0001;
+
+const SOURCE_DIAGONAL_DISTANCE: f32 = std::f32::consts::SQRT_2;
 
 /// Fallback TRAEGER cargo capacity per trip, from figuren.cod `Maxtrag: 4`.
 const DEFAULT_CARRIER_MAX_LOAD: u16 = 4;
+
+/// TRAEGER `Gfx: GFXTRAEGER` resolves to this BSH sprite base.
+const DEFAULT_CARRIER_SPRITE_BASE: u16 = 0;
+const DEFAULT_CARRIER_FRAME_SPEED_MS: u16 = 85;
+const DEFAULT_CARRIER_FRAMES_PER_DIRECTION: u8 = 8;
+
+/// Fallback KARREN cargo capacity per trip, from figuren.cod `Maxtrag: 6`.
+const DEFAULT_CITY_CART_MAX_LOAD: u16 = 6;
+
+/// KARREN `Gfx: GFXKARREN` resolves to this BSH sprite base.
+const DEFAULT_CITY_CART_SPRITE_BASE: u16 = 496;
+const DEFAULT_CITY_CART_FRAME_SPEED_MS: u16 = 60;
+const DEFAULT_CITY_CART_FRAMES_PER_DIRECTION: u8 = 8;
+
+/// Source-map quantities use 1/32-unit fixed-point storage.
+const SOURCE_STORAGE_UNIT: u16 = 32;
+
+/// Compile a `Wegspeed` percentage into the low-seven-bit source path class.
+/// `FUN_00462852` uses `min(126, floor(speed * 32 / 100))`.
+pub const fn source_path_class(speed: u16) -> u8 {
+    (((speed as u32).saturating_mul(32) / 100).min(126)) as u8
+}
+
+/// `FUN_0045d0b0` scales a moving figure's authored `AnimSpeed` by its
+/// current terrain path class. Idle `ENDLESS` animation uses the raw speed.
+pub const fn source_animation_frame_duration_ms(
+    authored_anim_speed_ms: u16,
+    terrain_wegspeed: u16,
+    moving: bool,
+) -> u32 {
+    let raw = if authored_anim_speed_ms == 0 {
+        1
+    } else {
+        authored_anim_speed_ms as u32
+    };
+    let duration = if moving {
+        raw.saturating_mul(source_path_class(terrain_wegspeed) as u32) / 32
+    } else {
+        raw
+    };
+    if duration == 0 { 1 } else { duration }
+}
+
+/// The source loader multiplies one authored decimal rate by the 8192.0
+/// constant at `0x496450`, truncates it, and divides by its 600-tick minute
+/// scale before FUN_0047f7b0 consumes it.
+const fn city_demand_rate(authored_tenths: u32) -> u32 {
+    authored_tenths.saturating_mul(8_192) / 6_000
+}
+
+const FOOD_DEMAND_RATE: u32 = city_demand_rate(13);
+const CLOTH_DEMAND_RATES: [u32; 5] = [
+    0,
+    city_demand_rate(6),
+    city_demand_rate(7),
+    city_demand_rate(8),
+    0,
+];
+const ALCOHOL_DEMAND_RATES: [u32; 5] = [
+    0,
+    city_demand_rate(5),
+    city_demand_rate(6),
+    city_demand_rate(7),
+    city_demand_rate(8),
+];
+const TOBACCO_PRODUCTS_DEMAND_RATES: [u32; 5] = [
+    0,
+    0,
+    city_demand_rate(5),
+    city_demand_rate(6),
+    city_demand_rate(6),
+];
+const SPICES_DEMAND_RATES: [u32; 5] = [
+    0,
+    0,
+    city_demand_rate(5),
+    city_demand_rate(6),
+    city_demand_rate(6),
+];
+const COCOA_DEMAND_RATES: [u32; 5] = [0, 0, 0, city_demand_rate(7), city_demand_rate(6)];
+const CLOTHING_DEMAND_RATES: [u32; 5] = [0, 0, 0, 0, city_demand_rate(5)];
+const JEWELRY_DEMAND_RATES: [u32; 5] = [0, 0, 0, 0, city_demand_rate(2)];
+
+fn city_demand_target(good: Good, population: [u32; 5]) -> u32 {
+    let weighted_total = match good {
+        Good::Food => population
+            .into_iter()
+            .fold(0u32, |total, tier| total.saturating_add(tier))
+            .saturating_mul(FOOD_DEMAND_RATE),
+        Good::Cloth => weighted_population(population, CLOTH_DEMAND_RATES),
+        Good::Alcohol => weighted_population(population, ALCOHOL_DEMAND_RATES),
+        Good::TobaccoProducts => weighted_population(population, TOBACCO_PRODUCTS_DEMAND_RATES),
+        Good::Spices => weighted_population(population, SPICES_DEMAND_RATES),
+        Good::Cocoa => weighted_population(population, COCOA_DEMAND_RATES),
+        Good::Clothing => weighted_population(population, CLOTHING_DEMAND_RATES),
+        Good::Jewelry => weighted_population(population, JEWELRY_DEMAND_RATES),
+        _ => 0,
+    };
+    weighted_total.saturating_mul(6) >> 8
+}
+
+fn weighted_population(population: [u32; 5], rates: [u32; 5]) -> u32 {
+    population
+        .into_iter()
+        .zip(rates)
+        .fold(0u32, |total, (population, rate)| {
+            total.saturating_add(population.saturating_mul(rate))
+        })
+}
 
 /// Source-derived carrier constants used by the simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CarrierConfig {
     /// Maximum goods moved by one TRAEGER trip.
     pub max_load: u16,
+    /// Authored TRAEGER `Speed` used by source-grid traversal.
+    pub movement_speed: u16,
+    /// Resolved empty-walk TRAEGER sprite base in its BSH file.
+    pub sprite_base: u16,
+    /// Authored `ANIM 0` frame duration.
+    pub frame_speed_ms: u16,
+    /// Authored `ANIM 0` frames in each rotation strip.
+    pub frames_per_direction: u8,
 }
 
 impl Default for CarrierConfig {
     fn default() -> Self {
         Self {
             max_load: DEFAULT_CARRIER_MAX_LOAD,
+            movement_speed: 220,
+            sprite_base: DEFAULT_CARRIER_SPRITE_BASE,
+            frame_speed_ms: DEFAULT_CARRIER_FRAME_SPEED_MS,
+            frames_per_direction: DEFAULT_CARRIER_FRAMES_PER_DIRECTION,
         }
     }
 }
@@ -49,115 +177,681 @@ impl CarrierConfig {
             .ok()
             .filter(|&n| n > 0)
             .unwrap_or(default.max_load);
-        Self { max_load }
+        let movement_speed = u16::try_from(def.speed())
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or(default.movement_speed);
+        let sprite_base = def
+            .gfx
+            .checked_add(
+                def.walk_anim()
+                    .map(|animation| animation.anim_offs)
+                    .unwrap_or(0),
+            )
+            .and_then(|sprite| u16::try_from(sprite).ok())
+            .unwrap_or(default.sprite_base);
+        let frame_speed_ms = def
+            .walk_anim()
+            .and_then(|anim| u16::try_from(anim.anim_speed).ok())
+            .filter(|&speed| speed > 0)
+            .unwrap_or(default.frame_speed_ms);
+        let frames_per_direction = def
+            .walk_anim()
+            .and_then(|anim| u8::try_from(anim.anim_anz).ok())
+            .filter(|&frames| frames > 0)
+            .unwrap_or(default.frames_per_direction);
+        Self {
+            max_load,
+            movement_speed,
+            sprite_base,
+            frame_speed_ms,
+            frames_per_direction,
+        }
     }
 }
 
-/// Try to spawn a carrier for a production building.
-/// Returns Some(figure) if a carrier was created.
-pub fn try_spawn_carrier(
-    building: &mut BuildingInstance,
-    def: &BuildingDef,
-    warehouses: &[Warehouse],
-    island_maps: &[IslandMap],
-    coverage_maps: &[CoverageMap],
-    config: CarrierConfig,
-) -> Option<Figure> {
-    if def.output_good == Good::None || def.storage_capacity == 0 {
-        return None;
-    }
+/// Source-derived cart capacity for the type-11 MARKT/KONTOR/HAUPT transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CityCartConfig {
+    /// Maximum goods moved by one KARREN trip.
+    pub max_load: u16,
+    /// Authored KARREN `Speed` used by source-grid traversal.
+    pub movement_speed: u16,
+    /// Resolved empty-walk KARREN sprite base in its BSH file.
+    pub sprite_base: u16,
+    /// Authored `ANIM 0` frame duration.
+    pub frame_speed_ms: u16,
+    /// Authored `ANIM 0` frames in each rotation strip.
+    pub frames_per_direction: u8,
+}
 
-    // Only spawn when output exceeds half capacity
-    if building.output_stock <= def.storage_capacity / 2 {
-        return None;
-    }
+/// Per-good selector bytes built by the city object before a type-11 cart
+/// search. FUN_00480610 writes zero for unavailable city capacity, one for
+/// ordinary demand, and two for below-half population demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CityCartEligibility {
+    pub owner: u8,
+    priorities: [u8; 25],
+}
 
-    // Marketplace adjacency: a production building only ships goods if at
-    // least one of its footprint tiles is inside the island's service
-    // coverage (warehouse base radius + marketplace overlays). If the
-    // island has a coverage map but the building falls outside, the
-    // carrier won't spawn — output backs up and efficiency tanks until
-    // the player builds a closer warehouse / marketplace.
-    if let Some(cov) = coverage_maps
-        .iter()
-        .find(|c| c.island_id == building.island_id)
-    {
-        let bx = building.tile_x;
-        let by = building.tile_y;
-        let bw = def.width as u16;
-        let bh = def.height as u16;
-        let mut any = false;
-        for dy in 0..bh.max(1) {
-            for dx in 0..bw.max(1) {
-                if cov.is_covered(bx + dx, by + dy) {
-                    any = true;
-                    break;
-                }
+impl CityCartEligibility {
+    /// Reproduce FUN_00480610 from the local city inventory, its source
+    /// shared capacity, and the STADT4 BGRUPPE population counts.
+    pub fn from_city_store(warehouse: &Warehouse, city_capacity_fixed: u32) -> Self {
+        let mut priorities = [0; 25];
+        for (raw_good, good) in SOURCE_WARE_GOODS {
+            let stock_fixed = u32::from(warehouse.city_stock_fixed(good));
+            if city_capacity_fixed.saturating_sub(stock_fixed) < u32::from(SOURCE_STORAGE_UNIT) {
+                continue;
             }
-            if any {
-                break;
-            }
+            let target = city_demand_target(good, warehouse.city_population);
+            priorities[raw_good as usize] = if stock_fixed < target / 2 { 2 } else { 1 };
         }
-        if !any {
+        Self {
+            owner: warehouse.owner,
+            priorities,
+        }
+    }
+
+    /// Construct decoded selector bytes directly for a city object.
+    pub fn from_priorities(owner: u8, priorities: [u8; 25]) -> Self {
+        Self { owner, priorities }
+    }
+
+    fn priority(self, good: Good) -> u8 {
+        good.source_ware_slot()
+            .and_then(|slot| self.priorities.get(slot as usize).copied())
+            .unwrap_or(0)
+    }
+}
+
+impl Default for CityCartConfig {
+    fn default() -> Self {
+        Self {
+            max_load: DEFAULT_CITY_CART_MAX_LOAD,
+            movement_speed: 300,
+            sprite_base: DEFAULT_CITY_CART_SPRITE_BASE,
+            frame_speed_ms: DEFAULT_CITY_CART_FRAME_SPEED_MS,
+            frames_per_direction: DEFAULT_CITY_CART_FRAMES_PER_DIRECTION,
+        }
+    }
+}
+
+impl CityCartConfig {
+    pub fn from_figure_def(def: &anno_formats::figuren::FigureDef) -> Self {
+        let default = Self::default();
+        let max_load = u16::try_from(def.max_load())
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or(default.max_load);
+        let movement_speed = u16::try_from(def.speed())
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or(default.movement_speed);
+        let sprite_base = def
+            .gfx
+            .checked_add(
+                def.walk_anim()
+                    .map(|animation| animation.anim_offs)
+                    .unwrap_or(0),
+            )
+            .and_then(|sprite| u16::try_from(sprite).ok())
+            .unwrap_or(default.sprite_base);
+        let frame_speed_ms = def
+            .walk_anim()
+            .and_then(|anim| u16::try_from(anim.anim_speed).ok())
+            .filter(|&speed| speed > 0)
+            .unwrap_or(default.frame_speed_ms);
+        let frames_per_direction = def
+            .walk_anim()
+            .and_then(|anim| u8::try_from(anim.anim_anz).ok())
+            .filter(|&frames| frames > 0)
+            .unwrap_or(default.frames_per_direction);
+        Self {
+            max_load,
+            movement_speed,
+            sprite_base,
+            frame_speed_ms,
+            frames_per_direction,
+        }
+    }
+}
+
+/// A source root which can satisfy a generic carrier request. This is derived
+/// from active buildings before dispatch so the mutable source-state table can
+/// reserve the selected root without aliasing the building collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarrierSupplier {
+    pub island: u8,
+    pub owner: u8,
+    pub x: u16,
+    pub y: u16,
+    pub good: Good,
+    pub available: u16,
+    pub storage: CarrierSupplierStorage,
+    /// `Wegspeed[Speedtyp]` compiled into the source-grid path class for
+    /// this producer root. The generic supplier set uses TRAEGER's
+    /// `Speedtyp: 0`; city scheduling derives a KARREN `Speedtyp: 2` view.
+    pub source_path_class: u8,
+    /// Oriented source-map footprint of this root. `FUN_004706e0` marks each
+    /// of these cells as an owner-specific callback target.
+    pub source_footprint: (u8, u8),
+}
+
+/// Backing stock selected by the generic source search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarrierSupplierStorage {
+    SourceRoot,
+    Warehouse(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CarrierRequest {
+    good: Good,
+    amount: u16,
+}
+
+/// Choose the input whose stock is closest to exhaustion. The source scheduler
+/// starts a generic carrier below two production batches, which corresponds to
+/// its 256/128 stock-ratio threshold.
+fn carrier_request(
+    building: &BuildingInstance,
+    def: &BuildingDef,
+    max_load: u16,
+) -> Option<CarrierRequest> {
+    [
+        (def.input_good_1, building.input_1_stock, def.input_1_rate),
+        (def.input_good_2, building.input_2_stock, def.input_2_rate),
+    ]
+    .into_iter()
+    .filter_map(|(good, stock, rate)| {
+        if good == Good::None {
             return None;
         }
+        let batch = rate.max(1);
+        let target = batch.saturating_mul(2);
+        (stock < target).then_some((good, stock, batch, target))
+    })
+    .min_by_key(|(_, stock, batch, _)| (u32::from(*stock) << 16) / u32::from(*batch))
+    .map(|(good, stock, _, target)| CarrierRequest {
+        good,
+        amount: target.saturating_sub(stock).min(max_load).max(1),
+    })
+}
+
+/// Run FUN_00471380's first-reservable type-8 supplier search. The callback
+/// accepts the first same-owner root whose requested input has at least half
+/// a TRAEGER load available, reserving up to the full fixed-point load.
+fn select_carrier_source_wave(
+    start: (i32, i32),
+    island: u8,
+    owner: u8,
+    requested_good: Good,
+    suppliers: &[CarrierSupplier],
+    source_cells: &[SourceMapCellState],
+    warehouses: &[Warehouse],
+    map: &IslandMap,
+    max_load: u16,
+) -> Option<(usize, CarrierSupplier, (i32, i32), Vec<(i32, i32)>, u16)> {
+    let max_fixed = max_load.checked_mul(SOURCE_STORAGE_UNIT)?;
+    let minimum_fixed = max_fixed / 2;
+    let mut grid = map.carrier_path_grid();
+
+    for candidate in source_cells.iter().copied() {
+        if candidate.island != island || !matches!(candidate.kind_code, 1..=8) {
+            continue;
+        }
+        let Some(supplier) = suppliers.iter().copied().find(|supplier| {
+            supplier.island == candidate.island
+                && supplier.owner == owner
+                && supplier.x == u16::from(candidate.x)
+                && supplier.y == u16::from(candidate.y)
+        }) else {
+            continue;
+        };
+        let position = (i32::from(candidate.x), i32::from(candidate.y));
+        let Some(target) = SourcePathTargetRect::new(
+            position,
+            usize::from(supplier.source_footprint.0.max(1)),
+            usize::from(supplier.source_footprint.1.max(1)),
+        ) else {
+            continue;
+        };
+        // FUN_004704d0 replaces both the callback bit and the low-seven-bit
+        // path class with the candidate root's `Wegspeed[Speedtyp]` entry.
+        grid.set_target_region_metadata(target, (supplier.source_path_class & 0x7f) | 0x80);
     }
 
-    // Find nearest warehouse on same island
-    let wh_idx = warehouse::find_nearest_warehouse(
-        warehouses,
-        building.island_id,
-        building.owner,
-        building.tile_x,
-        building.tile_y,
-    )?;
+    let mut selected: Option<(usize, CarrierSupplier, (i32, i32), u16)> = None;
+    let result = grid
+        .search_with_blocked_cell_callback(start, |position, _| {
+            let Some((state_idx, candidate, supplier)) =
+                source_cells.iter().copied().enumerate().rev().find_map(
+                    |(state_idx, candidate)| {
+                        let supplier = suppliers.iter().copied().find(|supplier| {
+                            supplier.island == candidate.island
+                                && supplier.owner == owner
+                                && supplier.x == u16::from(candidate.x)
+                                && supplier.y == u16::from(candidate.y)
+                        })?;
+                        let within_footprint = candidate.island == island
+                            && matches!(candidate.kind_code, 1..=8)
+                            && position.0 >= i32::from(candidate.x)
+                            && position.1 >= i32::from(candidate.y)
+                            && position.0
+                                < i32::from(candidate.x)
+                                    + i32::from(supplier.source_footprint.0.max(1))
+                            && position.1
+                                < i32::from(candidate.y)
+                                    + i32::from(supplier.source_footprint.1.max(1));
+                        within_footprint.then_some((state_idx, candidate, supplier))
+                    },
+                )
+            else {
+                return SourcePathBlockedCellDecision::Block;
+            };
+            if supplier.good != requested_good {
+                return SourcePathBlockedCellDecision::Block;
+            }
+            let available_fixed = match supplier.storage {
+                CarrierSupplierStorage::SourceRoot => candidate
+                    .storage_fill
+                    .saturating_sub(candidate.reserved_storage),
+                CarrierSupplierStorage::Warehouse(warehouse_idx) => warehouses
+                    .get(warehouse_idx)
+                    .map(|warehouse| {
+                        warehouse
+                            .stock(requested_good)
+                            .saturating_sub(warehouse.reserved(requested_good))
+                            .saturating_mul(SOURCE_STORAGE_UNIT)
+                    })
+                    .unwrap_or(0),
+            };
+            let reserved_fixed = available_fixed.min(max_fixed);
+            if reserved_fixed < minimum_fixed || reserved_fixed == 0 {
+                return SourcePathBlockedCellDecision::Block;
+            }
+            selected = Some((state_idx, supplier, position, reserved_fixed));
+            SourcePathBlockedCellDecision::Complete
+        })
+        .ok()?;
+    let (state_idx, supplier, reached, reserved_fixed) = selected?;
+    if result.position != reached {
+        return None;
+    }
+    let path = source_route_positions(start, &result.steps)?;
+    (path.last().copied() == Some(reached)).then_some((
+        state_idx,
+        supplier,
+        reached,
+        path,
+        reserved_fixed,
+    ))
+}
 
-    let wh = &warehouses[wh_idx];
-
-    // Compute A* path if island map is available
-    let start = (building.tile_x as i32, building.tile_y as i32);
-    let goal = (wh.tile_x as i32, wh.tile_y as i32);
-
-    let path = if let Some(map) = island_maps
+/// Try to spawn a generic type-8 carrier for a production input request.
+/// Returns `Some(figure)` only after reserving the selected supplier's source
+/// storage.
+pub fn try_spawn_carrier(
+    building: &BuildingInstance,
+    def: &BuildingDef,
+    suppliers: &[CarrierSupplier],
+    source_cells: &mut [SourceMapCellState],
+    warehouses: &mut [Warehouse],
+    island_maps: &[IslandMap],
+    config: CarrierConfig,
+) -> Option<Figure> {
+    let request = carrier_request(building, def, config.max_load)?;
+    let start = (i32::from(building.tile_x), i32::from(building.tile_y));
+    let map = island_maps
         .iter()
-        .find(|m| m.island_id == building.island_id)
-    {
-        pathfinding::find_path_for_carrier(map, start, goal, pathfinding::CarrierLoad::Loaded)?
-    } else {
-        direct_path(start, goal)
-    };
+        .find(|map| map.island_id == building.island_id);
 
-    let amount = building.output_stock.min(config.max_load);
-    building.output_stock -= amount;
+    let mut selected: Option<(usize, CarrierSupplier, (i32, i32), Vec<(i32, i32)>, u16)> = None;
+    if let Some(map) = map {
+        let (state_idx, supplier, reached, path, cargo_fixed) = select_carrier_source_wave(
+            start,
+            building.island_id,
+            building.owner,
+            request.good,
+            suppliers,
+            source_cells,
+            warehouses,
+            map,
+            config.max_load,
+        )?;
+        selected = Some((state_idx, supplier, reached, path, cargo_fixed));
+    }
+
+    // No static source grid is available for this island. Keep the direct
+    // coordinate fallback for synthetic maps and save replay diagnostics.
+    for (state_idx, cell) in source_cells.iter().enumerate() {
+        if map.is_some() {
+            break;
+        }
+        if cell.island != building.island_id {
+            continue;
+        }
+        let Some(supplier) = suppliers.iter().find(|supplier| {
+            supplier.island == cell.island
+                && supplier.owner == building.owner
+                && supplier.x == u16::from(cell.x)
+                && supplier.y == u16::from(cell.y)
+                && supplier.good == request.good
+                && supplier.available >= request.amount
+        }) else {
+            continue;
+        };
+        let valid_storage = match supplier.storage {
+            CarrierSupplierStorage::SourceRoot => {
+                !matches!(cell.kind_code, 7 | 8)
+                    && cell.storage_fill.saturating_sub(cell.reserved_storage)
+                        >= request.amount.saturating_mul(SOURCE_STORAGE_UNIT)
+            }
+            CarrierSupplierStorage::Warehouse(warehouse_idx) => {
+                matches!(cell.kind_code, 7 | 8)
+                    && warehouses.get(warehouse_idx).is_some_and(|warehouse| {
+                        warehouse
+                            .stock(request.good)
+                            .saturating_sub(warehouse.reserved(request.good))
+                            >= request.amount
+                    })
+            }
+        };
+        if !valid_storage {
+            continue;
+        }
+        let goal = (i32::from(supplier.x), i32::from(supplier.y));
+        let path = direct_path(start, goal);
+        if selected
+            .as_ref()
+            .is_none_or(|(_, _, _, best_path, _)| path.len() < best_path.len())
+        {
+            selected = Some((
+                state_idx,
+                *supplier,
+                goal,
+                path,
+                request.amount.saturating_mul(SOURCE_STORAGE_UNIT),
+            ));
+        }
+    }
+
+    let (state_idx, selected_supplier, reached, path, cargo_fixed) = selected?;
+    let cargo = cargo_fixed / SOURCE_STORAGE_UNIT;
+    if cargo_fixed == 0
+        || (matches!(
+            selected_supplier.storage,
+            CarrierSupplierStorage::Warehouse(_)
+        ) && cargo == 0)
+    {
+        return None;
+    }
+    let supplier = source_cells.get_mut(state_idx)?;
+    let reserved = match selected_supplier.storage {
+        CarrierSupplierStorage::SourceRoot => supplier.reserve_storage(cargo_fixed),
+        CarrierSupplierStorage::Warehouse(warehouse_idx) => warehouses
+            .get_mut(warehouse_idx)
+            .is_some_and(|warehouse| warehouse.reserve(request.good, cargo)),
+    };
+    if !reserved {
+        return None;
+    }
 
     let mut carrier = Figure::new();
     carrier.action = ActionType::CarryingGoods;
     carrier.owner = building.owner;
-    carrier.tile_x = building.tile_x as i32;
-    carrier.tile_y = building.tile_y as i32;
-    carrier.target_x = wh.tile_x as i32;
-    carrier.target_y = wh.tile_y as i32;
-    carrier.building_idx = 0; // Will be set by caller
-    carrier.carried_good = def.output_good as u8;
-    carrier.carried_amount = amount;
+    carrier.tile_x = i32::from(building.tile_x);
+    carrier.tile_y = i32::from(building.tile_y);
+    carrier.target_x = reached.0;
+    carrier.target_y = reached.1;
+    carrier.destination_kind = supplier.kind_code;
+    carrier.supplier_x = supplier.x;
+    carrier.supplier_y = supplier.y;
+    carrier.carried_good = request.good as u8;
+    carrier.carried_amount = cargo;
+    carrier.cargo_fixed = cargo_fixed;
     carrier.speed = CARRIER_SPEED;
+    carrier.source_move_speed = config.movement_speed;
+    carrier.base_sprite = config.sprite_base;
+    carrier.initialize_source_position();
+    carrier.source_position_z = map
+        .and_then(|map| map.source_terrain_height(start))
+        .unwrap_or(0.0)
+        .max(0.56);
     carrier.path = path;
     carrier.path_idx = 0;
-
     Some(carrier)
 }
 
-/// Move a carrier one step along its path.
-/// Returns true if the carrier reached its target.
+/// Start a type-11 city cart from a MARKT, KONTOR, or HAUPT source root.
+/// `FUN_004717b0` retains the strictly highest `storage_fill × 128 /
+/// Maxlager` candidate, accepts consumer goods 11 through 24 at any positive
+/// score, and otherwise requires a score above 127. The caller supplies only
+/// producers that already passed the decoded city-good eligibility table.
+fn select_city_cart_source_wave(
+    start: (i32, i32),
+    island: u8,
+    city: CityCartEligibility,
+    suppliers: &[CarrierSupplier],
+    source_cells: &[SourceMapCellState],
+    map: &IslandMap,
+) -> Option<(usize, CarrierSupplier, (i32, i32), Vec<(i32, i32)>, u32)> {
+    let mut grid = map.city_cart_path_grid();
+
+    for candidate in source_cells.iter().copied() {
+        if candidate.island != island || !matches!(candidate.kind_code, 1..=6) {
+            continue;
+        }
+        let Some(supplier) = suppliers.iter().copied().find(|supplier| {
+            supplier.storage == CarrierSupplierStorage::SourceRoot
+                && supplier.island == candidate.island
+                && supplier.owner == city.owner
+                && supplier.x == u16::from(candidate.x)
+                && supplier.y == u16::from(candidate.y)
+        }) else {
+            continue;
+        };
+        let position = (i32::from(candidate.x), i32::from(candidate.y));
+        let Some(target) = SourcePathTargetRect::new(
+            position,
+            usize::from(supplier.source_footprint.0.max(1)),
+            usize::from(supplier.source_footprint.1.max(1)),
+        ) else {
+            continue;
+        };
+        grid.set_target_region_metadata(target, (supplier.source_path_class & 0x7f) | 0x80);
+    }
+
+    let mut selected: Option<(usize, CarrierSupplier, (i32, i32), u32)> = None;
+    let _ = grid.search_with_blocked_cell_callback(start, |position, _| {
+        let Some((state_idx, candidate, supplier)) = source_cells
+            .iter()
+            .copied()
+            .enumerate()
+            .rev()
+            .find_map(|(state_idx, candidate)| {
+                let supplier = suppliers.iter().copied().find(|supplier| {
+                    supplier.storage == CarrierSupplierStorage::SourceRoot
+                        && supplier.island == candidate.island
+                        && supplier.owner == city.owner
+                        && supplier.x == u16::from(candidate.x)
+                        && supplier.y == u16::from(candidate.y)
+                })?;
+                let within_footprint = candidate.island == island
+                    && matches!(candidate.kind_code, 1..=6)
+                    && position.0 >= i32::from(candidate.x)
+                    && position.1 >= i32::from(candidate.y)
+                    && position.0
+                        < i32::from(candidate.x) + i32::from(supplier.source_footprint.0.max(1))
+                    && position.1
+                        < i32::from(candidate.y) + i32::from(supplier.source_footprint.1.max(1));
+                within_footprint.then_some((state_idx, candidate, supplier))
+            })
+        else {
+            return SourcePathBlockedCellDecision::Block;
+        };
+        let Some(score) = candidate.storage_fill_score() else {
+            return SourcePathBlockedCellDecision::Block;
+        };
+        let Some(source_good_slot) = supplier.good.source_ware_slot() else {
+            return SourcePathBlockedCellDecision::Block;
+        };
+        let priority = city.priority(supplier.good);
+        if score == 0
+            || priority == 0
+            || !((11..=24).contains(&source_good_slot) || score > 127)
+            || candidate
+                .storage_fill
+                .saturating_sub(candidate.reserved_storage)
+                < SOURCE_STORAGE_UNIT
+        {
+            return SourcePathBlockedCellDecision::Block;
+        }
+        if selected
+            .as_ref()
+            .is_some_and(|(_, _, _, best_score)| score <= *best_score)
+        {
+            return SourcePathBlockedCellDecision::Block;
+        }
+        if priority == 2 {
+            selected = Some((state_idx, supplier, position, score));
+            SourcePathBlockedCellDecision::AdvanceFrontier
+        } else {
+            if selected
+                .as_ref()
+                .is_none_or(|(_, _, _, best_score)| score > *best_score)
+            {
+                selected = Some((state_idx, supplier, position, score));
+            }
+            SourcePathBlockedCellDecision::Block
+        }
+    });
+    selected.and_then(|(state_idx, supplier, reached, score)| {
+        let steps = grid.steps_to_reached_marker(start, reached)?;
+        let path = source_route_positions(start, &steps)?;
+        (path.last().copied() == Some(reached))
+            .then_some((state_idx, supplier, reached, path, score))
+    })
+}
+
+pub fn try_spawn_city_cart(
+    origin: SourceMapCellState,
+    city: CityCartEligibility,
+    suppliers: &[CarrierSupplier],
+    source_cells: &mut [SourceMapCellState],
+    island_maps: &[IslandMap],
+    config: CityCartConfig,
+) -> Option<Figure> {
+    if !matches!(origin.kind_code, 7 | 8 | 30) {
+        return None;
+    }
+
+    let start = (i32::from(origin.x), i32::from(origin.y));
+    let map = island_maps
+        .iter()
+        .find(|map| map.island_id == origin.island);
+    let mut selected: Option<(usize, CarrierSupplier, (i32, i32), Vec<(i32, i32)>, u32)> = None;
+
+    if let Some(map) = map {
+        let (state_idx, supplier, reached, path, score) =
+            select_city_cart_source_wave(start, origin.island, city, suppliers, source_cells, map)?;
+        selected = Some((state_idx, supplier, reached, path, score));
+    }
+
+    for (state_idx, candidate) in source_cells.iter().copied().enumerate() {
+        if map.is_some() {
+            break;
+        }
+        if candidate.island != origin.island || matches!(candidate.kind_code, 7 | 8 | 30) {
+            continue;
+        }
+        let Some(supplier) = suppliers.iter().find(|supplier| {
+            supplier.storage == CarrierSupplierStorage::SourceRoot
+                && supplier.island == candidate.island
+                && supplier.owner == city.owner
+                && supplier.x == u16::from(candidate.x)
+                && supplier.y == u16::from(candidate.y)
+        }) else {
+            continue;
+        };
+        let Some(score) = candidate.storage_fill_score() else {
+            continue;
+        };
+        let Some(source_good_slot) = supplier.good.source_ware_slot() else {
+            continue;
+        };
+        let priority = city.priority(supplier.good);
+        if score == 0
+            || priority == 0
+            || !((11..=24).contains(&source_good_slot) || score > 127)
+            || candidate
+                .storage_fill
+                .saturating_sub(candidate.reserved_storage)
+                < SOURCE_STORAGE_UNIT
+        {
+            continue;
+        }
+        if selected
+            .as_ref()
+            .is_some_and(|(_, _, _, _, best_score)| score <= *best_score)
+        {
+            continue;
+        }
+        let goal = (i32::from(supplier.x), i32::from(supplier.y));
+        let path = direct_path(start, goal);
+        if priority == 2 {
+            selected = Some((state_idx, *supplier, goal, path, score));
+            break;
+        }
+        selected = Some((state_idx, *supplier, goal, path, score));
+    }
+
+    let (state_idx, supplier, reached, path, _) = selected?;
+    let state = source_cells.get_mut(state_idx)?;
+    let available_fixed = state.storage_fill.saturating_sub(state.reserved_storage);
+    let cargo_fixed = available_fixed.min(config.max_load.saturating_mul(SOURCE_STORAGE_UNIT));
+    let cargo = cargo_fixed / SOURCE_STORAGE_UNIT;
+    if cargo_fixed < SOURCE_STORAGE_UNIT || !state.reserve_storage(cargo_fixed) {
+        return None;
+    }
+
+    let mut cart = Figure::new();
+    cart.action = ActionType::CarryingGoods;
+    cart.cargo_route = CargoRoute::CityCart;
+    cart.owner = city.owner;
+    cart.tile_x = start.0;
+    cart.tile_y = start.1;
+    cart.target_x = reached.0;
+    cart.target_y = reached.1;
+    cart.destination_kind = supplier.kind_code;
+    cart.supplier_x = supplier.x;
+    cart.supplier_y = supplier.y;
+    cart.origin_island = origin.island;
+    cart.origin_x = u16::from(origin.x);
+    cart.origin_y = u16::from(origin.y);
+    cart.origin_kind = origin.kind_code;
+    cart.carried_good = supplier.good as u8;
+    cart.carried_amount = cargo;
+    cart.cargo_fixed = cargo_fixed;
+    cart.speed = CARRIER_SPEED;
+    cart.source_move_speed = config.movement_speed;
+    cart.base_sprite = config.sprite_base;
+    cart.initialize_source_position();
+    cart.source_position_z = map
+        .and_then(|map| map.source_terrain_height(start))
+        .unwrap_or(0.0);
+    cart.path = path;
+    cart.path_idx = 0;
+    Some(cart)
+}
+
+/// Move a carrier one step along its path. Returns true on arrival.
 pub fn step_carrier(figure: &mut Figure) -> bool {
     if figure.speed == 0 {
         return false;
     }
 
-    // Advance animation frame on each step
-    figure.anim_frame = figure.anim_frame.wrapping_add(1) % 8;
-
-    // Follow pre-computed path
     if figure.path_idx < figure.path.len() {
         let (nx, ny) = figure.path[figure.path_idx];
         let dx = nx - figure.tile_x;
@@ -166,111 +860,165 @@ pub fn step_carrier(figure: &mut Figure) -> bool {
         figure.tile_x = nx;
         figure.tile_y = ny;
         figure.path_idx += 1;
-
         figure.path_idx >= figure.path.len()
     } else {
-        // Fallback: direct movement if no path
         let dx = figure.target_x - figure.tile_x;
         let dy = figure.target_y - figure.tile_y;
-
         if dx == 0 && dy == 0 {
             return true;
         }
-
-        let step = 1i32;
         if dx.abs() >= dy.abs() {
-            figure.tile_x += dx.signum() * step;
+            figure.tile_x += dx.signum();
         } else {
-            figure.tile_y += dy.signum() * step;
+            figure.tile_y += dy.signum();
         }
-
         figure.direction = direction_from_delta(dx, dy);
         figure.tile_x == figure.target_x && figure.tile_y == figure.target_y
     }
 }
 
-/// Compute compass direction from delta.
+/// Advance one source-grid carrier step according to `FUN_0044a690` and
+/// `FUN_00451890`. The retained path positions are integer cells, so this
+/// stores only the source distance still required before the next cell edge.
+/// `source_move_speed == 0` retains the direct one-cell behavior for legacy
+/// figures that do not carry source route state.
+pub fn advance_source_carrier(figure: &mut Figure, elapsed_ms: u32, terrain_wegspeed: u16) -> bool {
+    if figure.source_move_speed == 0 {
+        return step_carrier(figure);
+    }
+    if !figure.source_position_initialized {
+        figure.initialize_source_position();
+    }
+
+    let next = figure
+        .path
+        .get(figure.path_idx)
+        .copied()
+        .unwrap_or((figure.target_x, figure.target_y));
+    let dx = next.0 - figure.tile_x;
+    let dy = next.1 - figure.tile_y;
+    if dx == 0 && dy == 0 {
+        return step_carrier(figure);
+    }
+    if figure.source_step_remaining <= 0.0 {
+        figure.source_step_remaining = if dx != 0 && dy != 0 {
+            SOURCE_DIAGONAL_DISTANCE
+        } else {
+            1.0
+        };
+    }
+
+    let terrain_wegspeed = terrain_wegspeed.max(1) as f32;
+    let traversal = elapsed_ms as f32
+        * SOURCE_MOTION_TIME_SCALE
+        * (figure.source_move_speed as f32 * SOURCE_FIGURE_SPEED_SCALE * 32.0 / terrain_wegspeed);
+    if traversal < figure.source_step_remaining {
+        let distance = if dx != 0 && dy != 0 {
+            SOURCE_DIAGONAL_DISTANCE
+        } else {
+            1.0
+        };
+        figure.source_position_x += dx as f32 * traversal / distance;
+        figure.source_position_y += dy as f32 * traversal / distance;
+        figure.source_step_remaining -= traversal;
+        return false;
+    }
+
+    figure.source_step_remaining = 0.0;
+    let arrived = step_carrier(figure);
+    figure.initialize_source_position();
+    arrived
+}
+
 fn direction_from_delta(dx: i32, dy: i32) -> u8 {
     match (dx.signum(), dy.signum()) {
-        (0, -1) => 0,  // N
-        (1, -1) => 1,  // NE
-        (1, 0) => 2,   // E
-        (1, 1) => 3,   // SE
-        (0, 1) => 4,   // S
-        (-1, 1) => 5,  // SW
-        (-1, 0) => 6,  // W
-        (-1, -1) => 7, // NW
+        (0, -1) => 0,
+        (1, -1) => 1,
+        (1, 0) => 2,
+        (1, 1) => 3,
+        (0, 1) => 4,
+        (-1, 1) => 5,
+        (-1, 0) => 6,
+        (-1, -1) => 7,
         _ => 0,
     }
 }
 
-/// Process a carrier that has arrived at its destination.
-/// Returns `(should_despawn, delivered_amount)`.
+/// Advance a type-8 figure across an arrival boundary. On the outbound leg it
+/// changes to `Returning` while retaining the picked cargo; the caller applies
+/// the source-state transfer at that boundary. On the return leg it despawns.
 pub fn handle_arrival(
     figure: &mut Figure,
-    warehouses: &mut [Warehouse],
     buildings: &[BuildingInstance],
     island_maps: &[IslandMap],
-) -> (bool, u16) {
-    match figure.action {
-        ActionType::CarryingGoods => {
-            let source_island = buildings
-                .get(figure.building_idx as usize)
-                .map(|building| building.island_id);
-            let mut delivered = 0;
-            // Find the warehouse at the target location
-            if let Some(wh) = warehouses.iter_mut().find(|w| {
-                Some(w.island_id) == source_island
-                    && w.tile_x == figure.target_x as u16
-                    && w.tile_y == figure.target_y as u16
-            }) {
-                // Deposit goods
-                let good = good_from_u8(figure.carried_good);
-                delivered = wh.deposit(good, figure.carried_amount);
-                figure.carried_amount -= delivered;
-            }
-
-            // Return to source building
-            if figure.building_idx < buildings.len() as u16 {
-                let building = &buildings[figure.building_idx as usize];
+) -> bool {
+    if figure.cargo_route == CargoRoute::CityCart {
+        return match figure.action {
+            ActionType::CarryingGoods => {
                 let start = (figure.tile_x, figure.tile_y);
-                let goal = (building.tile_x as i32, building.tile_y as i32);
-
-                // Compute return path
-                let path = if let Some(map) = island_maps
+                let goal = (i32::from(figure.origin_x), i32::from(figure.origin_y));
+                let path = match island_maps
                     .iter()
-                    .find(|m| m.island_id == building.island_id)
+                    .find(|map| map.island_id == figure.origin_island)
                 {
-                    match pathfinding::find_path_for_carrier(
+                    Some(map) => match pathfinding::find_path_for_carrier(
                         map,
                         start,
                         goal,
-                        pathfinding::CarrierLoad::Empty,
+                        pathfinding::CarrierLoad::Loaded,
                     ) {
                         Some(path) => path,
-                        None => return (true, delivered),
-                    }
-                } else {
-                    direct_path(start, goal)
+                        None => return true,
+                    },
+                    None => direct_path(start, goal),
                 };
-
-                figure.target_x = building.tile_x as i32;
-                figure.target_y = building.tile_y as i32;
+                figure.target_x = goal.0;
+                figure.target_y = goal.1;
                 figure.action = ActionType::Returning;
-                figure.carried_good = 0;
-                figure.carried_amount = 0;
+                figure.reset_source_animation();
                 figure.path = path;
                 figure.path_idx = 0;
-                (false, delivered)
-            } else {
-                (true, delivered) // No building to return to
+                figure.source_step_remaining = 0.0;
+                false
             }
+            ActionType::Returning => true,
+            _ => true,
+        };
+    }
+
+    match figure.action {
+        ActionType::CarryingGoods => {
+            let Some(building) = buildings.get(figure.building_idx as usize) else {
+                return true;
+            };
+            let start = (figure.tile_x, figure.tile_y);
+            let goal = (i32::from(building.tile_x), i32::from(building.tile_y));
+            let path = match island_maps
+                .iter()
+                .find(|map| map.island_id == building.island_id)
+            {
+                Some(map) => match pathfinding::find_path_for_carrier(
+                    map,
+                    start,
+                    goal,
+                    pathfinding::CarrierLoad::Loaded,
+                ) {
+                    Some(path) => path,
+                    None => return true,
+                },
+                None => direct_path(start, goal),
+            };
+            figure.target_x = goal.0;
+            figure.target_y = goal.1;
+            figure.action = ActionType::Returning;
+            figure.reset_source_animation();
+            figure.path = path;
+            figure.path_idx = 0;
+            figure.source_step_remaining = 0.0;
+            false
         }
-        ActionType::Returning => {
-            // Back at source building — despawn
-            (true, 0)
-        }
-        _ => (true, 0),
+        ActionType::Returning => true,
+        _ => true,
     }
 }
 
@@ -278,31 +1026,23 @@ pub fn handle_arrival(
 fn direct_path(start: (i32, i32), goal: (i32, i32)) -> Vec<(i32, i32)> {
     let mut path = Vec::new();
     let mut pos = start;
-
     while pos != goal {
         let dx = goal.0 - pos.0;
         let dy = goal.1 - pos.1;
-
-        // Move diagonally when possible, otherwise axis-aligned
-        let sx = dx.signum();
-        let sy = dy.signum();
-
         if dx != 0 && dy != 0 {
-            pos = (pos.0 + sx, pos.1 + sy);
+            pos = (pos.0 + dx.signum(), pos.1 + dy.signum());
         } else if dx != 0 {
-            pos = (pos.0 + sx, pos.1);
+            pos = (pos.0 + dx.signum(), pos.1);
         } else {
-            pos = (pos.0, pos.1 + sy);
+            pos = (pos.0, pos.1 + dy.signum());
         }
-
         path.push(pos);
     }
-
     path
 }
 
 /// Convert Good u8 repr back to Good enum.
-fn good_from_u8(val: u8) -> Good {
+pub(crate) fn good_from_u8(val: u8) -> Good {
     match val {
         1 => Good::Wood,
         2 => Good::Iron,
@@ -343,201 +1083,924 @@ fn good_from_u8(val: u8) -> Good {
 mod tests {
     use super::*;
     use crate::types::ProductionType;
-    use anno_formats::figuren::FigureDef;
 
-    fn def_for_tools() -> BuildingDef {
+    fn consumer_def() -> BuildingDef {
         BuildingDef {
-            id: 0,
-            category: 0,
-            width: 1,
-            height: 1,
             production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(),
-            prod_kind: "HANDWERK".into(),
-            radius: 0,
-            output_good: Good::Tools,
-            input_good_1: Good::None,
-            input_good_2: Good::None,
-            output_rate: 0,
-            input_1_rate: 0,
-            input_2_rate: 0,
-            storage_capacity: 50,
-            cycle_time_ms: 1000,
-            cost_gold: 0,
-            cost_tools: 0,
-            cost_wood: 0,
-            cost_bricks: 0,
-            maintenance_cost: 0,
-            native: false,
-            min_tier: 0,
-            max_no_input_ticks: 6,
-            can_dry_up: false,
-            wegspeed: [100; 4],
-            has_door: false,
-            upgradeable: false,
-            max_energy: 0,
-            ore_deposit: crate::building::OreDeposit::None,
-            pirate_owned: false,
-            defensive_cannons: 0,
-            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
-            ruin_id: crate::building::NO_RUIN_ID,
-            required_fertility: None,
+            input_good_1: Good::Iron,
+            input_1_rate: 2,
+            ..Default::default()
+        }
+    }
+
+    fn supplier_state(x: u8, y: u8, fill: u16) -> SourceMapCellState {
+        SourceMapCellState {
+            storage_fill: fill,
+            ..SourceMapCellState::new(
+                0,
+                x,
+                y,
+                &anno_formats::cod::BuildingDef {
+                    kind: "HANDWERK".into(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
         }
     }
 
     #[test]
-    fn carrier_skipped_when_outside_coverage() {
-        let def = def_for_tools();
-        let mut b = BuildingInstance::new(0, 0, 50, 50, 0);
-        b.output_stock = 40; // > capacity / 2
-        let warehouses = vec![Warehouse::new(0, 0, 1, 1)];
-        let cov = CoverageMap::new(0, 60, 60); // empty: nothing covered
-        assert!(try_spawn_carrier(
-            &mut b,
-            &def,
-            &warehouses,
+    fn source_carrier_step_uses_runtime_speed_and_raw_wegspeed() {
+        let mut carrier = Figure::new();
+        carrier.action = ActionType::CarryingGoods;
+        carrier.speed = CARRIER_SPEED;
+        carrier.source_move_speed = 220;
+        carrier.target_x = 1;
+        carrier.path = vec![(1, 0)];
+
+        for _ in 0..28 {
+            assert!(!advance_source_carrier(&mut carrier, 100, 100));
+        }
+        assert_eq!((carrier.tile_x, carrier.tile_y), (0, 0));
+        assert!((carrier.source_position_x - 1.4856).abs() < 0.000_001);
+        assert_eq!(carrier.source_position_y, 0.5);
+        assert!(advance_source_carrier(&mut carrier, 100, 100));
+        assert_eq!((carrier.tile_x, carrier.tile_y), (1, 0));
+        assert_eq!(carrier.source_step_remaining, 0.0);
+        assert_eq!(
+            (carrier.source_position_x, carrier.source_position_y),
+            (1.5, 0.5)
+        );
+    }
+
+    #[test]
+    fn source_carrier_diagonal_step_uses_sqrt_two_distance() {
+        let mut carrier = Figure::new();
+        carrier.action = ActionType::CarryingGoods;
+        carrier.speed = CARRIER_SPEED;
+        carrier.source_move_speed = 220;
+        carrier.target_x = 1;
+        carrier.target_y = 1;
+        carrier.path = vec![(1, 1)];
+
+        for _ in 0..40 {
+            assert!(!advance_source_carrier(&mut carrier, 100, 100));
+        }
+        assert_eq!((carrier.tile_x, carrier.tile_y), (0, 0));
+        assert!((carrier.source_position_x - 1.495_606_7).abs() < 0.000_001);
+        assert!((carrier.source_position_y - 1.495_606_7).abs() < 0.000_001);
+        assert!(advance_source_carrier(&mut carrier, 100, 100));
+        assert_eq!((carrier.tile_x, carrier.tile_y), (1, 1));
+        assert_eq!(
+            (carrier.source_position_x, carrier.source_position_y),
+            (1.5, 1.5)
+        );
+    }
+
+    #[test]
+    fn generic_carrier_reserves_nearest_reachable_matching_supplier() {
+        let consumer = BuildingInstance::new(0, 0, 5, 5, 0);
+        let suppliers = [
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 4,
+                y: 4,
+                good: Good::Iron,
+                available: 4,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 0,
+                source_footprint: (1, 1),
+            },
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 20,
+                y: 20,
+                good: Good::Iron,
+                available: 4,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 0,
+                source_footprint: (1, 1),
+            },
+        ];
+        let mut states = vec![supplier_state(4, 4, 128), supplier_state(20, 20, 128)];
+
+        let carrier = try_spawn_carrier(
+            &consumer,
+            &consumer_def(),
+            &suppliers,
+            &mut states,
+            &mut [],
             &[],
-            &[cov],
-            CarrierConfig::default()
+            CarrierConfig {
+                sprite_base: 12,
+                ..CarrierConfig::default()
+            },
         )
-        .is_none());
+        .expect("matching supplier should be reserved");
+
+        assert_eq!((carrier.target_x, carrier.target_y), (4, 4));
+        assert_eq!(carrier.carried_good, Good::Iron as u8);
+        assert_eq!(carrier.carried_amount, 4);
+        assert_eq!(carrier.base_sprite, 12);
+        assert_eq!(states[0].reserved_storage, 128);
+        assert_eq!(states[1].reserved_storage, 0);
     }
 
     #[test]
-    fn carrier_dispatched_when_covered() {
-        let def = def_for_tools();
-        let mut b = BuildingInstance::new(0, 0, 5, 5, 0);
-        b.output_stock = 40;
-        let warehouses = vec![Warehouse::new(0, 0, 4, 4)];
-        // Build a coverage map where the building tile IS covered.
-        let mut cov = CoverageMap::new(0, 60, 60);
-        cov.recompute(&[b.clone()], &[def.clone()], &[(4, 4, 22)]);
-        // sanity check
-        assert!(cov.is_covered(5, 5));
-        let result = try_spawn_carrier(
-            &mut b,
-            &def,
-            &warehouses,
-            &[],
-            &[cov],
-            CarrierConfig::default(),
+    fn generic_carrier_ignores_nonmatching_or_unavailable_supplier() {
+        let consumer = BuildingInstance::new(0, 0, 5, 5, 0);
+        let suppliers = [
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 4,
+                y: 4,
+                good: Good::Wood,
+                available: 4,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 0,
+                source_footprint: (1, 1),
+            },
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 8,
+                y: 5,
+                good: Good::Iron,
+                available: 3,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 0,
+                source_footprint: (1, 1),
+            },
+        ];
+        let mut states = vec![supplier_state(4, 4, 128), supplier_state(8, 5, 128)];
+
+        assert!(
+            try_spawn_carrier(
+                &consumer,
+                &consumer_def(),
+                &suppliers,
+                &mut states,
+                &mut [],
+                &[],
+                CarrierConfig::default(),
+            )
+            .is_none()
         );
-        assert!(result.is_some(), "should dispatch when covered");
     }
 
     #[test]
-    fn carrier_not_dispatched_when_island_map_has_no_route() {
-        let def = def_for_tools();
-        let mut b = BuildingInstance::new(0, 0, 2, 5, 0);
-        b.output_stock = 40;
-        let warehouses = vec![Warehouse::new(0, 0, 8, 5)];
-        let mut map = IslandMap::new_open(0, 10, 10);
-        for y in 0..10 {
-            map.set_walkable(5, y, false);
-        }
+    fn generic_carrier_source_wave_reserves_the_first_qualifying_fixed_load() {
+        let consumer = BuildingInstance::new(0, 0, 0, 0, 0);
+        let supplier = CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 4,
+            y: 0,
+            good: Good::Iron,
+            available: 4,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 32,
+            source_footprint: (1, 1),
+        };
+        let mut states = [supplier_state(4, 0, 96)];
 
-        let result = try_spawn_carrier(
-            &mut b,
-            &def,
-            &warehouses,
+        let carrier = try_spawn_carrier(
+            &consumer,
+            &consumer_def(),
+            &[supplier],
+            &mut states,
+            &mut [],
+            &[IslandMap::new_open(0, 5, 1)],
+            CarrierConfig::default(),
+        )
+        .expect("96 fixed units exceed the 64-unit TRAEGER reservation floor");
+
+        assert_eq!((carrier.target_x, carrier.target_y), (4, 0));
+        assert_eq!((carrier.supplier_x, carrier.supplier_y), (4, 0));
+        assert_eq!(carrier.carried_amount, 3);
+        assert_eq!(carrier.cargo_fixed, 96);
+        assert_eq!(states[0].reserved_storage, 96);
+    }
+
+    #[test]
+    fn generic_carrier_preserves_nonintegral_source_reservation() {
+        let consumer = BuildingInstance::new(0, 0, 0, 0, 0);
+        let supplier = CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 4,
+            y: 0,
+            good: Good::Iron,
+            available: 4,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 32,
+            source_footprint: (1, 1),
+        };
+        let mut states = [supplier_state(4, 0, 65)];
+
+        let carrier = try_spawn_carrier(
+            &consumer,
+            &consumer_def(),
+            &[supplier],
+            &mut states,
+            &mut [],
+            &[IslandMap::new_open(0, 5, 1)],
+            CarrierConfig::default(),
+        )
+        .expect("the 64-unit threshold admits a 65-unit source reservation");
+
+        assert_eq!(carrier.carried_amount, 2);
+        assert_eq!(carrier.cargo_fixed, 65);
+        assert_eq!(states[0].reserved_storage, 65);
+    }
+
+    #[test]
+    fn generic_carrier_source_wave_rejects_stock_below_half_load() {
+        let consumer = BuildingInstance::new(0, 0, 0, 0, 0);
+        let supplier = CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 4,
+            y: 0,
+            good: Good::Iron,
+            available: 4,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 32,
+            source_footprint: (1, 1),
+        };
+        let mut states = [supplier_state(4, 0, 32)];
+
+        assert!(
+            try_spawn_carrier(
+                &consumer,
+                &consumer_def(),
+                &[supplier],
+                &mut states,
+                &mut [],
+                &[IslandMap::new_open(0, 5, 1)],
+                CarrierConfig::default(),
+            )
+            .is_none()
+        );
+        assert_eq!(states[0].reserved_storage, 0);
+    }
+
+    #[test]
+    fn generic_carrier_uses_source_grid_callback_cell_and_route() {
+        let consumer = BuildingInstance::new(0, 0, 0, 0, 0);
+        let supplier = CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 3,
+            y: 0,
+            good: Good::Iron,
+            available: 4,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 32,
+            source_footprint: (2, 1),
+        };
+        let mut states = [supplier_state(3, 0, 128)];
+        let mut map = IslandMap::new_open(0, 5, 1);
+        map.set_walkable(2, 0, false);
+
+        let carrier = try_spawn_carrier(
+            &consumer,
+            &consumer_def(),
+            &[supplier],
+            &mut states,
+            &mut [],
             &[map],
-            &[],
             CarrierConfig::default(),
-        );
+        )
+        .expect("source-grid wave reaches the footprint despite A* walkability");
 
-        assert!(result.is_none());
-        assert_eq!(b.output_stock, 40);
+        assert_eq!((carrier.target_x, carrier.target_y), (3, 0));
+        assert_eq!((carrier.supplier_x, carrier.supplier_y), (3, 0));
+        assert_eq!(carrier.path.last(), Some(&(3, 0)));
+        assert!(carrier.path.contains(&(2, 0)));
     }
 
     #[test]
-    fn returning_carrier_despawns_when_source_route_is_blocked() {
+    fn generic_carrier_keeps_supplier_anchor_when_wave_reaches_footprint_edge() {
+        let consumer = BuildingInstance::new(0, 0, 2, 2, 0);
+        let supplier = CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 1,
+            y: 1,
+            good: Good::Iron,
+            available: 4,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 32,
+            source_footprint: (2, 1),
+        };
+        let mut states = [supplier_state(1, 1, 128)];
+
+        let carrier = try_spawn_carrier(
+            &consumer,
+            &consumer_def(),
+            &[supplier],
+            &mut states,
+            &mut [],
+            &[IslandMap::new_open(0, 5, 5)],
+            CarrierConfig::default(),
+        )
+        .expect("the footprint's east edge is a valid source-grid callback");
+
+        assert_eq!((carrier.target_x, carrier.target_y), (2, 1));
+        assert_eq!((carrier.supplier_x, carrier.supplier_y), (1, 1));
+        assert_eq!(carrier.path.last(), Some(&(2, 1)));
+    }
+
+    #[test]
+    fn kontor_supplier_reserves_city_stock_without_storage_animation_fill() {
+        let consumer = BuildingInstance::new(0, 0, 5, 5, 0);
+        let suppliers = [CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 4,
+            y: 4,
+            good: Good::Iron,
+            available: 4,
+            storage: CarrierSupplierStorage::Warehouse(0),
+            source_path_class: 0,
+            source_footprint: (1, 1),
+        }];
+        let mut states = vec![
+            SourceMapCellState::new(
+                0,
+                4,
+                4,
+                &anno_formats::cod::BuildingDef {
+                    kind: "KONTOR".into(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap(),
+        ];
+
+        let mut warehouses = [Warehouse::new(0, 0, 4, 4)];
+        warehouses[0].deposit(Good::Iron, 4);
+        assert!(
+            try_spawn_carrier(
+                &consumer,
+                &consumer_def(),
+                &suppliers,
+                &mut states,
+                &mut warehouses,
+                &[],
+                CarrierConfig::default(),
+            )
+            .is_some()
+        );
+        assert_eq!(states[0].storage_fill, 0);
+        assert_eq!(states[0].reserved_storage, 0);
+        assert_eq!(warehouses[0].reserved(Good::Iron), 4);
+    }
+
+    #[test]
+    fn outbound_arrival_preserves_cargo_for_loaded_return() {
         let mut figure = Figure::new();
         figure.action = ActionType::CarryingGoods;
         figure.tile_x = 8;
         figure.tile_y = 5;
-        figure.target_x = 8;
-        figure.target_y = 5;
         figure.building_idx = 0;
-        figure.carried_good = Good::Tools as u8;
+        figure.carried_good = Good::Iron as u8;
         figure.carried_amount = 4;
-
+        figure.anim_frame = 5;
+        figure.source_animation_elapsed_ms = 425;
         let buildings = vec![BuildingInstance::new(0, 0, 2, 5, 0)];
-        let mut warehouses = vec![Warehouse::new(0, 0, 8, 5)];
-        let mut map = IslandMap::new_open(0, 10, 10);
-        for y in 0..10 {
-            map.set_walkable(5, y, false);
-        }
 
-        assert!(handle_arrival(&mut figure, &mut warehouses, &buildings, &[map],).0);
-        assert_eq!(warehouses[0].stock(Good::Tools), 4);
+        assert!(!handle_arrival(&mut figure, &buildings, &[]));
+        assert_eq!(figure.action, ActionType::Returning);
+        assert_eq!(figure.carried_amount, 4);
+        assert_eq!((figure.target_x, figure.target_y), (2, 5));
+        assert_eq!(figure.anim_frame, 0);
+        assert_eq!(figure.source_animation_elapsed_ms, 0);
     }
 
     #[test]
     fn carrier_config_uses_figuren_maxtrag() {
-        let mut fig = FigureDef::default();
+        let mut fig = anno_formats::figuren::FigureDef::default();
         fig.properties.insert("Maxtrag".into(), "7".into());
-
-        assert_eq!(CarrierConfig::from_figure_def(&fig).max_load, 7);
+        fig.properties.insert("Speed".into(), "235".into());
+        fig.gfx = 12;
+        fig.anims.push(anno_formats::figuren::FigureAnim {
+            nummer: 0,
+            anim_anz: 6,
+            anim_speed: 91,
+            ..Default::default()
+        });
+        let config = CarrierConfig::from_figure_def(&fig);
+        assert_eq!(config.max_load, 7);
+        assert_eq!(config.movement_speed, 235);
+        assert_eq!(config.sprite_base, 12);
+        assert_eq!(config.frame_speed_ms, 91);
+        assert_eq!(config.frames_per_direction, 6);
     }
 
     #[test]
-    fn carrier_load_clamped_to_traeger_maxtrag() {
-        let def = def_for_tools();
-        let mut b = BuildingInstance::new(0, 0, 5, 5, 0);
-        b.output_stock = 40;
-        let warehouses = vec![Warehouse::new(0, 0, 4, 4)];
-
-        let carrier = try_spawn_carrier(
-            &mut b,
-            &def,
-            &warehouses,
-            &[],
-            &[],
-            CarrierConfig::default(),
-        )
-        .expect("carrier spawned when output is over half capacity");
-
-        assert_eq!(carrier.carried_amount, 4);
-        assert_eq!(b.output_stock, 36);
+    fn city_cart_uses_karren_maxtrag() {
+        let mut fig = anno_formats::figuren::FigureDef::default();
+        fig.properties.insert("Maxtrag".into(), "6".into());
+        fig.properties.insert("Speed".into(), "300".into());
+        fig.gfx = 496;
+        fig.anims.push(anno_formats::figuren::FigureAnim {
+            nummer: 0,
+            anim_anz: 7,
+            anim_speed: 73,
+            ..Default::default()
+        });
+        let config = CityCartConfig::from_figure_def(&fig);
+        assert_eq!(config.max_load, 6);
+        assert_eq!(config.movement_speed, 300);
+        assert_eq!(config.sprite_base, 496);
+        assert_eq!(config.frame_speed_ms, 73);
+        assert_eq!(config.frames_per_direction, 7);
     }
 
     #[test]
-    fn carrier_load_uses_configured_maxtrag() {
-        let def = def_for_tools();
-        let mut b = BuildingInstance::new(0, 0, 5, 5, 0);
-        b.output_stock = 40;
-        let warehouses = vec![Warehouse::new(0, 0, 4, 4)];
-
-        let carrier = try_spawn_carrier(
-            &mut b,
-            &def,
-            &warehouses,
-            &[],
-            &[],
-            CarrierConfig { max_load: 7 },
-        )
-        .expect("carrier spawned when output is over half capacity");
-
-        assert_eq!(carrier.carried_amount, 7);
-        assert_eq!(b.output_stock, 33);
+    fn source_path_class_matches_compiled_wegspeed_scale() {
+        assert_eq!(source_path_class(100), 32);
+        assert_eq!(source_path_class(170), 54);
+        assert_eq!(source_path_class(u16::MAX), 126);
     }
 
     #[test]
-    fn no_coverage_map_means_no_gating() {
-        // Backwards-compat: islands without a coverage map keep the old
-        // behaviour where carriers spawn unconditionally on full output.
-        let def = def_for_tools();
-        let mut b = BuildingInstance::new(0, 0, 5, 5, 0);
-        b.output_stock = 40;
-        let warehouses = vec![Warehouse::new(0, 0, 1, 1)];
-        assert!(try_spawn_carrier(
-            &mut b,
-            &def,
-            &warehouses,
-            &[],
-            &[],
-            CarrierConfig::default()
+    fn source_animation_duration_uses_the_live_path_class_only_while_moving() {
+        assert_eq!(source_animation_frame_duration_ms(85, 100, true), 85);
+        assert_eq!(source_animation_frame_duration_ms(85, 150, true), 127);
+        assert_eq!(source_animation_frame_duration_ms(60, 150, true), 90);
+        assert_eq!(source_animation_frame_duration_ms(85, 150, false), 85);
+    }
+
+    #[test]
+    fn city_cart_prefers_the_highest_eligible_storage_score() {
+        let origin = SourceMapCellState::new(
+            0,
+            0,
+            0,
+            &anno_formats::cod::BuildingDef {
+                kind: "MARKT".into(),
+                ..Default::default()
+            },
+            0,
         )
-        .is_some());
+        .unwrap();
+        let mut lower = supplier_state(2, 0, 128);
+        lower.storage_animation_capacity = 320;
+        let mut higher = supplier_state(4, 0, 192);
+        higher.storage_animation_capacity = 320;
+        let suppliers = [
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 2,
+                y: 0,
+                good: Good::Cloth,
+                available: 4,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 0,
+                source_footprint: (1, 1),
+            },
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 4,
+                y: 0,
+                good: Good::Cloth,
+                available: 6,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 0,
+                source_footprint: (1, 1),
+            },
+        ];
+        let mut states = vec![lower, higher];
+
+        let city = CityCartEligibility::from_priorities(0, [1; 25]);
+        let cart = try_spawn_city_cart(
+            origin,
+            city,
+            &suppliers,
+            &mut states,
+            &[],
+            CityCartConfig {
+                sprite_base: 496,
+                ..CityCartConfig::default()
+            },
+        )
+        .expect("highest-fill supplier should be reserved");
+
+        assert_eq!((cart.target_x, cart.target_y), (4, 0));
+        assert_eq!(cart.cargo_route, CargoRoute::CityCart);
+        assert_eq!(cart.carried_amount, 6);
+        assert_eq!(cart.base_sprite, 496);
+        assert_eq!(states[0].reserved_storage, 0);
+        assert_eq!(states[1].reserved_storage, 192);
+    }
+
+    #[test]
+    fn city_cart_preserves_nonintegral_source_reservation() {
+        let origin = SourceMapCellState::new(
+            0,
+            0,
+            0,
+            &anno_formats::cod::BuildingDef {
+                kind: "MARKT".into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        let mut source = supplier_state(2, 0, 65);
+        source.storage_animation_capacity = 320;
+        let supplier = CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 2,
+            y: 0,
+            good: Good::Cloth,
+            available: 6,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 32,
+            source_footprint: (1, 1),
+        };
+        let mut priorities = [0; 25];
+        priorities[Good::Cloth.source_ware_slot().unwrap() as usize] = 1;
+        let mut states = [source];
+
+        let cart = try_spawn_city_cart(
+            origin,
+            CityCartEligibility::from_priorities(0, priorities),
+            &[supplier],
+            &mut states,
+            &[IslandMap::new_open(0, 3, 1)],
+            CityCartConfig::default(),
+        )
+        .expect("a consumer good accepts positive source stock");
+
+        assert_eq!(cart.carried_amount, 2);
+        assert_eq!(cart.cargo_fixed, 65);
+        assert_eq!(states[0].reserved_storage, 65);
+    }
+
+    #[test]
+    fn city_cart_rejects_a_good_with_no_city_capacity() {
+        let origin = SourceMapCellState::new(
+            0,
+            0,
+            0,
+            &anno_formats::cod::BuildingDef {
+                kind: "MARKT".into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        let mut source = supplier_state(2, 0, 192);
+        source.storage_animation_capacity = 320;
+        let suppliers = [CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 2,
+            y: 0,
+            good: Good::Cloth,
+            available: 6,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 0,
+            source_footprint: (1, 1),
+        }];
+        let mut warehouse = Warehouse::new(0, 0, 0, 0);
+        warehouse.deposit(Good::Cloth, 50);
+
+        assert!(
+            try_spawn_city_cart(
+                origin,
+                CityCartEligibility::from_city_store(
+                    &warehouse,
+                    warehouse.city_storage_capacity_fixed(1),
+                ),
+                &suppliers,
+                &mut [source],
+                &[],
+                CityCartConfig::default(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn city_cart_priority_two_overrides_an_earlier_ordinary_candidate() {
+        let origin = SourceMapCellState::new(
+            0,
+            0,
+            0,
+            &anno_formats::cod::BuildingDef {
+                kind: "MARKT".into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        let mut ordinary = supplier_state(2, 0, 192);
+        ordinary.storage_animation_capacity = 320;
+        let mut priority = supplier_state(4, 0, 256);
+        priority.storage_animation_capacity = 320;
+        let suppliers = [
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 2,
+                y: 0,
+                good: Good::Bricks,
+                available: 6,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 0,
+                source_footprint: (1, 1),
+            },
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 4,
+                y: 0,
+                good: Good::Cloth,
+                available: 4,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 0,
+                source_footprint: (1, 1),
+            },
+        ];
+        let warehouse = Warehouse::with_capacity_and_population(0, 0, 0, 0, 50, [0, 100, 0, 0, 0]);
+        let city = CityCartEligibility::from_city_store(
+            &warehouse,
+            warehouse.city_storage_capacity_fixed(1),
+        );
+
+        let cart = try_spawn_city_cart(
+            origin,
+            city,
+            &suppliers,
+            &mut [ordinary, priority],
+            &[],
+            CityCartConfig::default(),
+        )
+        .expect("priority-two city good should be selected");
+
+        assert_eq!((cart.target_x, cart.target_y), (4, 0));
+        assert_eq!(cart.carried_good, Good::Cloth as u8);
+    }
+
+    #[test]
+    fn city_cart_priority_two_uses_source_wave_order_not_source_record_order() {
+        let origin = SourceMapCellState::new(
+            0,
+            2,
+            2,
+            &anno_formats::cod::BuildingDef {
+                kind: "MARKT".into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        let mut west = supplier_state(1, 2, 128);
+        west.storage_animation_capacity = 320;
+        let mut east = supplier_state(3, 2, 128);
+        east.storage_animation_capacity = 320;
+        let suppliers = [
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 1,
+                y: 2,
+                good: Good::Cloth,
+                available: 4,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 32,
+                source_footprint: (1, 1),
+            },
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 3,
+                y: 2,
+                good: Good::Alcohol,
+                available: 4,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 32,
+                source_footprint: (1, 1),
+            },
+        ];
+        let mut priorities = [0; 25];
+        priorities[Good::Cloth.source_ware_slot().unwrap() as usize] = 2;
+        priorities[Good::Alcohol.source_ware_slot().unwrap() as usize] = 2;
+
+        let cart = try_spawn_city_cart(
+            origin,
+            CityCartEligibility::from_priorities(0, priorities),
+            &suppliers,
+            &mut [west, east],
+            &[IslandMap::new_open(0, 5, 5)],
+            CityCartConfig::default(),
+        )
+        .expect("source wave should reach the eastern root first");
+
+        assert_eq!((cart.target_x, cart.target_y), (3, 2));
+        assert_eq!(cart.carried_good, Good::Alcohol as u8);
+    }
+
+    #[test]
+    fn city_cart_uses_the_source_grid_route_after_selection() {
+        let origin = SourceMapCellState::new(
+            0,
+            0,
+            0,
+            &anno_formats::cod::BuildingDef {
+                kind: "MARKT".into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        let mut source = supplier_state(4, 0, 128);
+        source.storage_animation_capacity = 320;
+        let supplier = CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 4,
+            y: 0,
+            good: Good::Cloth,
+            available: 4,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 32,
+            source_footprint: (1, 1),
+        };
+        let mut priorities = [0; 25];
+        priorities[Good::Cloth.source_ware_slot().unwrap() as usize] = 2;
+        let mut map = IslandMap::new_open(0, 5, 1);
+        map.set_walkable(2, 0, false);
+
+        let cart = try_spawn_city_cart(
+            origin,
+            CityCartEligibility::from_priorities(0, priorities),
+            &[supplier],
+            &mut [source],
+            &[map],
+            CityCartConfig::default(),
+        )
+        .expect("source-grid route should not be replaced with A* walkability");
+
+        assert_eq!(cart.path, vec![(1, 0), (2, 0), (3, 0), (4, 0)]);
+    }
+
+    #[test]
+    fn city_cart_source_wave_accepts_a_non_anchor_oriented_footprint_cell() {
+        let origin = SourceMapCellState::new(
+            0,
+            2,
+            2,
+            &anno_formats::cod::BuildingDef {
+                kind: "MARKT".into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        let mut source = supplier_state(1, 1, 128);
+        source.storage_animation_capacity = 320;
+        let mut north = supplier_state(2, 0, 128);
+        north.storage_animation_capacity = 320;
+        let suppliers = [
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 1,
+                y: 1,
+                good: Good::Cloth,
+                available: 4,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 32,
+                source_footprint: (2, 1),
+            },
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 2,
+                y: 0,
+                good: Good::Alcohol,
+                available: 4,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 32,
+                source_footprint: (1, 1),
+            },
+        ];
+        let mut priorities = [0; 25];
+        priorities[Good::Cloth.source_ware_slot().unwrap() as usize] = 2;
+        priorities[Good::Alcohol.source_ware_slot().unwrap() as usize] = 2;
+
+        let cart = try_spawn_city_cart(
+            origin,
+            CityCartEligibility::from_priorities(0, priorities),
+            &suppliers,
+            &mut [source, north],
+            &[IslandMap::new_open(0, 5, 5)],
+            CityCartConfig::default(),
+        )
+        .expect("source wave should select the nearer non-anchor footprint cell");
+
+        assert_eq!((cart.target_x, cart.target_y), (2, 1));
+        assert_eq!((cart.supplier_x, cart.supplier_y), (1, 1));
+        assert_eq!(cart.carried_good, Good::Cloth as u8);
+    }
+
+    #[test]
+    fn city_cart_source_wave_uses_the_last_root_to_write_an_overlapping_cell() {
+        let origin = SourceMapCellState::new(
+            0,
+            2,
+            2,
+            &anno_formats::cod::BuildingDef {
+                kind: "MARKT".into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        let mut west = supplier_state(1, 1, 128);
+        west.storage_animation_capacity = 320;
+        let mut east = supplier_state(2, 1, 128);
+        east.storage_animation_capacity = 320;
+        let suppliers = [
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 1,
+                y: 1,
+                good: Good::Cloth,
+                available: 4,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 32,
+                source_footprint: (2, 1),
+            },
+            CarrierSupplier {
+                island: 0,
+                owner: 0,
+                x: 2,
+                y: 1,
+                good: Good::Alcohol,
+                available: 4,
+                storage: CarrierSupplierStorage::SourceRoot,
+                source_path_class: 32,
+                source_footprint: (1, 1),
+            },
+        ];
+        let mut priorities = [0; 25];
+        priorities[Good::Cloth.source_ware_slot().unwrap() as usize] = 2;
+        priorities[Good::Alcohol.source_ware_slot().unwrap() as usize] = 2;
+
+        let cart = try_spawn_city_cart(
+            origin,
+            CityCartEligibility::from_priorities(0, priorities),
+            &suppliers,
+            &mut [west, east],
+            &[IslandMap::new_open(0, 5, 5)],
+            CityCartConfig::default(),
+        )
+        .expect("last writer should own the shared source-grid target cell");
+
+        assert_eq!((cart.target_x, cart.target_y), (2, 1));
+        assert_eq!(cart.carried_good, Good::Alcohol as u8);
+    }
+
+    #[test]
+    fn city_eligibility_uses_source_fixed_point_population_target() {
+        let mut warehouse =
+            Warehouse::with_capacity_and_population(0, 0, 0, 0, 50, [0, 100, 0, 0, 0]);
+        let capacity = warehouse.city_storage_capacity_fixed(1);
+
+        assert_eq!(
+            city_demand_target(Good::Cloth, warehouse.city_population),
+            18
+        );
+        let selector = CityCartEligibility::from_city_store(&warehouse, capacity);
+        assert_eq!(selector.priority(Good::Cloth), 2);
+        assert_eq!(selector.priority(Good::Iron), 1);
+
+        warehouse.deposit(Good::Cloth, 3);
+        let selector = CityCartEligibility::from_city_store(&warehouse, capacity);
+        assert_eq!(selector.priority(Good::Cloth), 1);
+    }
+
+    #[test]
+    fn city_capacity_adds_one_market_store_per_extra_transfer_root() {
+        let warehouse = Warehouse::with_capacity(0, 0, 0, 0, 50);
+
+        assert_eq!(warehouse.city_storage_capacity_fixed(1), 1_600);
+        assert_eq!(warehouse.city_storage_capacity_fixed(3), 2_240);
     }
 }

@@ -8,9 +8,9 @@
 //! The map is built once from scenario data and cached.
 
 use crate::source_route::{
-    source_direction_delta, SourcePathGrid, SourcePathSearchError, SourcePathTargetRect,
-    SourceResolvedStaticTarget, SourceShipRouteWindow, SourceShipTargetRouteBranch,
-    SourceTargetDescriptor,
+    SourcePathGrid, SourcePathSearchError, SourcePathTargetRect, SourceResolvedStaticTarget,
+    SourceShipRouteWindow, SourceShipTargetRouteBranch, SourceTargetDescriptor,
+    source_direction_delta,
 };
 use anno_formats::cod::BuildingDef as CodBuilding;
 use anno_formats::szs::SzsFile;
@@ -248,7 +248,7 @@ impl OceanMap {
         }
     }
 
-    /// Route a static target already resolved from a kind-`0x32` or `0x33`
+    /// Route a static target already resolved from a kind-`0x32`, `0x33`, or `0x34`
     /// descriptor. The static wrapper preserves the previous descriptor-level
     /// API while dynamic `0x35`/`0x36` callers use the common rectangle path.
     pub fn find_source_ship_path_in_window_for_resolved_static_target(
@@ -700,6 +700,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let definitions = [CodBuilding {
             source_id: 0x4e20,
@@ -717,9 +718,11 @@ mod tests {
             .find_source_ship_path_in_radius((0, 1), (2, 1), 1)
             .unwrap();
         assert_eq!(partial_path.last(), Some(&(1, 0)));
-        assert!(ocean
-            .find_source_ship_path_in_radius((0, 1), (2, 1), 2)
-            .is_some());
+        assert!(
+            ocean
+                .find_source_ship_path_in_radius((0, 1), (2, 1), 2)
+                .is_some()
+        );
     }
 
     #[test]
@@ -731,6 +734,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let ocean = OceanMap::from_source_scenario(&scenario, &[]);
         let target = SourceResolvedStaticTarget {
@@ -771,6 +775,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let ocean = OceanMap::from_source_scenario(&scenario, &[]);
         let target = crate::source_route::SourceResolvedDynamicTarget {
@@ -827,6 +832,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let definitions = [
             CodBuilding {

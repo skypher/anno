@@ -79,6 +79,90 @@ pub enum Good {
                     // good from the refined ZUCKER (Sugar)
 }
 
+/// Source text.cod WARE slots 2 through 24, in executable table order.
+/// The local Good discriminants intentionally differ, so source systems
+/// indexed by WARE must use this mapping rather than casting Good to u8.
+pub const SOURCE_WARE_GOODS: [(u8, Good); 23] = [
+    (2, Good::Ore),
+    (3, Good::Gold),
+    (4, Good::Wool),
+    (5, Good::Sugar),
+    (6, Good::Tobacco),
+    (7, Good::Cattle),
+    (8, Good::Grain),
+    (9, Good::Flour),
+    (10, Good::Iron),
+    (11, Good::Swords),
+    (12, Good::Muskets),
+    (13, Good::Cannons),
+    (14, Good::Food),
+    (15, Good::TobaccoProducts),
+    (16, Good::Spices),
+    (17, Good::Cocoa),
+    (18, Good::Alcohol),
+    (19, Good::Cloth),
+    (20, Good::Clothing),
+    (21, Good::Jewelry),
+    (22, Good::Tools),
+    (23, Good::Wood),
+    (24, Good::Bricks),
+];
+
+impl Good {
+    /// Source text.cod WARE slot used by executable city-good tables.
+    pub const fn source_ware_slot(self) -> Option<u8> {
+        match self {
+            Self::Ore => Some(2),
+            Self::Gold => Some(3),
+            Self::Wool => Some(4),
+            Self::Sugar => Some(5),
+            Self::Tobacco => Some(6),
+            Self::Cattle => Some(7),
+            Self::Grain => Some(8),
+            Self::Flour => Some(9),
+            Self::Iron => Some(10),
+            Self::Swords => Some(11),
+            Self::Muskets => Some(12),
+            Self::Cannons => Some(13),
+            Self::Food => Some(14),
+            Self::TobaccoProducts => Some(15),
+            Self::Spices => Some(16),
+            Self::Cocoa => Some(17),
+            Self::Alcohol => Some(18),
+            Self::Cloth => Some(19),
+            Self::Clothing => Some(20),
+            Self::Jewelry => Some(21),
+            Self::Tools => Some(22),
+            Self::Wood => Some(23),
+            Self::Bricks => Some(24),
+            Self::None
+            | Self::Grapes
+            | Self::Stone
+            | Self::WildGame
+            | Self::Cotton
+            | Self::Silk
+            | Self::Fish
+            | Self::Meat
+            | Self::SugarCane => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Good, SOURCE_WARE_GOODS};
+
+    #[test]
+    fn source_ware_slots_match_text_cod_order() {
+        assert_eq!(Good::Food.source_ware_slot(), Some(14));
+        assert_eq!(Good::Cloth.source_ware_slot(), Some(19));
+        assert_eq!(Good::Tools.source_ware_slot(), Some(22));
+        assert_eq!(Good::Wood.source_ware_slot(), Some(23));
+        assert_eq!(Good::Bricks.source_ware_slot(), Some(24));
+        assert_eq!(SOURCE_WARE_GOODS.len(), 23);
+    }
+}
+
 /// Military unit types — mirrors the four `FIGTYP_*` land entries
 /// in `figuren.cod` (`SCHWERT`, `KAVALERIE`, `MUSKETIER`,
 /// `KANONIER`). The discriminants follow the order of `[FIGKIND]`

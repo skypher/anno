@@ -6,6 +6,9 @@
 
 use crate::building::BuildingInstance;
 use crate::combat::{DiplomacyMatrix, MilitaryUnit};
+use crate::data_bridge::{
+    SourceCityTable, SourceKind4Occupant, SourceKind13Location, SourceKind13LocationTable,
+};
 use crate::entity::Figure;
 use crate::player::Player;
 use crate::simulation::Simulation;
@@ -61,17 +64,77 @@ use std::path::Path;
 /// v29: `SourceBuildingCommand` gained every packed `FUN_004631b0` field.
 /// v30: source command-root animation records persist their live frame state.
 /// v31: source command-root records retain their fixed-point production inputs.
-pub const SAVE_VERSION: u32 = 31;
+/// v32: `Figure` gained `destination_kind`, preserving the selected
+/// source command-root kind for an in-flight carrier supplier.
+/// v33: source command-root records retain outstanding type-8 supplier
+/// reservations.
+/// v34: warehouse city-good reservations persist across in-flight carriers.
+/// v35: `Figure` gained type-11 city-cart route identity and its source-root
+/// origin, preserving in-flight KARREN transfers.
+/// v36: `Warehouse` gained source-city BGRUPPE population, preserving the
+/// type-11 cart selector's city-local demand priorities.
+/// v37: `Figure` gained source supplier-root coordinates, separating a
+/// type-11 cart's reached footprint cell from its selected root record.
+/// v38: `Warehouse` gained its oriented source KONTOR footprint for type-8
+/// source-grid supplier selection.
+/// v39: `Warehouse` gained its compiled type-8 TRAEGER source path class.
+/// v40: `Figure` gained exact type-8 1/32-good in-flight cargo.
+/// v41: `Warehouse` gained exact type-11 city-store balances.
+/// v42: `Figure` gained source route traversal speed and remaining cell
+/// distance, preserving in-flight TRAEGER/KARREN movement timing.
+/// v43: `Figure` gained continuous source-grid coordinates for in-flight
+/// TRAEGER/KARREN rendering and route-state replay.
+/// v44: `Figure` gained its source-grid Z coordinate, seeded from the
+/// replayed map-cell `Posoffs` terrain elevation.
+/// v45: `Figure` gained its source animation-time accumulator, preserving
+/// per-figure `ANIM` phase across save/load.
+/// v46: the source animation accumulator changed from a presentation elapsed
+/// clock to the executable's per-frame remainder.
+/// v47: source kind-13 map-location anchors persist for the kind-`0x12`
+/// civilian supplier.
+/// v48: kind-13 map locations use the source's fixed 4,160-slot hash table.
+/// v49: fixed source city records and the kind-12 dispatch phase/cursor are
+///      persisted so the next two-city source update remains reproducible.
+/// v50: military units retain the source island occupied by kind-4 land
+///      figures, preserving source city-activity gates across save/load.
+/// v51: authored `SOLDAT3` kind-4 occupancy persists independently of the
+///      partially reconstructed local combat entity model.
+/// v52: source kind-4 records retain their runtime slots, authored state,
+///      position, and selected animation for lifecycle replay.
+/// v53: source-backed military units retain their `SOLDAT3` runtime slots
+///      and compiled figure definitions, linking combat lifecycle to source
+///      island-owner occupancy.
+/// v54: source kind-4 occupancy retains the four-byte `SOLDAT3` descriptor
+///      consumed by the type-4 dispatcher.
+/// v55: source-backed military units retain their non-null type-4 target
+///      descriptor alongside source occupancy.
+/// v56: source-backed military units and type-4 occupancy retain the
+///      `SOLDAT3` idle-anchor descriptor.
+/// v57: the MSVC-compatible source `rand()` state persists across saves.
+/// v58: the source 100-ms clock and kind-4 idle-gate timestamps persist.
+/// v59: native kind-4 timestamps begin after the source `Worktime` cadence.
+/// v60: type-4 land figures retain continuous source-engine motion state.
+/// v61: type-4 figures and runtime slots retain the `FUN_004581f0`
+/// failed-route retry counter that controls shifted search windows.
+/// v62: type-4 figures and runtime slots retain the packed `+0x130` direction
+/// program and its `+0x02` cursor between dispatcher updates.
+/// v63: type-4 figures retain the `FUN_00456d00` terminal route residual.
+/// v64: source type-4 dispatch retains source player/session state.
+pub const SAVE_VERSION: u32 = 64;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
 /// index shift, struct field reorder) or a known data-corruption
 /// risk and is hard-rejected.
 ///
-/// v31 baseline: source command-root records retain fixed-point production
-/// inputs and selector fields, so earlier
-/// payloads have a different bincode struct layout.
-pub const MIN_LOADABLE_VERSION: u32 = 31;
+/// v52 baseline: carrier figures retain type-8 supplier identity, exact
+/// 1/32-good cargo, continuous source position, and route timing; city stores retain fractional balances; type-11 carts
+/// retain origin identity; source command-root records retain fixed-point
+/// production inputs, selector fields, and in-flight supplier reservations;
+/// warehouse records retain city population, source-root footprint, and
+/// type-8 path-class data; figures retain independent source animation
+/// accumulators and the kind-13 source slot table in a distinct bincode layout.
+pub const MIN_LOADABLE_VERSION: u32 = 64;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -87,6 +150,16 @@ pub struct SaveState {
     pub buildings: Vec<BuildingInstance>,
     pub source_dynamic_map_objects: Vec<SourceDynamicMapObject>,
     pub source_map_cell_states: Vec<SourceMapCellState>,
+    pub source_kind13_locations: SourceKind13LocationTable,
+    pub source_cities: SourceCityTable,
+    pub source_kind4_occupants: Vec<SourceKind4Occupant>,
+    pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
+    pub source_time_ticks: u32,
+    pub source_time_remainder_ms: u32,
+    pub source_city_dispatch_elapsed_ms: u32,
+    pub source_city_dispatch_phase: u8,
+    pub source_city_dispatch_cursor: usize,
+    pub source_rng_state: crate::source_rand::SourceRand,
     pub warehouses: Vec<Warehouse>,
     pub figures: Vec<Figure>,
     pub military_units: Vec<MilitaryUnit>,
@@ -139,6 +212,16 @@ impl Simulation {
             buildings: self.buildings.clone(),
             source_dynamic_map_objects: self.source_dynamic_map_objects.clone(),
             source_map_cell_states: self.source_map_cell_states.clone(),
+            source_kind13_locations: self.source_kind13_locations.clone(),
+            source_cities: self.source_cities.clone(),
+            source_kind4_occupants: self.source_kind4_occupants.clone(),
+            source_kind4_dispatch: self.source_kind4_dispatch,
+            source_time_ticks: self.source_time_ticks,
+            source_time_remainder_ms: self.source_time_remainder_ms,
+            source_city_dispatch_elapsed_ms: self.source_city_dispatch_elapsed_ms,
+            source_city_dispatch_phase: self.source_city_dispatch_phase,
+            source_city_dispatch_cursor: self.source_city_dispatch_cursor,
+            source_rng_state: self.rng_state,
             warehouses: self.warehouses.clone(),
             figures: self.figures.clone(),
             military_units: self.military_units.clone(),
@@ -161,6 +244,16 @@ impl Simulation {
         self.buildings = s.buildings;
         self.source_dynamic_map_objects = s.source_dynamic_map_objects;
         self.source_map_cell_states = s.source_map_cell_states;
+        self.source_kind13_locations = s.source_kind13_locations;
+        self.source_cities = s.source_cities;
+        self.source_kind4_occupants = s.source_kind4_occupants;
+        self.source_kind4_dispatch = s.source_kind4_dispatch;
+        self.source_time_ticks = s.source_time_ticks;
+        self.source_time_remainder_ms = s.source_time_remainder_ms;
+        self.source_city_dispatch_elapsed_ms = s.source_city_dispatch_elapsed_ms;
+        self.source_city_dispatch_phase = s.source_city_dispatch_phase;
+        self.source_city_dispatch_cursor = s.source_city_dispatch_cursor;
+        self.rng_state = s.source_rng_state;
         self.warehouses = s.warehouses;
         self.figures = s.figures;
         self.military_units = s.military_units;
@@ -223,6 +316,16 @@ mod tests {
             buildings: vec![],
             source_dynamic_map_objects: vec![],
             source_map_cell_states: vec![],
+            source_kind13_locations: SourceKind13LocationTable::default(),
+            source_cities: SourceCityTable::default(),
+            source_kind4_occupants: vec![],
+            source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
+            source_time_ticks: 0,
+            source_time_remainder_ms: 0,
+            source_city_dispatch_elapsed_ms: 0,
+            source_city_dispatch_phase: 0,
+            source_city_dispatch_cursor: 0,
+            source_rng_state: crate::source_rand::SourceRand::default(),
             warehouses: vec![],
             figures: vec![],
             military_units: vec![],
@@ -263,8 +366,11 @@ mod tests {
         sim.players[0].satisfaction[0] = 96;
         sim.game_clock = 7777;
         sim.paused = true;
+        sim.seed_source_rand(1);
+        let _ = sim.next_source_rand();
 
         let snap = sim.snapshot();
+        let expected_next_rand = sim.next_source_rand();
         let bytes = bincode::serialize(&snap).unwrap();
         let restored: SaveState = bincode::deserialize(&bytes).unwrap();
 
@@ -277,6 +383,7 @@ mod tests {
         assert_eq!(sim2.players[0].satisfaction[0], 96);
         assert_eq!(sim2.game_clock, 7777);
         assert!(sim2.paused);
+        assert_eq!(sim2.next_source_rand(), expected_next_rand);
     }
 
     #[test]
@@ -316,6 +423,7 @@ mod tests {
                 work_material_stock: 64,
                 raw_material_stock: 128,
                 storage_fill: 128,
+                reserved_storage: 32,
                 storage_animation_capacity: 160,
                 source_production_amount: 32,
                 source_raw_material_amount: 64,
@@ -326,11 +434,120 @@ mod tests {
                 animation_continues: true,
                 kind_code: 7,
             });
+        assert!(
+            sim.source_kind13_locations
+                .insert(crate::data_bridge::SourceKind13Location {
+                    island_id: 1,
+                    tile_x: 9,
+                    tile_y: 11,
+                    orientation: 3,
+                    source_owner: 4,
+                })
+        );
+        assert!(sim.source_cities.set_record(
+            3,
+            Some(crate::data_bridge::SourceCityRecord {
+                island_id: 1,
+                source_owner: 4,
+                owner_slot: 4,
+                phase: 6,
+                tier_population: [10, 20, 30, 40, 50],
+            }),
+        ));
+        sim.source_city_dispatch_elapsed_ms = 9_800;
+        sim.source_city_dispatch_phase = 6;
+        sim.source_city_dispatch_cursor = 17;
+        sim.source_time_ticks = 19;
+        sim.source_time_remainder_ms = 99;
+        sim.source_kind4_dispatch = crate::combat::SourceKind4DispatchState {
+            active_player_slot: 2,
+            single_player: false,
+            faction_states: [0x0c, 0x0c, 0, 0x0c, 0x0d, 0x0e, 0x0b],
+        };
+        let mut source_route_program = crate::combat::default_source_kind4_route_program();
+        source_route_program[0] = 0x31;
+        source_route_program[1] = 0x42;
+        source_route_program[2] = crate::combat::SOURCE_KIND4_ROUTE_PROGRAM_TERMINATOR;
+        sim.source_kind4_occupants
+            .push(crate::data_bridge::SourceKind4Occupant {
+                runtime_slot: 0,
+                figure_definition_id: 0,
+                route_radius: crate::combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
+                route_retry_count: 3,
+                route_program: source_route_program,
+                route_program_cursor: 1,
+                idle_remaining_bits: 1.25_f32.to_bits(),
+                origin_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    0x33, 1, 2, 3,
+                ]),
+                position: (0, 0),
+                island_id: 1,
+                owner: 4,
+                direction: 0,
+                animation_state: 0,
+                state_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    0x38, 0, 16, 32,
+                ]),
+                idle_timestamp_ticks: 0,
+                state_flags: 0,
+                state_payload: [0; 8],
+                active: true,
+            });
+        let mut source_spearman =
+            crate::combat::MilitaryUnit::new(crate::combat::UnitType::NativeSpearman, 6, 12, 14);
+        source_spearman.source_island_id = Some(1);
+        source_spearman.source_runtime_slot = Some(0);
+        source_spearman.source_figure_definition_id = Some(33);
+        source_spearman.source_origin_descriptor =
+            Some(crate::source_route::SourceTargetDescriptor::from_bytes([
+                0x33, 1, 2, 3,
+            ]));
+        source_spearman.source_target_descriptor =
+            Some(crate::source_route::SourceTargetDescriptor::from_bytes([
+                0x38, 0, 16, 32,
+            ]));
+        source_spearman.source_route_retry_count = 3;
+        source_spearman.source_route_program = source_route_program;
+        source_spearman.source_route_program_cursor = 1;
+        source_spearman.source_step_remaining = 0.375;
+        source_spearman.source_idle_remaining = 1.25;
+        source_spearman.source_motion_target = Some((14, 16));
+        source_spearman.source_position_x = 6.25;
+        source_spearman.source_position_y = 7.75;
+        source_spearman.source_position_initialized = true;
+        sim.military_units.push(source_spearman);
         let mut wh = Warehouse::new(1, 0, 5, 5);
+        wh.city_population = [10, 20, 30, 40, 50];
+        wh.set_source_path_class(55);
         wh.set_capacity(Good::Wood, 100);
         wh.deposit(Good::Wood, 50);
         wh.deposit(Good::Tools, 7);
+        assert_eq!(wh.deposit_city_good_fixed(Good::Cloth, 65, 1_600), 65);
+        assert!(wh.reserve(Good::Wood, 4));
         sim.warehouses.push(wh);
+        let mut carrier = crate::entity::Figure::new();
+        carrier.action = crate::entity::ActionType::CarryingGoods;
+        carrier.target_x = 5;
+        carrier.target_y = 5;
+        carrier.destination_kind = 8;
+        carrier.supplier_x = 6;
+        carrier.supplier_y = 7;
+        carrier.cargo_route = crate::entity::CargoRoute::CityCart;
+        carrier.origin_island = 1;
+        carrier.origin_x = 10;
+        carrier.origin_y = 20;
+        carrier.origin_kind = 7;
+        carrier.carried_good = Good::Wood as u8;
+        carrier.carried_amount = 7;
+        carrier.cargo_fixed = 231;
+        carrier.source_move_speed = 300;
+        carrier.source_step_remaining = 0.75;
+        carrier.source_position_x = 10.25;
+        carrier.source_position_y = 20.5;
+        carrier.source_position_z = 0.56;
+        carrier.source_position_initialized = true;
+        carrier.source_animation_elapsed_ms = 75;
+        sim.figures.push(carrier);
 
         let snap = sim.snapshot();
         let bytes = bincode::serialize(&snap).unwrap();
@@ -368,6 +585,7 @@ mod tests {
                 work_material_stock: 64,
                 raw_material_stock: 128,
                 storage_fill: 128,
+                reserved_storage: 32,
                 storage_animation_capacity: 160,
                 source_production_amount: 32,
                 source_raw_material_amount: 64,
@@ -380,6 +598,112 @@ mod tests {
             }]
         );
         assert_eq!(sim2.source_map_cell_states[0].market_frame_selector(4), 3);
+        assert_eq!(
+            sim2.source_kind13_locations.active_locations(),
+            vec![crate::data_bridge::SourceKind13Location {
+                island_id: 1,
+                tile_x: 9,
+                tile_y: 11,
+                orientation: 3,
+                source_owner: 4,
+            }]
+        );
+        assert_eq!(
+            sim2.source_cities.record(3),
+            Some(crate::data_bridge::SourceCityRecord {
+                island_id: 1,
+                source_owner: 4,
+                owner_slot: 4,
+                phase: 6,
+                tier_population: [10, 20, 30, 40, 50],
+            })
+        );
+        assert_eq!(sim2.source_city_dispatch_elapsed_ms, 9_800);
+        assert_eq!(sim2.source_city_dispatch_phase, 6);
+        assert_eq!(sim2.source_city_dispatch_cursor, 17);
+        assert_eq!(sim2.source_time_ticks, 19);
+        assert_eq!(sim2.source_time_remainder_ms, 99);
+        assert_eq!(
+            sim2.source_kind4_dispatch,
+            crate::combat::SourceKind4DispatchState {
+                active_player_slot: 2,
+                single_player: false,
+                faction_states: [0x0c, 0x0c, 0, 0x0c, 0x0d, 0x0e, 0x0b],
+            }
+        );
+        assert_eq!(
+            sim2.source_kind4_occupants,
+            vec![crate::data_bridge::SourceKind4Occupant {
+                runtime_slot: 0,
+                figure_definition_id: 0,
+                route_radius: crate::combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
+                route_retry_count: 3,
+                route_program: source_route_program,
+                route_program_cursor: 1,
+                idle_remaining_bits: 1.25_f32.to_bits(),
+                origin_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    0x33, 1, 2, 3,
+                ]),
+                position: (0, 0),
+                island_id: 1,
+                owner: 4,
+                direction: 0,
+                animation_state: 0,
+                state_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    0x38, 0, 16, 32,
+                ]),
+                idle_timestamp_ticks: 0,
+                state_flags: 0,
+                state_payload: [0; 8],
+                active: true,
+            }]
+        );
+        assert_eq!(sim2.military_units.len(), 1);
+        assert_eq!(
+            sim2.military_units[0].unit_type,
+            crate::combat::UnitType::NativeSpearman
+        );
+        assert_eq!(sim2.military_units[0].source_island_id, Some(1));
+        assert_eq!(sim2.military_units[0].source_runtime_slot, Some(0));
+        assert_eq!(sim2.military_units[0].source_figure_definition_id, Some(33));
+        assert_eq!(sim2.military_units[0].source_route_retry_count, 3);
+        assert_eq!(
+            sim2.military_units[0].source_route_program[..3],
+            [0x31, 0x42, 0xc1]
+        );
+        assert_eq!(sim2.military_units[0].source_route_program_cursor, 1);
+        assert_eq!(
+            sim2.source_kind4_occupants[0].route_program[..3],
+            [0x31, 0x42, 0xc1]
+        );
+        assert_eq!(sim2.source_kind4_occupants[0].route_program_cursor, 1);
+        assert_eq!(sim2.source_kind4_occupants[0].idle_remaining_bits, 1.25_f32.to_bits());
+        assert_eq!(sim2.military_units[0].source_step_remaining, 0.375);
+        assert_eq!(sim2.military_units[0].source_idle_remaining, 1.25);
+        assert_eq!(sim2.military_units[0].source_motion_target, Some((14, 16)));
+        assert_eq!(sim2.military_units[0].source_position_x, 6.25);
+        assert_eq!(sim2.military_units[0].source_position_y, 7.75);
+        assert!(sim2.military_units[0].source_position_initialized);
+        assert_eq!(
+            sim2.military_units[0]
+                .source_origin_descriptor
+                .map(crate::source_route::SourceTargetDescriptor::bytes),
+            Some([0x33, 1, 2, 3])
+        );
+        assert_eq!(
+            sim2.military_units[0]
+                .source_target_descriptor
+                .map(crate::source_route::SourceTargetDescriptor::bytes),
+            Some([0x38, 0, 16, 32])
+        );
+        assert_eq!(
+            sim2.source_kind4_occupants[0].state_descriptor.bytes(),
+            sim2.military_units[0]
+                .source_target_descriptor
+                .expect("source unit target descriptor")
+                .bytes()
+        );
+        assert_eq!(sim2.warehouses[0].city_population, [10, 20, 30, 40, 50]);
         assert_eq!(
             sim2.source_dynamic_map_object_table(1).object(0),
             Some(SourceDynamicMapObject {
@@ -425,6 +749,37 @@ mod tests {
         assert_eq!(sim2.warehouses.len(), 1);
         assert_eq!(sim2.warehouses[0].stock(Good::Wood), 50);
         assert_eq!(sim2.warehouses[0].stock(Good::Tools), 7);
+        assert_eq!(sim2.warehouses[0].city_stock_fixed(Good::Cloth), 65);
+        assert_eq!(sim2.warehouses[0].reserved(Good::Wood), 4);
+        assert_eq!(sim2.warehouses[0].source_path_class, 55);
+        assert_eq!(sim2.figures.len(), 1);
+        assert_eq!(
+            sim2.figures[0].action,
+            crate::entity::ActionType::CarryingGoods
+        );
+        assert_eq!(sim2.figures[0].target_x, 5);
+        assert_eq!(sim2.figures[0].target_y, 5);
+        assert_eq!(sim2.figures[0].destination_kind, 8);
+        assert_eq!(sim2.figures[0].supplier_x, 6);
+        assert_eq!(sim2.figures[0].supplier_y, 7);
+        assert_eq!(
+            sim2.figures[0].cargo_route,
+            crate::entity::CargoRoute::CityCart
+        );
+        assert_eq!(sim2.figures[0].origin_island, 1);
+        assert_eq!(sim2.figures[0].origin_x, 10);
+        assert_eq!(sim2.figures[0].origin_y, 20);
+        assert_eq!(sim2.figures[0].origin_kind, 7);
+        assert_eq!(sim2.figures[0].carried_good, Good::Wood as u8);
+        assert_eq!(sim2.figures[0].carried_amount, 7);
+        assert_eq!(sim2.figures[0].cargo_fixed, 231);
+        assert_eq!(sim2.figures[0].source_move_speed, 300);
+        assert_eq!(sim2.figures[0].source_step_remaining, 0.75);
+        assert_eq!(sim2.figures[0].source_position_x, 10.25);
+        assert_eq!(sim2.figures[0].source_position_y, 20.5);
+        assert_eq!(sim2.figures[0].source_position_z, 0.56);
+        assert!(sim2.figures[0].source_position_initialized);
+        assert_eq!(sim2.figures[0].source_animation_elapsed_ms, 75);
     }
 
     #[test]

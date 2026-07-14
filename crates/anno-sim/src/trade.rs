@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(compass_heading(-1, 1, 0), 5); // SW
         assert_eq!(compass_heading(-1, 0, 0), 6); // W
         assert_eq!(compass_heading(-1, -1, 0), 7); // NW
-                                                   // Stalled ships keep their previous heading
+        // Stalled ships keep their previous heading
         assert_eq!(compass_heading(0, 0, 5), 5);
     }
 
@@ -839,6 +839,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let ocean = crate::ocean_map::OceanMap::from_scenario(&szs);
 
@@ -898,6 +899,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let definitions = [anno_formats::cod::BuildingDef {
             source_id: 0x4e20,
@@ -949,6 +951,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let ocean = crate::ocean_map::OceanMap::from_source_scenario(&scenario, &[]);
         let mut route = TradeRoute::new(0, 0);
@@ -1001,6 +1004,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let ocean = crate::ocean_map::OceanMap::from_source_scenario(&scenario, &[]);
         let mut route = TradeRoute::new(0, 0);
@@ -1066,7 +1070,7 @@ mod tests {
         let wh_b = make_warehouse(1, 0, 20, 20);
 
         wh_a.deposit(Good::Spices, 25); // Surplus
-                                        // wh_b has no spices — needs some
+        // wh_b has no spices — needs some
 
         let warehouses = vec![wh_a, wh_b];
         let trade = free_trader_find_trade(&warehouses, 0, DEFAULT_SMALL_TRADER_CARGO_CAPACITY);

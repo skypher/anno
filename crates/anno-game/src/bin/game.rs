@@ -43,7 +43,7 @@ use anno_sim::ai::AiController;
 use anno_sim::building::BuildingInstance;
 use anno_sim::combat::{Diplomacy, UnitType};
 use anno_sim::data_bridge;
-use anno_sim::entity::ActionType;
+use anno_sim::entity::{ActionType, CargoRoute};
 use anno_sim::island_map::IslandMap;
 use anno_sim::player::Player;
 use anno_sim::simulation::{Simulation, TileClear};
@@ -455,11 +455,7 @@ impl BuildingPlacer {
 
     fn page_count(&self) -> usize {
         let n = self.category_indices().len();
-        if n == 0 {
-            0
-        } else {
-            (n - 1) / 9 + 1
-        }
+        if n == 0 { 0 } else { (n - 1) / 9 + 1 }
     }
 
     fn next_page(&mut self) {
@@ -1071,17 +1067,25 @@ fn main() {
     let carrier_sprites: Vec<Vec<(u32, u32, Vec<u8>)>> = (0..3)
         .map(|z| decode_entity_sprites(&sprite_mgr, SpriteCategory::Traeger, z, &palette))
         .collect();
+    let worker_sprites: Vec<Vec<(u32, u32, Vec<u8>)>> = (0..3)
+        .map(|z| decode_entity_sprites(&sprite_mgr, SpriteCategory::Maeher, z, &palette))
+        .collect();
     let ship_sprites: Vec<Vec<(u32, u32, Vec<u8>)>> = (0..3)
         .map(|z| decode_entity_sprites(&sprite_mgr, SpriteCategory::Ship, z, &palette))
         .collect();
     let soldier_sprites: Vec<Vec<(u32, u32, Vec<u8>)>> = (0..3)
         .map(|z| decode_entity_sprites(&sprite_mgr, SpriteCategory::Soldat, z, &palette))
         .collect();
+    let shadow_sprites: Vec<Vec<(u32, u32, Vec<u8>)>> = (0..3)
+        .map(|z| decode_entity_sprites(&sprite_mgr, SpriteCategory::Schatten, z, &palette))
+        .collect();
     println!(
-        "Entity sprites: carriers={} ships={} soldiers={}",
+        "Entity sprites: carriers={} workers={} ships={} soldiers={} shadows={}",
         carrier_sprites[0].len(),
+        worker_sprites[0].len(),
         ship_sprites[0].len(),
         soldier_sprites[0].len(),
+        shadow_sprites[0].len(),
     );
 
     // Load building definitions
@@ -1115,6 +1119,7 @@ fn main() {
     // Pull the layout bits we'll use during render. Falls back to the old
     // heuristic values if the figure can't be found.
     let traeger_def = figures.find("TRAEGER").cloned();
+    let karren_def = figures.find("KARREN").cloned();
     let handel1_def = figures
         .find(ShipClass::SmallTrader.source_figure_name())
         .cloned();
@@ -1156,8 +1161,27 @@ fn main() {
         .and_then(|f| f.anim(1))
         .and_then(|a| usize::try_from(a.anim_offs).ok())
         .unwrap_or(carrier_walk_anz * 8);
+    let carrier_shadow_layout = carrier_shadow_layout_from_figure(
+        figures.find("SCHATTEN"),
+        CarrierShadowLayout::normal_default(),
+    );
+    let city_cart_shadow_layout = carrier_shadow_layout_from_figure(
+        figures.find("SCHATTENLANG"),
+        CarrierShadowLayout::long_default(),
+    );
+    let carrier_shadow_y_offset = traeger_def
+        .as_ref()
+        .map(|figure| figure.position_offset.1)
+        .unwrap_or(5);
+    let city_cart_shadow_y_offset = karren_def
+        .as_ref()
+        .map(|figure| figure.position_offset.1)
+        .unwrap_or(5);
+    let civilian_shadow_y_offset = figures
+        .find("ADELWEIBL")
+        .map(|figure| figure.position_offset.1)
+        .unwrap_or(5);
     let civilian_config = anno_sim::civilian::CivilianConfig::from_figures(&figures);
-    let civilian_walk_anz = civilian_frames_per_dir_from_figures(&figures);
     let _ = &figures;
 
     // Parse CLI: positional scenario path + optional --host PORT / --join HOST:PORT
@@ -1378,6 +1402,9 @@ fn main() {
     let mut last_source_map_cell_revision = sim.source_map_cell_revision;
     if let Some(traeger) = traeger_def.as_ref() {
         sim.carrier_config = anno_sim::carrier::CarrierConfig::from_figure_def(traeger);
+    }
+    if let Some(karren) = karren_def.as_ref() {
+        sim.city_cart_config = anno_sim::carrier::CityCartConfig::from_figure_def(karren);
     }
     sim.civilian_config = civilian_config;
     println!(
@@ -2606,11 +2633,26 @@ fn main() {
                                     rs.tile_w,
                                     rs.tile_h,
                                 );
+                                let active_island_id = islands[current_island].number;
                                 hit_unit = sim.military_units.iter().position(|u| {
-                                    u.is_alive()
-                                        && u.owner == 0
-                                        && (u.tile_x - tile_x).abs() <= 1
-                                        && (u.tile_y - tile_y).abs() <= 1
+                                    if !u.is_alive() || u.owner != 0 {
+                                        return false;
+                                    }
+                                    if let Some(island_id) = u.source_island_id {
+                                        return island_id == active_island_id
+                                            && sim
+                                                .island_maps
+                                                .iter()
+                                                .find(|map| map.island_id == island_id)
+                                                .and_then(|map| {
+                                                    map.source_world_to_local((u.tile_x, u.tile_y))
+                                                })
+                                                .is_some_and(|(x, y)| {
+                                                    (x - tile_x).abs() <= 1
+                                                        && (y - tile_y).abs() <= 1
+                                                });
+                                    }
+                                    (u.tile_x - tile_x).abs() <= 1 && (u.tile_y - tile_y).abs() <= 1
                                 });
                                 hit_trade_ship = sim.trade_ships.iter().position(|s| {
                                     s.active
@@ -2719,14 +2761,71 @@ fn main() {
                                 rs.tile_h,
                             );
                             let mut moved = 0;
+                            let active_island_id = islands[current_island].number;
+                            let source_time_ticks = sim.source_time_ticks;
                             for &ui in &selected_units {
+                                let mut source_target_update = None;
                                 if let Some(u) = sim.military_units.get_mut(ui) {
                                     if u.is_alive() {
-                                        u.target_x = tile_x;
-                                        u.target_y = tile_y;
+                                        if let Some(island_id) = u.source_island_id {
+                                            if island_id != active_island_id {
+                                                continue;
+                                            }
+                                            let Some(target) = sim
+                                                .island_maps
+                                                .iter()
+                                                .find(|map| map.island_id == island_id)
+                                                .and_then(|map| {
+                                                    map.local_to_source_world((tile_x, tile_y))
+                                                })
+                                            else {
+                                                continue;
+                                            };
+                                            u.target_x = target.0;
+                                            u.target_y = target.1;
+                                            let Some(descriptor) = anno_sim::source_route::SourceTargetDescriptor::from_source_land_route_coordinate(
+                                                target.0, target.1,
+                                            ) else {
+                                                continue;
+                                            };
+                                            u.source_target_descriptor = Some(descriptor);
+                                            u.source_route_retry_count = 0;
+                                            u.source_idle_remaining = 0.0;
+                                            u.clear_source_route_program();
+                                            source_target_update =
+                                                u.source_runtime_slot.map(|slot| {
+                                                    (
+                                                        slot,
+                                                        descriptor,
+                                                        u.unit_type == UnitType::NativeSpearman,
+                                                    )
+                                                });
+                                        } else {
+                                            u.target_x = tile_x;
+                                            u.target_y = tile_y;
+                                        }
                                         u.combat_target = -1;
                                         u.move_timer_ms = 0;
                                         moved += 1;
+                                    }
+                                }
+                                if let Some((runtime_slot, descriptor, native_spearman)) =
+                                    source_target_update
+                                {
+                                    if let Some(occupant) = sim
+                                        .source_kind4_occupants
+                                        .iter_mut()
+                                        .find(|occupant| occupant.runtime_slot == runtime_slot)
+                                    {
+                                        occupant.state_descriptor = descriptor;
+                                        occupant.route_retry_count = 0;
+                                        occupant.idle_remaining_bits = 0;
+                                        occupant.route_program = anno_sim::combat::default_source_kind4_route_program();
+                                        occupant.route_program_cursor = 0;
+                                        if native_spearman {
+                                            occupant.idle_timestamp_ticks =
+                                                source_time_ticks.wrapping_add(8);
+                                        }
                                     }
                                 }
                             }
@@ -3022,6 +3121,7 @@ fn main() {
                         name,
                     } => {
                         println!("[net] joined slot={slot} id={player_id} name={name}");
+                        sim.source_kind4_dispatch.single_player = false;
                         net_status = format!(
                             "HOST :{} ({} peers)",
                             net_role_port(&net_role),
@@ -3030,6 +3130,7 @@ fn main() {
                     }
                     anno_net::session::SessionEvent::PlayerLeft { slot, player_id } => {
                         println!("[net] left slot={slot} id={player_id}");
+                        sim.source_kind4_dispatch.single_player = host.session().player_count < 2;
                         net_status = format!(
                             "HOST :{} ({} peers)",
                             net_role_port(&net_role),
@@ -3115,7 +3216,7 @@ fn main() {
                 needs_redraw = true;
             }
             entity_visual_elapsed_ms = entity_visual_elapsed_ms.wrapping_add(dt_ms);
-            let entity_visual_gen = entity_visual_elapsed_ms / 100;
+            let entity_visual_gen = entity_visual_elapsed_ms / 20;
             if entity_visual_gen != last_entity_visual_gen {
                 last_entity_visual_gen = entity_visual_gen;
                 needs_redraw = true;
@@ -3179,8 +3280,8 @@ fn main() {
                         || line.starts_with("[victory]")
                     {
                         voice_trader_slot // triumph.wav for positive
-                                          // diplomacy / objective /
-                                          // victory events
+                    // diplomacy / objective /
+                    // victory events
                     } else if line.starts_with("[defeat]") {
                         voice_attack_slot
                     } else {
@@ -3322,6 +3423,8 @@ fn main() {
                     },
                     &islands,
                     &carrier_sprites[sprite_zoom],
+                    &worker_sprites[sprite_zoom],
+                    &shadow_sprites[sprite_zoom],
                     &ship_sprites[sprite_zoom],
                     &soldier_sprites[sprite_zoom],
                     &selected_units,
@@ -3329,7 +3432,11 @@ fn main() {
                     carrier_walk_anz,
                     carrier_empty_anim_offs,
                     carrier_loaded_anim_offs,
-                    civilian_walk_anz,
+                    carrier_shadow_layout,
+                    city_cart_shadow_layout,
+                    carrier_shadow_y_offset,
+                    city_cart_shadow_y_offset,
+                    civilian_shadow_y_offset,
                     ship_sprite_layout,
                     soldier_sprite_layout,
                     entity_visual_elapsed_ms,
@@ -5253,11 +5360,76 @@ struct SoldierSpriteFamily {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CarrierShadowLayout {
+    base: usize,
+    frames_per_dir: usize,
+    directional: bool,
+}
+
+impl CarrierShadowLayout {
+    const fn normal_default() -> Self {
+        Self {
+            base: 0,
+            frames_per_dir: 8,
+            directional: false,
+        }
+    }
+
+    const fn long_default() -> Self {
+        Self {
+            base: 8,
+            frames_per_dir: 8,
+            directional: true,
+        }
+    }
+
+    fn sprite_index(self, direction: u8, frame: usize) -> usize {
+        let frames = self.frames_per_dir.max(1);
+        self.base
+            + if self.directional {
+                usize::from(direction % 8) * frames
+            } else {
+                0
+            }
+            + frame % frames
+    }
+}
+
+fn carrier_shadow_layout_from_figure(
+    figure: Option<&anno_formats::figuren::FigureDef>,
+    fallback: CarrierShadowLayout,
+) -> CarrierShadowLayout {
+    let Some(figure) = figure else {
+        return fallback;
+    };
+    let Some(walk) = figure.walk_anim() else {
+        return fallback;
+    };
+    let Some(base) = figure
+        .gfx
+        .checked_add(walk.anim_offs)
+        .and_then(|base| usize::try_from(base).ok())
+    else {
+        return fallback;
+    };
+    let frames_per_dir = usize::try_from(walk.anim_anz)
+        .ok()
+        .filter(|&frames| frames > 0)
+        .unwrap_or(fallback.frames_per_dir);
+    CarrierShadowLayout {
+        base,
+        frames_per_dir,
+        directional: figure.rotate > 0,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SoldierSpriteLayout {
     infantry: SoldierSpriteFamily,
     cavalry: SoldierSpriteFamily,
     cannon: SoldierSpriteFamily,
     musketeer: SoldierSpriteFamily,
+    native_spearman: SoldierSpriteFamily,
 }
 
 impl SoldierSpriteLayout {
@@ -5283,6 +5455,11 @@ impl SoldierSpriteLayout {
                 ["MUSKETIER1", "MUSKETIER2", "MUSKETIER3", "MUSKETIER4"],
                 [3200, 3336, 3472, 3608],
             ),
+            native_spearman: soldier_family_from_figures(
+                figures,
+                ["SPEER1", "SPEER1", "SPEER1", "SPEER1"],
+                [3744, 3744, 3744, 3744],
+            ),
         }
     }
 
@@ -5292,6 +5469,7 @@ impl SoldierSpriteLayout {
             UnitType::Cavalry => Some(self.cavalry),
             UnitType::Cannon => Some(self.cannon),
             UnitType::Musketeer => Some(self.musketeer),
+            UnitType::NativeSpearman => Some(self.native_spearman),
             _ => None,
         }
     }
@@ -5379,13 +5557,23 @@ fn entity_walk_sprite_index(
     anim_offs: usize,
     frames_per_dir: usize,
     direction: u8,
-    anim_frame: u8,
+    anim_frame: usize,
 ) -> usize {
     let frames = frames_per_dir.max(1);
-    base_sprite as usize
-        + anim_offs
-        + usize::from(direction % 8) * frames
-        + usize::from(anim_frame) % frames
+    base_sprite as usize + anim_offs + usize::from(direction % 8) * frames + anim_frame % frames
+}
+
+fn source_walk_frame(source_frame: u8, frames_per_dir: usize) -> usize {
+    let frames = frames_per_dir.max(1);
+    usize::from(source_frame) % frames
+}
+
+fn source_shadow_y_offset(tile_width: i32, position_offset_y: i32) -> i32 {
+    tile_width.saturating_mul(position_offset_y) / 64
+}
+
+fn source_terrain_z_lift(terrain_height: f32, tile_height: i32) -> i32 {
+    (terrain_height * tile_height as f32).round() as i32
 }
 
 fn rotated_walk_sprite_index(
@@ -5396,10 +5584,6 @@ fn rotated_walk_sprite_index(
 ) -> usize {
     let frames = frames_per_dir.max(1);
     base + usize::from(direction % 8) * frames + frame % frames
-}
-
-fn civilian_frames_per_dir_from_figures(figures: &anno_formats::figuren::FiguresFile) -> usize {
-    usize::from(anno_sim::civilian::CivilianConfig::from_figures(figures).frames_per_dir)
 }
 
 #[cfg(test)]
@@ -5928,9 +6112,11 @@ mod tests {
     #[test]
     fn diplomacy_panel_help_omits_fixed_tribute_shortcut() {
         assert!(!DIPLOMACY_PANEL_HELP.contains('G'));
-        assert!(!DIPLOMACY_PANEL_HELP
-            .to_ascii_lowercase()
-            .contains("tribute"));
+        assert!(
+            !DIPLOMACY_PANEL_HELP
+                .to_ascii_lowercase()
+                .contains("tribute")
+        );
     }
 
     #[test]
@@ -6244,28 +6430,64 @@ mod tests {
     }
 
     #[test]
-    fn civilian_frames_per_dir_comes_from_figuren_cod_when_available() {
-        let figures = anno_formats::figuren::FiguresFile {
-            constants: Default::default(),
-            figures: vec![FigureDef {
-                name: "PASSANT".into(),
-                anims: vec![FigureAnim {
-                    nummer: 0,
-                    anim_anz: 6,
-                    ..Default::default()
-                }],
+    fn source_walk_frame_uses_the_figure_selected_by_source_animation() {
+        assert_eq!(source_walk_frame(0, 8), 0);
+        assert_eq!(source_walk_frame(7, 8), 7);
+        assert_eq!(source_walk_frame(10, 8), 2);
+    }
+
+    #[test]
+    fn source_shadow_y_offset_scales_with_the_horizontal_tile_width() {
+        assert_eq!(source_shadow_y_offset(64, 5), 5);
+        assert_eq!(source_shadow_y_offset(32, 5), 2);
+        assert_eq!(source_shadow_y_offset(16, 5), 1);
+    }
+
+    #[test]
+    fn source_terrain_z_lift_matches_the_figure_projection_scale() {
+        assert_eq!(source_terrain_z_lift(0.28, 32), 9);
+        assert_eq!(source_terrain_z_lift(0.28, 16), 4);
+        assert_eq!(source_terrain_z_lift(0.28, 8), 2);
+    }
+
+    #[test]
+    fn carrier_shadow_layout_matches_source_normal_and_long_families() {
+        let normal = FigureDef {
+            gfx: 0,
+            rotate: 0,
+            anims: vec![FigureAnim {
+                nummer: 0,
+                anim_anz: 8,
                 ..Default::default()
             }],
+            ..Default::default()
+        };
+        let long = FigureDef {
+            gfx: 8,
+            rotate: 8,
+            anims: vec![FigureAnim {
+                nummer: 0,
+                anim_anz: 8,
+                ..Default::default()
+            }],
+            ..Default::default()
         };
 
-        assert_eq!(civilian_frames_per_dir_from_figures(&figures), 6);
-        assert_eq!(
-            civilian_frames_per_dir_from_figures(&anno_formats::figuren::FiguresFile {
-                constants: Default::default(),
-                figures: Vec::new(),
-            }),
-            8,
-        );
+        let normal_layout =
+            carrier_shadow_layout_from_figure(Some(&normal), CarrierShadowLayout::normal_default());
+        let long_layout =
+            carrier_shadow_layout_from_figure(Some(&long), CarrierShadowLayout::long_default());
+        assert_eq!(normal_layout.sprite_index(5, 3), 3);
+        assert_eq!(long_layout.sprite_index(5, 3), 51);
+    }
+
+    #[test]
+    fn shadow_mask_blit_uses_black_for_opaque_source_pixels() {
+        let mut dst = vec![9; 8];
+        let src = [20, 30, 40, 255, 50, 60, 70, 0];
+        blit_rgba_mask_color(&mut dst, 2, 1, 0, 0, &src, 2, 1, [0, 0, 0, 255]);
+        assert_eq!(&dst[..4], &[0, 0, 0, 255]);
+        assert_eq!(&dst[4..], &[9, 9, 9, 9]);
     }
 
     #[test]
@@ -6290,6 +6512,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -6324,6 +6547,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -6354,6 +6578,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -6496,6 +6721,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -6556,6 +6782,7 @@ mod tests {
                 heading_byte: 4,
                 cargo_slots: [0; 7],
             }],
+            land_figures: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -6600,6 +6827,7 @@ mod tests {
                 heading_byte: 0,
                 cargo_slots: [0; 7],
             }],
+            land_figures: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -6629,6 +6857,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -6668,6 +6897,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -6753,6 +6983,7 @@ mod tests {
                 def("MUSKETIER2", 3336, 100),
                 def("MUSKETIER3", 3472, 100),
                 def("MUSKETIER4", 3608, 100),
+                def("SPEER1", 3744, 80),
             ],
         };
         let layout = SoldierSpriteLayout::from_figures(&figures);
@@ -6778,6 +7009,10 @@ mod tests {
             Some(3618),
         );
         assert_eq!(
+            layout.sprite_index(UnitType::NativeSpearman, 6, 1, 160, true),
+            Some(3754),
+        );
+        assert_eq!(
             layout.sprite_index(UnitType::SmallWarship, 0, 0, 0, false),
             None,
         );
@@ -6799,6 +7034,8 @@ fn overlay_entities(
     current_island: Option<&Island>,
     islands: &[Island],
     carrier_sprites: &[(u32, u32, Vec<u8>)],
+    worker_sprites: &[(u32, u32, Vec<u8>)],
+    shadow_sprites: &[(u32, u32, Vec<u8>)],
     ship_sprites: &[(u32, u32, Vec<u8>)],
     soldier_sprites: &[(u32, u32, Vec<u8>)],
     selected_units: &[usize],
@@ -6806,7 +7043,11 @@ fn overlay_entities(
     carrier_walk_anz: usize,
     carrier_empty_anim_offs: usize,
     carrier_loaded_anim_offs: usize,
-    civilian_walk_anz: usize,
+    carrier_shadow_layout: CarrierShadowLayout,
+    city_cart_shadow_layout: CarrierShadowLayout,
+    carrier_shadow_y_offset: i32,
+    city_cart_shadow_y_offset: i32,
+    civilian_shadow_y_offset: i32,
     ship_sprite_layout: ShipSpriteLayout,
     soldier_sprite_layout: SoldierSpriteLayout,
     anim_elapsed_ms: u32,
@@ -6823,12 +7064,12 @@ fn overlay_entities(
         (sx, sy)
     };
 
-    // Draw carrier/civilian figures from TRAEGER.BSH.
-    // Layout (from figuren.cod TRAEGER): 8 rotations × `carrier_walk_anz`
-    // frames laid out as base + dir*anz + frame. base_sprite is the per-figure
-    // offset in the BSH (TRAEGER=0, ESEL=192, etc.).
+    // Draw carrier/civilian figures from their source BSH sprite families.
+    // TRAEGER and KARREN both use 8 rotations × `carrier_walk_anz` frames,
+    // laid out as base + dir*anz + frame. base_sprite selects the figure's
+    // resolved Gfx base (TRAEGER=0, KARREN=496, ESEL=192, etc.).
     let carrier_frames_per_dir = carrier_walk_anz.max(1);
-    let civilian_frames_per_dir = civilian_walk_anz.max(1);
+    let civilian_frames_per_dir = usize::from(sim.civilian_config.frames_per_dir.max(1));
     for figure in &sim.figures {
         if !figure.is_active() {
             continue;
@@ -6837,21 +7078,27 @@ fn overlay_entities(
             figure.action,
             ActionType::CarryingGoods | ActionType::Returning
         );
-        let is_civilian = anno_sim::civilian::is_civilian(figure);
-        if !is_carrier && !is_civilian {
+        let is_kind12 = sim.civilian_config.is_kind12(figure);
+        let is_worker = sim.civilian_config.is_worker(figure);
+        if !is_carrier && !is_kind12 {
             continue;
         }
 
         // Find island position for this figure's island
         let (ix, iy) = if world_mode {
-            if (figure.building_idx as usize) < sim.buildings.len() {
+            if is_kind12 {
+                island_offset_for(figure.origin_island, sim, current_island, islands)
+            } else if (figure.building_idx as usize) < sim.buildings.len() {
                 let bld = &sim.buildings[figure.building_idx as usize];
                 island_offset_for(bld.island_id, sim, current_island, islands)
             } else {
                 (0, 0)
             }
         } else if let Some(island) = current_island {
-            if (figure.building_idx as usize) < sim.buildings.len() {
+            if is_kind12 && figure.origin_island != island.number {
+                continue;
+            }
+            if !is_kind12 && (figure.building_idx as usize) < sim.buildings.len() {
                 let bld = &sim.buildings[figure.building_idx as usize];
                 if bld.island_id != island.number {
                     continue;
@@ -6862,27 +7109,61 @@ fn overlay_entities(
             continue;
         };
 
-        let (sx, sy) = tile_to_screen(figure.tile_x as i32, figure.tile_y as i32, ix, iy);
+        let (sx, sy) = if (is_carrier || is_kind12) && figure.source_position_initialized {
+            let world_x = ix as f32 + figure.source_position_x;
+            let world_y = iy as f32 + figure.source_position_y;
+            // `FUN_00451220` converts a source figure's Z coordinate with
+            // the horizontal tile scale divided by two. Here that is tile_h.
+            let z_lift = (figure.source_position_z * tile_h as f32).round() as i32;
+            (
+                (origin_x as f32 + (world_x - world_y) * half_tw as f32).round() as i32,
+                (origin_y as f32 + (world_x + world_y) * half_th as f32).round() as i32 - z_lift,
+            )
+        } else {
+            // Source save reconstruction obtains every civilian's Z from
+            // FUN_00451180(island, current X, current Y) before constructing
+            // the source figure. Re-evaluate that live map-cell height for
+            // the rendered tile rather than treating civilian sprites as
+            // terrain-flat.
+            let civilian_z_lift = if is_kind12 {
+                sim.island_maps
+                    .iter()
+                    .find(|map| map.island_id == figure.origin_island)
+                    .and_then(|map| map.source_terrain_height((figure.tile_x, figure.tile_y)))
+                    .map(|height| source_terrain_z_lift(height, tile_h))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let (sx, sy) = tile_to_screen(figure.tile_x, figure.tile_y, ix, iy);
+            (sx, sy - civilian_z_lift)
+        };
 
-        // Try sprite rendering. Carrier TRAEGER has two walk animations
-        // (`figuren.cod` Nummer:TRAEGER):
+        // TRAEGER and KARREN have matching empty/loaded walk layouts in
+        // figuren.cod: 8 rotations × 8 frames at offsets 0 and 64.
         //   anim 0 = empty walking, AnimOffs 0   (8 rotations × 8 frames = 64 sprites)
         //   anim 1 = loaded walking, AnimOffs 64 (same shape)
         // We pick the animation by figure action: empty when Returning,
         // loaded when CarryingGoods. The original game does NOT carry
         // per-good sprites — the loaded silhouette is generic.
         //
-        // Civilian wanderers already store the resolved GFXZIVIL base
+        // Civilian figures already store the resolved GFXZIVIL base
         // (`ADELWEIBL`..`PILGER`) in `base_sprite`, and their ANIM blocks
         // start at offset 0, so no TRAEGER loaded/empty offset applies.
-        let (sprite_idx, fallback_color, fallback_radius) = if is_civilian {
+        let mut carrier_shadow = None;
+        let (sprite_idx, fallback_color, fallback_radius) = if is_kind12 {
+            let anim_frame = source_walk_frame(figure.anim_frame, civilian_frames_per_dir);
+            carrier_shadow = Some((
+                carrier_shadow_layout.sprite_index(figure.direction, anim_frame),
+                civilian_shadow_y_offset,
+            ));
             (
                 entity_walk_sprite_index(
                     figure.base_sprite,
                     0,
                     civilian_frames_per_dir,
                     figure.direction,
-                    figure.anim_frame,
+                    anim_frame,
                 ),
                 [0xE8, 0xD8, 0xB0, 0xFF],
                 2,
@@ -6893,15 +7174,25 @@ fn overlay_entities(
             } else {
                 carrier_empty_anim_offs
             };
-            // No per-good chip: TRAEGER in the original has only
-            // empty/loaded animations, not per-good sprites.
+            let anim_frame = source_walk_frame(figure.anim_frame, carrier_frames_per_dir);
+            let (shadow_layout, shadow_y_offset) = if figure.cargo_route == CargoRoute::CityCart {
+                (city_cart_shadow_layout, city_cart_shadow_y_offset)
+            } else {
+                (carrier_shadow_layout, carrier_shadow_y_offset)
+            };
+            carrier_shadow = Some((
+                shadow_layout.sprite_index(figure.direction, anim_frame),
+                shadow_y_offset,
+            ));
+            // These source transport figures have only empty/loaded walk
+            // animations, not per-good sprites.
             (
                 entity_walk_sprite_index(
                     figure.base_sprite,
                     anim_offs,
                     carrier_frames_per_dir,
                     figure.direction,
-                    figure.anim_frame,
+                    anim_frame,
                 ),
                 match figure.action {
                     ActionType::CarryingGoods => [0xFF, 0xDD, 0x00, 0xFF],
@@ -6912,9 +7203,33 @@ fn overlay_entities(
             )
         };
 
+        if let Some((shadow_idx, shadow_y_offset)) = carrier_shadow {
+            if let Some((sw, sh, data)) = shadow_sprites.get(shadow_idx) {
+                if *sw > 0 && *sh > 0 {
+                    let shadow_y_offset = source_shadow_y_offset(tile_w, shadow_y_offset);
+                    blit_rgba_mask_color(
+                        rgba,
+                        img_w,
+                        img_h,
+                        sx + half_tw - *sw as i32 / 2,
+                        sy + half_th - shadow_y_offset - *sh as i32 / 2,
+                        data,
+                        *sw,
+                        *sh,
+                        [0, 0, 0, 255],
+                    );
+                }
+            }
+        }
+
         let mut drew_sprite = false;
-        if sprite_idx < carrier_sprites.len() {
-            let (sw, sh, ref data) = carrier_sprites[sprite_idx];
+        let figure_sprites = if is_worker {
+            worker_sprites
+        } else {
+            carrier_sprites
+        };
+        if sprite_idx < figure_sprites.len() {
+            let (sw, sh, ref data) = figure_sprites[sprite_idx];
             if sw > 0 && sh > 0 {
                 let dy = sy + half_th - sh as i32;
                 blit_rgba(
@@ -6957,8 +7272,55 @@ fn overlay_entities(
         if !unit.is_alive() {
             continue;
         }
-        let (ix, iy) = if world_mode { (0, 0) } else { (0, 0) };
-        let (sx, sy) = tile_to_screen(unit.tile_x as i32, unit.tile_y as i32, ix, iy);
+        let (unit_x, unit_y, ix, iy, target, source_position) =
+            if let Some(island_id) = unit.source_island_id {
+                let Some(map) = sim
+                    .island_maps
+                    .iter()
+                    .find(|map| map.island_id == island_id)
+                else {
+                    continue;
+                };
+                let Some((unit_x, unit_y)) = map.source_world_to_local((unit.tile_x, unit.tile_y))
+                else {
+                    continue;
+                };
+                if !world_mode && current_island.map(|island| island.number) != Some(island_id) {
+                    continue;
+                }
+                let (ix, iy) = if world_mode {
+                    (map.source_world_origin.0 / 2, map.source_world_origin.1 / 2)
+                } else {
+                    (0, 0)
+                };
+                let target = map
+                    .source_world_to_local((unit.target_x, unit.target_y))
+                    .unwrap_or((unit_x, unit_y));
+                let source_position = unit.source_position_initialized.then_some((
+                    unit.source_position_x - map.source_world_origin.0 as f32 * 0.5 - 0.25,
+                    unit.source_position_y - map.source_world_origin.1 as f32 * 0.5 - 0.25,
+                ));
+                (unit_x, unit_y, ix, iy, target, source_position)
+            } else {
+                (
+                    unit.tile_x,
+                    unit.tile_y,
+                    0,
+                    0,
+                    (unit.target_x, unit.target_y),
+                    None,
+                )
+            };
+        let (sx, sy) = if let Some((unit_x, unit_y)) = source_position {
+            let world_x = ix as f32 + unit_x;
+            let world_y = iy as f32 + unit_y;
+            (
+                (origin_x as f32 + (world_x - world_y) * half_tw as f32).round() as i32,
+                (origin_y as f32 + (world_x + world_y) * half_th as f32).round() as i32,
+            )
+        } else {
+            tile_to_screen(unit_x, unit_y, ix, iy)
+        };
         let is_selected = selected_units.contains(&uidx);
 
         // Selection ring (drawn behind sprite/marker)
@@ -6986,7 +7348,7 @@ fn overlay_entities(
                     );
                     if is_selected && (unit.tile_x != unit.target_x || unit.tile_y != unit.target_y)
                     {
-                        let (tsx, tsy) = tile_to_screen(unit.target_x, unit.target_y, ix, iy);
+                        let (tsx, tsy) = tile_to_screen(target.0, target.1, ix, iy);
                         draw_marker(
                             rgba,
                             img_w,
@@ -7024,7 +7386,7 @@ fn overlay_entities(
                     );
                     if is_selected && (unit.tile_x != unit.target_x || unit.tile_y != unit.target_y)
                     {
-                        let (tsx, tsy) = tile_to_screen(unit.target_x, unit.target_y, ix, iy);
+                        let (tsx, tsy) = tile_to_screen(target.0, target.1, ix, iy);
                         draw_marker(
                             rgba,
                             img_w,
@@ -7284,6 +7646,10 @@ fn init_simulation(
             .and_then(|i| i.city.as_ref())
             .map(|c| c.owner_slot)
             .unwrap_or(0);
+        let city_population = island
+            .and_then(|i| i.city.as_ref())
+            .map(|c| c.tier_population)
+            .unwrap_or([0; 5]);
         let (avg_x, avg_y) = if !island_buildings.is_empty() {
             let ax = island_buildings
                 .iter()
@@ -7307,12 +7673,13 @@ fn init_simulation(
         } else {
             continue;
         };
-        warehouses.push(Warehouse::with_capacity(
+        warehouses.push(Warehouse::with_capacity_and_population(
             island_id,
             owner,
             avg_x,
             avg_y,
             anno_sim::warehouse::BASE_KONTOR_CAPACITY,
+            city_population,
         ));
     }
 
@@ -7350,11 +7717,17 @@ fn init_simulation(
 
     let mut sim = Simulation::new();
     sim.diplomacy = anno_sim::data_bridge::diplomacy_from_player4_relationships(&szs.players);
+    sim.source_kind4_dispatch =
+        anno_sim::data_bridge::source_kind4_dispatch_state_from_scenario(szs);
     sim.building_defs = defs.to_vec();
     sim.source_dynamic_map_objects =
         anno_sim::data_bridge::source_dynamic_map_objects_from_scenario(szs, cod);
     sim.source_map_cell_states =
         anno_sim::data_bridge::source_map_cell_states_from_scenario(szs, cod);
+    sim.source_kind13_locations =
+        anno_sim::data_bridge::source_kind13_locations_from_scenario(szs, cod);
+    sim.source_cities = anno_sim::data_bridge::source_cities_from_scenario(szs);
+    sim.source_kind4_occupants = anno_sim::data_bridge::source_kind4_occupants_from_scenario(szs);
     sim.buildings = instances;
     sim.warehouses = warehouses;
     sim.island_maps = island_maps;
@@ -7430,6 +7803,18 @@ fn init_simulation(
     }
     for p in &mut sim.players {
         p.total_population = p.population.iter().sum();
+    }
+
+    // Reconstruct every static type-4 land figure from SOLDAT3. These units
+    // retain their source slots so combat removal can update the matching
+    // source island-owner occupancy record.
+    let land_units = anno_sim::data_bridge::land_units_from_scenario(szs);
+    if !land_units.is_empty() {
+        println!(
+            "Spawning {} static land unit(s) from SOLDAT3",
+            land_units.len()
+        );
+        sim.military_units.extend(land_units);
     }
 
     // Spawn warships from SHIP4: SmallWarship / LargeWarship /
@@ -7578,14 +7963,14 @@ fn source_command_frame_selector(
 
 /// Reproduce the selector value used by the STADTFLD draw loop immediately
 /// after an INSELHAUS command creates its live cell record. `FUN_00481fc0`
-/// clears that record, so source kinds 1 through 7 start at frame zero;
+/// clears that record, so source kinds 1 through 8 start at frame zero;
 /// their later state-machine transitions are handled by separate routines.
 fn source_command_initial_frame_selector(
     definition: &anno_formats::cod::BuildingDef,
     packed_variant: u8,
 ) -> i32 {
     match definition.source_kind_code() {
-        Some(1..=7) => 0,
+        Some(1..=8) => 0,
         Some(10) if definition.anim_time == 0 => i32::from(packed_variant),
         _ => i32::from(packed_variant) + definition.anim_frame,
     }
@@ -7941,6 +8326,40 @@ fn blit_rgba(
             dst[dst_off + 1] = src[src_off + 1];
             dst[dst_off + 2] = src[src_off + 2];
             dst[dst_off + 3] = 255;
+        }
+    }
+}
+
+fn blit_rgba_mask_color(
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    x: i32,
+    y: i32,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    color: [u8; 4],
+) {
+    for row in 0..src_h as i32 {
+        let dy = y + row;
+        if dy < 0 || dy >= dst_h as i32 {
+            continue;
+        }
+        for col in 0..src_w as i32 {
+            let dx = x + col;
+            if dx < 0 || dx >= dst_w as i32 {
+                continue;
+            }
+            let src_off = ((row as u32 * src_w + col as u32) * 4) as usize;
+            if src_off + 3 >= src.len() || src[src_off + 3] == 0 {
+                continue;
+            }
+            let dst_off = ((dy as u32 * dst_w + dx as u32) * 4) as usize;
+            if dst_off + 3 >= dst.len() {
+                continue;
+            }
+            dst[dst_off..dst_off + 4].copy_from_slice(&color);
         }
     }
 }

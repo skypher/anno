@@ -10,20 +10,23 @@ use crate::carrier;
 use crate::civilian;
 use crate::combat::{self, DiplomacyMatrix, MilitaryUnit};
 use crate::coverage::CoverageMap;
+use crate::data_bridge::{
+    SourceCityRecord, SourceCityTable, SourceKind4Occupant, SourceKind13LocationTable,
+};
 use crate::economy;
-use crate::entity::{ActionType, Figure};
+use crate::entity::{ActionType, CargoRoute, Figure};
 use crate::island_map::IslandMap;
 use crate::ocean_map::OceanMap;
-use crate::player::Player;
+use crate::player::{Player, PlayerState};
 use crate::population;
 use crate::production;
 use crate::source_cell::SourceMapCellState;
 use crate::source_route::{
-    SourceDynamicMapObject, SourceDynamicMapObjectTable, SourceResolvedDynamicTarget,
-    SourceTargetDescriptor,
+    SourceDynamicMapObject, SourceDynamicMapObjectTable, SourcePathBlockedCellDecision,
+    SourceResolvedDynamicTarget, SourceTargetDescriptor, source_route_positions,
 };
 use crate::trade::{self, TradeRoute, TradeShip};
-use crate::types::TICKS_PER_MINUTE;
+use crate::types::{Good, TICKS_PER_MINUTE};
 use crate::warehouse::Warehouse;
 
 /// Auto-save interval in game ticks (~10 minutes of game time).
@@ -85,13 +88,14 @@ pub struct Simulation {
 
     // Subsystem cadences (1000-ms tick aligned).
     timer_production: SubsystemTimer, // PRODUCTION_TICK_MS (1000)
-    timer_civilians: SubsystemTimer,  // 4_999
     timer_population: SubsystemTimer, // 10_000
     timer_events: SubsystemTimer,     // 10_000
     timer_ships: SubsystemTimer,      // 1_000
     timer_market: SubsystemTimer,     // 1_000
-    timer_military: SubsystemTimer,   // 10_000
-    timer_diplomacy: SubsystemTimer,  // 5_000
+    // Retained for the timing-status surface. Source land figures are
+    // dispatched by the per-update entity loop, not this legacy 10 s value.
+    timer_military: SubsystemTimer,
+    timer_diplomacy: SubsystemTimer, // 5_000
 
     // Game state
     pub players: Vec<Player>,
@@ -101,6 +105,25 @@ pub struct Simulation {
     pub source_dynamic_map_objects: Vec<SourceDynamicMapObject>,
     /// Renderer-relevant state for source INSELHAUS command roots.
     pub source_map_cell_states: Vec<SourceMapCellState>,
+    /// Placement anchors retained by the source kind-13 location table.
+    pub source_kind13_locations: SourceKind13LocationTable,
+    /// Fixed source city-record pool read by `FUN_0047f8a0`.
+    pub source_cities: SourceCityTable,
+    /// Live kind-4 occupancy reconstructed from authored `SOLDAT3` figures.
+    pub source_kind4_occupants: Vec<SourceKind4Occupant>,
+    /// Source player globals that select type-4 terminal-route dispatch.
+    pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
+    /// `DAT_005b6040`: source simulation clock in 100-ms ticks.
+    pub source_time_ticks: u32,
+    /// Milliseconds not yet promoted into `source_time_ticks`.
+    pub source_time_remainder_ms: u32,
+    /// `DAT_0054a3b4`: shared source city-dispatch time accumulator.
+    pub source_city_dispatch_elapsed_ms: u32,
+    /// Low-three-bit phase incremented after the source accumulator exceeds
+    /// 9,999 ms.
+    pub source_city_dispatch_phase: u8,
+    /// Physical source city-record cursor. Each dispatch visits two slots.
+    pub source_city_dispatch_cursor: usize,
     /// Monotone revision of the renderer-relevant source map-cell table.
     pub source_map_cell_revision: u64,
     pub building_defs: Vec<BuildingDef>,
@@ -117,6 +140,10 @@ pub struct Simulation {
     /// Source-derived carrier constants. Preserved across save snapshots;
     /// the game binary reloads them from `figuren.cod` at startup.
     pub carrier_config: carrier::CarrierConfig,
+    /// Source-derived KARREN constants for the type-11 city transfer.
+    /// Like `carrier_config`, this is immutable game-data state reloaded at
+    /// startup rather than serialized into save snapshots.
+    pub city_cart_config: carrier::CityCartConfig,
     /// Source-derived civilian sprite layout. Preserved across save
     /// snapshots; the game binary reloads it from `figuren.cod` at startup.
     pub civilian_config: civilian::CivilianConfig,
@@ -148,9 +175,9 @@ pub struct Simulation {
     /// victory banner when this flips.
     pub scenario_complete: bool,
 
-    /// Source-shaped MSVC `rand()` stream. Persisted as a sim field only;
-    /// not serialized into save files (each load reseeds).
-    rng_state: crate::source_rand::SourceRand,
+    /// Source-shaped MSVC `rand()` stream. Saved and restored exactly so
+    /// source dispatches retain their `rand()` consumption order.
+    pub(crate) rng_state: crate::source_rand::SourceRand,
 
     /// Per-island fog-of-war bitmap. Lazily allocated on first sighting.
     pub exploration: Vec<crate::exploration::ExplorationMap>,
@@ -365,11 +392,8 @@ impl Simulation {
             paused: false,
 
             // Main subsystem cadences mirror the binary's `-1000` ms
-            // game-tick decrement (1602_exe.c:16110). The civilian
-            // building dispatcher uses its separate 4999 ms gate from
-            // 1602_exe.c:84620.
+            // game-tick decrement (1602_exe.c:16110).
             timer_production: SubsystemTimer::new(crate::production::PRODUCTION_TICK_MS),
-            timer_civilians: SubsystemTimer::new(civilian::CIVILIAN_BUILDING_TICK_MS),
             timer_population: SubsystemTimer::new(crate::fidelity::POPULATION_TICK_MS),
             timer_events: SubsystemTimer::new(crate::fidelity::EVENT_TICK_MS),
             timer_ships: SubsystemTimer::new(crate::fidelity::SHIP_TICK_MS),
@@ -381,6 +405,15 @@ impl Simulation {
             buildings: Vec::new(),
             source_dynamic_map_objects: Vec::new(),
             source_map_cell_states: Vec::new(),
+            source_kind13_locations: SourceKind13LocationTable::default(),
+            source_cities: SourceCityTable::default(),
+            source_kind4_occupants: Vec::new(),
+            source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
+            source_time_ticks: 0,
+            source_time_remainder_ms: 0,
+            source_city_dispatch_elapsed_ms: 0,
+            source_city_dispatch_phase: 0,
+            source_city_dispatch_cursor: 0,
             source_map_cell_revision: 0,
             building_defs: Vec::new(),
             figures: Vec::new(),
@@ -394,6 +427,7 @@ impl Simulation {
             coverage_maps: Vec::new(),
             ocean_map: None,
             carrier_config: carrier::CarrierConfig::default(),
+            city_cart_config: carrier::CityCartConfig::default(),
             civilian_config: civilian::CivilianConfig::default(),
             ship_cargo_config: trade::ShipCargoConfig::default(),
 
@@ -532,7 +566,6 @@ impl Simulation {
         use crate::fidelity::Subsystem;
         vec![
             (Subsystem::Production, self.timer_production.interval_ms),
-            (Subsystem::Civilians, self.timer_civilians.interval_ms),
             (Subsystem::Population, self.timer_population.interval_ms),
             (Subsystem::Diplomacy, self.timer_diplomacy.interval_ms),
             (Subsystem::MarketCoverage, self.timer_market.interval_ms),
@@ -611,22 +644,19 @@ impl Simulation {
 
     /// Single simulation step (max 200ms).
     fn step(&mut self, dt_ms: u32) {
+        self.advance_source_clock(dt_ms);
+
         // 1. Building production
         if self.timer_production.advance(dt_ms) {
             self.tick_production();
         }
 
-        // 2. Civilian building figure dispatcher
-        if self.timer_civilians.advance(dt_ms) {
-            self.tick_civilians();
-        }
-
-        // 3. Population/economy
+        // 2. Population/economy
         if self.timer_population.advance(dt_ms) {
             self.tick_population();
         }
 
-        // 4. Diplomacy
+        // 3. Diplomacy
         if self.timer_diplomacy.advance(dt_ms) {
             self.tick_diplomacy();
         }
@@ -641,22 +671,256 @@ impl Simulation {
             self.tick_ships();
         }
 
-        // 6. Military combat
-        if self.timer_military.advance(dt_ms) {
-            self.tick_military();
-        }
-
         // 7. Source-triggered event hooks.
         if self.timer_events.advance(dt_ms) {
             self.tick_events();
         }
 
+        self.tick_source_city_dispatch(dt_ms);
+
         // Entity movement (every step)
         self.tick_entities(dt_ms);
+        self.tick_source_land_figures(dt_ms);
+    }
+
+    /// Replay the kind-12 city dispatcher in `FUN_0047f8a0`. Its city pool
+    /// traversal is independent of the coarser population subsystem: each
+    /// source simulation slice updates exactly two physical city slots.
+    fn tick_source_city_dispatch(&mut self, dt_ms: u32) {
+        self.source_city_dispatch_elapsed_ms =
+            self.source_city_dispatch_elapsed_ms.saturating_add(dt_ms);
+        if self.source_city_dispatch_elapsed_ms > 9_999 {
+            self.source_city_dispatch_elapsed_ms = 0;
+            self.source_city_dispatch_phase = self.source_city_dispatch_phase.wrapping_add(1) & 7;
+        }
+
+        for _ in 0..2 {
+            let slot = self.source_city_dispatch_cursor;
+            self.source_city_dispatch_cursor =
+                (self.source_city_dispatch_cursor + 1) % SourceCityTable::slot_count();
+
+            let Some(city) = self.source_cities.record(slot) else {
+                continue;
+            };
+            if city.phase == self.source_city_dispatch_phase {
+                continue;
+            }
+            if let Some(city) = self.source_cities.record_mut(slot) {
+                city.phase = self.source_city_dispatch_phase;
+            }
+            if city.tier_population.iter().copied().sum::<u32>() > 29
+                && self.source_city_activity_allows(city)
+            {
+                self.spawn_source_kind12_figures(city);
+            }
+        }
+    }
+
+    /// The seven-player guard at the start of `FUN_00480370`. Source island
+    /// bytes `+0x4a..=+0x50` count live kind-4 land figures by owner; an
+    /// active human or AI owner other than this city owner blocks the whole
+    /// allocator before its fifteen discarded random draws.
+    fn source_city_activity_allows(&self, city: SourceCityRecord) -> bool {
+        self.players
+            .iter()
+            .enumerate()
+            .filter(|(owner, player)| {
+                *owner != usize::from(city.owner_slot)
+                    && matches!(
+                        player.state,
+                        PlayerState::HumanActive | PlayerState::AiActive
+                    )
+            })
+            .all(|(owner, _)| {
+                !self.source_kind4_occupants.iter().any(|occupant| {
+                    occupant.active
+                        && occupant.owner == owner as u8
+                        && occupant.island_id == city.island_id
+                }) && !self.military_units.iter().any(|unit| {
+                    unit.active
+                        && unit.owner == owner as u8
+                        && unit.source_island_id == Some(city.island_id)
+                        && !matches!(
+                            unit.unit_type,
+                            crate::combat::UnitType::SmallWarship
+                                | crate::combat::UnitType::LargeWarship
+                                | crate::combat::UnitType::PirateShip
+                        )
+                })
+            })
+    }
+
+    /// Delete one live source kind-4 figure by its `SOLDAT3` runtime slot.
+    ///
+    /// The source type-4 deletion branch (`FUN_00443520` → `FUN_00443830`)
+    /// removes the runtime figure and decrements the matching island-owner
+    /// counter. The local combat record and source occupancy record share
+    /// this slot, so they must transition together.
+    pub fn deactivate_source_kind4_figure(&mut self, runtime_slot: u16) -> bool {
+        let mut changed = false;
+        for occupant in &mut self.source_kind4_occupants {
+            if occupant.runtime_slot == runtime_slot && occupant.active {
+                occupant.active = false;
+                changed = true;
+            }
+        }
+        for unit in &mut self.military_units {
+            if unit.source_runtime_slot == Some(runtime_slot) && unit.active {
+                unit.active = false;
+                unit.health = 0.0;
+                changed = true;
+            }
+        }
+        if changed {
+            let alive: Vec<bool> = self
+                .military_units
+                .iter()
+                .map(crate::combat::MilitaryUnit::is_alive)
+                .collect();
+            for unit in &mut self.military_units {
+                if unit.combat_target >= 0
+                    && alive
+                        .get(unit.combat_target as usize)
+                        .is_some_and(|&target_alive| !target_alive)
+                {
+                    unit.combat_target = -1;
+                }
+            }
+        }
+        changed
+    }
+
+    /// `FUN_00480370`: consume its discarded rand draws, sample at most ten
+    /// physical kind-13 slots, and submit every matching source anchor to
+    /// the kind-12 route allocator.
+    fn spawn_source_kind12_figures(&mut self, city: SourceCityRecord) {
+        for _ in 0..15 {
+            self.next_source_rand();
+        }
+
+        let locations = self
+            .source_kind13_locations
+            .city_slice(city.island_id)
+            .to_vec();
+        for _ in 0..10 {
+            let location_index = usize::from(self.next_source_rand()) % locations.len();
+            let Some(location) = locations[location_index] else {
+                continue;
+            };
+            if location.island_id != city.island_id || location.source_owner != city.source_owner {
+                continue;
+            }
+
+            let permission_branch = (self.next_source_rand() & 3) as u8;
+            if let Some(figure) = self.allocate_source_kind12_figure(location, permission_branch) {
+                self.figures.push(figure);
+            }
+        }
+    }
+
+    /// `FUN_0044b140`: initialize a kind-12 figure at one kind-13 anchor,
+    /// then retain only the route that its threshold callback reaches.
+    fn allocate_source_kind12_figure(
+        &mut self,
+        location: crate::data_bridge::SourceKind13Location,
+        permission_branch: u8,
+    ) -> Option<Figure> {
+        let _initial_definition =
+            civilian::source_kind12_initial_definition(self.next_source_rand());
+        let threshold = (u32::from(self.next_source_rand() & 7) + 5) * 0x40;
+        let map = self
+            .island_maps
+            .iter()
+            .find(|map| map.island_id == location.island_id)?;
+        let start = (i32::from(location.tile_x), i32::from(location.tile_y));
+        let mut grid = map.civilian_path_grid(start, location.source_owner, permission_branch);
+        let route = grid
+            .search_with_blocked_cell_callback(start, |_, elapsed_cost| {
+                if elapsed_cost >= threshold {
+                    SourcePathBlockedCellDecision::Complete
+                } else {
+                    SourcePathBlockedCellDecision::Expand
+                }
+            })
+            .ok()?;
+        let target_kind = map.civilian_path_kind(route.position)?;
+        let definition = civilian::source_kind12_definition(target_kind, self.next_source_rand());
+        let path = source_route_positions(start, &route.steps)?;
+
+        let mut figure = Figure::new();
+        figure.action = ActionType::Walking;
+        figure.owner = location.source_owner;
+        figure.origin_island = location.island_id;
+        figure.tile_x = start.0;
+        figure.tile_y = start.1;
+        figure.target_x = route.position.0;
+        figure.target_y = route.position.1;
+        figure.speed = carrier::CARRIER_SPEED;
+        figure.source_move_speed = self
+            .civilian_config
+            .movement_speed_for_definition(definition);
+        figure.sprite_set = definition;
+        figure.base_sprite = self.civilian_config.sprite_base_for_definition(definition);
+        figure.source_position_z = map.source_terrain_height(start).unwrap_or(0.0);
+        figure.initialize_source_position();
+        figure.path = path;
+        figure.path_idx = 0;
+
+        Some(figure)
     }
 
     fn tick_production(&mut self) {
         let mut new_carriers = Vec::new();
+        let carrier_suppliers: Vec<_> = self
+            .buildings
+            .iter()
+            .filter(|building| building.active && building.output_stock != 0)
+            .filter_map(|building| {
+                let definition = self.building_defs.get(building.def_id as usize)?;
+                let orientation = building
+                    .source_placement_command
+                    .map(|command| command.orientation)
+                    .unwrap_or(0);
+                let source_footprint = if orientation & 1 == 0 {
+                    (definition.width.max(1), definition.height.max(1))
+                } else {
+                    (definition.height.max(1), definition.width.max(1))
+                };
+                (definition.output_good != Good::None).then_some(carrier::CarrierSupplier {
+                    island: building.island_id,
+                    owner: building.owner,
+                    x: building.tile_x,
+                    y: building.tile_y,
+                    good: definition.output_good,
+                    available: building.output_stock,
+                    storage: carrier::CarrierSupplierStorage::SourceRoot,
+                    source_path_class: carrier::source_path_class(definition.wegspeed[0]),
+                    source_footprint,
+                })
+            })
+            .collect();
+        let mut carrier_suppliers = carrier_suppliers;
+        carrier_suppliers.extend(
+            self.warehouses
+                .iter()
+                .filter(|warehouse| warehouse.active)
+                .enumerate()
+                .flat_map(|(warehouse_idx, warehouse)| {
+                    warehouse.all_stock().into_iter().map(|(good, stock, _)| {
+                        carrier::CarrierSupplier {
+                            island: warehouse.island_id,
+                            owner: warehouse.owner,
+                            x: warehouse.tile_x,
+                            y: warehouse.tile_y,
+                            good,
+                            available: stock,
+                            storage: carrier::CarrierSupplierStorage::Warehouse(warehouse_idx),
+                            source_path_class: warehouse.source_path_class,
+                            source_footprint: warehouse.source_footprint,
+                        }
+                    })
+                }),
+        );
 
         for i in 0..self.buildings.len() {
             let def_id = self.buildings[i].def_id;
@@ -681,14 +945,26 @@ impl Simulation {
                     )
                 }) {
                 let before = *state;
-                if produced != 0 {
+                // Scenario and player building stocks enter the source record
+                // once. Afterwards the record remains authoritative so 1/32
+                // remainders from production and type-8 transfers survive.
+                if state.raw_material_stock == 0 && source_raw_material_stock != 0 {
                     state.raw_material_stock = source_raw_material_stock;
+                }
+                if state.work_material_stock == 0 && source_work_material_stock != 0 {
                     state.work_material_stock = source_work_material_stock;
+                }
+                if state.storage_fill == 0 && source_storage_fill != 0 {
                     state.storage_fill = source_storage_fill;
+                }
+                if produced != 0 {
                     state.advance_source_scheduler(self.buildings[i].efficiency);
                 } else {
                     state.set_activity(self.buildings[i].efficiency);
                 }
+                self.buildings[i].input_1_stock = state.raw_material_stock / 32;
+                self.buildings[i].input_2_stock = state.work_material_stock / 32;
+                self.buildings[i].output_stock = state.storage_fill / 32;
                 *state != before
             } else {
                 false
@@ -697,7 +973,7 @@ impl Simulation {
                 self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
             }
 
-            if produced > 0 && production::needs_carrier(&self.buildings[i], &def) {
+            if self.buildings[i].active {
                 // Check if this building already has an active carrier
                 let has_carrier = self.figures.iter().any(|f| {
                     f.is_active()
@@ -707,11 +983,12 @@ impl Simulation {
 
                 if !has_carrier {
                     if let Some(mut c) = carrier::try_spawn_carrier(
-                        &mut self.buildings[i],
+                        &self.buildings[i],
                         &def,
-                        &self.warehouses,
+                        &carrier_suppliers,
+                        &mut self.source_map_cell_states,
+                        &mut self.warehouses,
                         &self.island_maps,
-                        &self.coverage_maps,
                         self.carrier_config,
                     ) {
                         c.building_idx = i as u16;
@@ -721,35 +998,98 @@ impl Simulation {
             }
         }
 
-        self.figures.extend(new_carriers);
-    }
-
-    fn tick_civilians(&mut self) {
-        let mut new_civilians = Vec::new();
-
-        for i in 0..self.buildings.len() {
-            let def_id = self.buildings[i].def_id as usize;
-            if def_id >= self.building_defs.len() {
+        // Type 11 is scheduled from city command roots, not from the
+        // production-building loop. MARKT and KONTOR roots use their city's
+        // inventory to build the FUN_00480610 capacity eligibility bytes
+        // before selecting and reserving a producer root.
+        let city_cart_suppliers =
+            Self::city_cart_supplier_view(&carrier_suppliers, &self.buildings, &self.building_defs);
+        let city_origins: Vec<_> = self
+            .source_map_cell_states
+            .iter()
+            .copied()
+            .filter(|state| matches!(state.kind_code, 7 | 8 | 30))
+            .collect();
+        for origin in city_origins {
+            let Some(warehouse_idx) = self
+                .warehouses
+                .iter()
+                .enumerate()
+                .find(|warehouse| {
+                    warehouse.1.active
+                        && warehouse.1.island_id == origin.island
+                        && (origin.kind_code != 8
+                            || (warehouse.1.tile_x == u16::from(origin.x)
+                                && warehouse.1.tile_y == u16::from(origin.y)))
+                })
+                .map(|(idx, _)| idx)
+            else {
+                continue;
+            };
+            let transfer_root_count = self
+                .source_map_cell_states
+                .iter()
+                .filter(|state| state.island == origin.island && matches!(state.kind_code, 7 | 8))
+                .count();
+            let city_capacity_fixed =
+                self.warehouses[warehouse_idx].city_storage_capacity_fixed(transfer_root_count);
+            let city = carrier::CityCartEligibility::from_city_store(
+                &self.warehouses[warehouse_idx],
+                city_capacity_fixed,
+            );
+            let has_cart = self.figures.iter().any(|figure| {
+                figure.is_active()
+                    && figure.cargo_route == CargoRoute::CityCart
+                    && figure.origin_island == origin.island
+                    && figure.origin_x == u16::from(origin.x)
+                    && figure.origin_y == u16::from(origin.y)
+            });
+            if has_cart {
                 continue;
             }
-            let def = self.building_defs[def_id].clone();
-            if def.prod_kind != "WOHN" {
-                continue;
-            }
-            let r = self.next_rand() | (self.next_rand() << 32);
-            if let Some(mut fig) = civilian::try_spawn_civilian_with_config(
-                &self.buildings[i],
-                &def,
-                i as u16,
-                r,
-                self.civilian_config,
+            if let Some(cart) = carrier::try_spawn_city_cart(
+                origin,
+                city,
+                &city_cart_suppliers,
+                &mut self.source_map_cell_states,
+                &self.island_maps,
+                self.city_cart_config,
             ) {
-                fig.building_idx = i as u16;
-                new_civilians.push(fig);
+                new_carriers.push(cart);
             }
         }
 
-        self.figures.extend(new_civilians);
+        self.figures.extend(new_carriers);
+    }
+
+    fn city_cart_supplier_view(
+        suppliers: &[carrier::CarrierSupplier],
+        buildings: &[BuildingInstance],
+        definitions: &[BuildingDef],
+    ) -> Vec<carrier::CarrierSupplier> {
+        suppliers
+            .iter()
+            .copied()
+            .map(|mut supplier| {
+                if supplier.storage == carrier::CarrierSupplierStorage::SourceRoot {
+                    if let Some(definition) = buildings
+                        .iter()
+                        .find(|building| {
+                            building.active
+                                && building.island_id == supplier.island
+                                && building.owner == supplier.owner
+                                && building.tile_x == supplier.x
+                                && building.tile_y == supplier.y
+                        })
+                        .and_then(|building| definitions.get(building.def_id as usize))
+                    {
+                        supplier.source_path_class =
+                            carrier::source_path_class(definition.wegspeed[2]);
+                    }
+                }
+                supplier
+            })
+            .collect()
     }
 
     pub(crate) fn tick_population(&mut self) {
@@ -1050,7 +1390,15 @@ impl Simulation {
             .military_units
             .iter()
             .filter(|u| u.is_alive() && u.owner == PLAYER && !u.unit_type.stats().is_naval)
-            .map(|u| {
+            .filter_map(|u| {
+                if let Some(island_id) = u.source_island_id {
+                    return self
+                        .island_maps
+                        .iter()
+                        .find(|map| map.island_id == island_id)
+                        .and_then(|map| map.source_world_to_local((u.tile_x, u.tile_y)))
+                        .map(|(x, y)| (island_id, x, y));
+                }
                 // Try to find which island this unit is on by walkability map.
                 let island_id = self
                     .island_maps
@@ -1058,7 +1406,7 @@ impl Simulation {
                     .find(|m| m.is_walkable(u.tile_x, u.tile_y))
                     .map(|m| m.island_id)
                     .unwrap_or(0);
-                (island_id, u.tile_x, u.tile_y)
+                Some((island_id, u.tile_x, u.tile_y))
             })
             .collect();
         for (iid, x, y) in unit_seeds {
@@ -1297,7 +1645,226 @@ impl Simulation {
         trader.target_y = ty;
     }
 
-    fn tick_military(&mut self) {}
+    /// Advance the local type-4 land-figure model once per simulation step.
+    ///
+    /// `FUN_00451890` receives the dispatcher delta on every engine update,
+    /// accumulates it on each active figure, and dispatches type 4 through
+    /// `FUN_00456d00`. This keeps local source-slot removal on the same
+    /// per-step path. The combat and order rules below remain the local model
+    /// until the full type-4 state machine is reconstructed.
+    fn tick_source_land_figures(&mut self, dt_ms: u32) {
+        self.assign_native_idle_targets();
+        combat::acquire_source_kind4_candidates(&mut self.military_units, &self.diplomacy);
+        let mut source_rand = std::mem::take(&mut self.rng_state);
+        combat::tick_unit_orders_with_maps_and_source_rand_and_dispatch_state(
+            &mut self.military_units,
+            dt_ms,
+            self.ocean_map.as_ref(),
+            &self.island_maps,
+            &mut source_rand,
+            self.source_kind4_dispatch,
+        );
+        self.rng_state = source_rand;
+        let dead = combat::tick_combat_with_maps(
+            &mut self.military_units,
+            &self.diplomacy,
+            dt_ms,
+            self.ocean_map.as_ref(),
+            &self.island_maps,
+        );
+        let source_slots: Vec<u16> = dead
+            .into_iter()
+            .filter_map(|index| self.military_units.get(index)?.source_runtime_slot)
+            .collect();
+        for runtime_slot in source_slots {
+            self.deactivate_source_kind4_figure(runtime_slot);
+        }
+        self.sync_source_kind4_occupants();
+    }
+
+    /// Replay the idle-target branch in `FUN_00456d00` for slot-6 SPEER
+    /// figures. Once a coordinate target is reached, the source clears it;
+    /// each idle dispatch then has a one-in-four gate and up to five bounded
+    /// anchor-relative attempts at offsets `9 - 2 * (rand() % 9)`. The
+    /// source command scheduler first defers the native SPEER slot by its
+    /// `Worktime: 0.8`, or eight source ticks.
+    fn assign_native_idle_targets(&mut self) {
+        for unit in &mut self.military_units {
+            if unit.unit_type == crate::combat::UnitType::NativeSpearman
+                && unit.owner == 6
+                && unit.source_target_descriptor.is_some_and(|descriptor| {
+                    descriptor.kind() == 0x34
+                })
+                && (unit.tile_x, unit.tile_y) == (unit.target_x, unit.target_y)
+            {
+                unit.source_target_descriptor = None;
+            }
+        }
+
+        let idle_units: Vec<(usize, u8, (i32, i32))> = self
+            .military_units
+            .iter()
+            .enumerate()
+            .filter(|(_, unit)| {
+                unit.is_alive()
+                    && unit.unit_type == crate::combat::UnitType::NativeSpearman
+                    && unit.owner == 6
+                    && unit.source_target_descriptor.is_none()
+                    && (unit.tile_x, unit.tile_y) == (unit.target_x, unit.target_y)
+                    && unit.source_runtime_slot.is_some_and(|runtime_slot| {
+                        self.source_kind4_occupants.iter().any(|occupant| {
+                            occupant.active
+                                && occupant.runtime_slot == runtime_slot
+                                && self
+                                    .source_time_ticks
+                                    .wrapping_sub(occupant.idle_timestamp_ticks)
+                                    >= 20
+                        })
+                    })
+            })
+            .filter_map(|(index, unit)| {
+                let island_id = unit.source_island_id?;
+                let anchor = unit.source_origin_descriptor?;
+                self.island_maps
+                    .iter()
+                    .find(|map| map.island_id == island_id)
+                    .and_then(|map| map.source_land_idle_anchor(anchor))
+                    .map(|anchor| (index, island_id, anchor))
+            })
+            .collect();
+
+        for (index, island_id, anchor) in idle_units {
+            if self.next_source_rand() & 3 != 0 {
+                continue;
+            }
+            for _ in 0..5 {
+                let offset_x = 9 - 2 * i32::from(self.next_source_rand() % 9);
+                let offset_y = 9 - 2 * i32::from(self.next_source_rand() % 9);
+                let target = self
+                    .island_maps
+                    .iter()
+                    .find(|map| map.island_id == island_id)
+                    .and_then(|map| {
+                        let (anchor_x, anchor_y) = map.source_world_to_local(anchor)?;
+                        let local = (
+                            (anchor_x + offset_x).clamp(0, i32::from(map.width) - 1),
+                            (anchor_y + offset_y).clamp(0, i32::from(map.height) - 1),
+                        );
+                        if !map.source_native_idle_target_allowed(local) {
+                            return None;
+                        }
+                        Some((local, map.local_to_source_world(local)?))
+                    });
+                let Some((target_local, target)) = target else {
+                    continue;
+                };
+                let (Ok(target_x), Ok(target_y)) =
+                    (u8::try_from(target_local.0), u8::try_from(target_local.1))
+                else {
+                    continue;
+                };
+                let descriptor =
+                    SourceTargetDescriptor::from_source_kind34_island_cell(island_id, target_x, target_y);
+                let runtime_slot = {
+                    let unit = &mut self.military_units[index];
+                    unit.target_x = target.0;
+                    unit.target_y = target.1;
+                    unit.source_target_descriptor = Some(descriptor);
+                    unit.source_route_retry_count = 0;
+                    unit.source_idle_remaining = 0.0;
+                    unit.clear_source_route_program();
+                    unit.source_runtime_slot
+                };
+                if let Some(runtime_slot) = runtime_slot {
+                    if let Some(occupant) = self
+                        .source_kind4_occupants
+                        .iter_mut()
+                        .find(|occupant| occupant.active && occupant.runtime_slot == runtime_slot)
+                    {
+                        occupant.idle_timestamp_ticks = self.source_time_ticks.wrapping_add(8);
+                        occupant.route_retry_count = 0;
+                        occupant.idle_remaining_bits = 0;
+                        occupant.route_program = crate::combat::default_source_kind4_route_program();
+                        occupant.route_program_cursor = 0;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    /// Advance `DAT_005b6040` exactly as `FUN_00489670`: source time gains
+    /// one integer tick for every accumulated 100 ms of scaled dispatcher
+    /// input.
+    fn advance_source_clock(&mut self, dt_ms: u32) {
+        let elapsed = self.source_time_remainder_ms.saturating_add(dt_ms);
+        self.source_time_ticks = self.source_time_ticks.wrapping_add(elapsed / 100);
+        self.source_time_remainder_ms = elapsed % 100;
+    }
+
+    /// Keep the type-4 slot table aligned with its live combat entity. The
+    /// executable indexes both records by the `SOLDAT3` runtime slot, so a
+    /// moved source figure must not retain its load-time occupancy position.
+    fn sync_source_kind4_occupants(&mut self) {
+        let unit_state: Vec<(
+            u16,
+            (u16, u16),
+            u8,
+            Option<SourceTargetDescriptor>,
+            u8,
+            [u8; crate::combat::SOURCE_KIND4_ROUTE_PROGRAM_CAPACITY],
+            u8,
+            u32,
+        )> = self
+            .military_units
+            .iter()
+            .filter(|unit| unit.is_alive())
+            .filter_map(|unit| {
+                Some((
+                    unit.source_runtime_slot?,
+                    (
+                        u16::try_from(unit.tile_x).ok()?,
+                        u16::try_from(unit.tile_y).ok()?,
+                    ),
+                    unit.direction,
+                    unit.source_target_descriptor,
+                    unit.source_route_retry_count,
+                    unit.source_route_program,
+                    unit.source_route_program_cursor,
+                    unit.source_idle_remaining.to_bits(),
+                ))
+            })
+            .collect();
+        for occupant in self
+            .source_kind4_occupants
+            .iter_mut()
+            .filter(|occupant| occupant.active)
+        {
+            let Some((
+                _,
+                position,
+                direction,
+                target_descriptor,
+                route_retry_count,
+                route_program,
+                route_program_cursor,
+                idle_remaining_bits,
+            )) = unit_state
+                .iter()
+                .find(|(runtime_slot, _, _, _, _, _, _, _)| *runtime_slot == occupant.runtime_slot)
+            else {
+                continue;
+            };
+            occupant.position = *position;
+            occupant.direction = *direction;
+            occupant.state_descriptor =
+                target_descriptor.unwrap_or(SourceTargetDescriptor::from_bytes([0; 4]));
+            occupant.route_retry_count = *route_retry_count;
+            occupant.route_program = *route_program;
+            occupant.route_program_cursor = *route_program_cursor;
+            occupant.idle_remaining_bits = *idle_remaining_bits;
+        }
+    }
 
     fn tick_entities(&mut self, dt_ms: u32) {
         // Refresh escort targets so warships stay glued to their assigned
@@ -1352,69 +1919,538 @@ impl Simulation {
         }
 
         let mut despawn_indices = Vec::new();
-
+        let carrier_config = self.carrier_config;
+        let city_cart_config = self.city_cart_config;
         let civilian_config = self.civilian_config;
+
         for (idx, figure) in self.figures.iter_mut().enumerate() {
             if !figure.is_active() {
                 continue;
             }
 
             figure.move_timer_ms += dt_ms;
-            if figure.speed > 0 && figure.move_timer_ms >= 100 {
+            while figure.speed > 0 && figure.move_timer_ms >= 100 {
                 figure.move_timer_ms -= 100;
 
                 match figure.action {
                     ActionType::CarryingGoods | ActionType::Returning => {
-                        let arrived = carrier::step_carrier(figure);
-                        if arrived {
-                            let delivery_island = self
-                                .buildings
+                        let terrain_wegspeed = if figure.cargo_route == CargoRoute::CityCart {
+                            self.island_maps
+                                .iter()
+                                .find(|map| map.island_id == figure.origin_island)
+                                .and_then(|map| {
+                                    map.city_cart_movement_speed((figure.tile_x, figure.tile_y))
+                                })
+                        } else {
+                            self.buildings
                                 .get(figure.building_idx as usize)
-                                .map(|building| building.island_id);
-                            let delivery_target = (figure.target_x as u16, figure.target_y as u16);
-                            let (should_despawn, delivered) = carrier::handle_arrival(
-                                figure,
-                                &mut self.warehouses,
-                                &self.buildings,
-                                &self.island_maps,
-                            );
-                            if let Some(island) = delivery_island {
-                                if let Some(state) =
-                                    self.source_map_cell_states.iter_mut().find(|state| {
-                                        state.matches(island, delivery_target.0, delivery_target.1)
-                                    })
-                                {
-                                    if state.accept_market_transfer(delivered) {
-                                        self.source_map_cell_revision =
-                                            self.source_map_cell_revision.wrapping_add(1);
+                                .and_then(|building| {
+                                    self.island_maps
+                                        .iter()
+                                        .find(|map| map.island_id == building.island_id)
+                                })
+                                .and_then(|map| {
+                                    map.carrier_movement_speed((figure.tile_x, figure.tile_y))
+                                })
+                        }
+                        .unwrap_or(100);
+                        let (frame_speed_ms, frames_per_direction) =
+                            if figure.cargo_route == CargoRoute::CityCart {
+                                (
+                                    city_cart_config.frame_speed_ms,
+                                    city_cart_config.frames_per_direction,
+                                )
+                            } else {
+                                (
+                                    carrier_config.frame_speed_ms,
+                                    carrier_config.frames_per_direction,
+                                )
+                            };
+                        let next = figure
+                            .path
+                            .get(figure.path_idx)
+                            .copied()
+                            .unwrap_or((figure.target_x, figure.target_y));
+                        let moving = next != (figure.tile_x, figure.tile_y);
+                        let frame_duration_ms = carrier::source_animation_frame_duration_ms(
+                            frame_speed_ms,
+                            terrain_wegspeed,
+                            moving,
+                        );
+                        figure.advance_source_animation(
+                            100,
+                            frame_duration_ms,
+                            frames_per_direction,
+                        );
+                        let arrived =
+                            carrier::advance_source_carrier(figure, 100, terrain_wegspeed);
+                        if arrived {
+                            if figure.cargo_route == CargoRoute::CityCart {
+                                let arrival_action = figure.action;
+                                let supplier_target = (figure.supplier_x, figure.supplier_y);
+                                let supplier_kind = figure.destination_kind;
+                                let good = carrier::good_from_u8(figure.carried_good);
+                                let requested = figure.carried_amount;
+                                let requested_fixed = if figure.cargo_fixed == 0 {
+                                    requested.saturating_mul(32)
+                                } else {
+                                    figure.cargo_fixed
+                                };
+                                let origin = (
+                                    figure.origin_island,
+                                    figure.origin_x,
+                                    figure.origin_y,
+                                    figure.origin_kind,
+                                );
+                                let should_despawn = carrier::handle_arrival(
+                                    figure,
+                                    &self.buildings,
+                                    &self.island_maps,
+                                );
+
+                                match arrival_action {
+                                    ActionType::CarryingGoods if should_despawn => {
+                                        if let Some(state) =
+                                            self.source_map_cell_states.iter_mut().find(|state| {
+                                                state.kind_code == supplier_kind
+                                                    && state.matches(
+                                                        origin.0,
+                                                        supplier_target.0,
+                                                        supplier_target.1,
+                                                    )
+                                            })
+                                        {
+                                            state.release_storage_reservation(requested_fixed);
+                                            self.source_map_cell_revision =
+                                                self.source_map_cell_revision.wrapping_add(1);
+                                        }
+                                    }
+                                    ActionType::CarryingGoods => {
+                                        let supplier_idx =
+                                            self.buildings.iter().position(|building| {
+                                                building.active
+                                                    && building.island_id == origin.0
+                                                    && building.owner == figure.owner
+                                                    && building.tile_x == supplier_target.0
+                                                    && building.tile_y == supplier_target.1
+                                                    && self
+                                                        .building_defs
+                                                        .get(building.def_id as usize)
+                                                        .is_some_and(|definition| {
+                                                            definition.output_good == good
+                                                        })
+                                            });
+                                        let picked =
+                                            supplier_idx.map(|_| requested_fixed / 32).unwrap_or(0);
+                                        let mut remaining_source_fill = None;
+                                        let collected = picked != 0
+                                            && self
+                                                .source_map_cell_states
+                                                .iter_mut()
+                                                .find(|state| {
+                                                    state.kind_code == supplier_kind
+                                                        && state.matches(
+                                                            origin.0,
+                                                            supplier_target.0,
+                                                            supplier_target.1,
+                                                        )
+                                                })
+                                                .is_some_and(|state| {
+                                                    let collected = state
+                                                        .collect_reserved_storage(requested_fixed);
+                                                    if collected {
+                                                        remaining_source_fill =
+                                                            Some(state.storage_fill);
+                                                    }
+                                                    collected
+                                                });
+                                        if collected {
+                                            if let Some(supplier_idx) = supplier_idx {
+                                                self.buildings[supplier_idx].output_stock =
+                                                    remaining_source_fill.unwrap_or(0) / 32;
+                                            }
+                                            figure.carried_amount = picked;
+                                            figure.cargo_fixed = requested_fixed;
+                                            self.source_map_cell_revision =
+                                                self.source_map_cell_revision.wrapping_add(1);
+                                        } else {
+                                            figure.carried_amount = 0;
+                                            figure.cargo_fixed = 0;
+                                        }
+                                        let uncollected_fixed = if collected {
+                                            requested_fixed.saturating_sub(figure.cargo_fixed)
+                                        } else {
+                                            requested_fixed
+                                        };
+                                        if uncollected_fixed != 0 {
+                                            if let Some(state) = self
+                                                .source_map_cell_states
+                                                .iter_mut()
+                                                .find(|state| {
+                                                    state.kind_code == supplier_kind
+                                                        && state.matches(
+                                                            origin.0,
+                                                            supplier_target.0,
+                                                            supplier_target.1,
+                                                        )
+                                                })
+                                            {
+                                                state
+                                                    .release_storage_reservation(uncollected_fixed);
+                                                self.source_map_cell_revision =
+                                                    self.source_map_cell_revision.wrapping_add(1);
+                                            }
+                                        }
+                                    }
+                                    ActionType::Returning => {
+                                        let delivered = figure.carried_amount;
+                                        let delivered_fixed = if figure.cargo_fixed == 0 {
+                                            delivered.saturating_mul(32)
+                                        } else {
+                                            figure.cargo_fixed
+                                        };
+                                        if delivered_fixed != 0 {
+                                            let transfer_root_count = self
+                                                .source_map_cell_states
+                                                .iter()
+                                                .filter(|state| {
+                                                    state.island == origin.0
+                                                        && matches!(state.kind_code, 7 | 8)
+                                                })
+                                                .count();
+                                            let accepted_fixed = if let Some(warehouse) =
+                                                self.warehouses.iter_mut().find(|warehouse| {
+                                                    warehouse.active
+                                                        && warehouse.island_id == origin.0
+                                                        && warehouse.owner == figure.owner
+                                                        && (origin.3 != 8
+                                                            || (warehouse.tile_x == origin.1
+                                                                && warehouse.tile_y == origin.2))
+                                                }) {
+                                                let city_capacity_fixed = warehouse
+                                                    .city_storage_capacity_fixed(
+                                                        transfer_root_count,
+                                                    );
+                                                warehouse.deposit_city_good_fixed(
+                                                    good,
+                                                    delivered_fixed,
+                                                    city_capacity_fixed,
+                                                )
+                                            } else {
+                                                0
+                                            };
+                                            if origin.3 == 7 {
+                                                if let Some(state) = self
+                                                    .source_map_cell_states
+                                                    .iter_mut()
+                                                    .find(|state| {
+                                                        state.kind_code == 7
+                                                            && state.matches(
+                                                                origin.0, origin.1, origin.2,
+                                                            )
+                                                    })
+                                                {
+                                                    state.accept_market_transfer(accepted_fixed);
+                                                    self.source_map_cell_revision = self
+                                                        .source_map_cell_revision
+                                                        .wrapping_add(1);
+                                                }
+                                            }
+                                        }
+                                        figure.destination_kind = 0;
+                                        figure.carried_amount = 0;
+                                        figure.cargo_fixed = 0;
+                                    }
+                                    _ => {}
+                                }
+                                if should_despawn {
+                                    despawn_indices.push(idx);
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            let arrival_action = figure.action;
+                            let supplier_target = (figure.supplier_x, figure.supplier_y);
+                            let supplier_kind = figure.destination_kind;
+                            let good = carrier::good_from_u8(figure.carried_good);
+                            let requested = figure.carried_amount;
+                            let requested_fixed = if figure.cargo_fixed == 0 {
+                                requested.saturating_mul(32)
+                            } else {
+                                figure.cargo_fixed
+                            };
+                            let origin_idx = figure.building_idx as usize;
+                            let should_despawn =
+                                carrier::handle_arrival(figure, &self.buildings, &self.island_maps);
+
+                            match arrival_action {
+                                ActionType::CarryingGoods => {
+                                    let island = self
+                                        .buildings
+                                        .get(origin_idx)
+                                        .map(|building| building.island_id);
+                                    if should_despawn {
+                                        if matches!(supplier_kind, 7 | 8) {
+                                            if let Some(warehouse) =
+                                                self.warehouses.iter_mut().find(|warehouse| {
+                                                    island.is_some_and(|island| {
+                                                        warehouse.island_id == island
+                                                            && warehouse.owner == figure.owner
+                                                            && warehouse.tile_x == supplier_target.0
+                                                            && warehouse.tile_y == supplier_target.1
+                                                    })
+                                                })
+                                            {
+                                                warehouse.release_reservation(good, requested);
+                                            }
+                                        } else if let Some(island) = island {
+                                            if let Some(state) = self
+                                                .source_map_cell_states
+                                                .iter_mut()
+                                                .find(|state| {
+                                                    state.kind_code == supplier_kind
+                                                        && state.matches(
+                                                            island,
+                                                            supplier_target.0,
+                                                            supplier_target.1,
+                                                        )
+                                                })
+                                            {
+                                                state.release_storage_reservation(requested_fixed);
+                                                self.source_map_cell_revision =
+                                                    self.source_map_cell_revision.wrapping_add(1);
+                                            }
+                                        }
+                                    } else {
+                                        let supplier_idx =
+                                            self.buildings.iter().position(|building| {
+                                                building.active
+                                                    && island.is_some_and(|island| {
+                                                        building.island_id == island
+                                                            && building.tile_x == supplier_target.0
+                                                            && building.tile_y == supplier_target.1
+                                                    })
+                                                    && self
+                                                        .building_defs
+                                                        .get(building.def_id as usize)
+                                                        .is_some_and(|definition| {
+                                                            definition.output_good == good
+                                                        })
+                                            });
+                                        let warehouse_idx = supplier_idx
+                                            .is_none()
+                                            .then(|| {
+                                                self.warehouses.iter().position(|warehouse| {
+                                                    warehouse.active
+                                                        && island.is_some_and(|island| {
+                                                            warehouse.island_id == island
+                                                                && warehouse.owner == figure.owner
+                                                                && warehouse.tile_x
+                                                                    == supplier_target.0
+                                                                && warehouse.tile_y
+                                                                    == supplier_target.1
+                                                        })
+                                                })
+                                            })
+                                            .flatten();
+                                        let picked = supplier_idx
+                                            .map(|_| requested_fixed / 32)
+                                            .or_else(|| {
+                                                warehouse_idx.map(|warehouse_idx| {
+                                                    requested.min(
+                                                        self.warehouses[warehouse_idx].stock(good),
+                                                    )
+                                                })
+                                            })
+                                            .unwrap_or(0);
+                                        let mut remaining_source_fill = None;
+                                        let collected = if picked == 0 {
+                                            false
+                                        } else if let Some(island) = island {
+                                            if matches!(supplier_kind, 7 | 8) {
+                                                self.warehouses
+                                                    .iter_mut()
+                                                    .find(|warehouse| {
+                                                        warehouse.active
+                                                            && warehouse.island_id == island
+                                                            && warehouse.owner == figure.owner
+                                                            && warehouse.tile_x == supplier_target.0
+                                                            && warehouse.tile_y == supplier_target.1
+                                                    })
+                                                    .is_some_and(|warehouse| {
+                                                        warehouse.collect_reserved(good, picked)
+                                                    })
+                                            } else {
+                                                self.source_map_cell_states
+                                                    .iter_mut()
+                                                    .find(|state| {
+                                                        state.kind_code == supplier_kind
+                                                            && state.matches(
+                                                                island,
+                                                                supplier_target.0,
+                                                                supplier_target.1,
+                                                            )
+                                                    })
+                                                    .is_some_and(|state| {
+                                                        let collected = state
+                                                            .collect_reserved_storage(
+                                                                requested_fixed,
+                                                            );
+                                                        if collected {
+                                                            remaining_source_fill =
+                                                                Some(state.storage_fill);
+                                                        }
+                                                        collected
+                                                    })
+                                            }
+                                        } else {
+                                            false
+                                        };
+                                        if let Some(supplier_idx) = supplier_idx {
+                                            if collected {
+                                                self.buildings[supplier_idx].output_stock =
+                                                    remaining_source_fill.unwrap_or(0) / 32;
+                                                self.source_map_cell_revision =
+                                                    self.source_map_cell_revision.wrapping_add(1);
+                                                figure.carried_amount = picked;
+                                                figure.cargo_fixed = requested_fixed;
+                                            } else {
+                                                figure.carried_amount = 0;
+                                                figure.cargo_fixed = 0;
+                                            }
+                                        } else if let Some(warehouse_idx) = warehouse_idx {
+                                            if collected {
+                                                self.source_map_cell_revision =
+                                                    self.source_map_cell_revision.wrapping_add(1);
+                                                figure.carried_amount = picked;
+                                                figure.cargo_fixed = picked.saturating_mul(32);
+                                            } else {
+                                                figure.carried_amount = 0;
+                                                figure.cargo_fixed = 0;
+                                            }
+                                        } else {
+                                            figure.carried_amount = 0;
+                                            figure.cargo_fixed = 0;
+                                        }
+                                        let uncollected_fixed = if collected {
+                                            requested_fixed.saturating_sub(figure.cargo_fixed)
+                                        } else {
+                                            requested_fixed
+                                        };
+                                        if uncollected_fixed != 0 {
+                                            if matches!(supplier_kind, 7 | 8) {
+                                                if let Some(warehouse) =
+                                                    self.warehouses.iter_mut().find(|warehouse| {
+                                                        island.is_some_and(|island| {
+                                                            warehouse.island_id == island
+                                                                && warehouse.owner == figure.owner
+                                                                && warehouse.tile_x
+                                                                    == supplier_target.0
+                                                                && warehouse.tile_y
+                                                                    == supplier_target.1
+                                                        })
+                                                    })
+                                                {
+                                                    warehouse.release_reservation(
+                                                        good,
+                                                        uncollected_fixed / 32,
+                                                    );
+                                                }
+                                            } else if let Some(island) = island {
+                                                if let Some(state) = self
+                                                    .source_map_cell_states
+                                                    .iter_mut()
+                                                    .find(|state| {
+                                                        state.kind_code == supplier_kind
+                                                            && state.matches(
+                                                                island,
+                                                                supplier_target.0,
+                                                                supplier_target.1,
+                                                            )
+                                                    })
+                                                {
+                                                    state.release_storage_reservation(
+                                                        uncollected_fixed,
+                                                    );
+                                                    self.source_map_cell_revision = self
+                                                        .source_map_cell_revision
+                                                        .wrapping_add(1);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
+                                ActionType::Returning => {
+                                    let delivered = figure.carried_amount;
+                                    let delivered_fixed = if figure.cargo_fixed == 0 {
+                                        delivered.saturating_mul(32)
+                                    } else {
+                                        figure.cargo_fixed
+                                    };
+                                    let inputs =
+                                        self.buildings.get(origin_idx).and_then(|building| {
+                                            self.building_defs.get(building.def_id as usize).map(
+                                                |definition| {
+                                                    (
+                                                        definition.input_good_1,
+                                                        definition.input_good_2,
+                                                    )
+                                                },
+                                            )
+                                        });
+                                    if let Some((input_1, input_2)) = inputs {
+                                        let (island, x, y, accepted) = {
+                                            let building = &mut self.buildings[origin_idx];
+                                            let accepted = if good == input_1 {
+                                                building.input_1_stock = building
+                                                    .input_1_stock
+                                                    .saturating_add(delivered);
+                                                true
+                                            } else if good == input_2 {
+                                                building.input_2_stock = building
+                                                    .input_2_stock
+                                                    .saturating_add(delivered);
+                                                true
+                                            } else {
+                                                false
+                                            };
+                                            (
+                                                building.island_id,
+                                                building.tile_x,
+                                                building.tile_y,
+                                                accepted,
+                                            )
+                                        };
+                                        if accepted {
+                                            if let Some(state) = self
+                                                .source_map_cell_states
+                                                .iter_mut()
+                                                .find(|state| state.matches(island, x, y))
+                                            {
+                                                if good == input_1 {
+                                                    state.raw_material_stock = state
+                                                        .raw_material_stock
+                                                        .saturating_add(delivered_fixed);
+                                                } else {
+                                                    state.work_material_stock = state
+                                                        .work_material_stock
+                                                        .saturating_add(delivered_fixed);
+                                                }
+                                                self.source_map_cell_revision =
+                                                    self.source_map_cell_revision.wrapping_add(1);
+                                            }
+                                        }
+                                    }
+                                    figure.destination_kind = 0;
+                                    figure.carried_amount = 0;
+                                    figure.cargo_fixed = 0;
+                                }
+                                _ => {}
                             }
                             if should_despawn {
                                 despawn_indices.push(idx);
-                            }
-                        }
-                    }
-                    ActionType::Walking if civilian_config.is_civilian(figure) => {
-                        // Step toward target tile, one tile per move
-                        // step. When the figure reaches its target or
-                        // its TTL (stored in the unused-for-civilians
-                        // `health` field) expires, mark it for
-                        // despawn.
-                        let dx = figure.target_x - figure.tile_x;
-                        let dy = figure.target_y - figure.tile_y;
-                        if dx == 0 && dy == 0 {
-                            despawn_indices.push(idx);
-                        } else {
-                            if dx.abs() >= dy.abs() {
-                                figure.tile_x += dx.signum();
-                            } else {
-                                figure.tile_y += dy.signum();
-                            }
-                            figure.anim_frame = figure.anim_frame.wrapping_add(1);
-                            figure.health = figure.health.saturating_sub(1);
-                            if figure.health == 0 {
-                                despawn_indices.push(idx);
+                                break;
                             }
                         }
                     }
@@ -1422,9 +2458,40 @@ impl Simulation {
                     | ActionType::Sailing
                     | ActionType::Patrolling
                     | ActionType::Exploring => {
+                        if civilian_config.is_kind12(figure) && figure.source_move_speed > 0 {
+                            let terrain_wegspeed = self
+                                .island_maps
+                                .iter()
+                                .find(|map| map.island_id == figure.origin_island)
+                                .and_then(|map| {
+                                    map.civilian_movement_speed((figure.tile_x, figure.tile_y))
+                                })
+                                .unwrap_or(100);
+                            let next = figure
+                                .path
+                                .get(figure.path_idx)
+                                .copied()
+                                .unwrap_or((figure.target_x, figure.target_y));
+                            let moving = next != (figure.tile_x, figure.tile_y);
+                            let frame_duration_ms = carrier::source_animation_frame_duration_ms(
+                                civilian_config.frame_speed_for(figure) as u16,
+                                terrain_wegspeed,
+                                moving,
+                            );
+                            figure.advance_source_animation(
+                                100,
+                                frame_duration_ms,
+                                civilian_config.frames_per_dir,
+                            );
+                            if carrier::advance_source_carrier(figure, 100, terrain_wegspeed) {
+                                despawn_indices.push(idx);
+                            }
+                            continue;
+                        }
+
                         // Generic move-toward-target step for any
-                        // remaining figure that isn't a carrier or
-                        // civilian. Walking, Sailing, Patrolling and
+                        // remaining figure that isn't a carrier.
+                        // Walking, Sailing, Patrolling and
                         // Exploring all share the same naive iso
                         // step semantics; other ActionTypes (Combat,
                         // TradeShipAi, FreeTrader, etc.) are handled
@@ -1441,7 +2508,15 @@ impl Simulation {
                             } else {
                                 figure.tile_y += dy.signum();
                             }
-                            figure.anim_frame = figure.anim_frame.wrapping_add(1);
+                            if civilian_config.is_civilian(figure) {
+                                figure.advance_source_animation(
+                                    100,
+                                    civilian_config.frame_speed_for(figure),
+                                    civilian_config.frames_per_dir,
+                                );
+                            } else {
+                                figure.anim_frame = figure.anim_frame.wrapping_add(1);
+                            }
                         }
                     }
                     _ => {
@@ -1998,7 +3073,289 @@ mod tests {
     use crate::ai::{AiController, AiPersonality, Difficulty};
 
     #[test]
-    fn production_completion_advances_matching_source_cell_in_fixed_point() {
+    fn source_city_activity_gate_counts_only_foreign_kind_four_land_units() {
+        let mut sim = Simulation::new();
+        sim.players = vec![Player::new_human(0), Player::new_ai(1, 0)];
+        let city = SourceCityRecord {
+            island_id: 3,
+            source_owner: 0,
+            owner_slot: 0,
+            phase: 0,
+            tier_population: [30, 0, 0, 0, 0],
+        };
+        let mut foreign_land = MilitaryUnit::new(crate::combat::UnitType::Infantry, 1, 4, 4);
+        foreign_land.source_island_id = Some(3);
+        sim.military_units.push(foreign_land);
+        assert!(!sim.source_city_activity_allows(city));
+
+        sim.military_units[0].source_island_id = Some(4);
+        assert!(sim.source_city_activity_allows(city));
+
+        sim.military_units[0].source_island_id = Some(3);
+        sim.military_units[0].unit_type = crate::combat::UnitType::SmallWarship;
+        assert!(sim.source_city_activity_allows(city));
+
+        sim.military_units[0].unit_type = crate::combat::UnitType::Infantry;
+        sim.military_units[0].source_runtime_slot = Some(42);
+        sim.source_kind4_occupants.push(SourceKind4Occupant {
+            runtime_slot: 42,
+            figure_definition_id: 0,
+            route_radius: crate::combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
+            route_retry_count: 0,
+            route_program: crate::combat::default_source_kind4_route_program(),
+            route_program_cursor: 0,
+            idle_remaining_bits: 0,
+            origin_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            position: (0, 0),
+            island_id: 3,
+            owner: 1,
+            direction: 0,
+            animation_state: 0,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            idle_timestamp_ticks: 0,
+            state_flags: 0,
+            state_payload: [0; 8],
+            active: true,
+        });
+        assert!(!sim.source_city_activity_allows(city));
+        assert!(sim.deactivate_source_kind4_figure(42));
+        assert!(!sim.source_kind4_occupants[0].active);
+        assert!(!sim.military_units[0].active);
+        assert!(sim.source_city_activity_allows(city));
+        assert!(!sim.deactivate_source_kind4_figure(42));
+    }
+
+    #[test]
+    fn per_step_military_death_deactivates_matching_source_kind_four_slot() {
+        let mut sim = Simulation::new();
+        sim.diplomacy.set(0, 6, crate::combat::Diplomacy::War);
+        sim.military_units
+            .push(MilitaryUnit::new(crate::combat::UnitType::Cannon, 0, 0, 0));
+
+        let mut source_spearman =
+            MilitaryUnit::new(crate::combat::UnitType::NativeSpearman, 6, 1, 0);
+        source_spearman.health = 0.1;
+        source_spearman.source_island_id = Some(2);
+        source_spearman.source_runtime_slot = Some(91);
+        source_spearman.source_figure_definition_id = Some(33);
+        source_spearman.source_origin_descriptor =
+            Some(SourceTargetDescriptor::from_bytes([0x33, 2, 0, 0]));
+        sim.military_units.push(source_spearman);
+        sim.source_kind4_occupants.push(SourceKind4Occupant {
+            runtime_slot: 91,
+            figure_definition_id: 33,
+            route_radius: crate::combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
+            route_retry_count: 0,
+            route_program: crate::combat::default_source_kind4_route_program(),
+            route_program_cursor: 0,
+            idle_remaining_bits: 0,
+            origin_descriptor: SourceTargetDescriptor::from_bytes([0x33, 2, 0, 0]),
+            position: (1, 0),
+            island_id: 2,
+            owner: 6,
+            direction: 0,
+            animation_state: 0,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            idle_timestamp_ticks: 0,
+            state_flags: 0,
+            state_payload: [0; 8],
+            active: true,
+        });
+
+        sim.military_units[0].attack_timer_ms = 2_800;
+        sim.step(200);
+
+        assert!(!sim.military_units[1].active);
+        assert!(!sim.source_kind4_occupants[0].active);
+    }
+
+    #[test]
+    fn source_kind_four_occupant_tracks_slot_linked_unit_motion() {
+        let mut sim = Simulation::new();
+        let mut map = IslandMap::new_open(2, 30, 30);
+        map.source_world_origin = (220, 260);
+        sim.island_maps.push(map);
+        let target_descriptor = SourceTargetDescriptor::from_source_land_route_coordinate(222, 260)
+            .expect("source world coordinate fits the descriptor encoding");
+        let mut unit = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 220, 260);
+        unit.source_island_id = Some(2);
+        unit.source_runtime_slot = Some(91);
+        unit.target_x = 222;
+        unit.target_y = 260;
+        unit.source_target_descriptor = Some(target_descriptor);
+        sim.military_units.push(unit);
+        sim.source_kind4_occupants.push(SourceKind4Occupant {
+            runtime_slot: 91,
+            figure_definition_id: 1,
+            route_radius: crate::combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
+            route_retry_count: 0,
+            route_program: crate::combat::default_source_kind4_route_program(),
+            route_program_cursor: 0,
+            idle_remaining_bits: 0,
+            origin_descriptor: SourceTargetDescriptor::from_bytes([0x33, 2, 0, 0]),
+            position: (220, 260),
+            island_id: 2,
+            owner: 0,
+            direction: 0,
+            animation_state: 0,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            idle_timestamp_ticks: 0,
+            state_flags: 0,
+            state_payload: [0; 8],
+            active: true,
+        });
+
+        sim.step(400);
+
+        let occupant = &sim.source_kind4_occupants[0];
+        assert_eq!(occupant.position, (221, 260));
+        assert_eq!(occupant.direction, 2);
+        assert_eq!(occupant.state_descriptor, target_descriptor);
+    }
+
+    #[test]
+    fn source_kind_four_slot_sync_copies_the_live_direction_program() {
+        let mut sim = Simulation::new();
+        let mut unit = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 220, 260);
+        unit.source_runtime_slot = Some(91);
+        unit.source_route_program[0] = 0x31;
+        unit.source_route_program[1] = 0x42;
+        unit.source_route_program[2] = crate::combat::SOURCE_KIND4_ROUTE_PROGRAM_TERMINATOR;
+        unit.source_route_program_cursor = 1;
+        unit.source_idle_remaining = 1.25;
+        sim.military_units.push(unit);
+        sim.source_kind4_occupants.push(SourceKind4Occupant {
+            runtime_slot: 91,
+            figure_definition_id: 1,
+            route_radius: crate::combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
+            route_retry_count: 0,
+            route_program: crate::combat::default_source_kind4_route_program(),
+            route_program_cursor: 0,
+            idle_remaining_bits: 0,
+            origin_descriptor: SourceTargetDescriptor::from_bytes([0x33, 2, 0, 0]),
+            position: (220, 260),
+            island_id: 2,
+            owner: 0,
+            direction: 0,
+            animation_state: 0,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            idle_timestamp_ticks: 0,
+            state_flags: 0,
+            state_payload: [0; 8],
+            active: true,
+        });
+
+        sim.sync_source_kind4_occupants();
+
+        assert_eq!(
+            sim.source_kind4_occupants[0].route_program[..3],
+            [0x31, 0x42, 0xc1]
+        );
+        assert_eq!(sim.source_kind4_occupants[0].route_program_cursor, 1);
+        assert_eq!(
+            sim.source_kind4_occupants[0].idle_remaining_bits,
+            1.25_f32.to_bits()
+        );
+    }
+
+    #[test]
+    fn native_idle_target_uses_anchor_relative_source_rng_offsets() {
+        let mut sim = Simulation::new();
+        sim.seed_source_rand(1);
+        let mut map = IslandMap::new_open(10, 64, 64);
+        map.source_world_origin = (220, 260);
+        sim.island_maps.push(map);
+        let mut unit = MilitaryUnit::new(crate::combat::UnitType::NativeSpearman, 6, 268, 302);
+        unit.source_island_id = Some(10);
+        unit.source_runtime_slot = Some(91);
+        unit.source_origin_descriptor =
+            Some(SourceTargetDescriptor::from_bytes([0x33, 10, 24, 21]));
+        sim.military_units.push(unit);
+
+        sim.assign_native_idle_targets();
+        assert!(sim.military_units[0].source_target_descriptor.is_none());
+        sim.source_time_ticks = 27;
+        sim.source_kind4_occupants.push(SourceKind4Occupant {
+            runtime_slot: 91,
+            figure_definition_id: 33,
+            route_radius: crate::combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
+            route_retry_count: 0,
+            route_program: crate::combat::default_source_kind4_route_program(),
+            route_program_cursor: 0,
+            idle_remaining_bits: 0,
+            origin_descriptor: SourceTargetDescriptor::from_bytes([0x33, 10, 24, 21]),
+            position: (268, 302),
+            island_id: 10,
+            owner: 6,
+            direction: 0,
+            animation_state: 0,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            idle_timestamp_ticks: 8,
+            state_flags: 0,
+            state_payload: [0; 8],
+            active: true,
+        });
+
+        sim.assign_native_idle_targets();
+        assert!(sim.military_units[0].source_target_descriptor.is_none());
+        sim.source_time_ticks = 28;
+
+        for _ in 0..64 {
+            sim.assign_native_idle_targets();
+            if sim.military_units[0].source_target_descriptor.is_some() {
+                break;
+            }
+        }
+
+        let unit = &sim.military_units[0];
+        let descriptor = unit
+            .source_target_descriptor
+            .expect("native idle branch selected a target");
+        assert_eq!(
+            descriptor.kind(),
+            0x34
+        );
+        let map = &sim.island_maps[0];
+        let target = map
+            .source_world_to_local((unit.target_x, unit.target_y))
+            .expect("native target remains on its island");
+        assert_eq!(
+            descriptor.bytes(),
+            [
+                0x34,
+                10,
+                u8::try_from(target.0).unwrap(),
+                u8::try_from(target.1).unwrap(),
+            ]
+        );
+        assert!((17..=33).contains(&target.0));
+        assert!((14..=30).contains(&target.1));
+        assert_eq!(sim.source_kind4_occupants[0].idle_timestamp_ticks, 36);
+    }
+
+    #[test]
+    fn source_clock_promotes_scaled_dispatch_time_in_100_ms_ticks() {
+        let mut sim = Simulation::new();
+
+        sim.advance_source_clock(99);
+        assert_eq!(
+            (sim.source_time_ticks, sim.source_time_remainder_ms),
+            (0, 99)
+        );
+        sim.advance_source_clock(1);
+        assert_eq!(
+            (sim.source_time_ticks, sim.source_time_remainder_ms),
+            (1, 0)
+        );
+        sim.advance_source_clock(250);
+        assert_eq!(
+            (sim.source_time_ticks, sim.source_time_remainder_ms),
+            (3, 50)
+        );
+    }
+
+    #[test]
+    fn production_completion_preserves_matching_source_cell_fixed_point_state() {
         use anno_formats::cod::{BuildingDef as CodBuilding, CodFile};
         use std::collections::HashMap;
 
@@ -2037,46 +3394,172 @@ mod tests {
         assert_eq!(state.progress, 16);
         assert_eq!(state.activity, 128);
         assert_eq!(sim.source_map_cell_revision, 1);
+
+        sim.tick_production();
+
+        let state = sim.source_map_cell_states[0];
+        assert_eq!(state.raw_material_stock, 32);
+        assert_eq!(state.storage_fill, 32);
+        assert_eq!(state.progress, 32);
+        assert_eq!(sim.buildings[0].input_1_stock, 1);
+        assert_eq!(sim.buildings[0].output_stock, 1);
     }
 
     #[test]
-    fn carrier_delivery_advances_matching_market_source_cell() {
+    fn city_cart_supplier_view_uses_karren_path_class_without_mutating_traeger_view() {
+        let supplier = carrier::CarrierSupplier {
+            island: 3,
+            owner: 1,
+            x: 9,
+            y: 12,
+            good: Good::Cloth,
+            available: 4,
+            storage: carrier::CarrierSupplierStorage::SourceRoot,
+            source_path_class: carrier::source_path_class(100),
+            source_footprint: (1, 1),
+        };
+        let building = BuildingInstance::new(0, 3, 9, 12, 1);
+        let definition = BuildingDef {
+            wegspeed: [100, 100, 150, 100],
+            ..Default::default()
+        };
+
+        let city_view =
+            Simulation::city_cart_supplier_view(&[supplier], &[building], &[definition]);
+
+        assert_eq!(supplier.source_path_class, 32);
+        assert_eq!(city_view[0].source_path_class, 48);
+    }
+
+    #[test]
+    fn source_carrier_consumes_each_ready_motion_quantum() {
+        let mut sim = Simulation::new();
+        let mut carrier = Figure::new();
+        carrier.action = ActionType::CarryingGoods;
+        carrier.speed = 4;
+        carrier.source_move_speed = 220;
+        carrier.target_x = 1;
+        carrier.path = vec![(1, 0)];
+        sim.figures.push(carrier);
+
+        sim.tick_entities(200);
+
+        let carrier = &sim.figures[0];
+        assert_eq!(carrier.move_timer_ms, 0);
+        assert_eq!((carrier.tile_x, carrier.tile_y), (0, 0));
+        assert!((carrier.source_step_remaining - 0.9296).abs() < 0.000_001);
+        assert!((carrier.source_position_x - 0.5704).abs() < 0.000_001);
+        assert_eq!(carrier.source_position_y, 0.5);
+    }
+
+    #[test]
+    fn generic_carrier_collects_from_supplier_anchor_after_reaching_footprint_edge() {
         use crate::types::Good;
         use anno_formats::cod::BuildingDef as CodBuilding;
 
         let mut sim = Simulation::new();
+        sim.building_defs = vec![
+            BuildingDef {
+                input_good_1: Good::Iron,
+                input_1_rate: 2,
+                ..Default::default()
+            },
+            BuildingDef {
+                output_good: Good::Iron,
+                ..Default::default()
+            },
+        ];
         sim.buildings.push(BuildingInstance::new(0, 4, 1, 1, 0));
-        sim.warehouses.push(Warehouse::new(4, 0, 3, 2));
-        sim.source_map_cell_states.push(
-            SourceMapCellState::new(
-                4,
-                3,
-                2,
-                &CodBuilding {
-                    kind: "MARKT".into(),
-                    ..Default::default()
-                },
-                0,
-            )
-            .unwrap(),
-        );
+        let mut supplier = BuildingInstance::new(1, 4, 3, 2, 0);
+        supplier.output_stock = 3;
+        sim.buildings.push(supplier);
+        let source_definition = CodBuilding {
+            kind: "HANDWERK".into(),
+            ..Default::default()
+        };
+        sim.source_map_cell_states
+            .push(SourceMapCellState::new(4, 1, 1, &source_definition, 0).unwrap());
+        let mut supplier_state = SourceMapCellState::new(4, 3, 2, &source_definition, 0).unwrap();
+        supplier_state.storage_fill = 65;
+        supplier_state.reserved_storage = 65;
+        sim.source_map_cell_states.push(supplier_state);
         let mut carrier = Figure::new();
         carrier.action = ActionType::CarryingGoods;
         carrier.speed = 4;
-        carrier.tile_x = 3;
+        carrier.tile_x = 4;
         carrier.tile_y = 2;
-        carrier.target_x = 3;
+        carrier.target_x = 4;
         carrier.target_y = 2;
+        carrier.destination_kind = 1;
+        carrier.supplier_x = 3;
+        carrier.supplier_y = 2;
         carrier.building_idx = 0;
-        carrier.carried_good = Good::Tools as u8;
-        carrier.carried_amount = 5;
+        carrier.carried_good = Good::Iron as u8;
+        carrier.carried_amount = 2;
+        carrier.cargo_fixed = 65;
         sim.figures.push(carrier);
 
         sim.tick_entities(100);
+        sim.tick_entities(100);
+        sim.tick_entities(100);
+        sim.tick_entities(100);
 
-        assert_eq!(sim.warehouses[0].stock(Good::Tools), 5);
-        assert_eq!(sim.source_map_cell_states[0].progress, 5);
-        assert_eq!(sim.source_map_cell_revision, 1);
+        assert_eq!(sim.buildings[1].output_stock, 0);
+        assert_eq!(sim.source_map_cell_states[1].storage_fill, 0);
+        assert_eq!(sim.source_map_cell_states[1].reserved_storage, 0);
+        assert_eq!(sim.buildings[0].input_1_stock, 2);
+        assert_eq!(sim.source_map_cell_states[0].raw_material_stock, 65);
+        assert!(sim.figures.is_empty());
+    }
+
+    #[test]
+    fn city_cart_collects_highest_score_supplier_and_credits_market_inventory() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let mut sim = Simulation::new();
+        sim.building_defs = vec![BuildingDef {
+            output_good: Good::Cloth,
+            ..Default::default()
+        }];
+        let mut supplier = BuildingInstance::new(0, 0, 2, 0, 0);
+        supplier.output_stock = 3;
+        sim.buildings.push(supplier);
+        sim.warehouses.push(Warehouse::new(0, 0, 0, 0));
+
+        let market = CodBuilding {
+            kind: "MARKT".into(),
+            ..Default::default()
+        };
+        let workshop = CodBuilding {
+            kind: "HANDWERK".into(),
+            storage_animation_capacity: 320,
+            ..Default::default()
+        };
+        sim.source_map_cell_states
+            .push(SourceMapCellState::new(0, 0, 0, &market, 0).unwrap());
+        let mut supplier_state = SourceMapCellState::new(0, 2, 0, &workshop, 0).unwrap();
+        supplier_state.storage_fill = 65;
+        sim.source_map_cell_states.push(supplier_state);
+
+        sim.tick_production();
+        assert_eq!(sim.figures.len(), 1);
+        assert_eq!(sim.figures[0].cargo_route, CargoRoute::CityCart);
+        assert_eq!(sim.source_map_cell_states[1].reserved_storage, 65);
+
+        for _ in 0..100 {
+            if sim.figures.is_empty() {
+                break;
+            }
+            sim.tick_entities(100);
+        }
+
+        assert!(sim.figures.is_empty());
+        assert_eq!(sim.buildings[0].output_stock, 0);
+        assert_eq!(sim.source_map_cell_states[1].storage_fill, 0);
+        assert_eq!(sim.source_map_cell_states[1].reserved_storage, 0);
+        assert_eq!(sim.warehouses[0].stock(Good::Cloth), 2);
+        assert_eq!(sim.warehouses[0].city_stock_fixed(Good::Cloth), 65);
+        assert_eq!(sim.source_map_cell_states[0].progress, 65);
     }
 
     #[test]
@@ -2497,6 +3980,28 @@ mod tests {
     }
 
     #[test]
+    fn exploration_converts_source_land_world_coordinates_to_its_island() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        let mut island = IslandMap::new_open(7, 30, 30);
+        island.source_world_origin = (220, 260);
+        sim.island_maps.push(island);
+        let mut unit = MilitaryUnit::new(UnitType::Infantry, 0, 224, 264);
+        unit.source_island_id = Some(7);
+        sim.military_units.push(unit);
+
+        sim.tick_exploration();
+
+        let map = sim
+            .exploration
+            .iter()
+            .find(|map| map.island_id == 7)
+            .expect("source island exploration map");
+        assert!(map.is_explored(2, 2));
+        assert!(!map.is_explored(15, 15));
+    }
+
+    #[test]
     fn construction_stalls_without_materials() {
         use crate::building::{BuildingDef, BuildingInstance};
         use crate::types::{Good, ProductionType};
@@ -2703,7 +4208,7 @@ mod tests {
 
     #[test]
     fn disaster_event_does_not_fabricate_fire_origin() {
-        use crate::building::{BuildingDef, BuildingInstance, BUILDING_MAX_HEALTH};
+        use crate::building::{BUILDING_MAX_HEALTH, BuildingDef, BuildingInstance};
         use crate::types::{Good, ProductionType};
 
         let mut sim = Simulation::new();
@@ -2758,7 +4263,7 @@ mod tests {
 
     #[test]
     fn disaster_event_does_not_fabricate_volcano_origin() {
-        use crate::building::{BuildingDef, BuildingInstance, BUILDING_MAX_HEALTH};
+        use crate::building::{BUILDING_MAX_HEALTH, BuildingDef, BuildingInstance};
         use crate::types::{Good, ProductionType};
 
         let mut sim = Simulation::new();
@@ -2808,10 +4313,11 @@ mod tests {
         sim.tick_disaster_event();
 
         assert_eq!(sim.buildings[0].health, BUILDING_MAX_HEALTH);
-        assert!(sim
-            .event_log
-            .iter()
-            .all(|line| !line.starts_with("[volcano]")));
+        assert!(
+            sim.event_log
+                .iter()
+                .all(|line| !line.starts_with("[volcano]"))
+        );
     }
 
     #[test]
@@ -3355,11 +4861,12 @@ mod tests {
                 local_position: (9, 7),
             }]
         );
-        assert!(sim
-            .source_dynamic_map_object_table(5)
-            .objects()
-            .next()
-            .is_none());
+        assert!(
+            sim.source_dynamic_map_object_table(5)
+                .objects()
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3481,7 +4988,7 @@ mod tests {
         };
         sim.building_defs.push(mk_def(5)); // def 0 cost 5
         sim.building_defs.push(mk_def(8)); // def 1 cost 8
-                                           // Player 0: 2× def0 + 1× def1 → 5+5+8 = 18
+        // Player 0: 2× def0 + 1× def1 → 5+5+8 = 18
         sim.buildings.push(BuildingInstance::new(0, 0, 0, 0, 0));
         sim.buildings.push(BuildingInstance::new(0, 0, 1, 1, 0));
         sim.buildings.push(BuildingInstance::new(1, 0, 2, 2, 0));
@@ -3703,7 +5210,7 @@ mod tests {
 
     #[test]
     fn patrol_cycles_waypoints() {
-        use crate::combat::{tick_unit_orders, MilitaryUnit, UnitType};
+        use crate::combat::{MilitaryUnit, UnitType, tick_unit_orders};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.military_units
@@ -3804,7 +5311,7 @@ mod tests {
 
     #[test]
     fn sell_ship_refunds_half_cost_and_deactivates() {
-        use crate::combat::{unit_build_cost, MilitaryUnit, UnitType};
+        use crate::combat::{MilitaryUnit, UnitType, unit_build_cost};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.players[0].gold = 100;
@@ -3886,7 +5393,9 @@ mod tests {
         // Break it: penalty flag set, can't re-propose immediately.
         assert!(sim.apply_command(&crate::commands::Command::BreakTradeAgreement { a: 0, b: 1 }));
         assert!(!sim.diplomacy.has_trade_agreement(0, 1));
-        assert!(!sim.apply_command(&crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 }));
+        assert!(
+            !sim.apply_command(&crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 })
+        );
 
         // Clear penalty (e.g. after cooldown), proposal allowed.
         sim.diplomacy.clear_broken_flag(0, 1);
@@ -4170,74 +5679,6 @@ mod tests {
     }
 
     #[test]
-    fn civilian_spawns_on_source_building_cadence() {
-        use crate::building::{BuildingDef, BuildingInstance};
-        use crate::types::{Good, ProductionType};
-
-        let mut sim = Simulation::new();
-        sim.building_defs.push(BuildingDef {
-            id: 0,
-            category: 0,
-            width: 2,
-            height: 2,
-            production_type: ProductionType::Residence,
-            kind: "GEBAEUDE".into(),
-            prod_kind: "WOHN".into(),
-            radius: 0,
-            output_good: Good::None,
-            input_good_1: Good::None,
-            input_good_2: Good::None,
-            output_rate: 0,
-            input_1_rate: 0,
-            input_2_rate: 0,
-            storage_capacity: 0,
-            cycle_time_ms: 1_000,
-            cost_gold: 0,
-            cost_tools: 0,
-            cost_wood: 0,
-            cost_bricks: 0,
-            maintenance_cost: 0,
-            native: false,
-            min_tier: 0,
-            max_no_input_ticks: 6,
-            can_dry_up: false,
-            wegspeed: [100; 4],
-            has_door: true,
-            upgradeable: true,
-            max_energy: 0,
-            ore_deposit: crate::building::OreDeposit::None,
-            pirate_owned: false,
-            defensive_cannons: 0,
-            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
-            ruin_id: crate::building::NO_RUIN_ID,
-            required_fertility: None,
-        });
-        sim.buildings.push(BuildingInstance::new(0, 0, 10, 10, 0));
-        sim.buildings.push(BuildingInstance::new(0, 0, 20, 20, 0));
-
-        for _ in 0..24 {
-            sim.tick(200);
-        }
-        sim.tick(198);
-        assert_eq!(
-            sim.figures
-                .iter()
-                .filter(|fig| civilian::is_civilian(fig))
-                .count(),
-            0
-        );
-
-        sim.tick(1);
-        assert_eq!(
-            sim.figures
-                .iter()
-                .filter(|fig| civilian::is_civilian(fig))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
     fn free_trader_retarget_uses_binary_seek_gate_after_docking() {
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -4299,6 +5740,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let ocean = OceanMap::from_scenario(&szs);
 
@@ -4349,6 +5791,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -4388,6 +5831,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -4431,6 +5875,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.ocean_map = Some(OceanMap::from_scenario(&szs));
@@ -4472,6 +5917,7 @@ mod tests {
             mission: None,
             scenario: Default::default(),
             ships: Vec::new(),
+            land_figures: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -4486,11 +5932,12 @@ mod tests {
         assert_eq!((trader.target_x, trader.target_y), (0, 85));
         assert!(trader.path_required);
         assert!(trader.path.is_empty());
-        assert!(sim
-            .ocean_map
-            .as_ref()
-            .unwrap()
-            .is_navigable(trader.target_x, trader.target_y));
+        assert!(
+            sim.ocean_map
+                .as_ref()
+                .unwrap()
+                .is_navigable(trader.target_x, trader.target_y)
+        );
     }
 
     #[test]
