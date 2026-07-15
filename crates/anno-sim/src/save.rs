@@ -190,7 +190,11 @@ use std::path::Path;
 ///       reservation/path state, and the source `+0x12` production-time
 ///       accumulator; figures retain type-12 worker route/home and animation
 ///       selectors.
-pub const SAVE_VERSION: u32 = 102;
+/// v103: static source cells retain the `ROHSTWACHS` `+0xa9` resource
+///       selector used by plantation-worker traversal after regrowth.
+/// v104: source resource-environment phase/cursor state and dry-cell markers
+///       retain the `FUN_0046b3e0` / `FUN_0047c920` transition schedule.
+pub const SAVE_VERSION: u32 = 104;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -204,7 +208,7 @@ pub const SAVE_VERSION: u32 = 102;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 102;
+pub const MIN_LOADABLE_VERSION: u32 = 104;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -237,6 +241,10 @@ pub struct SaveState {
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
     pub source_time_ticks: u32,
     pub source_time_remainder_ms: u32,
+    pub source_resource_environment_elapsed_ms: u32,
+    pub source_resource_environment_phase: u8,
+    pub source_resource_environment_cursor: usize,
+    pub source_resource_environment_last_phase: Vec<u8>,
     pub source_map_dispatch_elapsed_ms: u32,
     pub source_map_dispatch_phase: u8,
     pub source_city_dispatch_elapsed_ms: u32,
@@ -312,6 +320,12 @@ impl Simulation {
             source_kind4_dispatch: self.source_kind4_dispatch,
             source_time_ticks: self.source_time_ticks,
             source_time_remainder_ms: self.source_time_remainder_ms,
+            source_resource_environment_elapsed_ms: self.source_resource_environment_elapsed_ms,
+            source_resource_environment_phase: self.source_resource_environment_phase,
+            source_resource_environment_cursor: self.source_resource_environment_cursor,
+            source_resource_environment_last_phase: self
+                .source_resource_environment_last_phase
+                .clone(),
             source_map_dispatch_elapsed_ms: self.source_map_dispatch_elapsed_ms,
             source_map_dispatch_phase: self.source_map_dispatch_phase,
             source_city_dispatch_elapsed_ms: self.source_city_dispatch_elapsed_ms,
@@ -357,6 +371,10 @@ impl Simulation {
         self.source_kind4_dispatch = s.source_kind4_dispatch;
         self.source_time_ticks = s.source_time_ticks;
         self.source_time_remainder_ms = s.source_time_remainder_ms;
+        self.source_resource_environment_elapsed_ms = s.source_resource_environment_elapsed_ms;
+        self.source_resource_environment_phase = s.source_resource_environment_phase;
+        self.source_resource_environment_cursor = s.source_resource_environment_cursor;
+        self.source_resource_environment_last_phase = s.source_resource_environment_last_phase;
         self.source_map_dispatch_elapsed_ms = s.source_map_dispatch_elapsed_ms;
         self.source_map_dispatch_phase = s.source_map_dispatch_phase;
         self.source_city_dispatch_elapsed_ms = s.source_city_dispatch_elapsed_ms;
@@ -460,6 +478,10 @@ mod tests {
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
+            source_resource_environment_elapsed_ms: 0,
+            source_resource_environment_phase: 0,
+            source_resource_environment_cursor: 0,
+            source_resource_environment_last_phase: vec![],
             source_map_dispatch_elapsed_ms: 0,
             source_map_dispatch_phase: 0,
             source_city_dispatch_elapsed_ms: 0,
@@ -603,6 +625,8 @@ mod tests {
                 source_no_raw_material_count: 6,
                 source_output_ware_slot: 0x16,
                 source_raw_resource_ware_slot: 0x2d,
+                source_growth_resource_ware_slot: 0,
+                source_resource_is_dry: false,
                 source_plantation_worker_definition: 0x60,
                 source_resource_reserved: true,
                 source_path_class: 46,
@@ -670,6 +694,10 @@ mod tests {
         sim.source_city_dispatch_cursor = 17;
         sim.source_time_ticks = 19;
         sim.source_time_remainder_ms = 99;
+        sim.source_resource_environment_elapsed_ms = 17_000;
+        sim.source_resource_environment_phase = 3;
+        sim.source_resource_environment_cursor = 1;
+        sim.source_resource_environment_last_phase = vec![2, 3];
         sim.source_map_dispatch_elapsed_ms = 800;
         sim.source_map_dispatch_phase = 5;
         sim.source_kind4_dispatch = crate::combat::SourceKind4DispatchState {
@@ -906,6 +934,8 @@ mod tests {
                 source_no_raw_material_count: 6,
                 source_output_ware_slot: 0x16,
                 source_raw_resource_ware_slot: 0x2d,
+                source_growth_resource_ware_slot: 0,
+                source_resource_is_dry: false,
                 source_plantation_worker_definition: 0x60,
                 source_resource_reserved: true,
                 source_path_class: 46,
@@ -995,6 +1025,10 @@ mod tests {
         assert_eq!(sim2.source_city_dispatch_cursor, 17);
         assert_eq!(sim2.source_time_ticks, 19);
         assert_eq!(sim2.source_time_remainder_ms, 99);
+        assert_eq!(sim2.source_resource_environment_elapsed_ms, 17_000);
+        assert_eq!(sim2.source_resource_environment_phase, 3);
+        assert_eq!(sim2.source_resource_environment_cursor, 1);
+        assert_eq!(sim2.source_resource_environment_last_phase, vec![2, 3]);
         assert_eq!(sim2.source_map_dispatch_elapsed_ms, 800);
         assert_eq!(sim2.source_map_dispatch_phase, 5);
         assert_eq!(

@@ -73,6 +73,13 @@ const fn source_scheduler_enabled_default() -> bool {
     true
 }
 
+/// `FUN_0046f920` admits these outer map kinds without comparing their owner
+/// or compiled `Ware` selector. All remaining kinds need both fields to match
+/// the plantation worker's requested raw resource.
+pub const fn source_plantation_path_kind_always_walkable(kind_code: u8) -> bool {
+    matches!(kind_code, 1 | 11 | 12 | 13 | 18 | 29 | 30)
+}
+
 impl SourceTransferFigure {
     fn from_definition(definition: &BuildingDef) -> Self {
         match definition.properties.get("Figurnr").map(String::as_str) {
@@ -206,6 +213,16 @@ pub struct SourceMapCellState {
     /// `FUN_0047daf0` gives this raw-resource ware to `FUN_0044b7e0`.
     #[serde(default)]
     pub source_raw_resource_ware_slot: u8,
+    /// Compiled definition byte `+0xa9` for `ROHSTWACHS` records. The source
+    /// uses this associated resource selector instead of their `NOWARE` byte
+    /// when evaluating `FUN_0046f920` traversal and `FUN_004684a0` regrowth.
+    #[serde(default)]
+    pub source_growth_resource_ware_slot: u8,
+    /// `Doerrflg` on a production-kind-10 resource definition. `FUN_0047c920`
+    /// returns only these dry cells to their adjacent `ROHSTOFF` record;
+    /// ordinary `ROHSTWACHS` cells remain in their authored regrowth state.
+    #[serde(default)]
+    pub source_resource_is_dry: bool,
     /// Compiled worker definition passed to `FUN_00446ca0` by
     /// `FUN_0044b7e0`: MAEHER through PFLUECKER2 occupy 0x60..=0x64.
     #[serde(default)]
@@ -259,6 +276,44 @@ pub struct SourceMapCellState {
 }
 
 impl SourceMapCellState {
+    /// `FUN_0046f920`'s path-grid admission predicate for an already decoded
+    /// static map cell. A fixed terrain kind remains traversable across every
+    /// owner; all other cells require both the map owner and compiled `Ware`
+    /// selector to match the worker's root.
+    pub const fn admits_plantation_worker_path(
+        self,
+        source_owner: u8,
+        raw_resource_ware_slot: u8,
+    ) -> bool {
+        source_plantation_path_kind_always_walkable(self.kind_code)
+            || (self.source_map_owner_slot == source_owner
+                && self.plantation_path_resource_ware_slot() == raw_resource_ware_slot)
+    }
+
+    /// `FUN_0046f920` writes the metadata high bit for an admitted cell whose
+    /// ordinary compiled `Ware` matches the selected raw resource and whose
+    /// live static-map bit is not reserved by another worker.
+    pub const fn is_plantation_worker_target(
+        self,
+        source_owner: u8,
+        raw_resource_ware_slot: u8,
+    ) -> bool {
+        self.admits_plantation_worker_path(source_owner, raw_resource_ware_slot)
+            && self.source_production_kind_code != 10
+            && self.source_output_ware_slot == raw_resource_ware_slot
+            && !self.source_resource_reserved
+    }
+
+    /// `FUN_0046f920` reads `+0xa9` for production kind 10 and the ordinary
+    /// `Ware` byte for every other map definition.
+    pub const fn plantation_path_resource_ware_slot(self) -> u8 {
+        if self.source_production_kind_code == 10 {
+            self.source_growth_resource_ware_slot
+        } else {
+            self.source_output_ware_slot
+        }
+    }
+
     /// Construct the source roots that own scheduler or transfer dispatch.
     /// Besides the outer selector kinds retained by `FUN_00481fc0`, this
     /// includes nested production-kind-2 plantations, whose worker event is
@@ -337,6 +392,11 @@ impl SourceMapCellState {
             source_raw_resource_ware_slot: definition
                 .source_raw_resource_ware_slot()
                 .unwrap_or_default(),
+            source_growth_resource_ware_slot: 0,
+            source_resource_is_dry: definition
+                .properties
+                .get("Doerrflg")
+                .is_some_and(|value| value == "1"),
             source_plantation_worker_definition: definition
                 .source_plantation_worker_definition()
                 .unwrap_or_default(),
@@ -407,10 +467,54 @@ impl SourceMapCellState {
             }
         };
         self.kind_code = 10;
+        self.source_production_kind_code = 10;
+        self.source_growth_resource_ware_slot = self.source_output_ware_slot;
+        self.source_resource_is_dry = transition == SourceResourceHarvestTransition::Drought;
         self.source_output_ware_slot = 0;
         self.source_raw_resource_ware_slot = 0;
         self.source_plantation_worker_definition = 0;
         self.source_resource_reserved = false;
+        true
+    }
+
+    /// The raw-resource half of `FUN_0047c920`: an unclaimed kind-9 cell
+    /// moves one authored definition forward only when `FUN_004684a0` selects
+    /// the drought branch.
+    pub fn advance_raw_resource_to_drought(
+        &mut self,
+        transition: SourceResourceHarvestTransition,
+    ) -> bool {
+        if self.kind_code != 9
+            || self.source_resource_reserved
+            || transition != SourceResourceHarvestTransition::Drought
+        {
+            return false;
+        }
+        self.source_definition_offset = self.source_definition_offset.saturating_add(1);
+        self.kind_code = 10;
+        self.source_production_kind_code = 10;
+        self.source_growth_resource_ware_slot = self.source_output_ware_slot;
+        self.source_resource_is_dry = true;
+        self.source_output_ware_slot = 0;
+        self.source_raw_resource_ware_slot = 0;
+        self.source_plantation_worker_definition = 0;
+        true
+    }
+
+    /// The dry-resource half of `FUN_0047c920`: the preceding authored raw
+    /// definition is restored when the source growth mask selects regrowth.
+    pub fn restore_dry_resource(&mut self, transition: SourceResourceHarvestTransition) -> bool {
+        if self.kind_code != 10
+            || !self.source_resource_is_dry
+            || transition != SourceResourceHarvestTransition::Regrowth
+        {
+            return false;
+        }
+        self.source_definition_offset = self.source_definition_offset.saturating_sub(1);
+        self.kind_code = 9;
+        self.source_production_kind_code = 9;
+        self.source_output_ware_slot = self.source_growth_resource_ware_slot;
+        self.source_resource_is_dry = false;
         true
     }
 
@@ -1465,6 +1569,38 @@ mod tests {
     }
 
     #[test]
+    fn plantation_path_targeting_keeps_fixed_grass_terrain_owner_independent() {
+        let grass = BuildingDef {
+            kind: "BODEN".into(),
+            properties: [("Ware".into(), "GRAS".into())].into(),
+            ..Default::default()
+        };
+        let raw = BuildingDef {
+            kind: "ROHSTOFF".into(),
+            properties: [("Ware".into(), "GRAS".into())].into(),
+            ..Default::default()
+        };
+
+        let grass = SourceMapCellState {
+            source_map_owner_slot: 5,
+            ..SourceMapCellState::new_static(1, 4, 7, &grass, 0).unwrap()
+        };
+        let raw = SourceMapCellState {
+            source_map_owner_slot: 5,
+            ..SourceMapCellState::new_static(1, 5, 7, &raw, 0).unwrap()
+        };
+
+        assert!(grass.is_plantation_worker_target(2, 0x34));
+        assert!(!raw.is_plantation_worker_target(2, 0x34));
+        assert!(raw.is_plantation_worker_target(5, 0x34));
+        assert!(!SourceMapCellState {
+            source_resource_reserved: true,
+            ..grass
+        }
+        .is_plantation_worker_target(2, 0x34));
+    }
+
+    #[test]
     fn plantation_root_and_harvest_replacement_keep_the_source_selectors() {
         let plantation = BuildingDef {
             kind: "GEBAEUDE".into(),
@@ -1497,8 +1633,37 @@ mod tests {
         assert!(cell.replace_harvested_raw_resource(SourceResourceHarvestTransition::Regrowth));
         assert_eq!(cell.source_definition_offset, 99);
         assert_eq!(cell.kind_code, 10);
+        assert_eq!(cell.source_production_kind_code, 10);
         assert_eq!(cell.source_output_ware_slot, 0);
+        assert_eq!(cell.source_growth_resource_ware_slot, 0x2d);
+        assert!(!cell.source_resource_is_dry);
+        assert!(cell.admits_plantation_worker_path(0, 0x2d));
+        assert!(!cell.is_plantation_worker_target(0, 0x2d));
         assert!(!cell.source_resource_reserved);
+    }
+
+    #[test]
+    fn resource_environment_moves_only_dry_kind10_cells_back_to_raw() {
+        let raw = BuildingDef {
+            kind: "ROHSTOFF".into(),
+            gfx: 100,
+            properties: [("Ware".into(), "GETREIDE".into())].into(),
+            ..Default::default()
+        };
+        let mut cell = SourceMapCellState::new_static(1, 7, 9, &raw, 0).unwrap();
+        cell.source_resource_growth_factor = 128;
+        assert!(cell.replace_harvested_raw_resource(SourceResourceHarvestTransition::Drought));
+        assert!(cell.source_resource_is_dry);
+        assert!(cell.restore_dry_resource(SourceResourceHarvestTransition::Regrowth));
+        assert_eq!(cell.source_definition_offset, 100);
+        assert_eq!(cell.kind_code, 9);
+        assert_eq!(cell.source_production_kind_code, 9);
+        assert_eq!(cell.source_output_ware_slot, 0x2d);
+        assert!(!cell.source_resource_is_dry);
+
+        assert!(cell.replace_harvested_raw_resource(SourceResourceHarvestTransition::Regrowth));
+        assert!(!cell.source_resource_is_dry);
+        assert!(!cell.restore_dry_resource(SourceResourceHarvestTransition::Regrowth));
     }
 
     #[test]

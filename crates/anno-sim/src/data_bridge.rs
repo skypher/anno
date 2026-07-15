@@ -1901,6 +1901,29 @@ pub fn source_static_map_roots_from_scenario(
     source_map_roots_from_scenario(szs, cod, true)
 }
 
+/// Resolve the resource selector compiled at definition offset `+0xa9` for
+/// `ROHSTWACHS` records. The authored resource groups place their usable
+/// `ROHSTOFF` definition immediately next to each growth/dry record.
+fn source_growth_resource_ware_slot(cod: &CodFile, definition: &CodBuilding) -> u8 {
+    if definition.source_production_kind_code() != Some(10) {
+        return 0;
+    }
+    let Some(index) = cod
+        .buildings
+        .iter()
+        .position(|candidate| std::ptr::eq(candidate, definition))
+    else {
+        return 0;
+    };
+    [index.checked_add(1), index.checked_sub(1)]
+        .into_iter()
+        .flatten()
+        .filter_map(|neighbor| cod.buildings.get(neighbor))
+        .find(|candidate| candidate.source_production_kind_code() == Some(9))
+        .and_then(CodBuilding::source_ware_slot)
+        .unwrap_or_default()
+}
+
 /// Replay the source loader's `+0xafc` backing map. `FUN_00468550` copies
 /// only owner-slot-7 non-live definitions through `FUN_00463e10`; later
 /// `FUN_004641d0` uses this map when a `Ruinenr = 0xff` command is removed.
@@ -1931,6 +1954,8 @@ pub fn source_static_map_backing_cells_from_scenario(
             else {
                 continue;
             };
+            root.source_growth_resource_ware_slot =
+                source_growth_resource_ware_slot(cod, definition);
             root.set_footprint(width, height);
             root.set_source_command(command);
             root.configure_terminal_replacement(cod);
@@ -1956,9 +1981,10 @@ pub fn source_static_map_backing_cells_from_scenario(
 
 /// `FUN_00468550` copies only owner-slot-7 definitions whose outer `Kind`
 /// code is neither 12 nor 29 and for which `FUN_00480b70` returns zero.
-/// That helper switches on the nested production-kind code. Kinds 9 and 10
-/// use their compiled `Ware` byte as the source helper's special case; kind
-/// 0 checks the outer kind code directly.
+/// That helper switches on the nested production-kind code. Kind 9 uses its
+/// compiled `Ware` byte; kind 10 uses the associated `+0xa9` resource
+/// selector reconstructed from its neighboring kind-9 definition. Kind 0
+/// checks the outer kind code directly.
 fn source_loader_copies_static_backing(
     cod: &CodFile,
     tile: anno_formats::szs::IslandTile,
@@ -2037,6 +2063,8 @@ fn source_map_roots_from_scenario(
             let static_state =
                 SourceMapCellState::new_static(island.number, tile.x, tile.y, definition, 0).map(
                     |mut state| {
+                        state.source_growth_resource_ware_slot =
+                            source_growth_resource_ware_slot(cod, definition);
                         state.set_footprint(width, height);
                         state.set_source_command(command);
                         state.configure_terminal_replacement(cod);

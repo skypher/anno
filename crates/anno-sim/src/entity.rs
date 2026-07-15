@@ -236,8 +236,8 @@ pub struct Figure {
 
     /// Current generic-figure animation selector. `FUN_00446d90` resets the
     /// animation counters when this changes to a distinct authored selector;
-    /// the plantation path changes from 0 to 2 for its outbound search and
-    /// back to 0 after harvesting.
+    /// a plantation worker starts at selector 1, switches to 2 after reaching
+    /// its resource, then returns to 0 after harvesting.
     #[serde(default)]
     pub source_animation_state: u8,
 

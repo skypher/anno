@@ -14,6 +14,7 @@ use anno_formats::cod::BuildingDef as CodBuilding;
 use anno_formats::szs::{Island, IslandSourceResourceState};
 use std::collections::HashSet;
 
+use crate::source_cell::{source_plantation_path_kind_always_walkable, SourceMapCellState};
 use crate::source_route::{
     source_static_map_direction, SourcePathBlockedCellDecision, SourcePathGrid,
     SourcePathTargetRect, SourceTargetDescriptor,
@@ -287,6 +288,18 @@ impl IslandMap {
         self.source_resource_state.attenuation
     }
 
+    pub const fn source_resource_transition_deadline_ticks(&self) -> u32 {
+        self.source_resource_state.transition_deadline_ticks
+    }
+
+    /// The attenuation write in the latter branch of `FUN_0046b3e0`.
+    /// Values below twelve are cleared after the truncating half-step.
+    pub fn decay_source_resource_attenuation(&mut self) -> u8 {
+        let halved = self.source_resource_state.attenuation / 2;
+        self.source_resource_state.attenuation = if halved < 12 { 0 } else { halved };
+        self.source_resource_state.attenuation
+    }
+
     /// Active (non-sentinel) fertilities decoded into the typed
     /// `Fertility` enum. Mirrors `Island::active_fertilities`
     /// but on the simulation-side map so callers don't need to
@@ -424,6 +437,7 @@ impl IslandMap {
         radius: u8,
         source_owner: u8,
         raw_resource_ware_slot: u8,
+        static_cells: &[SourceMapCellState],
     ) -> SourcePathGrid {
         let radius_usize = usize::from(radius);
         let radius = i32::from(radius);
@@ -435,10 +449,22 @@ impl IslandMap {
         for y in origin.1..origin.1 + height as i32 {
             for x in origin.0..origin.0 + width as i32 {
                 grid.mark_direction_blocker((x, y));
+                if let Some(static_cell) = static_cells.iter().rev().find(|state| {
+                    state.island == self.island_id
+                        && i32::from(state.x) == x
+                        && i32::from(state.y) == y
+                }) {
+                    if static_cell
+                        .admits_plantation_worker_path(source_owner, raw_resource_ware_slot)
+                    {
+                        grid.set_traversable_cell((x, y), static_cell.source_path_class);
+                    }
+                    continue;
+                }
                 let Some(cell) = self.civilian_path_cell((x, y)) else {
                     continue;
                 };
-                let fixed_terrain = matches!(cell.kind_code, 1 | 11 | 12 | 13 | 18 | 29 | 30);
+                let fixed_terrain = source_plantation_path_kind_always_walkable(cell.kind_code);
                 let matching_raw_resource =
                     cell.owner == source_owner && cell.source_ware_slot == raw_resource_ware_slot;
                 if fixed_terrain || matching_raw_resource {
@@ -1522,12 +1548,42 @@ mod tests {
             path_class: 42,
         });
 
-        let grid = map.plantation_worker_path_grid((0, 0), (0, 0), (1, 1), 2, 2, 0x2d);
+        let grid = map.plantation_worker_path_grid((0, 0), (0, 0), (1, 1), 2, 2, 0x2d, &[]);
 
         assert_eq!(grid.metadata((0, 0)), Some(0x28));
         assert_eq!(grid.metadata((1, 0)), Some(41));
         assert!(grid.route_to((0, 0), (1, 0)).is_ok());
         assert!(grid.route_to((0, 0), (2, 0)).is_err());
+    }
+
+    #[test]
+    fn plantation_worker_grid_uses_the_live_growth_resource_selector() {
+        let map = IslandMap::new_open(3, 2, 1);
+        let growth = SourceMapCellState {
+            source_map_owner_slot: 2,
+            source_output_ware_slot: 0,
+            source_growth_resource_ware_slot: 0x2d,
+            source_production_kind_code: 10,
+            source_path_class: 46,
+            kind_code: 10,
+            ..SourceMapCellState::new_static(
+                3,
+                1,
+                0,
+                &CodBuilding {
+                    kind: "WALD".into(),
+                    properties: [("ProdKind".into(), "ROHSTWACHS".into())].into(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        };
+
+        let grid = map.plantation_worker_path_grid((0, 0), (0, 0), (1, 1), 2, 2, 0x2d, &[growth]);
+
+        assert_eq!(grid.metadata((1, 0)), Some(46));
+        assert!(grid.route_to((0, 0), (1, 0)).is_ok());
     }
 
     #[test]

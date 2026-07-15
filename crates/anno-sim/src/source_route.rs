@@ -294,6 +294,46 @@ pub fn encode_source_route_truncated(
     Ok(program)
 }
 
+/// Encode a bounded plantation-worker route with `FUN_00472b60`'s grouping
+/// rule. That routine merges adjacent identical directions regardless of the
+/// path-grid metadata class, unlike `FUN_0046cf70`.
+pub fn encode_source_direction_route_truncated(
+    steps: &[SourceRouteStep],
+    max_run_length: u8,
+    capacity: usize,
+) -> Result<Vec<u8>, SourceRouteError> {
+    if max_run_length == 0 || max_run_length > 0x0f {
+        return Err(SourceRouteError::InvalidRunLimit(max_run_length));
+    }
+    if capacity == 0 {
+        return Err(SourceRouteError::CapacityExceeded);
+    }
+
+    let mut program = Vec::new();
+    let mut index = 0;
+    while index < steps.len() {
+        let step = steps[index];
+        if source_direction_delta(step.direction).is_none() {
+            return Err(SourceRouteError::InvalidDirection(step.direction));
+        }
+
+        let mut length = 1usize;
+        while length < max_run_length as usize
+            && index + length < steps.len()
+            && steps[index + length].direction == step.direction
+        {
+            length += 1;
+        }
+        if program.len() + 1 >= capacity {
+            break;
+        }
+        program.push((step.direction << 4) | length as u8);
+        index += length;
+    }
+    program.push(SOURCE_ROUTE_TERMINATOR);
+    Ok(program)
+}
+
 /// Route-program validation or capacity failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceRouteError {
@@ -2812,6 +2852,29 @@ mod tests {
 
         let program = encode_source_route(&steps, 15, 100).unwrap();
         assert_eq!(program, [0x22, 0x21, 0xc1]);
+    }
+
+    #[test]
+    fn plantation_route_merges_matching_directions_across_metadata_classes() {
+        let steps = [
+            SourceRouteStep {
+                direction: 2,
+                metadata: 0x81,
+            },
+            SourceRouteStep {
+                direction: 2,
+                metadata: 1,
+            },
+            SourceRouteStep {
+                direction: 2,
+                metadata: 2,
+            },
+        ];
+
+        assert_eq!(
+            encode_source_direction_route_truncated(&steps, 15, 12),
+            Ok(vec![0x23, SOURCE_ROUTE_TERMINATOR])
+        );
     }
 
     #[test]

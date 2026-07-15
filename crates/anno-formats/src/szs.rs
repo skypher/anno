@@ -142,6 +142,10 @@ pub struct IslandSourceResourceState {
     pub records: [IslandSourceResourceRecord; 8],
     /// `INSEL5[0x5C..0x60]`, the crop-resource bitmask.
     pub crop_flags: u32,
+    /// `INSEL5[0x39..0x3d]`, compared with `DAT_005b6040` by
+    /// `FUN_0046b3e0` to choose its raw-to-dry scan before the source begins
+    /// the attenuation-decay and dry-to-raw branch.
+    pub transition_deadline_ticks: u32,
     /// `INSEL5[0x66]`, the mutable factor subtracted by `FUN_004684a0` for
     /// non-grass, non-tree, and non-fish resources.
     pub attenuation: u8,
@@ -1420,6 +1424,10 @@ impl SzsFile {
         if data.len() >= 0x60 {
             state.crop_flags = u32::from_le_bytes(data[0x5c..0x60].try_into().expect("slice size"));
         }
+        if data.len() >= 0x3d {
+            state.transition_deadline_ticks =
+                u32::from_le_bytes(data[0x39..0x3d].try_into().expect("slice size"));
+        }
         if data.len() > 0x66 {
             state.attenuation = data[0x66];
         }
@@ -2014,7 +2022,17 @@ mod tests {
             (0x28, "PIRATTURM", 72, 12, 15, 3.0, 10, Some(115)),
         ];
 
-        for (id, name, energy, hit_points, shot_radius, work_time, shot_delay_ticks, shot_figure_id) in cases {
+        for (
+            id,
+            name,
+            energy,
+            hit_points,
+            shot_radius,
+            work_time,
+            shot_delay_ticks,
+            shot_figure_id,
+        ) in cases
+        {
             assert_eq!(
                 SourceCombatDefinition::from_id(id),
                 Some(SourceCombatDefinition {
@@ -3566,6 +3584,7 @@ mod tests {
         body[0x1c..0x24].copy_from_slice(&[0x35, 0xaa, 0xbb, 0xcc, 1, 0xdd, 0x20, 0x00]);
         body[0x24..0x2c].copy_from_slice(&[0x36, 0, 0, 0, 0, 0, 0x40, 0x00]);
         body[0x5c..0x60].copy_from_slice(&(1_u32 << 2).to_le_bytes());
+        body[0x39..0x3d].copy_from_slice(&12_345_u32.to_le_bytes());
         body[0x66] = 0x40;
 
         let mut encoded = Vec::new();
@@ -3579,6 +3598,7 @@ mod tests {
         assert_eq!(state.records[0].remaining_amount(), 0x20);
         assert_eq!(state.records[1].ware(), 0x36);
         assert_eq!(state.attenuation, 0x40);
+        assert_eq!(state.transition_deadline_ticks, 12_345);
         assert_eq!(state.resource_strength(0x35), 0x40);
         assert_eq!(state.resource_strength(0x36), 0x80);
         assert_eq!(state.resource_strength(0x37), 0);

@@ -24,7 +24,8 @@ use crate::player::{Player, PlayerState};
 use crate::population;
 use crate::production;
 use crate::source_cell::{
-    source_resource_harvest_transition, SourceMapCellState, SourceTransferFigure,
+    source_resource_harvest_transition, SourceMapCellState, SourceResourceHarvestTransition,
+    SourceTransferFigure,
 };
 use crate::source_figure_event::SourceFigureEventRegistry;
 use crate::source_route::{
@@ -210,6 +211,15 @@ pub struct Simulation {
     pub source_time_ticks: u32,
     /// Milliseconds not yet promoted into `source_time_ticks`.
     pub source_time_remainder_ms: u32,
+    /// `DAT_005dbabc`: elapsed time for `FUN_0046b3e0`'s resource phase.
+    pub source_resource_environment_elapsed_ms: u32,
+    /// `DAT_005dbab0`: low-three-bit resource-environment phase.
+    pub source_resource_environment_phase: u8,
+    /// Physical island cursor corresponding to `PTR_DAT_0049a8c0`.
+    pub source_resource_environment_cursor: usize,
+    /// Per-island source field `+0x64`, recording the last processed
+    /// resource-environment phase.
+    pub source_resource_environment_last_phase: Vec<u8>,
     /// `DAT_005a6aec`: shared source map-root dispatch accumulator.
     pub source_map_dispatch_elapsed_ms: u32,
     /// `DAT_005a6c12`: low-three-bit phase consumed by `FUN_0047daf0`.
@@ -527,6 +537,10 @@ impl Simulation {
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
+            source_resource_environment_elapsed_ms: 0,
+            source_resource_environment_phase: 0,
+            source_resource_environment_cursor: 0,
+            source_resource_environment_last_phase: Vec::new(),
             source_map_dispatch_elapsed_ms: 0,
             source_map_dispatch_phase: 0,
             source_city_dispatch_elapsed_ms: 0,
@@ -991,6 +1005,7 @@ impl Simulation {
     /// Single simulation step (max 200ms).
     fn step(&mut self, dt_ms: u32) {
         self.advance_source_clock(dt_ms);
+        self.tick_source_resource_environment(dt_ms);
         self.tick_source_map_dispatch(dt_ms);
         self.tick_source_kind6_deferred_hits();
         self.tick_source_kind15_combat_figures(dt_ms);
@@ -1412,6 +1427,105 @@ impl Simulation {
         if self.source_map_dispatch_elapsed_ms > 999 {
             self.source_map_dispatch_elapsed_ms = 0;
             self.source_map_dispatch_phase = self.source_map_dispatch_phase.wrapping_add(1) & 7;
+        }
+    }
+
+    /// Replay the resource-cell portion of `FUN_0046b3e0`. Each invocation
+    /// advances one physical island cursor; an island is scanned at most once
+    /// per 30-second source phase. The unrelated disaster and fire branches
+    /// in that function remain in their dedicated source subsystems.
+    fn tick_source_resource_environment(&mut self, dt_ms: u32) {
+        self.source_resource_environment_elapsed_ms = self
+            .source_resource_environment_elapsed_ms
+            .saturating_add(dt_ms);
+        if self.source_resource_environment_elapsed_ms > 29_999 {
+            self.source_resource_environment_elapsed_ms = 0;
+            self.source_resource_environment_phase =
+                self.source_resource_environment_phase.wrapping_add(1) & 7;
+        }
+
+        let map_count = self.island_maps.len();
+        if map_count == 0 {
+            return;
+        }
+        self.source_resource_environment_last_phase
+            .resize(map_count, 0);
+        let map_index = self.source_resource_environment_cursor % map_count;
+        self.source_resource_environment_cursor = (map_index + 1) % map_count;
+        if self.source_resource_environment_last_phase[map_index]
+            == self.source_resource_environment_phase
+        {
+            return;
+        }
+        self.source_resource_environment_last_phase[map_index] =
+            self.source_resource_environment_phase;
+
+        let (island, width, height, deadline, attenuation) = {
+            let map = &self.island_maps[map_index];
+            (
+                map.island_id,
+                map.width,
+                map.height,
+                map.source_resource_transition_deadline_ticks(),
+                map.source_resource_attenuation(),
+            )
+        };
+        if attenuation == 0 {
+            return;
+        }
+
+        let mut changed = false;
+        if self.source_time_ticks < deadline {
+            let resource_state = self.island_maps[map_index].source_resource_state();
+            for y in 0..height {
+                let mut x = i32::from(width) - i32::from(self.next_source_rand() & 3) - 1;
+                while x >= 0 {
+                    let x_u8 = x as u8;
+                    if let Some(cell) = self
+                        .source_static_map_roots
+                        .iter_mut()
+                        .find(|cell| cell.matches(island, u16::from(x_u8), u16::from(y)))
+                    {
+                        let transition = source_resource_harvest_transition(
+                            resource_state.resource_strength(cell.source_output_ware_slot),
+                            cell.source_resource_growth_factor,
+                            attenuation,
+                            cell.source_output_ware_slot,
+                            island,
+                            u16::from(x_u8),
+                            u16::from(y),
+                        );
+                        changed |= cell.advance_raw_resource_to_drought(transition);
+                    }
+                    x -= 3;
+                }
+            }
+        } else {
+            let attenuation = self.island_maps[map_index].decay_source_resource_attenuation();
+            let resource_state = self.island_maps[map_index].source_resource_state();
+            for y in 0..height {
+                for x in (0..width).rev() {
+                    if let Some(cell) = self
+                        .source_static_map_roots
+                        .iter_mut()
+                        .find(|cell| cell.matches(island, u16::from(x), u16::from(y)))
+                    {
+                        let transition = source_resource_harvest_transition(
+                            resource_state.resource_strength(cell.source_growth_resource_ware_slot),
+                            cell.source_resource_growth_factor,
+                            attenuation,
+                            cell.source_growth_resource_ware_slot,
+                            island,
+                            u16::from(x),
+                            u16::from(y),
+                        );
+                        changed |= cell.restore_dry_resource(transition);
+                    }
+                }
+            }
+        }
+        if changed {
+            self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
         }
     }
 
@@ -1979,10 +2093,10 @@ impl Simulation {
             .enumerate()
             .filter(|(_, cell)| {
                 cell.island == figure.origin_island
-                    && cell.kind_code == 9
-                    && cell.source_output_ware_slot == figure.carried_good
-                    && cell.source_map_owner_slot == figure.origin_source_map_owner_slot
-                    && !cell.source_resource_reserved
+                    && cell.is_plantation_worker_target(
+                        figure.origin_source_map_owner_slot,
+                        figure.carried_good,
+                    )
             })
             .map(|(index, cell)| {
                 (
@@ -2008,6 +2122,7 @@ impl Simulation {
                 root.source_transfer_radius,
                 figure.origin_source_map_owner_slot,
                 figure.carried_good,
+                &self.source_static_map_roots,
             );
             for &(_, position, path_class) in &candidates {
                 let target = SourcePathTargetRect::new(position, 1, 1)?;
@@ -2033,14 +2148,13 @@ impl Simulation {
         figure.supplier_x = route.position.0 as u16;
         figure.supplier_y = route.position.1 as u16;
         figure.source_worker_route = SourceWorkerRoute::ToResource;
-        figure.select_source_animation_state(2);
         figure.path = path;
         figure.path_idx = 0;
         figure.source_step_remaining = 0.0;
         figure.source_event_route_steps = route.steps;
         if let Some(slot) = figure.source_event_slot {
             self.source_figure_events
-                .write_kind12_route(slot, &figure.source_event_route_steps);
+                .write_plantation_route(slot, &figure.source_event_route_steps);
         }
         true
     }
@@ -2075,6 +2189,7 @@ impl Simulation {
                     root.source_transfer_radius,
                     figure.origin_source_map_owner_slot,
                     figure.carried_good,
+                    &self.source_static_map_roots,
                 );
                 let root_target = SourcePathTargetRect::new(
                     (
@@ -2103,7 +2218,7 @@ impl Simulation {
         figure.source_event_route_steps = route_steps;
         if let Some(slot) = figure.source_event_slot {
             self.source_figure_events
-                .write_kind12_route(slot, &figure.source_event_route_steps);
+                .write_plantation_route(slot, &figure.source_event_route_steps);
         }
         true
     }
@@ -3515,7 +3630,7 @@ impl Simulation {
                     figure.source_event_route_steps.clear();
                     if let Some(slot) = figure.source_event_slot {
                         self.source_figure_events
-                            .write_kind12_route(slot, &figure.source_event_route_steps);
+                            .write_plantation_route(slot, &figure.source_event_route_steps);
                     }
                     figure.select_source_animation_state(0);
                     continue;
@@ -6391,7 +6506,7 @@ mod tests {
             SourceWorkerRoute::ToResource
         );
         assert!(sim.source_static_map_roots[0].source_resource_reserved);
-        assert_eq!(sim.figures[0].source_animation_state, 2);
+        assert_eq!(sim.figures[0].source_animation_state, 1);
 
         for _ in 0..100 {
             if sim.figures[0].source_worker_route == SourceWorkerRoute::Harvesting {
@@ -6508,6 +6623,117 @@ mod tests {
         );
         assert!(!sim.source_static_map_roots[0].source_resource_reserved);
         assert!(sim.source_static_map_roots[1].source_resource_reserved);
+    }
+
+    #[test]
+    fn plantation_worker_selects_a_fixed_grass_terrain_target() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(0, 3, 1));
+        let plantation = CodBuilding {
+            kind: "GEBAEUDE".into(),
+            source_transfer_radius: 3,
+            properties: [
+                ("ProdKind".into(), "PLANTAGE".into()),
+                ("Rohstoff".into(), "GRAS".into()),
+                ("Figurnr".into(), "PFLUECKER".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let grass = CodBuilding {
+            kind: "BODEN".into(),
+            properties: [
+                ("Ware".into(), "GRAS".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        sim.source_map_cell_states
+            .push(SourceMapCellState::new(0, 0, 0, &plantation, 0).unwrap());
+        sim.source_static_map_roots
+            .push(SourceMapCellState::new_static(0, 2, 0, &grass, 0).unwrap());
+
+        sim.tick_source_map_dispatch(1_000);
+        sim.tick_production();
+        assert_eq!(sim.figures.len(), 1);
+
+        sim.tick_entities(100);
+
+        assert_eq!(
+            sim.figures[0].source_worker_route,
+            SourceWorkerRoute::ToResource
+        );
+        assert_eq!((sim.figures[0].target_x, sim.figures[0].target_y), (2, 0));
+        assert!(sim.source_static_map_roots[0].source_resource_reserved);
+    }
+
+    #[test]
+    fn source_resource_environment_scans_raw_cells_before_the_deadline() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+        use anno_formats::szs::IslandSourceResourceState;
+
+        let mut sim = Simulation::new();
+        sim.island_maps
+            .push(IslandMap::new_open(0, 1, 1).with_source_resource_state(
+                IslandSourceResourceState {
+                    attenuation: 128,
+                    transition_deadline_ticks: 1,
+                    ..Default::default()
+                },
+            ));
+        let raw = CodBuilding {
+            kind: "ROHSTOFF".into(),
+            gfx: 100,
+            properties: [("Ware".into(), "GETREIDE".into())].into(),
+            ..Default::default()
+        };
+        sim.source_static_map_roots
+            .push(SourceMapCellState::new_static(0, 0, 0, &raw, 0).unwrap());
+
+        sim.tick_source_resource_environment(30_000);
+
+        let cell = sim.source_static_map_roots[0];
+        assert_eq!(cell.source_definition_offset, 101);
+        assert_eq!(cell.kind_code, 10);
+        assert!(cell.source_resource_is_dry);
+        assert_eq!(sim.island_maps[0].source_resource_attenuation(), 128);
+    }
+
+    #[test]
+    fn source_resource_environment_decays_and_restores_dry_cells() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+        use anno_formats::szs::IslandSourceResourceState;
+
+        let mut sim = Simulation::new();
+        sim.island_maps
+            .push(IslandMap::new_open(0, 1, 1).with_source_resource_state(
+                IslandSourceResourceState {
+                    attenuation: 64,
+                    crop_flags: 1,
+                    ..Default::default()
+                },
+            ));
+        let raw = CodBuilding {
+            kind: "ROHSTOFF".into(),
+            gfx: 100,
+            properties: [("Ware".into(), "GETREIDE".into())].into(),
+            ..Default::default()
+        };
+        let mut dry = SourceMapCellState::new_static(0, 0, 0, &raw, 0).unwrap();
+        dry.source_resource_growth_factor = 128;
+        assert!(dry.replace_harvested_raw_resource(SourceResourceHarvestTransition::Drought));
+        sim.source_static_map_roots.push(dry);
+
+        sim.tick_source_resource_environment(30_000);
+
+        let cell = sim.source_static_map_roots[0];
+        assert_eq!(cell.source_definition_offset, 100);
+        assert_eq!(cell.kind_code, 9);
+        assert!(!cell.source_resource_is_dry);
+        assert_eq!(sim.island_maps[0].source_resource_attenuation(), 32);
     }
 
     #[test]
