@@ -7,7 +7,6 @@ pub mod combat;
 pub mod commands;
 pub mod coverage;
 pub mod data_bridge;
-pub mod disaster;
 pub mod economy;
 pub mod entity;
 pub mod exploration;

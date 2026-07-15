@@ -241,13 +241,13 @@ pub struct BuildingInstance {
     #[serde(default)]
     pub construction_ms_total: u32,
 
-    /// Hit points used by modeled disaster effects.
+    /// Health scalar retained for source-map damage execution.
     #[serde(default = "default_building_health")]
     pub health: u16,
 
-    /// Fire damage ticks already applied to this building during its
-    /// current burn cycle. RE: haeuser.cod `Maxbrand: 4` default,
-    /// parsed at `1602_exe.c:68086`.
+    /// Reserved source fire-state counter. `Maxbrand`'s inherited default is
+    /// parsed at `1602_exe.c:68086`; its live event execution path is not yet
+    /// connected to this field.
     #[serde(default)]
     pub fire_damage_ticks: u16,
 

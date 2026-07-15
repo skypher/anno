@@ -992,7 +992,6 @@ impl Simulation {
 
     fn tick_events(&mut self) {
         self.tick_pirate_event();
-        self.tick_disaster_event();
     }
 
     fn tick_pirate_event(&mut self) {
@@ -1000,17 +999,6 @@ impl Simulation {
         // selection. Scenario-loaded pirate ships and player surrender still
         // populate the pirate faction; do not fabricate new ships from an
         // implementation-only random gate.
-    }
-
-    /// Source-anchored disaster scheduler placeholder. Called from
-    /// `tick_events`. RE: figuren.cod `Nummer: VULKAN` (figure 0x12)
-    /// and `Nummer: BRANDMARKT` (figure 0x08); see `disaster.rs`
-    /// module doc-comment.
-    fn tick_disaster_event(&mut self) {
-        // Fire and volcano events need decoded source triggers/anchors.
-        // Do not invent an origin from a random player building; the
-        // lower-level effect helpers remain available for source-anchored
-        // call sites.
     }
 
     /// Main simulation tick, called with real-time delta in milliseconds.
@@ -1471,8 +1459,8 @@ impl Simulation {
 
     /// Replay the resource-cell portion of `FUN_0046b3e0`. Each invocation
     /// advances one physical island cursor; an island is scanned at most once
-    /// per 30-second source phase. The unrelated disaster and fire branches
-    /// in that function remain in their dedicated source subsystems.
+    /// per 30-second source phase. Its remaining branches update other
+    /// dynamic map state and are outside this resource-cell replay.
     fn tick_source_resource_environment(&mut self, dt_ms: u32) {
         self.source_resource_environment_elapsed_ms = self
             .source_resource_environment_elapsed_ms
@@ -8098,180 +8086,6 @@ mod tests {
             sim.tick_events();
         }
         assert!(sim.military_units.iter().all(|u| u.owner != 6));
-    }
-
-    #[test]
-    fn fire_effect_uses_building_definition_maxbrand_cap() {
-        use crate::building::{BuildingDef, BuildingInstance};
-        use crate::types::{Good, ProductionType};
-
-        let mut sim = Simulation::new();
-        sim.players.push(Player::new_human(0));
-        sim.building_defs.push(BuildingDef {
-            id: 0,
-            category: 0,
-            width: 1,
-            height: 1,
-            production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(),
-            prod_kind: "HANDWERK".into(),
-            radius: 0,
-            output_good: Good::None,
-            input_good_1: Good::None,
-            input_good_2: Good::None,
-            output_rate: 0,
-            input_1_rate: 0,
-            input_2_rate: 0,
-            storage_capacity: 0,
-            cycle_time_ms: 1_000,
-            cost_gold: 0,
-            cost_tools: 0,
-            cost_wood: 0,
-            cost_bricks: 0,
-            maintenance_cost: 0,
-            native: false,
-            min_tier: 0,
-            max_no_input_ticks: 6,
-            can_dry_up: false,
-            wegspeed: [100; 4],
-            has_door: false,
-            upgradeable: false,
-            max_energy: 0,
-            ore_deposit: crate::building::OreDeposit::None,
-            pirate_owned: false,
-            defensive_cannons: 0,
-            max_brand_damage_ticks: 1,
-            ruin_id: crate::building::NO_RUIN_ID,
-            required_fertility: None,
-        });
-        sim.buildings.push(BuildingInstance::new(0, 0, 4, 4, 0));
-
-        assert!(crate::disaster::ignite_building_with_cap(
-            &mut sim.buildings[0],
-            sim.building_defs[0].max_brand_damage_ticks,
-        ));
-        assert_eq!(sim.buildings[0].fire_damage_ticks, 1);
-        let after_first_fire = sim.buildings[0].health;
-
-        assert!(!crate::disaster::ignite_building_with_cap(
-            &mut sim.buildings[0],
-            sim.building_defs[0].max_brand_damage_ticks,
-        ));
-        assert_eq!(sim.buildings[0].fire_damage_ticks, 1);
-        assert_eq!(sim.buildings[0].health, after_first_fire);
-    }
-
-    #[test]
-    fn disaster_event_does_not_fabricate_fire_origin() {
-        use crate::building::{BuildingDef, BuildingInstance, BUILDING_MAX_HEALTH};
-        use crate::types::{Good, ProductionType};
-
-        let mut sim = Simulation::new();
-        sim.players.push(Player::new_human(0));
-        sim.building_defs.push(BuildingDef {
-            id: 0,
-            category: 0,
-            width: 1,
-            height: 1,
-            production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(),
-            prod_kind: "HANDWERK".into(),
-            radius: 0,
-            output_good: Good::None,
-            input_good_1: Good::None,
-            input_good_2: Good::None,
-            output_rate: 0,
-            input_1_rate: 0,
-            input_2_rate: 0,
-            storage_capacity: 0,
-            cycle_time_ms: 1_000,
-            cost_gold: 0,
-            cost_tools: 0,
-            cost_wood: 0,
-            cost_bricks: 0,
-            maintenance_cost: 0,
-            native: false,
-            min_tier: 0,
-            max_no_input_ticks: 6,
-            can_dry_up: false,
-            wegspeed: [100; 4],
-            has_door: false,
-            upgradeable: false,
-            max_energy: 0,
-            ore_deposit: crate::building::OreDeposit::None,
-            pirate_owned: false,
-            defensive_cannons: 0,
-            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
-            ruin_id: crate::building::NO_RUIN_ID,
-            required_fertility: None,
-        });
-        sim.buildings.push(BuildingInstance::new(0, 0, 4, 4, 0));
-
-        // Seed 8 used to satisfy the removed speculative fire gate.
-        sim.seed_source_rand(8);
-        sim.tick_disaster_event();
-
-        assert_eq!(sim.buildings[0].health, BUILDING_MAX_HEALTH);
-        assert_eq!(sim.buildings[0].fire_damage_ticks, 0);
-        assert!(sim.event_log.iter().all(|line| !line.starts_with("[fire]")));
-    }
-
-    #[test]
-    fn disaster_event_does_not_fabricate_volcano_origin() {
-        use crate::building::{BuildingDef, BuildingInstance, BUILDING_MAX_HEALTH};
-        use crate::types::{Good, ProductionType};
-
-        let mut sim = Simulation::new();
-        sim.players.push(Player::new_human(0));
-        sim.building_defs.push(BuildingDef {
-            id: 0,
-            category: 0,
-            width: 1,
-            height: 1,
-            production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(),
-            prod_kind: "HANDWERK".into(),
-            radius: 0,
-            output_good: Good::None,
-            input_good_1: Good::None,
-            input_good_2: Good::None,
-            output_rate: 0,
-            input_1_rate: 0,
-            input_2_rate: 0,
-            storage_capacity: 0,
-            cycle_time_ms: 1_000,
-            cost_gold: 0,
-            cost_tools: 0,
-            cost_wood: 0,
-            cost_bricks: 0,
-            maintenance_cost: 0,
-            native: false,
-            min_tier: 0,
-            max_no_input_ticks: 6,
-            can_dry_up: false,
-            wegspeed: [100; 4],
-            has_door: false,
-            upgradeable: false,
-            max_energy: 0,
-            ore_deposit: crate::building::OreDeposit::None,
-            pirate_owned: false,
-            defensive_cannons: 0,
-            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
-            ruin_id: crate::building::NO_RUIN_ID,
-            required_fertility: None,
-        });
-        sim.buildings.push(BuildingInstance::new(0, 0, 4, 4, 0));
-
-        // Seed 2 used to treat 29216 % 32 == 0 as a volcano trigger
-        // centered on this ordinary player building.
-        sim.seed_source_rand(2);
-        sim.tick_disaster_event();
-
-        assert_eq!(sim.buildings[0].health, BUILDING_MAX_HEALTH);
-        assert!(sim
-            .event_log
-            .iter()
-            .all(|line| !line.starts_with("[volcano]")));
     }
 
     #[test]

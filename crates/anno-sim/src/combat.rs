@@ -2077,8 +2077,8 @@ pub fn tick_unit_orders_with_maps_and_source_rand_and_dispatch_state(
 /// `Speed` and current `Wegspeed[Speedtyp]`; `FUN_00451890` consumes
 /// `dt_ms * 0.05` until that route cell is exhausted.
 ///
-/// Returns true only for a fully identified source type-4 figure. Other
-/// units retain the local compatibility mover below.
+/// Returns true only for a source type-4 figure with a live runtime slot.
+/// Other units retain the local compatibility mover below.
 fn tick_source_kind4_order(
     unit: &mut MilitaryUnit,
     dt_ms: u32,
@@ -2086,6 +2086,9 @@ fn tick_source_kind4_order(
     source_rand: &mut SourceRand,
     dispatch_state: SourceKind4DispatchState,
 ) -> bool {
+    if unit.source_runtime_slot.is_none() {
+        return false;
+    }
     let Some(definition) = unit
         .source_figure_definition_id
         .and_then(anno_formats::szs::LandFigureDefinition::from_id)
@@ -3721,6 +3724,26 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_source_kind_four_identity_uses_the_local_mover() {
+        let map = crate::island_map::IslandMap::new_open(7, 8, 1);
+        let mut unit = MilitaryUnit::new(UnitType::Infantry, 0, 0, 0);
+        unit.source_island_id = Some(7);
+        unit.source_figure_definition_id = Some(1);
+        unit.target_x = 1;
+
+        tick_unit_orders_with_maps(
+            std::slice::from_mut(&mut unit),
+            1_000,
+            None,
+            std::slice::from_ref(&map),
+        );
+
+        assert_eq!((unit.tile_x, unit.tile_y), (1, 0));
+        assert!(!unit.source_position_initialized);
+        assert_eq!(unit.source_motion_target, None);
+    }
+
+    #[test]
     fn source_kind_four_uses_its_authored_max_step_count() {
         let map = crate::island_map::IslandMap::new_open(7, 8, 8);
         let mut unit = MilitaryUnit::new(UnitType::NativeSpearman, 6, 0, 0);
@@ -3894,6 +3917,7 @@ mod tests {
         let map = crate::island_map::IslandMap::from_island(&island, &[]);
         let mut unit = MilitaryUnit::new(UnitType::Infantry, 0, 0, 0);
         unit.source_island_id = Some(7);
+        unit.source_runtime_slot = Some(0);
         unit.source_figure_definition_id = Some(1);
         unit.source_route_radius = 1;
         unit.target_x = 2;
@@ -3950,6 +3974,7 @@ mod tests {
         let map = crate::island_map::IslandMap::new_open(7, 8, 1);
         let mut unit = MilitaryUnit::new(UnitType::Infantry, 1, 0, 0);
         unit.source_island_id = Some(7);
+        unit.source_runtime_slot = Some(0);
         unit.source_figure_definition_id = Some(1);
         unit.target_x = 2;
         let mut source_rand = SourceRand::new(3);
@@ -3976,6 +4001,7 @@ mod tests {
         let map = crate::island_map::IslandMap::new_open(7, 8, 8);
         let mut unit = MilitaryUnit::new(UnitType::Infantry, 0, 0, 0);
         unit.source_island_id = Some(7);
+        unit.source_runtime_slot = Some(0);
         unit.source_figure_definition_id = Some(1);
         unit.target_x = 2;
         unit.source_target_descriptor =
@@ -3998,6 +4024,7 @@ mod tests {
         let map = crate::island_map::IslandMap::new_open(7, 8, 8);
         let mut unit = MilitaryUnit::new(UnitType::Infantry, 0, 0, 0);
         unit.source_island_id = Some(7);
+        unit.source_runtime_slot = Some(0);
         unit.source_figure_definition_id = Some(1);
         unit.target_x = 2;
         unit.source_target_descriptor =
@@ -4040,6 +4067,7 @@ mod tests {
         let map = crate::island_map::IslandMap::new_open(7, 8, 1);
         let mut unit = MilitaryUnit::new(UnitType::Infantry, 0, 0, 0);
         unit.source_island_id = Some(7);
+        unit.source_runtime_slot = Some(0);
         unit.source_figure_definition_id = Some(1);
         unit.source_target_descriptor =
             Some(SourceTargetDescriptor::from_source_kind34_island_cell(7, 2, 0));

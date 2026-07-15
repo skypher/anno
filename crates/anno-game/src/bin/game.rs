@@ -1712,10 +1712,9 @@ fn main() {
         .or_else(|| audio.waves.load("SAMPLES/Vulkan1.wav"))
         .or_else(|| audio.waves.load("SAMPLES/vulkan2.wav"))
         .or_else(|| voice_stockpile_slot);
-    // Fire — no dedicated vulkan-style sample; reuse the generic
-    // event.wav alert. Manual sec. fire is a building-level disaster
-    // signalled by the BRANDMARKT figure (visual) plus the event
-    // sound; no specific WAV exists in SAMPLES/ for it.
+    // Fire routing is retained for future source-backed event logs. The
+    // compiled `BRANDMARKT` definition is the inactive-production symbol,
+    // not evidence for a fire event.
     let voice_fire_slot = voice_stockpile_slot;
 
     // SDL2 setup
