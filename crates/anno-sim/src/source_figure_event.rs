@@ -14,6 +14,9 @@ use crate::source_route::{
 /// exactly when both coordinate words are `-1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceFigureEventSlot {
+    /// Source byte `+0x00`, initialized from compiled `Radius` by the
+    /// type-8/type-11 constructors after generic figure allocation.
+    pub route_radius: u8,
     pub x: i16,
     pub y: i16,
     /// Source byte `+0x01`, written as `0xff` by the shared release branch
@@ -26,6 +29,9 @@ pub struct SourceFigureEventSlot {
     /// Source byte `+0x14`. `FUN_0044b140` preserves its low nibble and sets
     /// the high nibble to `0xc0` before it encodes a route.
     pub state: u8,
+    /// Source word `+0x28`, the 1/32-good quantity accumulated by a
+    /// type-11 `FUN_00459400` cart and passed to `FUN_0047d940` on arrival.
+    pub transfer_amount_fixed: u16,
     /// Source bytes `+0x14..=+0x1f`, written by `FUN_0046cf70` after a
     /// successful kind-12 grid search. The first byte is also `state` while
     /// `route_cursor` is zero.
@@ -35,12 +41,14 @@ pub struct SourceFigureEventSlot {
 impl Default for SourceFigureEventSlot {
     fn default() -> Self {
         Self {
+            route_radius: 0,
             x: -1,
             y: -1,
             lifecycle: 0,
             owner: 0,
             route_cursor: 0,
             state: 0,
+            transfer_amount_fixed: 0,
             route_program: [0; SourceFigureEventRegistry::KIND12_ROUTE_CAPACITY],
         }
     }
@@ -83,7 +91,9 @@ impl SourceFigureEventRegistry {
 
     fn probe_range(x: i16, y: i16) -> std::ops::Range<usize> {
         let start = Self::source_index(x, y);
-        let end = start.saturating_add(Self::PROBE_LENGTH).min(Self::SLOT_COUNT);
+        let end = start
+            .saturating_add(Self::PROBE_LENGTH)
+            .min(Self::SLOT_COUNT);
         start..end
     }
 
@@ -126,6 +136,33 @@ impl SourceFigureEventRegistry {
         self.prepare_kind12_if_absent(x, y, owner)
     }
 
+    /// `FUN_0044af10` counts every occupied event with the transfer root's
+    /// exact coordinate and map owner before `FUN_0044ad50` claims a free
+    /// slot. The compiled `Figuranz` value supplies this bound.
+    pub fn prepare_transfer_with_limit(
+        &mut self,
+        x: i16,
+        y: i16,
+        owner: u8,
+        limit: u8,
+    ) -> Option<u16> {
+        let matching_entries = Self::probe_range(x, y)
+            .filter(|&slot| {
+                let entry = self.slots[slot];
+                entry.x == x && entry.y == y && entry.owner == owner
+            })
+            .count();
+        if matching_entries >= usize::from(limit) {
+            return None;
+        }
+        let slot = Self::probe_range(x, y).find(|&slot| self.slots[slot].is_free())?;
+        let entry = &mut self.slots[slot];
+        entry.route_cursor = 0;
+        entry.state = 0xc0;
+        entry.route_program[0] = 0xc0;
+        Some(slot as u16)
+    }
+
     /// Write the prepared candidate's coordinates after `FUN_00446ca0` has
     /// returned a live kind-12 figure. A prepared candidate still has both
     /// free sentinels and may therefore be activated only once.
@@ -143,14 +180,24 @@ impl SourceFigureEventRegistry {
 
     /// Publish a type-8 or type-11 transfer event after its generic figure
     /// allocator has succeeded. Those constructors set source byte `+0x01`
-    /// to one and rewrite the map-owner byte, unlike kind 12.
-    pub fn activate_transfer(&mut self, slot: u16, x: i16, y: i16, owner: u8) -> bool {
+    /// to one, rewrite the map-owner byte, and store the compiled route
+    /// radius, unlike kind 12.
+    pub fn activate_transfer(
+        &mut self,
+        slot: u16,
+        x: i16,
+        y: i16,
+        owner: u8,
+        route_radius: u8,
+    ) -> bool {
         if !self.activate_kind12(slot, x, y) {
             return false;
         }
         let entry = &mut self.slots[usize::from(slot)];
+        entry.route_radius = route_radius;
         entry.lifecycle = 1;
         entry.owner = owner;
+        entry.transfer_amount_fixed = 0;
         true
     }
 
@@ -182,6 +229,27 @@ impl SourceFigureEventRegistry {
         entry.route_cursor = 0;
         entry.route_program[..program.len()].copy_from_slice(&program);
         entry.state = entry.route_program[0];
+        true
+    }
+
+    /// Write the type-8/type-11 route program used by `FUN_0045c8b0` and
+    /// consumed by the type-11 `FUN_00459400` dispatcher. The program uses
+    /// the same bounded `FUN_0046cf70` representation as kind 12.
+    pub fn write_transfer_route(&mut self, slot: u16, steps: &[SourceRouteStep]) -> bool {
+        self.write_kind12_route(slot, steps)
+    }
+
+    /// Synchronize source word `+0x28` after a type-11 cart has collected
+    /// from its supplier. The source keeps this quantity in the shared event
+    /// record, rather than in the generic figure, until terminal delivery.
+    pub fn set_transfer_amount_fixed(&mut self, slot: u16, amount: u16) -> bool {
+        let Some(entry) = self.slots.get_mut(usize::from(slot)) else {
+            return false;
+        };
+        if entry.is_free() {
+            return false;
+        }
+        entry.transfer_amount_fixed = amount;
         true
     }
 
@@ -249,6 +317,12 @@ impl SourceFigureEventRegistry {
         true
     }
 
+    /// Synchronize a type-8/type-11 event program after its linked figure
+    /// completes expanded source-grid steps.
+    pub fn set_transfer_route_progress(&mut self, slot: u16, completed_steps: usize) -> bool {
+        self.set_kind12_route_progress(slot, completed_steps)
+    }
+
     /// Release the coordinate pair exactly as the kind-12 branch in
     /// `FUN_00443520`, preserving the remaining event bytes except source
     /// lifecycle byte `+0x01`, which becomes `0xff`. Invalid indices are not
@@ -314,19 +388,68 @@ mod tests {
         let mut registry = SourceFigureEventRegistry::default();
         let slot = registry.prepare_transfer_if_absent(7, 9, 3).unwrap();
         assert!(registry.slot(slot).unwrap().is_free());
-        assert!(registry.activate_transfer(slot, 7, 9, 3));
+        assert!(registry.activate_transfer(slot, 7, 9, 3, 16));
         assert_eq!(
             registry.slot(slot),
             Some(SourceFigureEventSlot {
+                route_radius: 16,
                 x: 7,
                 y: 9,
                 lifecycle: 1,
                 owner: 3,
                 route_cursor: 0,
                 state: 0xc0,
+                transfer_amount_fixed: 0,
                 route_program: [0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             })
         );
+        assert!(registry.set_transfer_amount_fixed(slot, 65));
+        assert_eq!(registry.slot(slot).unwrap().transfer_amount_fixed, 65);
+    }
+
+    #[test]
+    fn transfer_release_preserves_noncoordinate_event_state() {
+        let mut registry = SourceFigureEventRegistry::default();
+        let slot = registry.prepare_transfer_if_absent(7, 9, 3).unwrap();
+        assert!(registry.activate_transfer(slot, 7, 9, 3, 16));
+        assert!(registry.write_transfer_route(
+            slot,
+            &[SourceRouteStep {
+                direction: 3,
+                metadata: 0,
+            }],
+        ));
+        assert!(registry.set_transfer_amount_fixed(slot, 129));
+
+        assert!(registry.release(slot));
+        assert_eq!(
+            registry.slot(slot),
+            Some(SourceFigureEventSlot {
+                route_radius: 16,
+                x: -1,
+                y: -1,
+                lifecycle: 0xff,
+                owner: 3,
+                route_cursor: 0,
+                state: 0x31,
+                transfer_amount_fixed: 129,
+                route_program: [0x31, SOURCE_ROUTE_TERMINATOR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,],
+            })
+        );
+    }
+
+    #[test]
+    fn type11_transfer_admission_counts_matching_live_entries_up_to_figuranz() {
+        let mut registry = SourceFigureEventRegistry::default();
+        let first = registry.prepare_transfer_with_limit(7, 9, 3, 2).unwrap();
+        assert!(registry.activate_transfer(first, 7, 9, 3, 2));
+        let second = registry.prepare_transfer_with_limit(7, 9, 3, 2).unwrap();
+        assert!(registry.activate_transfer(second, 7, 9, 3, 2));
+
+        assert_eq!(registry.prepare_transfer_with_limit(7, 9, 3, 2), None);
+        assert!(registry.prepare_transfer_with_limit(7, 9, 4, 2).is_some());
+        assert!(registry.release(first));
+        assert!(registry.prepare_transfer_with_limit(7, 9, 3, 2).is_some());
     }
 
     #[test]
@@ -352,7 +475,10 @@ mod tests {
         let entry = registry.slot(slot).unwrap();
         assert_eq!(entry.route_cursor, 0);
         assert_eq!(entry.state, 0x32);
-        assert_eq!(entry.route_program[..3], [0x32, 0x51, SOURCE_ROUTE_TERMINATOR]);
+        assert_eq!(
+            entry.route_program[..3],
+            [0x32, 0x51, SOURCE_ROUTE_TERMINATOR]
+        );
         assert_eq!(registry.kind12_route_step_count(slot), Some(3));
         assert!(registry.set_kind12_route_progress(slot, 1));
         assert_eq!(registry.slot(slot).unwrap().route_cursor, 0);

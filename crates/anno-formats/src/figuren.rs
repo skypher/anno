@@ -588,6 +588,12 @@ Nummer: SOLDAT2
         assert_eq!(cart_loaded.anim_anz, 8);
         assert_eq!(cart_loaded.anim_offs, 64);
         assert_eq!(cart_loaded.anim_speed, 60);
+        let traeger2 = f.find("TRAEGER2").expect("TRAEGER2 must exist");
+        assert_eq!(traeger2.speed(), 220);
+        assert_eq!(traeger2.max_load(), 4);
+        let native_walk = traeger2.walk_anim().expect("native carrier walk anim");
+        assert_eq!(native_walk.anim_anz, 8);
+        assert_eq!(native_walk.anim_speed, 85);
         let noblewoman = f.find("ADELWEIBL").expect("ADELWEIBL must exist");
         assert_eq!(noblewoman.position_offset, (0, 5));
         assert_eq!(

@@ -13,9 +13,8 @@ use crate::combat::{
 };
 use crate::coverage::CoverageMap;
 use crate::data_bridge::{
-    SourceCityRecord, SourceCityTable, SourceKind4Occupant, SourceKind13DispatchState,
-    SourceKind13Location, SourceKind13LocationTable,
-    SourceKind13PromotionDefinition,
+    SourceCityRecord, SourceCityTable, SourceKind13DispatchState, SourceKind13Location,
+    SourceKind13LocationTable, SourceKind13PromotionDefinition, SourceKind4Occupant,
 };
 use crate::economy;
 use crate::entity::{ActionType, CargoRoute, Figure, SourceFigureRecordLayout};
@@ -24,12 +23,12 @@ use crate::ocean_map::OceanMap;
 use crate::player::{Player, PlayerState};
 use crate::population;
 use crate::production;
-use crate::source_cell::SourceMapCellState;
+use crate::source_cell::{SourceMapCellState, SourceTransferFigure};
 use crate::source_figure_event::SourceFigureEventRegistry;
 use crate::source_route::{
-    SourceDynamicMapObject, SourceDynamicMapObjectTable, SourcePathBlockedCellDecision,
-    SourcePathTargetRect, SourceResolvedDynamicTarget, SourceTargetDescriptor,
-    source_route_positions,
+    source_route_positions, SourceDynamicMapObject, SourceDynamicMapObjectTable,
+    SourcePathBlockedCellDecision, SourcePathTargetRect, SourceResolvedDynamicTarget,
+    SourceTargetDescriptor,
 };
 use crate::trade::{self, TradeRoute, TradeShip};
 use crate::types::{Good, TICKS_PER_MINUTE};
@@ -133,6 +132,7 @@ struct SourceTransferEventCandidate {
     x: i16,
     y: i16,
     owner: u8,
+    route_radius: u8,
 }
 
 /// The main game simulation state.
@@ -154,7 +154,7 @@ pub struct Simulation {
     timer_events: SubsystemTimer,     // 10_000
     timer_ships: SubsystemTimer,      // 1_000
     timer_market: SubsystemTimer,     // 1_000
-    timer_diplomacy: SubsystemTimer, // 5_000
+    timer_diplomacy: SubsystemTimer,  // 5_000
 
     // Game state
     pub players: Vec<Player>,
@@ -240,6 +240,10 @@ pub struct Simulation {
     /// Like `carrier_config`, this is immutable game-data state reloaded at
     /// startup rather than serialized into save snapshots.
     pub city_cart_config: carrier::CityCartConfig,
+    /// Source-derived TRAEGER2 constants for native KONTOR type-11
+    /// transfers. The compiled `Figurnr` selects this instead of KARREN for
+    /// those roots.
+    pub city_cart_traeger2_config: carrier::CityCartConfig,
     /// Source-derived civilian sprite layout. Preserved across save
     /// snapshots; the game binary reloads it from `figuren.cod` at startup.
     pub civilian_config: civilian::CivilianConfig,
@@ -535,6 +539,7 @@ impl Simulation {
             ocean_map: None,
             carrier_config: carrier::CarrierConfig::default(),
             city_cart_config: carrier::CityCartConfig::default(),
+            city_cart_traeger2_config: carrier::CityCartConfig::default(),
             civilian_config: civilian::CivilianConfig::default(),
             ship_cargo_config: trade::ShipCargoConfig::default(),
 
@@ -610,8 +615,14 @@ impl Simulation {
                 let island = descriptor.bytes()[1];
                 let slot = descriptor.bytes()[2];
                 let table = self.source_dynamic_map_object_table(island);
-                let object = table.objects().find(|object| object.slot == slot).copied()?;
-                let map = self.island_maps.iter().find(|map| map.island_id == island)?;
+                let object = table
+                    .objects()
+                    .find(|object| object.slot == slot)
+                    .copied()?;
+                let map = self
+                    .island_maps
+                    .iter()
+                    .find(|map| map.island_id == island)?;
                 match descriptor.kind() {
                     0x35 => map.source_land_target_rect(SourceTargetDescriptor::from_bytes([
                         0x32,
@@ -640,11 +651,9 @@ impl Simulation {
         runtime_slot: u16,
     ) -> Option<combat::SourceKind6SelectedTarget> {
         let candidates = self.source_combat_candidates();
-        let attacker = candidates
-            .iter()
-            .find(|candidate| {
-                candidate.figure_kind == 6 && candidate.runtime_slot == runtime_slot
-            })?;
+        let attacker = candidates.iter().find(|candidate| {
+            candidate.figure_kind == 6 && candidate.runtime_slot == runtime_slot
+        })?;
         combat::source_kind6_select_target(attacker, &candidates, &self.diplomacy, |descriptor| {
             self.source_kind6_target_rect(descriptor)
         })
@@ -694,7 +703,8 @@ impl Simulation {
             return None;
         }
         let action = combat::source_kind6_action(&attacker, selected)?;
-        let next_ready_at = combat::source_kind6_action_ready_at(self.source_time_ticks, &attacker)?;
+        let next_ready_at =
+            combat::source_kind6_action_ready_at(self.source_time_ticks, &attacker)?;
         let impact_due_at = combat::source_kind6_impact_due_at(self.source_time_ticks, &attacker)?;
         let launcher_height = self
             .source_dynamic_combat_figures
@@ -728,8 +738,7 @@ impl Simulation {
         &mut self,
         mut figure: SourceDynamicCombatFigure,
     ) -> bool {
-        let Some((table, capacity)) = combat::source_dynamic_slot_table(figure.figure_kind)
-        else {
+        let Some((table, capacity)) = combat::source_dynamic_slot_table(figure.figure_kind) else {
             return false;
         };
         if figure.runtime_slot >= capacity {
@@ -746,10 +755,11 @@ impl Simulation {
             .source_dynamic_combat_figures
             .iter()
             .position(|existing| {
-                combat::source_dynamic_slot_table(existing.figure_kind)
-                    .is_some_and(|(existing_table, _)| {
+                combat::source_dynamic_slot_table(existing.figure_kind).is_some_and(
+                    |(existing_table, _)| {
                         existing_table == table && existing.runtime_slot == figure.runtime_slot
-                    })
+                    },
+                )
             })
         {
             self.source_dynamic_combat_figures[index] = figure;
@@ -875,12 +885,30 @@ impl Simulation {
     ) -> Vec<(crate::fidelity::Subsystem, crate::fidelity::TimingCadence)> {
         use crate::fidelity::{Subsystem, TimingCadence};
         vec![
-            (Subsystem::Production, TimingCadence::Interval(self.timer_production.interval_ms)),
-            (Subsystem::Population, TimingCadence::Interval(self.timer_population.interval_ms)),
-            (Subsystem::Diplomacy, TimingCadence::Interval(self.timer_diplomacy.interval_ms)),
-            (Subsystem::MarketCoverage, TimingCadence::Interval(self.timer_market.interval_ms)),
-            (Subsystem::Ships, TimingCadence::Interval(self.timer_ships.interval_ms)),
-            (Subsystem::Events, TimingCadence::Interval(self.timer_events.interval_ms)),
+            (
+                Subsystem::Production,
+                TimingCadence::Interval(self.timer_production.interval_ms),
+            ),
+            (
+                Subsystem::Population,
+                TimingCadence::Interval(self.timer_population.interval_ms),
+            ),
+            (
+                Subsystem::Diplomacy,
+                TimingCadence::Interval(self.timer_diplomacy.interval_ms),
+            ),
+            (
+                Subsystem::MarketCoverage,
+                TimingCadence::Interval(self.timer_market.interval_ms),
+            ),
+            (
+                Subsystem::Ships,
+                TimingCadence::Interval(self.timer_ships.interval_ms),
+            ),
+            (
+                Subsystem::Events,
+                TimingCadence::Interval(self.timer_events.interval_ms),
+            ),
             (Subsystem::Military, TimingCadence::PerUpdate),
         ]
     }
@@ -1045,11 +1073,8 @@ impl Simulation {
     /// `FUN_00463f40` consumer removes the command root and rewrites the
     /// oriented footprint with the root's `Ruinenr` replacement or clear.
     fn apply_source_kind6_terminal_map_command(&mut self, root: SourceMapCellState) {
-        let target = SourceTargetDescriptor::from_source_kind34_island_cell(
-            root.island,
-            root.x,
-            root.y,
-        );
+        let target =
+            SourceTargetDescriptor::from_source_kind34_island_cell(root.island, root.x, root.y);
         self.source_kind6_terminal_events
             .push(SourceKind6TerminalEvent {
                 target,
@@ -1195,11 +1220,9 @@ impl Simulation {
             let Some(&draw) = clear.source_ruin_draws.first() else {
                 return;
             };
-            let Some(definition) = cod.ruin_variant_building(
-                clear.ruin_id,
-                clear.ruin_uses_strand_table,
-                draw,
-            ) else {
+            let Some(definition) =
+                cod.ruin_variant_building(clear.ruin_id, clear.ruin_uses_strand_table, draw)
+            else {
                 return;
             };
             writes.push((clear.tile_x, clear.tile_y, definition));
@@ -1218,7 +1241,11 @@ impl Simulation {
                     ) else {
                         continue;
                     };
-                    writes.push((clear.tile_x + u16::from(dx), clear.tile_y + u16::from(dy), definition));
+                    writes.push((
+                        clear.tile_x + u16::from(dx),
+                        clear.tile_y + u16::from(dy),
+                        definition,
+                    ));
                 }
             }
         }
@@ -1226,7 +1253,9 @@ impl Simulation {
             let (Ok(x), Ok(y)) = (u8::try_from(x), u8::try_from(y)) else {
                 continue;
             };
-            let Some(mut root) = SourceMapCellState::new_static(clear.island_id, x, y, definition, 0) else {
+            let Some(mut root) =
+                SourceMapCellState::new_static(clear.island_id, x, y, definition, 0)
+            else {
                 continue;
             };
             let (width, height) = if matches!(clear.source_orientation & 3, 1 | 3) {
@@ -1443,7 +1472,12 @@ impl Simulation {
             ) else {
                 return;
             };
-            self.enqueue_source_kind13_replacement(updated_location, target_group, &definition, city_owner);
+            self.enqueue_source_kind13_replacement(
+                updated_location,
+                target_group,
+                &definition,
+                city_owner,
+            );
             return;
         }
 
@@ -1546,17 +1580,19 @@ impl Simulation {
                 && warehouse.island_id == city.island_id
                 && warehouse.owner == city.owner_slot
         })?;
-        Some(definition.materials(
-            warehouse
-                .city_stock_fixed(Good::Tools)
-                .saturating_sub(warehouse.city_reserved_fixed(Good::Tools)),
-            warehouse
-                .city_stock_fixed(Good::Wood)
-                .saturating_sub(warehouse.city_reserved_fixed(Good::Wood)),
-            warehouse
-                .city_stock_fixed(Good::Bricks)
-                .saturating_sub(warehouse.city_reserved_fixed(Good::Bricks)),
-        ))
+        Some(
+            definition.materials(
+                warehouse
+                    .city_stock_fixed(Good::Tools)
+                    .saturating_sub(warehouse.city_reserved_fixed(Good::Tools)),
+                warehouse
+                    .city_stock_fixed(Good::Wood)
+                    .saturating_sub(warehouse.city_reserved_fixed(Good::Wood)),
+                warehouse
+                    .city_stock_fixed(Good::Bricks)
+                    .saturating_sub(warehouse.city_reserved_fixed(Good::Bricks)),
+            ),
+        )
     }
 
     /// The outer `FUN_0047f8a0` gate and the seven-player guard at the start
@@ -1615,7 +1651,10 @@ impl Simulation {
                 .players
                 .get(usize::from(owner_slot))
                 .is_some_and(|player| {
-                    matches!(player.state, PlayerState::HumanActive | PlayerState::AiActive)
+                    matches!(
+                        player.state,
+                        PlayerState::HumanActive | PlayerState::AiActive
+                    )
                 })
     }
 
@@ -1717,8 +1756,14 @@ impl Simulation {
         let root = (i32::from(location.tile_x), i32::from(location.tile_y));
         let start = map.source_kind12_anchor_center(root)?;
         let event_position = (
-            map.source_world_origin.0.div_euclid(2).checked_add(start.0)?,
-            map.source_world_origin.1.div_euclid(2).checked_add(start.1)?,
+            map.source_world_origin
+                .0
+                .div_euclid(2)
+                .checked_add(start.0)?,
+            map.source_world_origin
+                .1
+                .div_euclid(2)
+                .checked_add(start.1)?,
         );
         let (Ok(event_x), Ok(event_y)) = (
             i16::try_from(event_position.0),
@@ -1757,15 +1802,19 @@ impl Simulation {
                 .source_figure_events
                 .write_kind12_route(event_slot, &route.steps);
             let preserved_steps = route_written
-                .then(|| self.source_figure_events.kind12_route_step_count(event_slot))
+                .then(|| {
+                    self.source_figure_events
+                        .kind12_route_step_count(event_slot)
+                })
                 .flatten()
                 .unwrap_or(0)
                 .min(route.steps.len());
-            let path = source_route_positions(start, &route.steps[..preserved_steps])
-                .unwrap_or_default();
+            let path =
+                source_route_positions(start, &route.steps[..preserved_steps]).unwrap_or_default();
             let target = path.last().copied().unwrap_or(start);
             if let Some(target_kind) = map.civilian_path_kind(route.position) {
-                definition = civilian::source_kind12_definition(target_kind, self.next_source_rand());
+                definition =
+                    civilian::source_kind12_definition(target_kind, self.next_source_rand());
             }
             (target, path)
         } else {
@@ -1800,7 +1849,10 @@ impl Simulation {
     /// dynamic-combat, and kind-15 projections in separate collections, but
     /// the executable allocates all of them from its 2,550-record pool.
     fn source_figure_pool_occupancy(&self) -> usize {
-        self.figures.iter().filter(|figure| figure.is_active()).count()
+        self.figures
+            .iter()
+            .filter(|figure| figure.is_active())
+            .count()
             + self
                 .source_dynamic_combat_figures
                 .iter()
@@ -1818,9 +1870,10 @@ impl Simulation {
     }
 
     fn tick_production(&mut self) {
+        self.sync_source_city_populations_to_warehouses();
         let mut new_carriers = Vec::new();
-        let mut source_figure_slots_remaining = SourceFigureRecordLayout::CAPACITY
-            .saturating_sub(self.source_figure_pool_occupancy());
+        let mut source_figure_slots_remaining =
+            SourceFigureRecordLayout::CAPACITY.saturating_sub(self.source_figure_pool_occupancy());
         let carrier_suppliers: Vec<_> = self
             .buildings
             .iter()
@@ -1975,9 +2028,18 @@ impl Simulation {
             .source_map_cell_states
             .iter()
             .copied()
-            .filter(|state| matches!(state.kind_code, 7 | 8 | 30))
+            .filter(|state| state.is_type11_transfer_root())
             .collect();
         for origin in city_origins {
+            let Some(city_cart_config) = self.city_cart_config_for(origin.source_transfer_figure)
+            else {
+                continue;
+            };
+            let Some(city_owner) =
+                self.source_city_player_owner(origin.island, origin.source_map_owner_slot)
+            else {
+                continue;
+            };
             let Some(warehouse_idx) = self
                 .warehouses
                 .iter()
@@ -1985,33 +2047,21 @@ impl Simulation {
                 .find(|warehouse| {
                     warehouse.1.active
                         && warehouse.1.island_id == origin.island
-                        && (origin.kind_code != 8
-                            || (warehouse.1.tile_x == u16::from(origin.x)
-                                && warehouse.1.tile_y == u16::from(origin.y)))
+                        && warehouse.1.owner == city_owner
                 })
                 .map(|(idx, _)| idx)
             else {
                 continue;
             };
-            let transfer_root_count = self
-                .source_map_cell_states
-                .iter()
-                .filter(|state| state.island == origin.island && matches!(state.kind_code, 7 | 8))
-                .count();
+            let transfer_root_count =
+                self.source_city_transfer_root_count(origin.island, origin.source_map_owner_slot);
             let city_capacity_fixed =
                 self.warehouses[warehouse_idx].city_storage_capacity_fixed(transfer_root_count);
             let city = carrier::CityCartEligibility::from_city_store(
                 &self.warehouses[warehouse_idx],
                 city_capacity_fixed,
             );
-            let has_cart = self.figures.iter().any(|figure| {
-                figure.is_active()
-                    && figure.cargo_route == CargoRoute::CityCart
-                    && figure.origin_island == origin.island
-                    && figure.origin_x == u16::from(origin.x)
-                    && figure.origin_y == u16::from(origin.y)
-            });
-            if has_cart {
+            if origin.source_transfer_figure_limit == 0 {
                 continue;
             }
             let event = match self.prepare_source_transfer_event(origin) {
@@ -2027,11 +2077,13 @@ impl Simulation {
                 &city_cart_suppliers,
                 &mut self.source_map_cell_states,
                 &self.island_maps,
-                self.city_cart_config,
+                city_cart_config,
             ) {
                 let mut cart = cart;
                 if let Some(event) = event {
                     if self.activate_source_transfer_event(event) {
+                        self.source_figure_events
+                            .write_transfer_route(event.slot, &cart.source_event_route_steps);
                         cart.source_event_slot = Some(event.slot);
                     }
                 }
@@ -2043,10 +2095,70 @@ impl Simulation {
         self.figures.extend(new_carriers);
     }
 
+    /// `FUN_0047bbc0` / `FUN_0047c080` mutate the live STADT4 population
+    /// groups. Type-11 `FUN_00480610` reads those groups when it builds city
+    /// eligibility bytes, so mirror the matching source-city record into all
+    /// KONTOR stores on that island before dispatching carts.
+    fn sync_source_city_populations_to_warehouses(&mut self) {
+        let cities = self.source_cities.active_records();
+        for warehouse in &mut self.warehouses {
+            if let Some(city) = cities.iter().find(|city| {
+                city.island_id == warehouse.island_id && city.owner_slot == warehouse.owner
+            }) {
+                warehouse.city_population = city.tier_population;
+            }
+        }
+    }
+
+    /// `FUN_00481170`, `FUN_00481fc0`, and `FUN_004820b0` maintain the
+    /// city-record field at `+0x1fa` through the island map's owner-indexed
+    /// city table. `FUN_0047ab00` reads that field for city capacity, so a
+    /// city counts only its own MARKT and KONTOR roots.
+    fn source_city_transfer_root_count(&self, island_id: u8, map_owner_slot: u8) -> usize {
+        self.source_map_cell_states
+            .iter()
+            .filter(|state| {
+                state.island == island_id
+                    && state.source_map_owner_slot == map_owner_slot
+                    && matches!(state.source_production_kind_code, 7 | 8)
+            })
+            .count()
+    }
+
+    /// `FUN_004596b0` identifies a city by the root's map-owner byte, then
+    /// `FUN_00480610` uses that city's player slot for its inventory. Source
+    /// scenarios provide the city table; empty tables occur only in local
+    /// synthetic maps, where the prior single owner identity is retained.
+    fn source_city_player_owner(&self, island_id: u8, map_owner_slot: u8) -> Option<u8> {
+        let cities = self.source_cities.active_records();
+        if cities.is_empty() {
+            return Some(map_owner_slot);
+        }
+        cities
+            .into_iter()
+            .find(|city| city.island_id == island_id && city.source_owner == map_owner_slot)
+            .map(|city| city.owner_slot)
+    }
+
+    /// Resolve the generic-figure definition selected by a type-11 root's
+    /// compiled `Figurnr`. The source invokes `FUN_00446ca0` with this
+    /// selector, so an unrecognized root cannot be substituted with KARREN.
+    fn city_cart_config_for(
+        &self,
+        source_figure: SourceTransferFigure,
+    ) -> Option<carrier::CityCartConfig> {
+        match source_figure {
+            SourceTransferFigure::Karren => Some(self.city_cart_config),
+            SourceTransferFigure::Traeger2 => Some(self.city_cart_traeger2_config),
+            SourceTransferFigure::Unknown => None,
+        }
+    }
+
     /// `FUN_0044ab60` / `FUN_0044ad50`: locate the source root's oriented
-    /// center, reject a matching live event, and initialize a free transfer
-    /// event before generic-figure allocation. A missing root only occurs in
-    /// the simulator's synthetic-map fallback, which has no source event
+    /// center and initialize a free transfer event before generic-figure
+    /// allocation. Type 8 rejects a matching live event; type 11 applies its
+    /// authored matching-entry bound. A missing root only occurs in the
+    /// simulator's synthetic-map fallback, which has no source event
     /// coordinate to register.
     fn prepare_source_transfer_event_for_root(
         &mut self,
@@ -2057,17 +2169,37 @@ impl Simulation {
         let (Ok(x), Ok(y)) = (u8::try_from(x), u8::try_from(y)) else {
             return Ok(None);
         };
-        let Some(root) = self.source_map_cell_states.iter().copied().find(|root| {
-            root.island == island && root.x == x && root.y == y
-        }) else {
+        let Some(root) = self
+            .source_map_cell_states
+            .iter()
+            .copied()
+            .find(|root| root.island == island && root.x == x && root.y == y)
+        else {
             return Ok(None);
         };
-        self.prepare_source_transfer_event(root)
+        self.prepare_source_type8_transfer_event(root)
     }
 
+    /// `FUN_0044ad50`: the type-11 root's `Figuranz` bounds the number of
+    /// matching x/y/owner entries, unlike the type-8 duplicate-only gate.
     fn prepare_source_transfer_event(
         &mut self,
         root: SourceMapCellState,
+    ) -> Result<Option<SourceTransferEventCandidate>, ()> {
+        self.prepare_source_transfer_event_with_limit(root, root.source_transfer_figure_limit)
+    }
+
+    fn prepare_source_type8_transfer_event(
+        &mut self,
+        root: SourceMapCellState,
+    ) -> Result<Option<SourceTransferEventCandidate>, ()> {
+        self.prepare_source_transfer_event_with_limit(root, 1)
+    }
+
+    fn prepare_source_transfer_event_with_limit(
+        &mut self,
+        root: SourceMapCellState,
+        limit: u8,
     ) -> Result<Option<SourceTransferEventCandidate>, ()> {
         let Some(map) = self
             .island_maps
@@ -2079,8 +2211,14 @@ impl Simulation {
         let center_x = i32::from(root.x) + (i32::from(root.footprint_width.max(1)) - 1) / 2;
         let center_y = i32::from(root.y) + (i32::from(root.footprint_height.max(1)) - 1) / 2;
         let (Some(world_x), Some(world_y)) = (
-            map.source_world_origin.0.div_euclid(2).checked_add(center_x),
-            map.source_world_origin.1.div_euclid(2).checked_add(center_y),
+            map.source_world_origin
+                .0
+                .div_euclid(2)
+                .checked_add(center_x),
+            map.source_world_origin
+                .1
+                .div_euclid(2)
+                .checked_add(center_y),
         ) else {
             return Ok(None);
         };
@@ -2090,16 +2228,27 @@ impl Simulation {
         let owner = root.source_map_owner_slot;
         let Some(slot) = self
             .source_figure_events
-            .prepare_transfer_if_absent(x, y, owner)
+            .prepare_transfer_with_limit(x, y, owner, limit)
         else {
             return Err(());
         };
-        Ok(Some(SourceTransferEventCandidate { slot, x, y, owner }))
+        Ok(Some(SourceTransferEventCandidate {
+            slot,
+            x,
+            y,
+            owner,
+            route_radius: root.source_transfer_radius,
+        }))
     }
 
     fn activate_source_transfer_event(&mut self, event: SourceTransferEventCandidate) -> bool {
-        self.source_figure_events
-            .activate_transfer(event.slot, event.x, event.y, event.owner)
+        self.source_figure_events.activate_transfer(
+            event.slot,
+            event.x,
+            event.y,
+            event.owner,
+            event.route_radius,
+        )
     }
 
     fn city_cart_supplier_view(
@@ -2736,9 +2885,9 @@ impl Simulation {
         for unit in &mut self.military_units {
             if unit.unit_type == crate::combat::UnitType::NativeSpearman
                 && unit.owner == 6
-                && unit.source_target_descriptor.is_some_and(|descriptor| {
-                    descriptor.kind() == 0x34
-                })
+                && unit
+                    .source_target_descriptor
+                    .is_some_and(|descriptor| descriptor.kind() == 0x34)
                 && (unit.tile_x, unit.tile_y) == (unit.target_x, unit.target_y)
             {
                 unit.source_target_descriptor = None;
@@ -2807,8 +2956,9 @@ impl Simulation {
                 else {
                     continue;
                 };
-                let descriptor =
-                    SourceTargetDescriptor::from_source_kind34_island_cell(island_id, target_x, target_y);
+                let descriptor = SourceTargetDescriptor::from_source_kind34_island_cell(
+                    island_id, target_x, target_y,
+                );
                 let runtime_slot = {
                     let unit = &mut self.military_units[index];
                     unit.target_x = target.0;
@@ -2828,7 +2978,8 @@ impl Simulation {
                         occupant.idle_timestamp_ticks = self.source_time_ticks.wrapping_add(8);
                         occupant.route_retry_count = 0;
                         occupant.idle_remaining_bits = 0;
-                        occupant.route_program = crate::combat::default_source_kind4_route_program();
+                        occupant.route_program =
+                            crate::combat::default_source_kind4_route_program();
                         occupant.route_program_cursor = 0;
                     }
                 }
@@ -3001,8 +3152,16 @@ impl Simulation {
                         let (frame_speed_ms, frames_per_direction) =
                             if figure.cargo_route == CargoRoute::CityCart {
                                 (
-                                    city_cart_config.frame_speed_ms,
-                                    city_cart_config.frames_per_direction,
+                                    if figure.source_animation_frame_speed_ms == 0 {
+                                        city_cart_config.frame_speed_ms
+                                    } else {
+                                        figure.source_animation_frame_speed_ms
+                                    },
+                                    if figure.source_animation_frames_per_direction == 0 {
+                                        city_cart_config.frames_per_direction
+                                    } else {
+                                        figure.source_animation_frames_per_direction
+                                    },
                                 )
                             } else {
                                 (
@@ -3028,6 +3187,12 @@ impl Simulation {
                         );
                         let arrived =
                             carrier::advance_source_carrier(figure, 100, terrain_wegspeed);
+                        if figure.cargo_route == CargoRoute::CityCart {
+                            if let Some(slot) = figure.source_event_slot {
+                                self.source_figure_events
+                                    .set_transfer_route_progress(slot, figure.path_idx);
+                            }
+                        }
                         if arrived {
                             if figure.cargo_route == CargoRoute::CityCart {
                                 let arrival_action = figure.action;
@@ -3040,17 +3205,38 @@ impl Simulation {
                                 } else {
                                     figure.cargo_fixed
                                 };
+                                let max_load_fixed = if figure.source_transfer_max_load_fixed == 0 {
+                                    requested_fixed
+                                } else {
+                                    figure.source_transfer_max_load_fixed
+                                };
                                 let origin = (
                                     figure.origin_island,
                                     figure.origin_x,
                                     figure.origin_y,
                                     figure.origin_kind,
                                 );
+                                let origin_production_kind = figure.origin_production_kind;
+                                let origin_source_map_owner_slot =
+                                    figure.origin_source_map_owner_slot;
+                                let origin_city_owner = self.source_city_player_owner(
+                                    figure.origin_island,
+                                    origin_source_map_owner_slot,
+                                );
                                 let should_despawn = carrier::handle_arrival(
                                     figure,
                                     &self.buildings,
                                     &self.island_maps,
                                 );
+
+                                if !should_despawn {
+                                    if let Some(slot) = figure.source_event_slot {
+                                        self.source_figure_events.write_transfer_route(
+                                            slot,
+                                            &figure.source_event_route_steps,
+                                        );
+                                    }
+                                }
 
                                 match arrival_action {
                                     ActionType::CarryingGoods if should_despawn => {
@@ -3074,7 +3260,6 @@ impl Simulation {
                                             self.buildings.iter().position(|building| {
                                                 building.active
                                                     && building.island_id == origin.0
-                                                    && building.owner == figure.owner
                                                     && building.tile_x == supplier_target.0
                                                     && building.tile_y == supplier_target.1
                                                     && self
@@ -3084,48 +3269,46 @@ impl Simulation {
                                                             definition.output_good == good
                                                         })
                                             });
-                                        let picked =
-                                            supplier_idx.map(|_| requested_fixed / 32).unwrap_or(0);
                                         let mut remaining_source_fill = None;
-                                        let collected = picked != 0
-                                            && self
-                                                .source_map_cell_states
-                                                .iter_mut()
-                                                .find(|state| {
-                                                    state.kind_code == supplier_kind
-                                                        && state.matches(
-                                                            origin.0,
-                                                            supplier_target.0,
-                                                            supplier_target.1,
-                                                        )
-                                                })
-                                                .is_some_and(|state| {
-                                                    let collected = state
-                                                        .collect_reserved_storage(requested_fixed);
-                                                    if collected {
-                                                        remaining_source_fill =
-                                                            Some(state.storage_fill);
-                                                    }
-                                                    collected
-                                                });
-                                        if collected {
+                                        let top_up = self
+                                            .source_map_cell_states
+                                            .iter_mut()
+                                            .find(|state| {
+                                                state.kind_code == supplier_kind
+                                                    && state.matches(
+                                                        origin.0,
+                                                        supplier_target.0,
+                                                        supplier_target.1,
+                                                    )
+                                            })
+                                            .map(|state| {
+                                                let top_up = state
+                                                    .collect_reserved_storage_with_top_up(
+                                                        requested_fixed,
+                                                        max_load_fixed,
+                                                    );
+                                                remaining_source_fill = Some(state.storage_fill);
+                                                top_up
+                                            });
+                                        if let Some(top_up) = top_up {
+                                            let cargo_fixed =
+                                                requested_fixed.saturating_add(top_up);
                                             if let Some(supplier_idx) = supplier_idx {
                                                 self.buildings[supplier_idx].output_stock =
                                                     remaining_source_fill.unwrap_or(0) / 32;
                                             }
-                                            figure.carried_amount = picked;
-                                            figure.cargo_fixed = requested_fixed;
+                                            figure.carried_amount = cargo_fixed / 32;
+                                            figure.cargo_fixed = cargo_fixed;
                                             self.source_map_cell_revision =
                                                 self.source_map_cell_revision.wrapping_add(1);
                                         } else {
                                             figure.carried_amount = 0;
                                             figure.cargo_fixed = 0;
                                         }
-                                        let uncollected_fixed = if collected {
-                                            requested_fixed.saturating_sub(figure.cargo_fixed)
-                                        } else {
-                                            requested_fixed
-                                        };
+                                        let uncollected_fixed = top_up
+                                            .is_none()
+                                            .then_some(requested_fixed)
+                                            .unwrap_or(0);
                                         if uncollected_fixed != 0 {
                                             if let Some(state) = self
                                                 .source_map_cell_states
@@ -3148,53 +3331,63 @@ impl Simulation {
                                     }
                                     ActionType::Returning => {
                                         let delivered = figure.carried_amount;
-                                        let delivered_fixed = if figure.cargo_fixed == 0 {
-                                            delivered.saturating_mul(32)
-                                        } else {
-                                            figure.cargo_fixed
-                                        };
+                                        let delivered_fixed = figure
+                                            .source_event_slot
+                                            .and_then(|slot| {
+                                                self.source_figure_events
+                                                    .slot(slot)
+                                                    .map(|event| event.transfer_amount_fixed)
+                                            })
+                                            .unwrap_or_else(|| {
+                                                if figure.cargo_fixed == 0 {
+                                                    delivered.saturating_mul(32)
+                                                } else {
+                                                    figure.cargo_fixed
+                                                }
+                                            });
                                         if delivered_fixed != 0 {
                                             let transfer_root_count = self
-                                                .source_map_cell_states
-                                                .iter()
-                                                .filter(|state| {
-                                                    state.island == origin.0
-                                                        && matches!(state.kind_code, 7 | 8)
-                                                })
-                                                .count();
-                                            let accepted_fixed = if let Some(warehouse) =
-                                                self.warehouses.iter_mut().find(|warehouse| {
-                                                    warehouse.active
-                                                        && warehouse.island_id == origin.0
-                                                        && warehouse.owner == figure.owner
-                                                        && (origin.3 != 8
-                                                            || (warehouse.tile_x == origin.1
-                                                                && warehouse.tile_y == origin.2))
-                                                }) {
-                                                let city_capacity_fixed = warehouse
-                                                    .city_storage_capacity_fixed(
-                                                        transfer_root_count,
-                                                    );
-                                                warehouse.deposit_city_good_fixed(
-                                                    good,
-                                                    delivered_fixed,
-                                                    city_capacity_fixed,
-                                                )
+                                                .source_city_transfer_root_count(
+                                                    origin.0,
+                                                    origin_source_map_owner_slot,
+                                                );
+                                            let _accepted_fixed = if let Some(city_owner) =
+                                                origin_city_owner
+                                            {
+                                                if let Some(warehouse) =
+                                                    self.warehouses.iter_mut().find(|warehouse| {
+                                                        warehouse.active
+                                                            && warehouse.island_id == origin.0
+                                                            && warehouse.owner == city_owner
+                                                    })
+                                                {
+                                                    let city_capacity_fixed = warehouse
+                                                        .city_storage_capacity_fixed(
+                                                            transfer_root_count,
+                                                        );
+                                                    warehouse.deposit_city_good_fixed(
+                                                        good,
+                                                        delivered_fixed,
+                                                        city_capacity_fixed,
+                                                    )
+                                                } else {
+                                                    0
+                                                }
                                             } else {
                                                 0
                                             };
-                                            if origin.3 == 7 {
+                                            if origin_production_kind == 7 {
                                                 if let Some(state) = self
                                                     .source_map_cell_states
                                                     .iter_mut()
                                                     .find(|state| {
-                                                        state.kind_code == 7
+                                                        state.source_production_kind_code == 7
                                                             && state.matches(
                                                                 origin.0, origin.1, origin.2,
                                                             )
                                                     })
                                                 {
-                                                    state.accept_market_transfer(accepted_fixed);
+                                                    state.accept_market_transfer(delivered_fixed);
                                                     self.source_map_cell_revision = self
                                                         .source_map_cell_revision
                                                         .wrapping_add(1);
@@ -3206,6 +3399,12 @@ impl Simulation {
                                         figure.cargo_fixed = 0;
                                     }
                                     _ => {}
+                                }
+                                if arrival_action == ActionType::CarryingGoods && !should_despawn {
+                                    if let Some(slot) = figure.source_event_slot {
+                                        self.source_figure_events
+                                            .set_transfer_amount_fixed(slot, figure.cargo_fixed);
+                                    }
                                 }
                                 if should_despawn {
                                     despawn_indices.push(idx);
@@ -3552,7 +3751,8 @@ impl Simulation {
                                 frame_duration_ms,
                                 civilian_config.frames_per_dir,
                             );
-                            let arrived = carrier::advance_source_carrier(figure, 100, terrain_wegspeed);
+                            let arrived =
+                                carrier::advance_source_carrier(figure, 100, terrain_wegspeed);
                             if let Some(slot) = figure.source_event_slot {
                                 self.source_figure_events
                                     .set_kind12_route_progress(slot, figure.path_idx);
@@ -4218,7 +4418,14 @@ mod tests {
         );
         assert_eq!(sim.source_kind13_replacement_commands.len(), 1);
         let replacement = sim.source_kind13_replacement_commands[0];
-        assert_eq!((replacement.island_id, replacement.tile_x, replacement.tile_y), (2, 8, 9));
+        assert_eq!(
+            (
+                replacement.island_id,
+                replacement.tile_x,
+                replacement.tile_y
+            ),
+            (2, 8, 9)
+        );
         assert_eq!(replacement.target_group, 1);
         assert_eq!(replacement.command.definition_offset, 77);
         assert_eq!(replacement.command.orientation, 2);
@@ -4338,7 +4545,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(3, 149), (4, 399), (6, 349)]
         );
-        assert_eq!(sim.source_dynamic_combat_figures[2].source_action_ready_at, 47);
+        assert_eq!(
+            sim.source_dynamic_combat_figures[2].source_action_ready_at,
+            47
+        );
     }
 
     #[test]
@@ -4455,13 +4665,13 @@ mod tests {
         assert_eq!(sim.source_kind6_actions, vec![action]);
         assert_eq!(
             sim.source_kind6_deferred_hits,
-            vec![crate::combat::SourceKind6DeferredHit {
-                due_at: 29,
-                action,
-            }]
+            vec![crate::combat::SourceKind6DeferredHit { due_at: 29, action }]
         );
         assert_eq!(sim.source_dynamic_combat_figures[0].direction, 2);
-        assert_eq!(sim.source_dynamic_combat_figures[0].source_action_ready_at, 69);
+        assert_eq!(
+            sim.source_dynamic_combat_figures[0].source_action_ready_at,
+            69
+        );
         assert_eq!(
             sim.source_kind15_combat_figures,
             vec![crate::combat::SourceKind15CombatFigure {
@@ -4486,27 +4696,28 @@ mod tests {
         let expected_ruin_draw = expected_rng.next_source_rand();
         sim.seed_source_rand(23);
         let target = SourceTargetDescriptor::from_source_kind34_island_cell(3, 4, 5);
-        sim.source_dynamic_combat_figures.push(SourceDynamicCombatFigure {
-            active: true,
-            figure_kind: 6,
-            candidate_list_key: 2,
-            figure_definition_id: 0x1f,
-            direction: 0,
-            source_payload: 0,
-            position: (0.0, 0.0),
-            position_z: 0.0,
-            source_energy: 285,
-            source_action_ready_at: 0,
-            target_descriptor: target,
-            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
-            owner: 1,
-            state: 0,
-            flags: 0,
-            notification: 0,
-            runtime_slot: 9,
-            auxiliary_kind: 0,
-            name_index: 0,
-        });
+        sim.source_dynamic_combat_figures
+            .push(SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 6,
+                candidate_list_key: 2,
+                figure_definition_id: 0x1f,
+                direction: 0,
+                source_payload: 0,
+                position: (0.0, 0.0),
+                position_z: 0.0,
+                source_energy: 285,
+                source_action_ready_at: 0,
+                target_descriptor: target,
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 1,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 9,
+                auxiliary_kind: 0,
+                name_index: 0,
+            });
         let definition = anno_formats::cod::BuildingDef {
             kind: "HANDWERK".into(),
             size: (2, 3),
@@ -4583,8 +4794,8 @@ mod tests {
             kind: "HANDWERK".into(),
             ..Default::default()
         };
-        let state = SourceMapCellState::new(2, 7, 9, &definition, 0)
-            .expect("selector-bearing source root");
+        let state =
+            SourceMapCellState::new(2, 7, 9, &definition, 0).expect("selector-bearing source root");
         let mut sim = Simulation::new();
         sim.source_map_cell_states.push(state);
         sim.source_static_map_roots.push(state);
@@ -4604,8 +4815,8 @@ mod tests {
             kind: "HANDWERK".into(),
             ..Default::default()
         };
-        let first = SourceMapCellState::new_static(2, 7, 9, &definition, 0)
-            .expect("static source cell");
+        let first =
+            SourceMapCellState::new_static(2, 7, 9, &definition, 0).expect("static source cell");
         let mut second = first;
         second.x = 8;
         let mut survivor = first;
@@ -4626,8 +4837,8 @@ mod tests {
             size: (2, 3),
             ..Default::default()
         };
-        let mut root = SourceMapCellState::new_static(2, 7, 9, &definition, 0)
-            .expect("static source command");
+        let mut root =
+            SourceMapCellState::new_static(2, 7, 9, &definition, 0).expect("static source command");
         root.set_footprint(3, 2);
         root.set_source_orientation(1);
         root.set_terminal_command_fields(6, 5);
@@ -4793,7 +5004,10 @@ mod tests {
         let restored = sim.source_static_map_roots[0];
         assert_eq!(restored.kind_code, 11);
         assert_eq!(restored.source_orientation, 1);
-        assert_eq!((restored.source_variant, restored.source_map_owner_slot), (0, 5));
+        assert_eq!(
+            (restored.source_variant, restored.source_map_owner_slot),
+            (0, 5)
+        );
     }
 
     #[test]
@@ -5082,10 +5296,7 @@ mod tests {
         let descriptor = unit
             .source_target_descriptor
             .expect("native idle branch selected a target");
-        assert_eq!(
-            descriptor.kind(),
-            0x34
-        );
+        assert_eq!(descriptor.kind(), 0x34);
         let map = &sim.island_maps[0];
         let target = map
             .source_world_to_local((unit.target_x, unit.target_y))
@@ -5224,6 +5435,140 @@ mod tests {
     }
 
     #[test]
+    fn type11_city_eligibility_uses_the_live_source_city_population() {
+        let mut sim = Simulation::new();
+        sim.warehouses.push(Warehouse::new(3, 4, 8, 9));
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 3,
+                source_owner: 4,
+                owner_slot: 4,
+                tier_population: [12, 34, 56, 78, 90],
+                ..SourceCityRecord::default()
+            })
+        ));
+
+        sim.sync_source_city_populations_to_warehouses();
+
+        assert_eq!(sim.warehouses[0].city_population, [12, 34, 56, 78, 90]);
+    }
+
+    #[test]
+    fn type11_city_capacity_counts_only_the_origin_map_owner_roots() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let market = CodBuilding {
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "MARKT".into())].into(),
+            ..Default::default()
+        };
+        let mut sim = Simulation::new();
+        let mut first = SourceMapCellState::new(5, 1, 1, &market, 0).unwrap();
+        first.source_map_owner_slot = 2;
+        let mut second = first;
+        second.x = 2;
+        let mut other_owner = first;
+        other_owner.x = 3;
+        other_owner.source_map_owner_slot = 3;
+        sim.source_map_cell_states = vec![first, second, other_owner];
+
+        assert_eq!(sim.source_city_transfer_root_count(5, 2), 2);
+        assert_eq!(sim.source_city_transfer_root_count(5, 3), 1);
+    }
+
+    #[test]
+    fn type11_city_owner_resolves_through_the_source_city_record() {
+        let mut sim = Simulation::new();
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 5,
+                source_owner: 2,
+                owner_slot: 4,
+                ..SourceCityRecord::default()
+            })
+        ));
+
+        assert_eq!(sim.source_city_player_owner(5, 2), Some(4));
+        assert_eq!(sim.source_city_player_owner(5, 3), None);
+    }
+
+    #[test]
+    fn type11_kontor_uses_its_owner_city_record_away_from_the_root_anchor() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let mut sim = Simulation::new();
+        sim.building_defs = vec![BuildingDef {
+            output_good: Good::Cloth,
+            ..Default::default()
+        }];
+        let mut supplier = BuildingInstance::new(0, 2, 2, 0, 0);
+        supplier.output_stock = 3;
+        supplier.owner = 4;
+        sim.buildings.push(supplier);
+        sim.warehouses.push(Warehouse::with_capacity_and_population(
+            2,
+            4,
+            1,
+            0,
+            50,
+            [0, 100, 0, 0, 0],
+        ));
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 2,
+                source_owner: 2,
+                owner_slot: 4,
+                tier_population: [0, 100, 0, 0, 0],
+                ..SourceCityRecord::default()
+            })
+        ));
+        sim.island_maps.push(IslandMap::new_open(2, 3, 1));
+
+        let kontor = CodBuilding {
+            kind: "HQ".into(),
+            source_transfer_radius: 16,
+            source_transfer_figure_limit: 1,
+            properties: [
+                ("ProdKind".into(), "KONTOR".into()),
+                ("Figurnr".into(), "KARREN".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let workshop = CodBuilding {
+            kind: "HANDWERK".into(),
+            storage_animation_capacity: 320,
+            ..Default::default()
+        };
+        let mut root = SourceMapCellState::new(2, 0, 0, &kontor, 0).unwrap();
+        root.source_map_owner_slot = 2;
+        let mut supplier_state = SourceMapCellState::new(2, 2, 0, &workshop, 0).unwrap();
+        supplier_state.source_map_owner_slot = 2;
+        supplier_state.storage_fill = 65;
+        sim.source_map_cell_states = vec![root, supplier_state];
+
+        sim.tick_production();
+
+        assert_eq!(sim.figures.len(), 1);
+        assert_eq!(sim.figures[0].cargo_route, CargoRoute::CityCart);
+        assert_eq!(sim.figures[0].owner, 4);
+        assert_eq!(sim.figures[0].origin_source_map_owner_slot, 2);
+
+        for _ in 0..100 {
+            if sim.figures.is_empty() {
+                break;
+            }
+            sim.tick_entities(100);
+        }
+
+        assert!(sim.figures.is_empty());
+        assert_eq!(sim.warehouses[0].city_stock_fixed(Good::Cloth), 65);
+    }
+
+    #[test]
     fn generic_carrier_collects_from_supplier_anchor_after_reaching_footprint_edge() {
         use crate::types::Good;
         use anno_formats::cod::BuildingDef as CodBuilding;
@@ -5296,9 +5641,16 @@ mod tests {
         supplier.output_stock = 3;
         sim.buildings.push(supplier);
         sim.warehouses.push(Warehouse::new(0, 0, 0, 0));
+        sim.island_maps.push(IslandMap::new_open(0, 3, 1));
 
         let market = CodBuilding {
-            kind: "MARKT".into(),
+            kind: "GEBAEUDE".into(),
+            source_transfer_figure_limit: 1,
+            properties: [
+                ("ProdKind".into(), "MARKT".into()),
+                ("Figurnr".into(), "KARREN".into()),
+            ]
+            .into(),
             ..Default::default()
         };
         let workshop = CodBuilding {
@@ -5311,11 +5663,31 @@ mod tests {
         let mut supplier_state = SourceMapCellState::new(0, 2, 0, &workshop, 0).unwrap();
         supplier_state.storage_fill = 65;
         sim.source_map_cell_states.push(supplier_state);
+        let city_capacity = sim.warehouses[0].city_storage_capacity_fixed(1);
+        assert_eq!(
+            sim.warehouses[0].deposit_city_good_fixed(
+                Good::Cloth,
+                city_capacity as u16 - 32,
+                city_capacity,
+            ),
+            city_capacity as u16 - 32
+        );
 
         sim.tick_production();
         assert_eq!(sim.figures.len(), 1);
         assert_eq!(sim.figures[0].cargo_route, CargoRoute::CityCart);
+        let event_slot = sim.figures[0]
+            .source_event_slot
+            .expect("type-11 cart owns its source event");
+        assert_eq!(
+            sim.source_figure_events
+                .slot(event_slot)
+                .unwrap()
+                .route_program[..2],
+            [0x32, crate::source_route::SOURCE_ROUTE_TERMINATOR]
+        );
         assert_eq!(sim.source_map_cell_states[1].reserved_storage, 65);
+        sim.source_map_cell_states[1].storage_fill += 64;
 
         for _ in 0..100 {
             if sim.figures.is_empty() {
@@ -5328,9 +5700,19 @@ mod tests {
         assert_eq!(sim.buildings[0].output_stock, 0);
         assert_eq!(sim.source_map_cell_states[1].storage_fill, 0);
         assert_eq!(sim.source_map_cell_states[1].reserved_storage, 0);
-        assert_eq!(sim.warehouses[0].stock(Good::Cloth), 2);
-        assert_eq!(sim.warehouses[0].city_stock_fixed(Good::Cloth), 65);
-        assert_eq!(sim.source_map_cell_states[0].progress, 65);
+        assert_eq!(sim.warehouses[0].stock(Good::Cloth), 50);
+        assert_eq!(
+            sim.warehouses[0].city_stock_fixed(Good::Cloth),
+            city_capacity as u16
+        );
+        assert_eq!(sim.source_map_cell_states[0].progress, 129);
+        assert_eq!(
+            sim.source_figure_events
+                .slot(event_slot)
+                .unwrap()
+                .transfer_amount_fixed,
+            129
+        );
     }
 
     #[test]
@@ -5979,7 +6361,7 @@ mod tests {
 
     #[test]
     fn disaster_event_does_not_fabricate_fire_origin() {
-        use crate::building::{BUILDING_MAX_HEALTH, BuildingDef, BuildingInstance};
+        use crate::building::{BuildingDef, BuildingInstance, BUILDING_MAX_HEALTH};
         use crate::types::{Good, ProductionType};
 
         let mut sim = Simulation::new();
@@ -6034,7 +6416,7 @@ mod tests {
 
     #[test]
     fn disaster_event_does_not_fabricate_volcano_origin() {
-        use crate::building::{BUILDING_MAX_HEALTH, BuildingDef, BuildingInstance};
+        use crate::building::{BuildingDef, BuildingInstance, BUILDING_MAX_HEALTH};
         use crate::types::{Good, ProductionType};
 
         let mut sim = Simulation::new();
@@ -6084,11 +6466,10 @@ mod tests {
         sim.tick_disaster_event();
 
         assert_eq!(sim.buildings[0].health, BUILDING_MAX_HEALTH);
-        assert!(
-            sim.event_log
-                .iter()
-                .all(|line| !line.starts_with("[volcano]"))
-        );
+        assert!(sim
+            .event_log
+            .iter()
+            .all(|line| !line.starts_with("[volcano]")));
     }
 
     #[test]
@@ -6632,12 +7013,11 @@ mod tests {
                 local_position: (9, 7),
             }]
         );
-        assert!(
-            sim.source_dynamic_map_object_table(5)
-                .objects()
-                .next()
-                .is_none()
-        );
+        assert!(sim
+            .source_dynamic_map_object_table(5)
+            .objects()
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -6759,7 +7139,7 @@ mod tests {
         };
         sim.building_defs.push(mk_def(5)); // def 0 cost 5
         sim.building_defs.push(mk_def(8)); // def 1 cost 8
-        // Player 0: 2× def0 + 1× def1 → 5+5+8 = 18
+                                           // Player 0: 2× def0 + 1× def1 → 5+5+8 = 18
         sim.buildings.push(BuildingInstance::new(0, 0, 0, 0, 0));
         sim.buildings.push(BuildingInstance::new(0, 0, 1, 1, 0));
         sim.buildings.push(BuildingInstance::new(1, 0, 2, 2, 0));
@@ -6981,7 +7361,7 @@ mod tests {
 
     #[test]
     fn patrol_cycles_waypoints() {
-        use crate::combat::{MilitaryUnit, UnitType, tick_unit_orders};
+        use crate::combat::{tick_unit_orders, MilitaryUnit, UnitType};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.military_units
@@ -7082,7 +7462,7 @@ mod tests {
 
     #[test]
     fn sell_ship_refunds_half_cost_and_deactivates() {
-        use crate::combat::{MilitaryUnit, UnitType, unit_build_cost};
+        use crate::combat::{unit_build_cost, MilitaryUnit, UnitType};
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.players[0].gold = 100;
@@ -7164,9 +7544,7 @@ mod tests {
         // Break it: penalty flag set, can't re-propose immediately.
         assert!(sim.apply_command(&crate::commands::Command::BreakTradeAgreement { a: 0, b: 1 }));
         assert!(!sim.diplomacy.has_trade_agreement(0, 1));
-        assert!(
-            !sim.apply_command(&crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 })
-        );
+        assert!(!sim.apply_command(&crate::commands::Command::ProposeTradeAgreement { a: 0, b: 1 }));
 
         // Clear penalty (e.g. after cooldown), proposal allowed.
         sim.diplomacy.clear_broken_flag(0, 1);
@@ -7703,12 +8081,11 @@ mod tests {
         assert_eq!((trader.target_x, trader.target_y), (0, 85));
         assert!(trader.path_required);
         assert!(trader.path.is_empty());
-        assert!(
-            sim.ocean_map
-                .as_ref()
-                .unwrap()
-                .is_navigable(trader.target_x, trader.target_y)
-        );
+        assert!(sim
+            .ocean_map
+            .as_ref()
+            .unwrap()
+            .is_navigable(trader.target_x, trader.target_y));
     }
 
     #[test]
@@ -7836,12 +8213,14 @@ mod tests {
         assert_eq!(
             sim.source_figure_events.slot(slot),
             Some(crate::source_figure_event::SourceFigureEventSlot {
+                route_radius: 0,
                 x: 115,
                 y: 137,
                 lifecycle: 0,
                 owner: 0,
                 route_cursor: 0,
                 state: 0xc0,
+                transfer_amount_fixed: 0,
                 route_program: [0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             })
         );
@@ -7867,6 +8246,8 @@ mod tests {
             &anno_formats::cod::BuildingDef {
                 kind: "MARKT".into(),
                 size: (3, 2),
+                source_transfer_figure_limit: 2,
+                source_transfer_radius: 16,
                 ..Default::default()
             },
             0,
@@ -7874,21 +8255,58 @@ mod tests {
         .unwrap();
         root.source_map_owner_slot = 4;
 
-        let event = sim.prepare_source_transfer_event(root).unwrap().unwrap();
-        assert_eq!((event.x, event.y, event.owner), (116, 137, 4));
-        assert!(sim.source_figure_events.slot(event.slot).unwrap().is_free());
-        assert!(sim.activate_source_transfer_event(event));
+        let first = sim.prepare_source_transfer_event(root).unwrap().unwrap();
+        assert_eq!((first.x, first.y, first.owner), (116, 137, 4));
+        assert!(sim.source_figure_events.slot(first.slot).unwrap().is_free());
+        assert!(sim.activate_source_transfer_event(first));
         assert_eq!(
-            sim.source_figure_events.slot(event.slot),
+            sim.source_figure_events.slot(first.slot),
             Some(crate::source_figure_event::SourceFigureEventSlot {
+                route_radius: 16,
                 x: 116,
                 y: 137,
                 lifecycle: 1,
                 owner: 4,
                 route_cursor: 0,
                 state: 0xc0,
+                transfer_amount_fixed: 0,
                 route_program: [0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             })
+        );
+        let second = sim.prepare_source_transfer_event(root).unwrap().unwrap();
+        assert!(sim.activate_source_transfer_event(second));
+        assert_eq!(sim.prepare_source_transfer_event(root), Err(()));
+    }
+
+    #[test]
+    fn city_cart_config_follows_the_compiled_figurnr_selector() {
+        let mut sim = Simulation::new();
+        sim.city_cart_config = carrier::CityCartConfig {
+            max_load: 6,
+            movement_speed: 300,
+            sprite_base: 496,
+            frame_speed_ms: 60,
+            frames_per_direction: 8,
+        };
+        sim.city_cart_traeger2_config = carrier::CityCartConfig {
+            max_load: 4,
+            movement_speed: 220,
+            sprite_base: 32,
+            frame_speed_ms: 85,
+            frames_per_direction: 8,
+        };
+
+        assert_eq!(
+            sim.city_cart_config_for(SourceTransferFigure::Karren),
+            Some(sim.city_cart_config)
+        );
+        assert_eq!(
+            sim.city_cart_config_for(SourceTransferFigure::Traeger2),
+            Some(sim.city_cart_traeger2_config)
+        );
+        assert_eq!(
+            sim.city_cart_config_for(SourceTransferFigure::Unknown),
+            None
         );
     }
 

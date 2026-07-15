@@ -7,7 +7,7 @@
 use crate::building::BuildingInstance;
 use crate::combat::{DiplomacyMatrix, MilitaryUnit, SourceDynamicCombatFigure};
 use crate::data_bridge::{
-    SourceCityTable, SourceKind4Occupant, SourceKind13DispatchState, SourceKind13LocationTable,
+    SourceCityTable, SourceKind13DispatchState, SourceKind13LocationTable, SourceKind4Occupant,
 };
 use crate::entity::Figure;
 use crate::player::Player;
@@ -166,7 +166,19 @@ use std::path::Path;
 ///      consumer has replayed their INSELHAUS writes.
 /// v91: source figures retain their shared event slots and the corresponding
 ///      `DAT_00505e38` coordinate registry survives save/load.
-pub const SAVE_VERSION: u32 = 91;
+/// v92: source roots retain type-11 `Figurnr`, and in-flight city figures
+///      retain the selected authored animation layout.
+/// v93: in-flight type-11 figures retain the exact source-grid predecessor
+///      steps used to reconstruct their shared-event route program.
+/// v94: in-flight type-11 figures retain the nested source production kind
+///      needed to distinguish MARKT and KONTOR arrival behavior.
+/// v95: source figure events retain the type-11 fixed-point transfer amount
+///      passed from supplier collection to terminal delivery.
+/// v96: in-flight type-11 figures retain the source map-owner selector used
+///      to address the origin city's inventory and root count.
+/// v97: in-flight type-11 figures retain their authored `Maxtrag`, needed for
+///      the source supplier-arrival top-up in `FUN_0047d640`.
+pub const SAVE_VERSION: u32 = 97;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -180,7 +192,7 @@ pub const SAVE_VERSION: u32 = 91;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 90;
+pub const MIN_LOADABLE_VERSION: u32 = 97;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -366,7 +378,9 @@ pub fn load_from_file(path: &Path) -> Result<SaveState, SaveError> {
     let version_offset = SAVE_MAGIC.len();
     let version_end = version_offset + std::mem::size_of::<u32>();
     if bytes.len() < version_end {
-        return Err(SaveError::Decode("save payload is missing its version".into()));
+        return Err(SaveError::Decode(
+            "save payload is missing its version".into(),
+        ));
     }
     let found_version = u32::from_le_bytes([
         bytes[version_offset],
@@ -542,6 +556,9 @@ mod tests {
                 source_orientation: 0,
                 source_variant: 8,
                 source_map_owner_slot: 6,
+                source_transfer_figure_limit: 2,
+                source_transfer_radius: 16,
+                source_transfer_figure: crate::source_cell::SourceTransferFigure::Karren,
                 ruin_id: 4,
                 ruin_footprint_width: 2,
                 ruin_footprint_height: 3,
@@ -565,6 +582,7 @@ mod tests {
                 animation_count: 4,
                 animation_continues: true,
                 kind_code: 7,
+                source_production_kind_code: 7,
             });
         let mut static_root = sim.source_map_cell_states[0];
         static_root.x = 14;
@@ -583,22 +601,21 @@ mod tests {
         backing_cell.source_command_anchor_x = 12;
         backing_cell.source_command_anchor_y = 18;
         sim.source_static_map_backing_cells.push(backing_cell);
-        assert!(
-            sim.source_kind13_locations
-                .insert(crate::data_bridge::SourceKind13Location {
-                    island_id: 1,
-                    tile_x: 9,
-                    tile_y: 11,
-                    orientation: 3,
-                    variant: 9,
-                    source_owner: 4,
-                    phase: 5,
-                    state_bits: 0xa0,
-                    population_group: 2,
-                    amount: 192,
-                    lifecycle_flags: 0x14,
-                })
-        );
+        assert!(sim
+            .source_kind13_locations
+            .insert(crate::data_bridge::SourceKind13Location {
+                island_id: 1,
+                tile_x: 9,
+                tile_y: 11,
+                orientation: 3,
+                variant: 9,
+                source_owner: 4,
+                phase: 5,
+                state_bits: 0xa0,
+                population_group: 2,
+                amount: 192,
+                lifecycle_flags: 0x14,
+            }));
         assert!(sim.source_cities.set_record(
             3,
             Some(crate::data_bridge::SourceCityRecord {
@@ -772,9 +789,12 @@ mod tests {
         carrier.origin_x = 10;
         carrier.origin_y = 20;
         carrier.origin_kind = 7;
+        carrier.origin_source_map_owner_slot = 3;
+        carrier.origin_production_kind = 7;
         carrier.carried_good = Good::Wood as u8;
         carrier.carried_amount = 7;
         carrier.cargo_fixed = 231;
+        carrier.source_transfer_max_load_fixed = 320;
         carrier.source_move_speed = 300;
         carrier.source_step_remaining = 0.75;
         carrier.source_position_x = 10.25;
@@ -824,6 +844,9 @@ mod tests {
                 source_orientation: 0,
                 source_variant: 8,
                 source_map_owner_slot: 6,
+                source_transfer_figure_limit: 2,
+                source_transfer_radius: 16,
+                source_transfer_figure: crate::source_cell::SourceTransferFigure::Karren,
                 ruin_id: 4,
                 ruin_footprint_width: 2,
                 ruin_footprint_height: 3,
@@ -847,6 +870,7 @@ mod tests {
                 animation_count: 4,
                 animation_continues: true,
                 kind_code: 7,
+                source_production_kind_code: 7,
             }]
         );
         assert_eq!(sim2.source_map_cell_states[0].market_frame_selector(4), 3);
@@ -856,8 +880,14 @@ mod tests {
         assert_eq!(sim2.source_static_map_roots[0].source_variant, 3);
         assert_eq!(sim2.source_static_map_roots[0].source_map_owner_slot, 5);
         assert_eq!(sim2.source_static_map_roots[0].source_definition_offset, 21);
-        assert_eq!(sim2.source_static_map_roots[0].fallback_strand_cells, 0b10_101);
-        assert_eq!(sim2.source_static_map_roots[0].source_damage_accumulator, 511);
+        assert_eq!(
+            sim2.source_static_map_roots[0].fallback_strand_cells,
+            0b10_101
+        );
+        assert_eq!(
+            sim2.source_static_map_roots[0].source_damage_accumulator,
+            511
+        );
         assert_eq!(sim2.source_static_map_backing_cells.len(), 1);
         assert!(sim2.source_static_map_backing_cells[0].matches(1, 12, 18));
         assert_eq!(
@@ -1060,7 +1090,10 @@ mod tests {
             [0x31, 0x42, 0xc1]
         );
         assert_eq!(sim2.source_kind4_occupants[0].route_program_cursor, 1);
-        assert_eq!(sim2.source_kind4_occupants[0].idle_remaining_bits, 1.25_f32.to_bits());
+        assert_eq!(
+            sim2.source_kind4_occupants[0].idle_remaining_bits,
+            1.25_f32.to_bits()
+        );
         assert_eq!(sim2.military_units[0].source_step_remaining, 0.375);
         assert_eq!(sim2.military_units[0].source_idle_remaining, 1.25);
         assert_eq!(sim2.military_units[0].source_motion_target, Some((14, 16)));
@@ -1153,9 +1186,12 @@ mod tests {
         assert_eq!(sim2.figures[0].origin_x, 10);
         assert_eq!(sim2.figures[0].origin_y, 20);
         assert_eq!(sim2.figures[0].origin_kind, 7);
+        assert_eq!(sim2.figures[0].origin_source_map_owner_slot, 3);
+        assert_eq!(sim2.figures[0].origin_production_kind, 7);
         assert_eq!(sim2.figures[0].carried_good, Good::Wood as u8);
         assert_eq!(sim2.figures[0].carried_amount, 7);
         assert_eq!(sim2.figures[0].cargo_fixed, 231);
+        assert_eq!(sim2.figures[0].source_transfer_max_load_fixed, 320);
         assert_eq!(sim2.figures[0].source_move_speed, 300);
         assert_eq!(sim2.figures[0].source_step_remaining, 0.75);
         assert_eq!(sim2.figures[0].source_position_x, 10.25);

@@ -228,14 +228,23 @@ fn source_kind13_growth_curve(satisfaction: u8) -> u8 {
 fn source_kind13_satisfaction_curve(satisfaction: u8) -> u8 {
     source_kind13_linear_curve(
         satisfaction,
-        &[(0, 0x33, 0xc0, 0x40), (0x33, 0x58, 0x40, 0x13), (0x58, 0x80, 0x13, 0)],
+        &[
+            (0, 0x33, 0xc0, 0x40),
+            (0x33, 0x58, 0x40, 0x13),
+            (0x58, 0x80, 0x13, 0),
+        ],
     )
 }
 
 fn source_kind13_group_curve(satisfaction: u8) -> u8 {
     source_kind13_linear_curve(
         satisfaction,
-        &[(0, 0x19, 0x6c, 0x46), (0x19, 0x33, 0x46, 0x20), (0x33, 0x58, 0x20, 0x0c), (0x58, 0x80, 0x0c, 0)],
+        &[
+            (0, 0x19, 0x6c, 0x46),
+            (0x19, 0x33, 0x46, 0x20),
+            (0x33, 0x58, 0x20, 0x0c),
+            (0x58, 0x80, 0x0c, 0),
+        ],
     )
 }
 
@@ -423,8 +432,8 @@ fn source_city_satisfaction_curve(index: u8) -> u32 {
         let start = u32::from(start);
         let end = u32::from(end);
         if index <= end {
-            let step = ((terminal * 0x100) as i32 - (initial * 0x100) as i32)
-                / (end - start) as i32;
+            let step =
+                ((terminal * 0x100) as i32 - (initial * 0x100) as i32) / (end - start) as i32;
             return ((initial * 0x100) as i32 + (index - start) as i32 * step) as u32 >> 8;
         }
     }
@@ -793,8 +802,7 @@ impl SourceKind13PromotionDefinition {
     /// `FUN_0047c080` random draw.
     pub fn variant_definition_offset(&self, rand_value: u16) -> Option<u16> {
         let count = self.variant_definition_offsets.len();
-        (count != 0)
-            .then(|| self.variant_definition_offsets[usize::from(rand_value) % count])
+        (count != 0).then(|| self.variant_definition_offsets[usize::from(rand_value) % count])
     }
 
     /// Encode the `FUN_004631b0` command emitted by a promoted residence
@@ -901,14 +909,13 @@ impl SourceKind13LocationTable {
         tile_x: u8,
         tile_y: u8,
     ) -> Option<SourceKind13Location> {
-        Self::lookup_range(island_id, tile_x, tile_y)
-            .find_map(|slot| {
-                self.slots[slot].filter(|location| {
+        Self::lookup_range(island_id, tile_x, tile_y).find_map(|slot| {
+            self.slots[slot].filter(|location| {
                 location.island_id == island_id
                     && location.tile_x == tile_x
                     && location.tile_y == tile_y
-                })
             })
+        })
     }
 
     /// Mutable form of [`Self::location_at`] retaining the source's first
@@ -950,29 +957,29 @@ impl SourceKind13LocationTable {
         let capacity = *SOURCE_KIND13_AMOUNT_CAPACITIES.get(group)?;
         let remaining = origin.amount.checked_sub(decrease)?;
 
-        let low_satisfaction = origin.state_byte() & 0x40 == 0
-            || city.satisfaction_by_group[group] < 0x58;
+        let low_satisfaction =
+            origin.state_byte() & 0x40 == 0 || city.satisfaction_by_group[group] < 0x58;
         if low_satisfaction && group != 0 && remaining <= SOURCE_KIND13_AMOUNT_CAPACITIES[group - 1]
         {
             let target_group = origin.population_group - 1;
             let target = usize::from(target_group);
-            city.tier_population[group] = city.tier_population[group]
-                .wrapping_sub(u32::from(origin.amount >> 6));
+            city.tier_population[group] =
+                city.tier_population[group].wrapping_sub(u32::from(origin.amount >> 6));
             city.tier_population[target] = city.tier_population[target]
                 .wrapping_add_signed(source_kind13_population_units(i32::from(remaining)));
             let origin = self.location_at_mut(island_id, tile_x, tile_y)?;
             origin.population_group = target_group;
             origin.amount = remaining;
             let transition_active = origin.source_transition_active_for_group(target_group);
-            origin.state_bits =
-                (origin.state_bits & !0x40) | (u8::from(transition_active) << 6);
+            origin.state_bits = (origin.state_bits & !0x40) | (u8::from(transition_active) << 6);
             return Some(SourceKind13DecreaseResult::DowngradeRequired {
                 target_group,
                 remaining_amount: remaining,
             });
         }
 
-        city.tier_population[group] = city.tier_population[group].wrapping_sub(u32::from(origin.amount >> 6));
+        city.tier_population[group] =
+            city.tier_population[group].wrapping_sub(u32::from(origin.amount >> 6));
         let mut remaining = i32::from(remaining);
         let mut redistributed = 0_i32;
         if !low_satisfaction && group != 0 && remaining < i32::from(capacity / 2) {
@@ -987,16 +994,16 @@ impl SourceKind13LocationTable {
                     continue;
                 }
 
-                city.tier_population[group] = city.tier_population[group]
-                    .wrapping_sub(u32::from(neighbor.amount >> 6));
+                city.tier_population[group] =
+                    city.tier_population[group].wrapping_sub(u32::from(neighbor.amount >> 6));
                 let room = i32::from(capacity) - i32::from(neighbor.amount);
                 let transfer = remaining.min(room);
                 let neighbor = self.location_at_mut(island_id, neighbor_x, neighbor_y)?;
                 neighbor.amount = (i32::from(neighbor.amount) + transfer) as u16;
                 remaining -= transfer;
                 redistributed += transfer;
-                city.tier_population[group] = city.tier_population[group]
-                    .wrapping_add(u32::from(neighbor.amount >> 6));
+                city.tier_population[group] =
+                    city.tier_population[group].wrapping_add(u32::from(neighbor.amount >> 6));
             }
         }
 
@@ -1034,8 +1041,8 @@ impl SourceKind13LocationTable {
         let old_group = usize::from(origin.population_group);
         let current_capacity = i32::from(*SOURCE_KIND13_AMOUNT_CAPACITIES.get(old_group)?);
         let mut amount = i32::from(origin.amount).checked_add(increase)?;
-        city.tier_population[old_group] = city.tier_population[old_group]
-            .wrapping_sub(u32::from(origin.amount >> 6));
+        city.tier_population[old_group] =
+            city.tier_population[old_group].wrapping_sub(u32::from(origin.amount >> 6));
 
         let mut selected_group = origin.population_group;
         let mut selected_capacity = current_capacity;
@@ -1045,7 +1052,8 @@ impl SourceKind13LocationTable {
 
         if amount > current_capacity {
             let target_group = origin.population_group.checked_add(1)?;
-            if let Some(&target_capacity) = SOURCE_KIND13_AMOUNT_CAPACITIES.get(usize::from(target_group))
+            if let Some(&target_capacity) =
+                SOURCE_KIND13_AMOUNT_CAPACITIES.get(usize::from(target_group))
             {
                 let target = usize::from(target_group);
                 let reservation_matches = city.promotion_reservations[target] != 0
@@ -1053,8 +1061,7 @@ impl SourceKind13LocationTable {
                     && city.phase != ((origin.state_byte() >> 3) & 7);
 
                 if reservation_matches {
-                    if city.overall_satisfaction > 0x7f
-                        && city.satisfaction_by_group[target] > 0x7f
+                    if city.overall_satisfaction > 0x7f && city.satisfaction_by_group[target] > 0x7f
                     {
                         if city.tier_population[target] != 0 {
                             let mut pending = amount / 2;
@@ -1063,7 +1070,8 @@ impl SourceKind13LocationTable {
                                 if pending == 0 || (neighbor_x, neighbor_y) == (tile_x, tile_y) {
                                     continue;
                                 }
-                                let Some(neighbor) = self.location_at(island_id, neighbor_x, neighbor_y)
+                                let Some(neighbor) =
+                                    self.location_at(island_id, neighbor_x, neighbor_y)
                                 else {
                                     continue;
                                 };
@@ -1073,8 +1081,12 @@ impl SourceKind13LocationTable {
 
                                 city.tier_population[target] = city.tier_population[target]
                                     .wrapping_sub(u32::from(neighbor.amount >> 6));
-                                let transfer = pending.min((i32::from(target_capacity) - i32::from(neighbor.amount)).max(0));
-                                let neighbor = self.location_at_mut(island_id, neighbor_x, neighbor_y)?;
+                                let transfer = pending.min(
+                                    (i32::from(target_capacity) - i32::from(neighbor.amount))
+                                        .max(0),
+                                );
+                                let neighbor =
+                                    self.location_at_mut(island_id, neighbor_x, neighbor_y)?;
                                 neighbor.amount = (i32::from(neighbor.amount) + transfer) as u16;
                                 pending -= transfer;
                                 redistributed += transfer;
@@ -1108,7 +1120,8 @@ impl SourceKind13LocationTable {
                             if pending == 0 || (neighbor_x, neighbor_y) == (tile_x, tile_y) {
                                 continue;
                             }
-                            let Some(neighbor) = self.location_at(island_id, neighbor_x, neighbor_y)
+                            let Some(neighbor) =
+                                self.location_at(island_id, neighbor_x, neighbor_y)
                             else {
                                 continue;
                             };
@@ -1122,7 +1135,8 @@ impl SourceKind13LocationTable {
                                 .wrapping_sub(u32::from(neighbor.amount >> 6));
                             let transfer = pending
                                 .min((selected_capacity - i32::from(neighbor.amount)).max(0));
-                            let neighbor = self.location_at_mut(island_id, neighbor_x, neighbor_y)?;
+                            let neighbor =
+                                self.location_at_mut(island_id, neighbor_x, neighbor_y)?;
                             neighbor.amount = (i32::from(neighbor.amount) + transfer) as u16;
                             pending -= transfer;
                             redistributed += transfer;
@@ -1613,7 +1627,11 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         min_tier: parse_bauinfra(prop("Bauinfra")),
         max_no_input_ticks: {
             let v = prop_int("Maxnorohst");
-            if v > 0 { (v as u8).min(255) } else { 6 }
+            if v > 0 {
+                (v as u8).min(255)
+            } else {
+                6
+            }
         },
         can_dry_up: prop("Doerrflg") == "1",
         wegspeed: {
@@ -1630,7 +1648,11 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         upgradeable: prop("Ausbauflg") == "1",
         max_energy: {
             let v = prop_int("Maxenergy");
-            if v > 0 { v as u16 } else { 0 }
+            if v > 0 {
+                v as u16
+            } else {
+                0
+            }
         },
         ore_deposit: match prop("Erzbergnr") {
             "ERZBERG_KLEIN" => crate::building::OreDeposit::Small,
@@ -1901,13 +1923,9 @@ pub fn source_static_map_backing_cells_from_scenario(
                 continue;
             }
             let command = crate::building::SourceBuildingCommand::from_island_tile(*tile);
-            let Some(mut root) = SourceMapCellState::new_static(
-                island.number,
-                tile.x,
-                tile.y,
-                definition,
-                0,
-            ) else {
+            let Some(mut root) =
+                SourceMapCellState::new_static(island.number, tile.x, tile.y, definition, 0)
+            else {
                 continue;
             };
             root.set_footprint(width, height);
@@ -2013,19 +2031,15 @@ fn source_map_roots_from_scenario(
             }
 
             let command = crate::building::SourceBuildingCommand::from_island_tile(*tile);
-            let static_state = SourceMapCellState::new_static(
-                island.number,
-                tile.x,
-                tile.y,
-                definition,
-                0,
-            )
-            .map(|mut state| {
-                state.set_footprint(width, height);
-                state.set_source_command(command);
-                state.configure_terminal_replacement(cod);
-                state
-            });
+            let static_state =
+                SourceMapCellState::new_static(island.number, tile.x, tile.y, definition, 0).map(
+                    |mut state| {
+                        state.set_footprint(width, height);
+                        state.set_source_command(command);
+                        state.configure_terminal_replacement(cod);
+                        state
+                    },
+                );
             if include_all_static_kinds {
                 if let Some(state) = static_state {
                     for dy in 0..height {
@@ -2048,6 +2062,7 @@ fn source_map_roots_from_scenario(
 
             if !include_all_static_kinds
                 && !matches!(definition.source_kind_code(), Some(1..=8 | 30))
+                && !matches!(definition.source_production_kind_code(), Some(7 | 8 | 30))
             {
                 continue;
             }
@@ -2121,12 +2136,12 @@ pub fn source_kind13_promotion_definitions(
         let group = group as u8;
         let base = cod.source_population_group_building(group)?;
         let fixed_cost = |key: &str| {
-            (base.properties
+            (base
+                .properties
                 .get(key)
                 .and_then(|value| value.parse::<i32>().ok())
                 .unwrap_or(0)
-                .max(0)
-                as u16)
+                .max(0) as u16)
                 .wrapping_shl(5)
         };
         let money_cost = base
@@ -2455,13 +2470,8 @@ pub fn warships_from_ships(ships: &[anno_formats::szs::Ship]) -> Vec<crate::comb
                 ShipClass::PirateShip => UnitType::PirateShip,
                 _ => return None,
             };
-            let mut unit = MilitaryUnit::with_name(
-                unit_type,
-                s.owner,
-                s.x as i32,
-                s.y as i32,
-                s.name.clone(),
-            );
+            let mut unit =
+                MilitaryUnit::with_name(unit_type, s.owner, s.x as i32, s.y as i32, s.name.clone());
             unit.source_live_runtime_slot = Some(s.runtime_slot);
             unit.source_candidate_list_key = Some(s.candidate_list_key);
             unit.source_figure_kind = Some(s.figure_kind);
@@ -2586,22 +2596,22 @@ mod tests {
             raw_record[0x2c..0x2e].copy_from_slice(&[0x61, 0x72]);
             raw_record[0x132..0x13a].copy_from_slice(&0x8877_6655_4433_2211_u64.to_le_bytes());
             Ship {
-            raw_record,
-            name: "test".into(),
-            x,
-            y,
-            owner,
-            figure_definition_id: class.into(),
-            ship_class: class,
-            stored_energy: u16::from(class) + 100,
-            runtime_slot: class.into(),
-            figure_kind: if owner == 5 { 3 } else { 1 },
-            candidate_list_key: 9,
-            source_direction: 6,
-            animation_state: 0,
-            heading_byte: 4,
-            cargo_slots: [0; 7],
-        }
+                raw_record,
+                name: "test".into(),
+                x,
+                y,
+                owner,
+                figure_definition_id: class.into(),
+                ship_class: class,
+                stored_energy: u16::from(class) + 100,
+                runtime_slot: class.into(),
+                figure_kind: if owner == 5 { 3 } else { 1 },
+                candidate_list_key: 9,
+                source_direction: 6,
+                animation_state: 0,
+                heading_byte: 4,
+                cargo_slots: [0; 7],
+            }
         };
         let ships = vec![
             mk(0, 0x15, 10, 10), // SmallTrader  → skip
@@ -2626,7 +2636,10 @@ mod tests {
             units[0].source_kind6_policy_raw_slots[0],
             0x8877_6655_4433_2211
         );
-        assert_eq!(units[0].source_kind6_target_descriptor_payload, Some([0x61, 0x72]));
+        assert_eq!(
+            units[0].source_kind6_target_descriptor_payload,
+            Some([0x61, 0x72])
+        );
         assert_eq!(units[0].direction, 6);
         assert_eq!(units[1].unit_type, UnitType::LargeWarship);
         assert_eq!(units[2].unit_type, UnitType::PirateShip);
@@ -2645,22 +2658,22 @@ mod tests {
             raw_record[0x2c..0x2e].copy_from_slice(&[0x28, 0x39]);
             raw_record[0x13a..0x142].copy_from_slice(&0x0123_4567_89ab_cdef_u64.to_le_bytes());
             Ship {
-            raw_record,
-            name: "test".into(),
-            x,
-            y,
-            owner,
-            figure_definition_id: class.into(),
-            ship_class: class,
-            stored_energy: u16::from(class) + 100,
-            runtime_slot: class.into(),
-            figure_kind: if owner == 5 { 3 } else { 1 },
-            candidate_list_key: 9,
-            source_direction: 6,
-            animation_state: 0,
-            heading_byte: 4,
-            cargo_slots: [0; 7],
-        }
+                raw_record,
+                name: "test".into(),
+                x,
+                y,
+                owner,
+                figure_definition_id: class.into(),
+                ship_class: class,
+                stored_energy: u16::from(class) + 100,
+                runtime_slot: class.into(),
+                figure_kind: if owner == 5 { 3 } else { 1 },
+                candidate_list_key: 9,
+                source_direction: 6,
+                animation_state: 0,
+                heading_byte: 4,
+                cargo_slots: [0; 7],
+            }
         };
         let ships = vec![
             mk(0, 0x15, 10, 10), // SmallTrader  → keep
@@ -2741,7 +2754,7 @@ mod tests {
 
     #[test]
     fn soldat3_kind_four_records_supply_island_owner_occupancy() {
-        use anno_formats::szs::{LandFigure, LandFigureFamily, SOLDAT3_RECORD_BYTES, ScenarioMeta};
+        use anno_formats::szs::{LandFigure, LandFigureFamily, ScenarioMeta, SOLDAT3_RECORD_BYTES};
 
         let scenario = SzsFile {
             chunks: Vec::new(),
@@ -3002,12 +3015,12 @@ mod tests {
 
         let static_cells = source_static_map_roots_from_scenario(&szs, &cod);
         assert_eq!(static_cells.len(), 4);
-        assert!(static_cells.iter().any(|state| {
-            state.matches(6, 2, 4) && state.kind_code == 14
-        }));
-        assert!(static_cells.iter().any(|state| {
-            state.matches(6, 3, 4) && state.kind_code == 14
-        }));
+        assert!(static_cells
+            .iter()
+            .any(|state| { state.matches(6, 2, 4) && state.kind_code == 14 }));
+        assert!(static_cells
+            .iter()
+            .any(|state| { state.matches(6, 3, 4) && state.kind_code == 14 }));
     }
 
     #[test]
@@ -3294,10 +3307,7 @@ mod tests {
                     source_id: base + 3,
                     kind: "PLATZ".into(),
                     size: (1, 1),
-                    properties: std::collections::HashMap::from([(
-                        "BGruppe".into(),
-                        "4".into(),
-                    )]),
+                    properties: std::collections::HashMap::from([("BGruppe".into(), "4".into())]),
                     ..Default::default()
                 },
             ],
@@ -3578,14 +3588,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            downgrade_table.apply_source_kind13_decrease(
-                &mut downgrade_city,
-                2,
-                8,
-                9,
-                20,
-                &[],
-            ),
+            downgrade_table.apply_source_kind13_decrease(&mut downgrade_city, 2, 8, 9, 20, &[],),
             Some(SourceKind13DecreaseResult::DowngradeRequired {
                 target_group: 0,
                 remaining_amount: 70,
@@ -3778,7 +3781,10 @@ mod tests {
     #[test]
     fn kind13_amount_capacities_match_shipped_bgruppe_maxwohn_rows() {
         assert_eq!(SOURCE_KIND13_MAX_RESIDENTS, [2, 6, 15, 25, 40]);
-        assert_eq!(SOURCE_KIND13_AMOUNT_CAPACITIES, [0x80, 0x180, 0x3c0, 0x640, 0xa00]);
+        assert_eq!(
+            SOURCE_KIND13_AMOUNT_CAPACITIES,
+            [0x80, 0x180, 0x3c0, 0x640, 0xa00]
+        );
 
         let location = SourceKind13Location {
             island_id: 0,
@@ -3806,14 +3812,20 @@ mod tests {
 
     #[test]
     fn city_group_satisfaction_replays_bgruppe_selectors_and_denominator_curve() {
-        assert_eq!(SOURCE_CITY_LUXURY_WARE_SLOTS, [0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15]);
+        assert_eq!(
+            SOURCE_CITY_LUXURY_WARE_SLOTS,
+            [0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15]
+        );
         assert_eq!(SOURCE_CITY_GROUP_FULFILLMENT_TARGETS, [0, 60, 90, 99, 107]);
         assert_eq!(
             SOURCE_CITY_GROUP_LUXURY_REQUIREMENTS[4],
             [true, true, true, true, false, true, true]
         );
         assert_eq!(source_city_group_satisfaction_denominator(0, 128, 60), 60);
-        assert_eq!(source_city_group_satisfaction_denominator(0x20, 128, 60), 59);
+        assert_eq!(
+            source_city_group_satisfaction_denominator(0x20, 128, 60),
+            59
+        );
 
         let mut city = SourceCityRecord {
             luxury_satisfaction: [0, 0, 0, 20, 40, 0, 0],
@@ -4217,7 +4229,10 @@ mod tests {
         let dispatch = source_kind4_dispatch_state_from_scenario(&scenario);
         assert_eq!(dispatch.active_player_slot, 0);
         assert!(dispatch.single_player);
-        assert_eq!(dispatch.faction_states, [0, 0x0c, 0xff, 0xff, 0xff, 0x0e, 0xff]);
+        assert_eq!(
+            dispatch.faction_states,
+            [0, 0x0c, 0xff, 0xff, 0xff, 0x0e, 0xff]
+        );
     }
 
     #[test]

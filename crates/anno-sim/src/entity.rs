@@ -92,6 +92,17 @@ pub struct Figure {
     #[serde(default)]
     pub source_move_speed: u16,
 
+    /// Authored `ANIM 0` duration selected from the type-11 root's compiled
+    /// `Figurnr`. Zero keeps manually constructed figures on the legacy
+    /// KARREN runtime configuration.
+    #[serde(default)]
+    pub source_animation_frame_speed_ms: u16,
+
+    /// Authored `ANIM 0` frames per direction for this source transfer
+    /// figure. Zero uses the same manual-figure fallback as the frame time.
+    #[serde(default)]
+    pub source_animation_frames_per_direction: u8,
+
     /// Remaining source-grid distance in the current route cell. Cardinal
     /// cells start at one; diagonal cells start at √2, matching
     /// `FUN_0044a690` and `FUN_00451890`.
@@ -158,6 +169,16 @@ pub struct Figure {
     pub origin_y: u16,
     #[serde(default)]
     pub origin_kind: u8,
+    /// Map-owner selector of the source city record that owns this type-11
+    /// root. `FUN_00481170` indexes the island's city-record table with this
+    /// selector when it updates the root-count field at `+0x1fa`.
+    #[serde(default)]
+    pub origin_source_map_owner_slot: u8,
+    /// Nested `HAUS_PRODTYP Kind` for a type-11 city-cart origin. This is
+    /// distinct from `origin_kind`, which remains the outer map-command
+    /// selector used to locate the root after the cart reaches a supplier.
+    #[serde(default)]
+    pub origin_production_kind: u8,
 
     /// Linked building instance index.
     pub building_idx: u16,
@@ -169,6 +190,11 @@ pub struct Figure {
     /// units. `carried_amount` remains the whole-good display quantity.
     #[serde(default)]
     pub cargo_fixed: u16,
+    /// Authored type-11 `Maxtrag`, retained in the source 1/32-good scale.
+    /// `FUN_0047d640` uses it at supplier arrival to top up the reservation
+    /// with output produced while the figure was walking to that supplier.
+    #[serde(default)]
+    pub source_transfer_max_load_fixed: u16,
 
     /// Health/hitpoints (for military units).
     pub health: u16,
@@ -194,6 +220,12 @@ pub struct Figure {
     /// Pre-computed path (sequence of tile positions to follow).
     pub path: Vec<(i32, i32)>,
 
+    /// Exact predecessor steps produced by the source grid for the current
+    /// shared-event leg. Type-11 copies these into `DAT_00505e38` before the
+    /// `FUN_0045c450` dispatcher consumes its bounded route program.
+    #[serde(default)]
+    pub source_event_route_steps: Vec<crate::source_route::SourceRouteStep>,
+
     /// Current index into the path.
     pub path_idx: usize,
 }
@@ -207,6 +239,8 @@ impl Figure {
             tile_y: 0,
             speed: 0,
             source_move_speed: 0,
+            source_animation_frame_speed_ms: 0,
+            source_animation_frames_per_direction: 0,
             source_step_remaining: 0.0,
             source_position_x: 0.0,
             source_position_y: 0.0,
@@ -224,10 +258,13 @@ impl Figure {
             origin_x: 0,
             origin_y: 0,
             origin_kind: 0,
+            origin_source_map_owner_slot: 0,
+            origin_production_kind: 0,
             building_idx: 0,
             carried_good: 0,
             carried_amount: 0,
             cargo_fixed: 0,
+            source_transfer_max_load_fixed: 0,
             health: 0,
             anim_frame: 0,
             source_animation_elapsed_ms: 0,
@@ -235,6 +272,7 @@ impl Figure {
             sprite_set: 0,
             base_sprite: 0,
             path: Vec::new(),
+            source_event_route_steps: Vec::new(),
             path_idx: 0,
         }
     }

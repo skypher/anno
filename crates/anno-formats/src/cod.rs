@@ -179,6 +179,12 @@ pub struct BuildingDef {
     /// `FUN_0046248d..0x004624c4` as `round(Maxenergy * 32)`. The deferred
     /// category-6 hit handler accumulates raw strength against this value.
     pub source_damage_threshold: u16,
+    /// Compiled `Radius` at definition offset `+0x20`, used by
+    /// `FUN_0045c8b0` to bound type-8/type-11 transfer path searches.
+    pub source_transfer_radius: u8,
+    /// Compiled `Figuranz` at definition offset `+0x3e`, the number of
+    /// simultaneous type-11 transfer figures admitted by `FUN_0044ad50`.
+    pub source_transfer_figure_limit: u8,
     /// Source `NoShotFlg` bit consumed by `FUN_0046f6d0` when it constructs
     /// the ship-route obstacle overlay.
     pub no_shot: bool,
@@ -215,6 +221,8 @@ impl Default for BuildingDef {
             source_raw_material_amount: 0,
             source_work_material_amount: 0,
             source_damage_threshold: 0,
+            source_transfer_radius: 0,
+            source_transfer_figure_limit: 0,
             no_shot: false,
             ruinenr: 255,
             properties: HashMap::new(),
@@ -410,6 +418,15 @@ impl CodFile {
                         let key = key.trim().trim_start_matches('@');
                         let value = value.trim();
                         if !key.is_empty() {
+                            if key == "Radius" {
+                                current.source_transfer_radius = Self::eval(&constants, value)
+                                    .clamp(0, i32::from(u8::MAX))
+                                    as u8;
+                            } else if key == "Figuranz" {
+                                current.source_transfer_figure_limit = Self::eval(&constants, value)
+                                    .clamp(0, i32::from(u8::MAX))
+                                    as u8;
+                            }
                             // Avoid overwriting the outer Kind with the inner Kind
                             let storage_key = if key == "Kind" {
                                 "ProdKind".to_string()
@@ -494,8 +511,7 @@ impl CodFile {
             // `FUN_0046248d..0x004624c4` multiplies Maxenergy by 32 before
             // storing it at compiled building-definition offset `+0x64`.
             if let Some(val_str) = line.strip_prefix("Maxenergy:") {
-                current.source_damage_threshold =
-                    Self::eval_scaled_32(&constants, val_str.trim());
+                current.source_damage_threshold = Self::eval_scaled_32(&constants, val_str.trim());
                 current
                     .properties
                     .insert("Maxenergy".to_string(), val_str.trim().to_string());
@@ -991,10 +1007,20 @@ mod tests {
 
     #[test]
     fn maxenergy_compiles_to_the_source_damage_threshold() {
-        let cod = CodFile::parse(b"@Nummer: 1\nMaxenergy: 50\n")
-            .expect("parse plaintext COD");
+        let cod = CodFile::parse(b"@Nummer: 1\nMaxenergy: 50\n").expect("parse plaintext COD");
 
         assert_eq!(cod.buildings[0].source_damage_threshold, 1_600);
+    }
+
+    #[test]
+    fn parses_symbolic_type11_radius_and_figure_count() {
+        let cod = CodFile::parse(
+            b"RADIUS_MARKT = 16\n@Nummer: 1\nKind: GEBAEUDE\nObjekt: HAUS_PRODTYP\nKind: MARKT\nRadius: RADIUS_MARKT\nFiguranz: 2\nEndObj;\n",
+        )
+        .expect("parse plaintext COD");
+
+        assert_eq!(cod.buildings[0].source_transfer_radius, 16);
+        assert_eq!(cod.buildings[0].source_transfer_figure_limit, 2);
     }
 
     #[test]
@@ -1015,7 +1041,8 @@ mod tests {
         .expect("parse plaintext COD");
 
         assert_eq!(
-            cod.source_population_group_building(1).map(|building| building.source_id),
+            cod.source_population_group_building(1)
+                .map(|building| building.source_id),
             Some(21001)
         );
         assert_eq!(
@@ -1116,6 +1143,18 @@ mod tests {
                 .all(|building| !building.storage_animation),
             "the shipped haeuser.cod corpus declares no LagAniFlg definitions"
         );
+        let market = cod
+            .buildings
+            .iter()
+            .find(|building| {
+                building
+                    .properties
+                    .get("ProdKind")
+                    .is_some_and(|kind| kind == "MARKT")
+            })
+            .expect("MARKT source definition");
+        assert_eq!(market.source_transfer_figure_limit, 2);
+        assert!(market.source_transfer_radius > 0);
 
         // Should have ~500 buildings
         assert!(
@@ -1289,8 +1328,9 @@ mod tests {
 
         assert_eq!(source_ware_slot("RIND"), Some(0x07));
         assert_eq!(source_ware_slot("wPIONIER4"), Some(0x2c));
-        assert_eq!(cod.source_kind6_policy_ware_slots([7, 0x26ad, 0xffff, 0, 0, 0, 0, 0]), [
-            0x23, 0x19, 0, 0, 0, 0, 0, 0,
-        ]);
+        assert_eq!(
+            cod.source_kind6_policy_ware_slots([7, 0x26ad, 0xffff, 0, 0, 0, 0, 0]),
+            [0x23, 0x19, 0, 0, 0, 0, 0, 0,]
+        );
     }
 }

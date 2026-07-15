@@ -455,7 +455,11 @@ impl BuildingPlacer {
 
     fn page_count(&self) -> usize {
         let n = self.category_indices().len();
-        if n == 0 { 0 } else { (n - 1) / 9 + 1 }
+        if n == 0 {
+            0
+        } else {
+            (n - 1) / 9 + 1
+        }
     }
 
     fn next_page(&mut self) {
@@ -971,11 +975,7 @@ fn try_place_building(
     PlaceOutcome::Placed
 }
 
-fn push_ruin_tiles(
-    island: &mut Island,
-    cod: &CodFile,
-    clear: TileClear,
-) {
+fn push_ruin_tiles(island: &mut Island, cod: &CodFile, clear: TileClear) {
     if clear.ruin_id == anno_sim::building::NO_RUIN_ID {
         return;
     }
@@ -1025,8 +1025,8 @@ fn push_ruin_tiles(
         for dx in (0..clear.width).rev() {
             let x = clear.tile_x + dx as u16;
             let y = clear.tile_y + dy as u16;
-            let draw_index = usize::from(dy) * usize::from(clear.width)
-                + usize::from(clear.width - 1 - dx);
+            let draw_index =
+                usize::from(dy) * usize::from(clear.width) + usize::from(clear.width - 1 - dx);
             let Some(&rand_value) = clear.source_ruin_draws.get(draw_index) else {
                 continue;
             };
@@ -1094,9 +1094,9 @@ fn apply_kind13_replacement_command(
     else {
         return false;
     };
-    island.tiles.retain(|tile| {
-        (tile.x, tile.y) != (replacement.tile_x, replacement.tile_y)
-    });
+    island
+        .tiles
+        .retain(|tile| (tile.x, tile.y) != (replacement.tile_x, replacement.tile_y));
     island.tiles.push(
         replacement
             .command
@@ -1175,7 +1175,10 @@ fn push_no_ruin_backing_tiles(
     if clear.ruin_id != anno_sim::building::NO_RUIN_ID {
         return;
     }
-    let Some(island) = islands.iter_mut().find(|island| island.number == clear.island_id) else {
+    let Some(island) = islands
+        .iter_mut()
+        .find(|island| island.number == clear.island_id)
+    else {
         return;
     };
     let right = clear.tile_x.saturating_add(u16::from(clear.width));
@@ -1296,6 +1299,7 @@ fn main() {
     // heuristic values if the figure can't be found.
     let traeger_def = figures.find("TRAEGER").cloned();
     let karren_def = figures.find("KARREN").cloned();
+    let traeger2_def = figures.find("TRAEGER2").cloned();
     let handel1_def = figures
         .find(ShipClass::SmallTrader.source_figure_name())
         .cloned();
@@ -1581,6 +1585,10 @@ fn main() {
     }
     if let Some(karren) = karren_def.as_ref() {
         sim.city_cart_config = anno_sim::carrier::CityCartConfig::from_figure_def(karren);
+    }
+    if let Some(traeger2) = traeger2_def.as_ref() {
+        sim.city_cart_traeger2_config =
+            anno_sim::carrier::CityCartConfig::from_figure_def(traeger2);
     }
     sim.civilian_config = civilian_config;
     println!(
@@ -2748,12 +2756,11 @@ fn main() {
                                     .source_placement_command
                                     .map(|command| command.orientation)
                                     .unwrap_or(0);
-                                let (source_width, source_height) =
-                                    if source_orientation & 1 == 0 {
-                                        (bw, bh)
-                                    } else {
-                                        (bh, bw)
-                                    };
+                                let (source_width, source_height) = if source_orientation & 1 == 0 {
+                                    (bw, bh)
+                                } else {
+                                    (bh, bw)
+                                };
                                 let refund = def.cost_gold / 2;
                                 let name = cod.buildings[b.def_id as usize]
                                     .properties
@@ -3013,7 +3020,8 @@ fn main() {
                                         occupant.state_descriptor = descriptor;
                                         occupant.route_retry_count = 0;
                                         occupant.idle_remaining_bits = 0;
-                                        occupant.route_program = anno_sim::combat::default_source_kind4_route_program();
+                                        occupant.route_program =
+                                            anno_sim::combat::default_source_kind4_route_program();
                                         occupant.route_program_cursor = 0;
                                         if native_spearman {
                                             occupant.idle_timestamp_ticks =
@@ -3473,8 +3481,8 @@ fn main() {
                         || line.starts_with("[victory]")
                     {
                         voice_trader_slot // triumph.wav for positive
-                    // diplomacy / objective /
-                    // victory events
+                                          // diplomacy / objective /
+                                          // victory events
                     } else if line.starts_with("[defeat]") {
                         voice_attack_slot
                     } else {
@@ -3499,11 +3507,7 @@ fn main() {
                 for clear in drained {
                     sim.apply_source_terminal_static_replacement(&cod, &clear);
                     apply_tile_clear_event(&mut islands, &cod, clear.clone());
-                    push_no_ruin_backing_tiles(
-                        &mut islands,
-                        &sim.source_static_map_roots,
-                        &clear,
-                    );
+                    push_no_ruin_backing_tiles(&mut islands, &sim.source_static_map_roots, &clear);
                     refresh_simulation_island_map(&mut sim, &islands, &cod, clear.island_id);
                 }
                 if speech_enabled {
@@ -3527,7 +3531,8 @@ fn main() {
             // here, where the game owns the scenario command stream and the
             // static island-map overlay.
             if !sim.source_kind13_replacement_commands.is_empty() {
-                let replacements: Vec<_> = sim.source_kind13_replacement_commands.drain(..).collect();
+                let replacements: Vec<_> =
+                    sim.source_kind13_replacement_commands.drain(..).collect();
                 for replacement in replacements {
                     if apply_kind13_replacement_command(&mut islands, replacement) {
                         apply_kind13_replacement_static(&mut sim, &cod, replacement);
@@ -6327,11 +6332,9 @@ mod tests {
     #[test]
     fn diplomacy_panel_help_omits_fixed_tribute_shortcut() {
         assert!(!DIPLOMACY_PANEL_HELP.contains('G'));
-        assert!(
-            !DIPLOMACY_PANEL_HELP
-                .to_ascii_lowercase()
-                .contains("tribute")
-        );
+        assert!(!DIPLOMACY_PANEL_HELP
+            .to_ascii_lowercase()
+            .contains("tribute"));
     }
 
     #[test]
@@ -6484,10 +6487,7 @@ mod tests {
         let expected = cod
             .ruin_variant_building(0, false, seeded_draw(3))
             .expect("ordinary land ruin variant");
-        assert_eq!(
-            islands[0].tiles[0].source_id(),
-            expected.source_id
-        );
+        assert_eq!(islands[0].tiles[0].source_id(), expected.source_id);
         assert_eq!(
             authored_island_gfx_tiles(&islands[0], &cod, &[]),
             vec![(3, 4, expected.gfx as u16)]
@@ -6499,12 +6499,13 @@ mod tests {
         let cod = load_test_cod();
         let definition_offset = cod.constants["GFXBODEN"] as u16;
         let definition = cod
-            .building_by_source_id(anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + i32::from(definition_offset))
+            .building_by_source_id(
+                anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + i32::from(definition_offset),
+            )
             .expect("BODEN definition");
-        let mut backing = anno_sim::source_cell::SourceMapCellState::new_static(
-            0, 3, 4, definition, 0,
-        )
-        .expect("static BODEN command");
+        let mut backing =
+            anno_sim::source_cell::SourceMapCellState::new_static(0, 3, 4, definition, 0)
+                .expect("static BODEN command");
         backing.set_source_orientation(3);
         backing.set_terminal_command_fields(0, 5);
         let clear = TileClear {
@@ -6601,10 +6602,7 @@ mod tests {
         let expected = cod
             .ruin_variant_building(0, true, seeded_draw(3))
             .expect("strand land ruin variant");
-        assert_eq!(
-            islands[0].tiles[0].source_id(),
-            expected.source_id
-        );
+        assert_eq!(islands[0].tiles[0].source_id(), expected.source_id);
         assert_eq!(
             authored_island_gfx_tiles(&islands[0], &cod, &[]),
             vec![(2, 2, expected.gfx as u16)]
@@ -6696,10 +6694,7 @@ mod tests {
         let expected = cod
             .ruin_variant_building(4, false, seeded_draw(1))
             .expect("raw-material ruin variant");
-        assert_eq!(
-            islands[0].tiles[0].source_id(),
-            expected.source_id
-        );
+        assert_eq!(islands[0].tiles[0].source_id(), expected.source_id);
         assert_eq!(
             authored_island_gfx_tiles(&islands[0], &cod, &[]),
             vec![(4, 4, expected.gfx as u16)]
@@ -6710,7 +6705,12 @@ mod tests {
     fn tile_clear_event_uses_per_cell_strand_table_in_fallback_order() {
         let cod = load_test_cod();
         let mut islands = vec![test_island(10, [7; 8])];
-        let draws = vec![seeded_draw(1), seeded_draw(2), seeded_draw(3), seeded_draw(4)];
+        let draws = vec![
+            seeded_draw(1),
+            seeded_draw(2),
+            seeded_draw(3),
+            seeded_draw(4),
+        ];
 
         apply_tile_clear_event(
             &mut islands,
@@ -6795,7 +6795,8 @@ mod tests {
             .expect("Kontor ruin variant");
         assert_eq!(islands[0].tiles[0].source_id(), expected.source_id);
         assert_eq!(islands[0].tiles[0].orientation & 3, 1);
-        let command = anno_sim::building::SourceBuildingCommand::from_island_tile(islands[0].tiles[0]);
+        let command =
+            anno_sim::building::SourceBuildingCommand::from_island_tile(islands[0].tiles[0]);
         assert_eq!(command.variant, 2);
         assert_eq!(command.map_owner_slot, 5);
         let mut got: Vec<_> = authored_island_gfx_tiles(&islands[0], &cod, &[])

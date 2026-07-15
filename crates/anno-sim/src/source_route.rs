@@ -81,7 +81,7 @@ pub fn source_diagonal_cost(metadata: u8) -> u32 {
 
 /// A source direction together with the map-cost class that controls whether
 /// adjacent steps are allowed to share one route byte.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceRouteStep {
     /// `FUN_0046cf70` direction, in `1..=8`.
     pub direction: u8,
@@ -1021,6 +1021,34 @@ impl SourcePathGrid {
         true
     }
 
+    /// Restrict traversal to one source temporary-grid rectangle. The caller
+    /// supplies the world-space origin and positive dimensions passed to the
+    /// source grid constructor; cells outside receive direction marker `0xc`
+    /// and therefore cannot enter the frontier.
+    pub fn block_outside_rect(&mut self, origin: (i32, i32), width: usize, height: usize) -> bool {
+        let (Ok(width), Ok(height)) = (i32::try_from(width), i32::try_from(height)) else {
+            return false;
+        };
+        let (Some(end_x), Some(end_y)) =
+            (origin.0.checked_add(width), origin.1.checked_add(height))
+        else {
+            return false;
+        };
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let position = (self.origin.0 + x as i32, self.origin.1 + y as i32);
+                if position.0 < origin.0
+                    || position.0 >= end_x
+                    || position.1 < origin.1
+                    || position.1 >= end_y
+                {
+                    self.cells[y * self.width + x].direction = 0x0c;
+                }
+            }
+        }
+        true
+    }
+
     /// Set one source direction byte without changing the cell's path
     /// metadata. `FUN_0046f460` uses this when it overlays a static map cell
     /// into its temporary type-4 target-selection grid.
@@ -1184,12 +1212,7 @@ impl SourcePathGrid {
     /// the local grid, requires the source's ceiling-quarter distance bound,
     /// and scans every raster cell after `start`. A direction-13 marker at
     /// `end` is permitted; every earlier direction-13 marker rejects the ray.
-    pub fn direction_13_ray_clear(
-        &self,
-        start: (i32, i32),
-        end: (i32, i32),
-        radius: u32,
-    ) -> bool {
+    pub fn direction_13_ray_clear(&self, start: (i32, i32), end: (i32, i32), radius: u32) -> bool {
         if self.index(start).is_none() || self.index(end).is_none() {
             return false;
         }
@@ -1941,7 +1964,10 @@ fn source_fixed_path_kind(definition: &CodBuilding) -> bool {
 /// Return the source direction marker that `FUN_0046f460` and `FUN_0046f6d0`
 /// write for one static map cell. `None` is the explicit `MEER`/`KIRCHE`
 /// pass-through.
-pub(crate) fn source_static_map_direction(definition: &CodBuilding, tile: IslandTile) -> Option<u8> {
+pub(crate) fn source_static_map_direction(
+    definition: &CodBuilding,
+    tile: IslandTile,
+) -> Option<u8> {
     let kind = definition.source_kind_code()?;
     if kind == 19 {
         return None;
@@ -2112,11 +2138,9 @@ mod tests {
                 expected_land
             );
         }
-        assert!(
-            SourceTargetDescriptor::from_bytes([0x35, 4, 9, 7])
-                .resolve_static_island_target(&[], &definitions)
-                .is_none()
-        );
+        assert!(SourceTargetDescriptor::from_bytes([0x35, 4, 9, 7])
+            .resolve_static_island_target(&[], &definitions)
+            .is_none());
     }
 
     #[test]
@@ -2172,11 +2196,9 @@ mod tests {
                 owner: 2,
             })
         );
-        assert!(
-            SourceTargetDescriptor::from_bytes([0x35, 4, 7, 0])
-                .resolve_dynamic_map_object_target(&[object], &[], &definitions)
-                .is_none()
-        );
+        assert!(SourceTargetDescriptor::from_bytes([0x35, 4, 7, 0])
+            .resolve_dynamic_map_object_target(&[object], &[], &definitions)
+            .is_none());
     }
 
     #[test]

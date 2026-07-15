@@ -8,6 +8,31 @@ use anno_formats::cod::{BuildingDef, CodFile};
 
 use crate::building::SourceBuildingCommand;
 
+/// Compiled `Figurnr` values used by type-11 city transfer roots.
+///
+/// `FUN_0044ad50` forwards this definition selector to `FUN_00446ca0` when
+/// it allocates the generic transfer figure. The extracted city roots use
+/// `KARREN` for MARKT and ordinary KONTOR definitions, and `TRAEGER2` for
+/// the two native KONTOR definitions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum SourceTransferFigure {
+    #[default]
+    Unknown = 0,
+    Karren = 1,
+    Traeger2 = 2,
+}
+
+impl SourceTransferFigure {
+    fn from_definition(definition: &BuildingDef) -> Self {
+        match definition.properties.get("Figurnr").map(String::as_str) {
+            Some("KARREN") => Self::Karren,
+            Some("TRAEGER2") => Self::Traeger2,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// The renderer-relevant subset of one source 20-byte map-cell record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceMapCellState {
@@ -44,6 +69,19 @@ pub struct SourceMapCellState {
     /// Packed map-owner selector (`bits 19..=21`) from the root command.
     /// The terminal writer retains it while rewriting the root footprint.
     pub source_map_owner_slot: u8,
+    /// Compiled `Figuranz` at definition offset `+0x3e`. `FUN_0044ad50`
+    /// admits this many type-11 transfer figures at this source root.
+    #[serde(default)]
+    pub source_transfer_figure_limit: u8,
+    /// Compiled `Radius` at definition offset `+0x20`. Type-8/type-11 event
+    /// routing uses this square search radius in `FUN_0045c8b0`.
+    #[serde(default)]
+    pub source_transfer_radius: u8,
+    /// Compiled `Figurnr` passed by `FUN_0044ad50` to the generic-figure
+    /// constructor. It selects the cart's authored capacity, speed, sprite,
+    /// and animation layout.
+    #[serde(default)]
+    pub source_transfer_figure: SourceTransferFigure,
     /// Source `Ruinenr` selected by `FUN_00463f40`; `0xff` enters its
     /// per-tile clear branch instead of issuing a ruin replacement command.
     pub ruin_id: u8,
@@ -104,6 +142,11 @@ pub struct SourceMapCellState {
     pub animation_continues: bool,
     /// Compiled source kind code, recorded for renderer dispatch.
     pub kind_code: u8,
+    /// Compiled nested `HAUS_PRODTYP Kind` at definition offset `+0x1c`.
+    /// `FUN_0047e1f0` switches on this selector before invoking the generic
+    /// type-11 allocator, independently of the outer map kind above.
+    #[serde(default)]
+    pub source_production_kind_code: u8,
 }
 
 impl SourceMapCellState {
@@ -111,7 +154,7 @@ impl SourceMapCellState {
     /// `FUN_00481fc0` map-cell record.
     pub fn new(island: u8, x: u8, y: u8, definition: &BuildingDef, phase: u8) -> Option<Self> {
         let state = Self::new_static(island, x, y, definition, phase)?;
-        matches!(state.kind_code, 1..=8 | 30).then_some(state)
+        (matches!(state.kind_code, 1..=8 | 30) || state.is_type11_transfer_root()).then_some(state)
     }
 
     /// Construct terminal metadata for any compiled static map root. Unlike
@@ -125,6 +168,18 @@ impl SourceMapCellState {
         phase: u8,
     ) -> Option<Self> {
         let kind_code = definition.source_kind_code()?;
+        let source_production_kind_code =
+            definition
+                .source_production_kind_code()
+                .unwrap_or(match definition.kind.as_str() {
+                    // Unit fixtures and hand-built fallback roots may use the
+                    // production label as the outer kind. Authored city roots
+                    // carry the nested `ProdKind` above; unrelated outer kinds,
+                    // including PIER, retain the compiled default zero.
+                    "MARKT" => 7,
+                    "KONTOR" => 8,
+                    _ => 0,
+                });
         Some(Self {
             island,
             x,
@@ -139,6 +194,9 @@ impl SourceMapCellState {
             source_orientation: 0,
             source_variant: 0,
             source_map_owner_slot: 0,
+            source_transfer_figure_limit: definition.source_transfer_figure_limit,
+            source_transfer_radius: definition.source_transfer_radius,
+            source_transfer_figure: SourceTransferFigure::from_definition(definition),
             ruin_id: definition.ruinenr.clamp(0, 255) as u8,
             ruin_footprint_width: 0,
             ruin_footprint_height: 0,
@@ -162,7 +220,16 @@ impl SourceMapCellState {
             animation_count: definition.anim_anz,
             animation_continues: definition.animation_continues,
             kind_code,
+            source_production_kind_code,
         })
+    }
+
+    /// `FUN_0047e1f0` calls `FUN_0044ad50` for these compiled production
+    /// kinds. The extracted city roots use 7 (`MARKT`) and 8 (`KONTOR`);
+    /// retaining 30 follows the executable switch for future authored data.
+    #[inline]
+    pub const fn is_type11_transfer_root(self) -> bool {
+        matches!(self.source_production_kind_code, 7 | 8 | 30)
     }
 
     #[inline]
@@ -283,8 +350,9 @@ impl SourceMapCellState {
         true
     }
 
-    /// Reserve fixed-point output for a type-8 carrier. `FUN_0047d810`
-    /// records this separately from the source's live `+0x0c` stock.
+    /// Reserve fixed-point output for a type-8 or type-11 carrier.
+    /// `FUN_0047d810` records this separately from the source's live `+0x0c`
+    /// stock.
     pub fn reserve_storage(&mut self, amount: u16) -> bool {
         if amount == 0 || self.storage_fill.saturating_sub(self.reserved_storage) < amount {
             return false;
@@ -301,6 +369,28 @@ impl SourceMapCellState {
         self.reserved_storage -= amount;
         self.storage_fill -= amount;
         true
+    }
+
+    /// Model `FUN_0047d640` for a type-11 supplier arrival. The figure first
+    /// consumes its reservation, then takes any source output produced after
+    /// dispatch until its authored `Maxtrag` capacity is full. The return is
+    /// the additional fixed-point cargo to add to the event amount.
+    pub fn collect_reserved_storage_with_top_up(
+        &mut self,
+        carried_amount: u16,
+        max_load: u16,
+    ) -> u16 {
+        let reserved_amount = carried_amount.min(self.reserved_storage);
+        let remaining_capacity = max_load.saturating_sub(reserved_amount);
+        let top_up = self
+            .storage_fill
+            .saturating_sub(self.reserved_storage)
+            .min(remaining_capacity);
+        self.reserved_storage = self.reserved_storage.saturating_sub(reserved_amount);
+        self.storage_fill = self
+            .storage_fill
+            .saturating_sub(reserved_amount.saturating_add(top_up));
+        top_up
     }
 
     /// Undo a reservation when the figure cannot complete its pickup leg.
@@ -363,7 +453,7 @@ impl SourceMapCellState {
     /// MARKT command root advances its selector accumulator by the accepted
     /// source-unit amount.
     pub fn accept_market_transfer(&mut self, amount: u16) -> bool {
-        if self.kind_code != 7 || amount == 0 {
+        if self.source_production_kind_code != 7 || amount == 0 {
             return false;
         }
         self.progress = self.progress.wrapping_add(amount);
@@ -435,6 +525,64 @@ mod tests {
     }
 
     #[test]
+    fn source_root_retains_compiled_figuranz_for_type11_admission() {
+        let definition = BuildingDef {
+            kind: "MARKT".into(),
+            source_transfer_figure_limit: 2,
+            source_transfer_radius: 16,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            SourceMapCellState::new_static(1, 2, 3, &definition, 0)
+                .unwrap()
+                .source_transfer_figure_limit,
+            2
+        );
+        assert_eq!(
+            SourceMapCellState::new_static(1, 2, 3, &definition, 0)
+                .unwrap()
+                .source_transfer_radius,
+            16
+        );
+    }
+
+    #[test]
+    fn source_root_retains_compiled_figurnr_for_type11_figure_selection() {
+        let definition = BuildingDef {
+            kind: "KONTOR".into(),
+            properties: [("Figurnr".into(), "TRAEGER2".into())].into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            SourceMapCellState::new_static(1, 2, 3, &definition, 0)
+                .unwrap()
+                .source_transfer_figure,
+            SourceTransferFigure::Traeger2
+        );
+    }
+
+    #[test]
+    fn source_city_root_uses_nested_production_kind_for_type11_dispatch() {
+        let definition = BuildingDef {
+            kind: "GEBAEUDE".into(),
+            properties: [
+                ("ProdKind".into(), "MARKT".into()),
+                ("Figurnr".into(), "KARREN".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        let state = SourceMapCellState::new(1, 2, 3, &definition, 0)
+            .expect("compiled MARKT root receives selector state");
+        assert_eq!(state.kind_code, 14);
+        assert_eq!(state.source_production_kind_code, 7);
+        assert!(state.is_type11_transfer_root());
+    }
+
+    #[test]
     fn definition_indices_follow_fun_00463b10_oriented_write_order() {
         let definition = BuildingDef {
             kind: "HANDWERK".into(),
@@ -442,8 +590,8 @@ mod tests {
             size: (2, 3),
             ..Default::default()
         };
-        let mut state = SourceMapCellState::new_static(0, 0, 0, &definition, 0)
-            .expect("static source command");
+        let mut state =
+            SourceMapCellState::new_static(0, 0, 0, &definition, 0).expect("static source command");
 
         let cases = [
             (0, 2, 3, [[100, 101, 0], [102, 103, 0], [104, 105, 0]]),
@@ -574,6 +722,30 @@ mod tests {
         assert_eq!(state.reserved_storage, 128);
         assert!(state.collect_reserved_storage(128));
         assert_eq!(state.storage_fill, 32);
+        assert_eq!(state.reserved_storage, 0);
+    }
+
+    #[test]
+    fn city_cart_collection_tops_up_a_reservation_with_new_output() {
+        let mut state = SourceMapCellState {
+            storage_fill: 129,
+            reserved_storage: 65,
+            ..SourceMapCellState::new(
+                0,
+                3,
+                5,
+                &BuildingDef {
+                    kind: "HANDWERK".into(),
+                    storage_animation_capacity: 320,
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(state.collect_reserved_storage_with_top_up(65, 192), 64);
+        assert_eq!(state.storage_fill, 0);
         assert_eq!(state.reserved_storage, 0);
     }
 
