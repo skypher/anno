@@ -14,6 +14,78 @@
 use std::collections::HashMap;
 use thiserror::Error;
 
+/// Base added by the executable before looking up a SHIP4 policy-slot
+/// definition in the compiled haeuser table.
+pub const SOURCE_DEFINITION_ID_BASE: i32 = 0x4e20;
+
+/// Translate one `Ware` token through the executable's registration table.
+/// The values `0x19..=0x2c` are the sixteen soldier, cavalry, musketeer,
+/// cannonier, and pioneer policy items tested by `FUN_00458e60`.
+pub const fn source_ware_slot(token: &str) -> Option<u8> {
+    Some(match token {
+        "NOWARE" => 0x00,
+        "ALLWARE" => 0x01,
+        "EISENERZ" => 0x02,
+        "GOLD" => 0x03,
+        "WOLLE" => 0x04,
+        "ZUCKER" => 0x05,
+        "TABAK" => 0x06,
+        "FLEISCH" | "RIND" => 0x07,
+        "KORN" => 0x08,
+        "MEHL" => 0x09,
+        "EISEN" => 0x0a,
+        "SCHWERTER" => 0x0b,
+        "MUSKETEN" => 0x0c,
+        "KANONEN" => 0x0d,
+        "NAHRUNG" => 0x0e,
+        "TABAKWAREN" => 0x0f,
+        "GEWUERZE" => 0x10,
+        "KAKAO" => 0x11,
+        "ALKOHOL" => 0x12,
+        "STOFFE" => 0x13,
+        "KLEIDUNG" => 0x14,
+        "SCHMUCK" => 0x15,
+        "WERKZEUG" => 0x16,
+        "HOLZ" => 0x17,
+        "ZIEGEL" => 0x18,
+        "wSOLDAT1" => 0x19,
+        "wSOLDAT2" => 0x1a,
+        "wSOLDAT3" => 0x1b,
+        "wSOLDAT4" => 0x1c,
+        "wKAVALERIE1" => 0x1d,
+        "wKAVALERIE2" => 0x1e,
+        "wKAVALERIE3" => 0x1f,
+        "wKAVALERIE4" => 0x20,
+        "wMUSKETIER1" => 0x21,
+        "wMUSKETIER2" => 0x22,
+        "wMUSKETIER3" => 0x23,
+        "wMUSKETIER4" => 0x24,
+        "wKANONIER1" => 0x25,
+        "wKANONIER2" => 0x26,
+        "wKANONIER3" => 0x27,
+        "wKANONIER4" => 0x28,
+        "wPIONIER1" => 0x29,
+        "wPIONIER2" => 0x2a,
+        "wPIONIER3" => 0x2b,
+        "wPIONIER4" => 0x2c,
+        "GETREIDE" => 0x2d,
+        "TABAKBAUM" => 0x2e,
+        "GEWUERZBAUM" => 0x2f,
+        "ZUCKERROHR" => 0x30,
+        "BAUMWOLLE" => 0x31,
+        "WEINTRAUBEN" => 0x32,
+        "KAKAOBAUM" => 0x33,
+        "GRAS" => 0x34,
+        "BAUM" => 0x35,
+        "STEINE" => 0x36,
+        "ERZE" => 0x37,
+        "WILD" => 0x38,
+        "FISCHE" => 0x39,
+        "SCHATZ" => 0x3a,
+        _ => return None,
+    })
+}
+
 #[derive(Error, Debug)]
 pub enum CodError {
     #[error("IO error: {0}")]
@@ -27,6 +99,27 @@ pub struct CodFile {
     pub constants: HashMap<String, i32>,
     /// Building definitions indexed by Nummer (0..N)
     pub buildings: Vec<BuildingDef>,
+}
+
+impl CodFile {
+    /// Resolve the low bytes written by `FUN_0045f9b2` for SHIP4 policy
+    /// slots. Ordinary entries dereference a compiled haeuser definition;
+    /// the executable's absent-definition fallback maps its finite special
+    /// range directly to `0x19..=0x4a`.
+    pub fn source_kind6_policy_ware_slots(&self, raw_slots: [u64; 8]) -> [u8; 8] {
+        std::array::from_fn(|index| {
+            let raw_id = raw_slots[index] as u16;
+            let source_id = SOURCE_DEFINITION_ID_BASE + i32::from(raw_id);
+            self.building_by_source_id(source_id)
+                .and_then(BuildingDef::source_ware_slot)
+                .or_else(|| {
+                    (0x74cd..=0x74fe)
+                        .contains(&source_id)
+                        .then_some((source_id as u8).wrapping_add(0x4c))
+                })
+                .unwrap_or(0)
+        })
+    }
 }
 
 /// A building/terrain definition from haeuser.cod.
@@ -125,6 +218,17 @@ impl Default for BuildingDef {
 }
 
 impl BuildingDef {
+    /// Compiled byte stored at definition offset `+0x21` from the current
+    /// `Ware:` property. Coefficients following the token are parsed by the
+    /// executable separately and do not affect this byte.
+    pub fn source_ware_slot(&self) -> Option<u8> {
+        self.properties
+            .get("Ware")
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .and_then(source_ware_slot)
+    }
+
     /// Runtime kind code assigned by the `FUN_00460750` symbol table before
     /// haeuser.cod is parsed. The table deliberately aliases terrain and
     /// production labels into one code space; for example `STRASSE` and
@@ -1060,5 +1164,24 @@ mod tests {
                 b.properties.get("Maxlager").unwrap_or(&"?".into()),
             );
         }
+    }
+
+    #[test]
+    fn source_kind6_policy_slots_follow_definition_and_special_fallback() {
+        let soldier_def = BuildingDef {
+            source_id: SOURCE_DEFINITION_ID_BASE + 7,
+            properties: HashMap::from([("Ware".into(), "wMUSKETIER3, 0.5".into())]),
+            ..Default::default()
+        };
+        let cod = CodFile {
+            constants: HashMap::new(),
+            buildings: vec![soldier_def],
+        };
+
+        assert_eq!(source_ware_slot("RIND"), Some(0x07));
+        assert_eq!(source_ware_slot("wPIONIER4"), Some(0x2c));
+        assert_eq!(cod.source_kind6_policy_ware_slots([7, 0x26ad, 0xffff, 0, 0, 0, 0, 0]), [
+            0x23, 0x19, 0, 0, 0, 0, 0, 0,
+        ]);
     }
 }

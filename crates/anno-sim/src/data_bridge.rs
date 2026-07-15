@@ -287,6 +287,8 @@ pub fn land_units_from_scenario(szs: &SzsFile) -> Vec<crate::combat::MilitaryUni
             unit.source_figure_kind = Some(figure.figure_kind);
             unit.source_figure_definition_id = Some(definition.id);
             unit.source_energy = figure.source_energy;
+            unit.source_kind6_target_descriptor_payload =
+                Some([figure.state_descriptor[2], figure.state_descriptor[3]]);
             unit.source_route_radius = figure.route_radius;
             unit.source_origin_descriptor =
                 Some(SourceTargetDescriptor::from_bytes(figure.origin_descriptor));
@@ -1321,10 +1323,31 @@ pub fn warships_from_ships(ships: &[anno_formats::szs::Ship]) -> Vec<crate::comb
             unit.source_figure_definition_id = Some(s.figure_definition_id);
             unit.source_energy = s.stored_energy;
             unit.source_score_state = s.heading_byte;
+            unit.source_kind6_policy_raw_slots = s.source_kind6_policy_raw_slots();
+            unit.source_kind6_target_descriptor_payload =
+                Some(s.source_kind6_target_descriptor_payload());
             unit.direction = s.source_direction;
             Some(unit)
         })
         .collect()
+}
+
+/// Populate the compiled category-6 policy bytes after SHIP4 entities have
+/// been created. The original loader resolves each low-16 raw value through
+/// the same haeuser definition table before combat dispatch reads it.
+pub fn resolve_ship_kind6_policy_slots(
+    cod: &CodFile,
+    warships: &mut [crate::combat::MilitaryUnit],
+    traders: &mut [crate::trade::TradeShip],
+) {
+    for ship in warships {
+        ship.source_kind6_policy_ware_slots =
+            cod.source_kind6_policy_ware_slots(ship.source_kind6_policy_raw_slots);
+    }
+    for ship in traders {
+        ship.source_kind6_policy_ware_slots =
+            cod.source_kind6_policy_ware_slots(ship.source_kind6_policy_raw_slots);
+    }
 }
 
 /// Convert SHIP4 records whose class is `SmallTrader` or
@@ -1373,6 +1396,9 @@ pub fn traders_from_ships(
             t.source_figure_definition_id = Some(s.figure_definition_id);
             t.source_energy = s.stored_energy;
             t.source_score_state = s.heading_byte;
+            t.source_kind6_policy_raw_slots = s.source_kind6_policy_raw_slots();
+            t.source_kind6_target_descriptor_payload =
+                Some(s.source_kind6_target_descriptor_payload());
             t.source_target_approach_radius = cargo_config.target_approach_radius_for(class);
             t
         })
@@ -1410,8 +1436,12 @@ mod tests {
     fn warships_from_ships_routes_warships_only() {
         use crate::combat::UnitType;
         use anno_formats::szs::Ship;
-        let mk = |owner: u8, class: u8, x: u16, y: u16| Ship {
-            raw_record: [0; anno_formats::szs::SHIP4_RECORD_BYTES],
+        let mk = |owner: u8, class: u8, x: u16, y: u16| {
+            let mut raw_record = [0; anno_formats::szs::SHIP4_RECORD_BYTES];
+            raw_record[0x2c..0x2e].copy_from_slice(&[0x61, 0x72]);
+            raw_record[0x132..0x13a].copy_from_slice(&0x8877_6655_4433_2211_u64.to_le_bytes());
+            Ship {
+            raw_record,
             name: "test".into(),
             x,
             y,
@@ -1426,6 +1456,7 @@ mod tests {
             animation_state: 0,
             heading_byte: 4,
             cargo_slots: [0; 7],
+        }
         };
         let ships = vec![
             mk(0, 0x15, 10, 10), // SmallTrader  → skip
@@ -1446,6 +1477,11 @@ mod tests {
         assert_eq!(units[0].source_figure_definition_id, Some(0x19));
         assert_eq!(units[0].source_energy, 125);
         assert_eq!(units[0].source_score_state, 4);
+        assert_eq!(
+            units[0].source_kind6_policy_raw_slots[0],
+            0x8877_6655_4433_2211
+        );
+        assert_eq!(units[0].source_kind6_target_descriptor_payload, Some([0x61, 0x72]));
         assert_eq!(units[0].direction, 6);
         assert_eq!(units[1].unit_type, UnitType::LargeWarship);
         assert_eq!(units[2].unit_type, UnitType::PirateShip);
@@ -1459,8 +1495,12 @@ mod tests {
     #[test]
     fn traders_from_ships_routes_traders_only_with_sentinel_id() {
         use anno_formats::szs::Ship;
-        let mk = |owner: u8, class: u8, x: u16, y: u16| Ship {
-            raw_record: [0; anno_formats::szs::SHIP4_RECORD_BYTES],
+        let mk = |owner: u8, class: u8, x: u16, y: u16| {
+            let mut raw_record = [0; anno_formats::szs::SHIP4_RECORD_BYTES];
+            raw_record[0x2c..0x2e].copy_from_slice(&[0x28, 0x39]);
+            raw_record[0x13a..0x142].copy_from_slice(&0x0123_4567_89ab_cdef_u64.to_le_bytes());
+            Ship {
+            raw_record,
             name: "test".into(),
             x,
             y,
@@ -1475,6 +1515,7 @@ mod tests {
             animation_state: 0,
             heading_byte: 4,
             cargo_slots: [0; 7],
+        }
         };
         let ships = vec![
             mk(0, 0x15, 10, 10), // SmallTrader  → keep
@@ -1506,6 +1547,14 @@ mod tests {
         assert_eq!(traders[0].source_figure_definition_id, Some(0x15));
         assert_eq!(traders[0].source_energy, 121);
         assert_eq!(traders[0].source_score_state, 4);
+        assert_eq!(
+            traders[0].source_kind6_policy_raw_slots[1],
+            0x0123_4567_89ab_cdef
+        );
+        assert_eq!(
+            traders[0].source_kind6_target_descriptor_payload,
+            Some([0x28, 0x39])
+        );
         assert_eq!(traders[0].heading, 2);
         assert_eq!(traders[0].class, crate::trade::TradeShipClass::SmallTrader);
         assert_eq!(traders[0].cargo_capacity(), 40);
@@ -1515,6 +1564,34 @@ mod tests {
         assert_eq!(traders[1].class, crate::trade::TradeShipClass::LargeTrader);
         assert_eq!(traders[1].cargo_capacity(), 60);
         assert_eq!(traders[1].source_target_approach_radius, 2);
+    }
+
+    #[test]
+    fn ship_kind6_policy_resolution_uses_compiled_ware_and_special_ids() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let cod = CodFile {
+            constants: HashMap::new(),
+            buildings: vec![CodBuilding {
+                source_id: anno_formats::cod::SOURCE_DEFINITION_ID_BASE + 7,
+                properties: HashMap::from([("Ware".into(), "wKANONIER2".into())]),
+                ..Default::default()
+            }],
+        };
+        let mut warships = vec![crate::combat::MilitaryUnit::new(
+            crate::combat::UnitType::SmallWarship,
+            1,
+            4,
+            5,
+        )];
+        warships[0].source_kind6_policy_raw_slots[0] = 7;
+        let mut traders = vec![crate::trade::TradeShip::new(2, 9, 6, 7, 40)];
+        traders[0].source_kind6_policy_raw_slots[0] = 0x26ad;
+
+        resolve_ship_kind6_policy_slots(&cod, &mut warships, &mut traders);
+
+        assert_eq!(warships[0].source_kind6_policy_ware_slots[0], 0x26);
+        assert_eq!(traders[0].source_kind6_policy_ware_slots[0], 0x19);
     }
 
     #[test]

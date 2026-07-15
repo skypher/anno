@@ -664,6 +664,13 @@ impl Ship {
             )
         })
     }
+
+    /// Bytes copied by `FUN_0045f550` from `SHIP4 + 0x2c` into the shared
+    /// category record at `+0x18`. `FUN_00445650` uses them to construct a
+    /// category-1/2/3 target descriptor for category-6 combat selection.
+    pub const fn source_kind6_target_descriptor_payload(&self) -> [u8; 2] {
+        [self.raw_record[0x2c], self.raw_record[0x2d]]
+    }
 }
 
 pub const SHIP4_RECORD_BYTES: usize = 436;
@@ -3578,6 +3585,14 @@ mod tests {
         assert_eq!(ship.raw_record[0x50], ship.source_direction);
         assert_eq!(ship.raw_record[0x4e], ship.animation_state);
         assert_eq!(ship.raw_record[0x4b], ship.owner);
+        assert_eq!(
+            ship.source_kind6_target_descriptor_payload(),
+            [ship.raw_record[0x2c], ship.raw_record[0x2d]]
+        );
+        assert_eq!(
+            ship.source_kind6_policy_raw_slots()[0],
+            u64::from_le_bytes(ship.raw_record[0x132..0x13a].try_into().unwrap())
+        );
         assert_eq!(
             u32::from_le_bytes(ship.raw_record[0x174..0x178].try_into().unwrap()),
             ship.cargo_slots[0]

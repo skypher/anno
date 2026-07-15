@@ -124,7 +124,11 @@ use std::path::Path;
 /// category-local live records independently of local unit types.
 /// v66: source figures retain SHIP4 byte `0x42` as the category-1/2/3
 /// `FUN_00454250` score-state tier.
-pub const SAVE_VERSION: u32 = 66;
+/// v67: SHIP4 policy-slot inputs and category-6 source action timestamps
+/// persist across save/load.
+/// v68: SHIP4 policy slots retain their executable-resolved Ware bytes.
+/// v69: source category-record target-descriptor bytes persist across saves.
+pub const SAVE_VERSION: u32 = 69;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -138,7 +142,7 @@ pub const SAVE_VERSION: u32 = 66;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 66;
+pub const MIN_LOADABLE_VERSION: u32 = 69;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -511,6 +515,7 @@ mod tests {
                 source_payload: 0x1234_5678,
                 position: (18.5, 21.25),
                 source_energy: 320,
+                source_action_ready_at: 53,
                 target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
                     0x37, 0, 9, 10,
                 ]),
@@ -666,6 +671,7 @@ mod tests {
                 source_payload: 0x1234_5678,
                 position: (18.5, 21.25),
                 source_energy: 320,
+                source_action_ready_at: 53,
                 target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
                     0x37, 0, 9, 10,
                 ]),
@@ -690,6 +696,10 @@ mod tests {
                 figure_definition_id: Some(31),
                 source_energy: 320,
                 source_score_state: 0,
+                source_kind6_policy_raw_slots: [0; 8],
+                source_kind6_policy_ware_slots: [0; 8],
+                source_kind6_target_descriptor_payload: None,
+                kind6_target_descriptor: None,
                 candidate_list_key: Some(1),
                 owner: 4,
                 position: (18.5, 21.25),

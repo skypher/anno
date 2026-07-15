@@ -219,6 +219,19 @@ pub struct TradeShip {
     /// through 3 independently from movement direction and animation state.
     #[serde(default)]
     pub source_score_state: u8,
+    /// Eight raw SHIP4 entries at `0x132 + 8i`. The source loader translates
+    /// them into the shared category-1 policy slots inspected by
+    /// `FUN_00458e60` during category-6 target dispatch.
+    #[serde(default)]
+    pub source_kind6_policy_raw_slots: [u64; 8],
+    /// Compiled low bytes produced by the source SHIP4 loader for the policy
+    /// slots inspected by category-6 dispatch.
+    #[serde(default)]
+    pub source_kind6_policy_ware_slots: [u8; 8],
+    /// SHIP4 bytes copied into the source shared category record at
+    /// `+0x18/+0x19`, used by `FUN_00445650` for a category-6 target row.
+    #[serde(default)]
+    pub source_kind6_target_descriptor_payload: Option<[u8; 2]>,
     /// Authored ship name from SHIP4 when available.
     #[serde(default)]
     pub name: String,
@@ -332,6 +345,9 @@ impl TradeShip {
             source_figure_definition_id: None,
             source_energy: 0,
             source_score_state: 0,
+            source_kind6_policy_raw_slots: [0; 8],
+            source_kind6_policy_ware_slots: [0; 8],
+            source_kind6_target_descriptor_payload: None,
             name: String::new(),
             route_id,
             world_x,

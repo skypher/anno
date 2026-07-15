@@ -7824,7 +7824,13 @@ fn init_simulation(
     // Spawn warships from SHIP4: SmallWarship / LargeWarship /
     // PirateShip records become MilitaryUnit instances at the
     // exact spawn coordinates the scenario author placed them.
-    let warships = anno_sim::data_bridge::warships_from_ships(&szs.ships);
+    let mut warships = anno_sim::data_bridge::warships_from_ships(&szs.ships);
+    // Spawn trader hulls from SHIP4 too: SmallTrader / LargeTrader
+    // records become TradeShip instances at their authored
+    // coordinates with a sentinel route_id so the trade tick
+    // leaves them inert until a route is assigned.
+    let mut traders = anno_sim::data_bridge::traders_from_ships(&szs.ships, sim.ship_cargo_config);
+    anno_sim::data_bridge::resolve_ship_kind6_policy_slots(&cod, &mut warships, &mut traders);
     if !warships.is_empty() {
         let named: Vec<&str> = warships
             .iter()
@@ -7845,11 +7851,6 @@ fn init_simulation(
         );
         sim.military_units.extend(warships);
     }
-    // Spawn trader hulls from SHIP4 too: SmallTrader / LargeTrader
-    // records become TradeShip instances at their authored
-    // coordinates with a sentinel route_id so the trade tick
-    // leaves them inert until a route is assigned.
-    let traders = anno_sim::data_bridge::traders_from_ships(&szs.ships, sim.ship_cargo_config);
     if !traders.is_empty() {
         println!("Spawning {} static trader(s) from SHIP4", traders.len());
         sim.trade_ships.extend(traders);

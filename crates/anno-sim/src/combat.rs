@@ -66,10 +66,23 @@ pub struct SourceCombatCandidate {
     /// raw record byte `0x42` here; `FUN_00454250` maps it to a target
     /// strength multiplier independently from the source movement direction.
     pub source_score_state: u8,
-    /// Category-6 table record `+0x0c`, copied from the `0x84a` spawn
-    /// descriptor. `FUN_00444fe0` dereferences this descriptor when a
-    /// category-6 figure itself is selected as a target; other categories
-    /// resolve from their live position instead.
+    /// Raw SHIP4 entries at `0x132 + 8i`. The loader resolves their low-16
+    /// source IDs before placing the translated policy entries at `+0x1f4`.
+    /// These remain raw until the executable's definition translation is
+    /// reconstructed.
+    pub source_kind6_policy_raw_slots: [u64; 8],
+    /// Low bytes resolved by `FUN_0045f9b2` from the raw SHIP4 policy slots.
+    /// `FUN_00458e60` compares these against `0x19..=0x2c`.
+    pub source_kind6_policy_ware_slots: [u8; 8],
+    /// Bytes at the backing category record's `+0x18/+0x19`. For target
+    /// kinds 1 through 5, `FUN_00445650` emits these as descriptor bytes
+    /// 1 and 2. SHIP4 supplies them from raw offsets `0x2c/0x2d`; SOLDAT3
+    /// supplies the last two bytes of its state descriptor.
+    pub source_kind6_target_descriptor_payload: Option<[u8; 2]>,
+    /// Category-6 table descriptor at `+0x10`. `FUN_00444fe0` reaches this
+    /// after `FUN_00445650` emits `[6, live+1, live+44]` for a category-6
+    /// target. It resolves firing geometry, but is not itself the emitted
+    /// action descriptor.
     pub kind6_target_descriptor: Option<SourceTargetDescriptor>,
     /// Live byte `+1`, used by `FUN_00453da0` to choose one of its candidate
     /// lists. This is independent from the faction byte at `+2`.
@@ -112,6 +125,31 @@ impl SourceCombatCandidate {
         crate::source_route::SourcePathTargetRect::new(origin, 1, 1)
             .map(SourceKind6TargetGeometry::Point)
     }
+
+    /// Construct the descriptor written by `FUN_00445650` into the selected
+    /// category-6 score row. The fourth byte is not written by the category
+    /// 1 through 5 branch and is ignored by their descriptor decoder, so this
+    /// representation fixes it at zero.
+    pub fn source_kind6_action_target_descriptor(&self) -> Option<SourceTargetDescriptor> {
+        match self.figure_kind {
+            1..=5 => {
+                let [byte_1, byte_2] = self.source_kind6_target_descriptor_payload?;
+                Some(SourceTargetDescriptor::from_bytes([
+                    self.figure_kind,
+                    byte_1,
+                    byte_2,
+                    0,
+                ]))
+            }
+            6 => Some(SourceTargetDescriptor::from_bytes([
+                6,
+                self.candidate_list_key?,
+                self.runtime_slot as u8,
+                (self.runtime_slot >> 8) as u8,
+            ])),
+            _ => None,
+        }
+    }
 }
 
 /// One directed row written by `FUN_0045cd20` to an attacker's bounded
@@ -139,6 +177,8 @@ pub struct SourceKind6RankedCandidate {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SourceKind6SelectedTarget {
     pub target: SourceCombatCandidate,
+    /// Exact descriptor that `FUN_004546e0` receives for the selected row.
+    pub target_descriptor: SourceTargetDescriptor,
     pub metric: u16,
     pub score: u16,
     pub direction: u8,
@@ -168,6 +208,12 @@ pub struct SourceDynamicCombatFigure {
     pub position: (f32, f32),
     /// Source energy at spawn-record offset `+0x0a`.
     pub source_energy: u16,
+    /// Category-6 table offset `+0x0c`: the unsigned source-clock timestamp
+    /// below which `FUN_00458ac0` may not emit another action. The loader
+    /// initializes it from `DAT_005b6040`; a successful dispatch adds
+    /// `Worktime * 10` source ticks.
+    #[serde(default)]
+    pub source_action_ready_at: u32,
     /// Target descriptor at spawn-record offset `+0x0c`.
     pub target_descriptor: SourceTargetDescriptor,
     /// Follow-up descriptor at spawn-record offset `+0x10`.
@@ -241,6 +287,9 @@ pub fn source_combat_candidate_buffer(
             figure_definition_id: unit.source_figure_definition_id,
             source_energy: unit.source_energy,
             source_score_state: unit.source_score_state,
+            source_kind6_policy_raw_slots: unit.source_kind6_policy_raw_slots,
+            source_kind6_policy_ware_slots: unit.source_kind6_policy_ware_slots,
+            source_kind6_target_descriptor_payload: unit.source_kind6_target_descriptor_payload,
             kind6_target_descriptor: None,
             candidate_list_key: unit.source_candidate_list_key,
             owner: unit.owner,
@@ -264,6 +313,9 @@ pub fn source_combat_candidate_buffer(
             figure_definition_id: ship.source_figure_definition_id,
             source_energy: ship.source_energy,
             source_score_state: ship.source_score_state,
+            source_kind6_policy_raw_slots: ship.source_kind6_policy_raw_slots,
+            source_kind6_policy_ware_slots: ship.source_kind6_policy_ware_slots,
+            source_kind6_target_descriptor_payload: ship.source_kind6_target_descriptor_payload,
             kind6_target_descriptor: None,
             candidate_list_key: ship.source_candidate_list_key,
             owner: ship.owner,
@@ -282,6 +334,9 @@ pub fn source_combat_candidate_buffer(
             figure_definition_id: Some(u16::from(figure.figure_definition_id)),
             source_energy: figure.source_energy,
             source_score_state: 0,
+            source_kind6_policy_raw_slots: [0; 8],
+            source_kind6_policy_ware_slots: [0; 8],
+            source_kind6_target_descriptor_payload: None,
             kind6_target_descriptor: (figure.figure_kind == 6).then_some(figure.target_descriptor),
             candidate_list_key: Some(figure.candidate_list_key),
             owner: figure.owner,
@@ -655,6 +710,19 @@ pub struct MilitaryUnit {
     /// the local renderer direction while scoring categories 1 through 3.
     #[serde(default)]
     pub source_score_state: u8,
+    /// Eight raw SHIP4 entries at `0x132 + 8i`. `FUN_0045f9b2` translates
+    /// their low-16 source IDs into the shared candidate record's policy
+    /// slots at `+0x1f4`; category-6 dispatch consumes those translated IDs.
+    #[serde(default)]
+    pub source_kind6_policy_raw_slots: [u64; 8],
+    /// Compiled low bytes written by the source SHIP4 loader after resolving
+    /// each policy slot through the haeuser definition table.
+    #[serde(default)]
+    pub source_kind6_policy_ware_slots: [u8; 8],
+    /// Backing category-record bytes used by `FUN_00445650` when this unit
+    /// is selected as a category-6 combat target.
+    #[serde(default)]
+    pub source_kind6_target_descriptor_payload: Option<[u8; 2]>,
     /// Type-4 origin descriptor restored from `SOLDAT3`.
     #[serde(default)]
     pub source_origin_descriptor: Option<SourceTargetDescriptor>,
@@ -827,6 +895,9 @@ impl MilitaryUnit {
             source_figure_definition_id: None,
             source_energy: 0,
             source_score_state: 0,
+            source_kind6_policy_raw_slots: [0; 8],
+            source_kind6_policy_ware_slots: [0; 8],
+            source_kind6_target_descriptor_payload: None,
             source_origin_descriptor: None,
             source_target_descriptor: None,
             source_route_radius: SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
@@ -1352,6 +1423,45 @@ pub fn source_kind6_candidate_score(
     u16::try_from(score).ok()
 }
 
+/// `FUN_00458ac0` permits an action precisely when its category-6 table
+/// timestamp is no greater than `DAT_005b6040`. This is an ordinary unsigned
+/// comparison, not a wrapping elapsed-time calculation.
+pub const fn source_kind6_action_is_ready(source_time_ticks: u32, ready_at: u32) -> bool {
+    ready_at <= source_time_ticks
+}
+
+/// Apply `FUN_00458e60` after category-6 selection. A defeated player
+/// (`state == 0x0e`) may only target an idle category-1 figure that carries
+/// one of the sixteen compiled soldier-policy values.
+pub fn source_kind6_target_policy_allows(
+    attacker_owner_state: u8,
+    target: &SourceCombatCandidate,
+) -> bool {
+    attacker_owner_state != 0x0e
+        || target.figure_kind != 1
+        || target.source_score_state != 0
+        || target
+            .source_kind6_policy_ware_slots
+            .iter()
+            .any(|slot| (0x19..=0x2c).contains(slot))
+}
+
+/// Reconstruct the category-6 table timestamp written after `FUN_004546e0`.
+/// `FUN_00458ac0` multiplies the compiled `Worktime` by 10, converts that
+/// source value to an integer, and adds it to the current 100-ms source clock.
+/// Every recovered category-6 definition has an integral `Worktime * 10`.
+pub fn source_kind6_action_ready_at(
+    source_time_ticks: u32,
+    attacker: &SourceCombatCandidate,
+) -> Option<u32> {
+    (attacker.figure_kind == 6)
+        .then(|| attacker.combat_definition())
+        .flatten()
+        .map(|definition| {
+            source_time_ticks.wrapping_add((definition.runtime_work_time * 10.0) as u32)
+        })
+}
+
 /// Apply `FUN_00458ac0`'s `metric < 0x61` row filter and rank the resulting
 /// `FUN_00454250` scores. Candidate rows arrive in the source pair-producer
 /// order, so equal scores retain that source row order until the executable's
@@ -1394,6 +1504,7 @@ pub fn source_kind6_select_target(
     source_kind6_ranked_candidates(attacker, candidates, diplomacy)
         .into_iter()
         .find_map(|candidate| {
+            let target_descriptor = candidate.target.source_kind6_action_target_descriptor()?;
             let target = match candidate.target.source_kind6_target_geometry()? {
                 SourceKind6TargetGeometry::Point(target) => Some(target),
                 SourceKind6TargetGeometry::Descriptor(descriptor) => resolve_descriptor(descriptor),
@@ -1401,6 +1512,7 @@ pub fn source_kind6_select_target(
             source_kind6_target_direction(attacker_position, target, attacker_shot_radius).map(
                 |direction| SourceKind6SelectedTarget {
                     target: candidate.target,
+                    target_descriptor,
                     metric: candidate.metric,
                     score: candidate.score,
                     direction,
@@ -2363,6 +2475,9 @@ mod tests {
             figure_definition_id: Some(definition_id),
             source_energy,
             source_score_state,
+            source_kind6_policy_raw_slots: [0; 8],
+            source_kind6_policy_ware_slots: [0; 8],
+            source_kind6_target_descriptor_payload: Some([0, 0]),
             kind6_target_descriptor: None,
             candidate_list_key: Some(0),
             owner: 0,
@@ -2408,6 +2523,7 @@ mod tests {
             source_payload: 0,
             position: (120.0, 130.0),
             source_energy: 320,
+            source_action_ready_at: 0,
             target_descriptor: SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             owner: 3,
@@ -2430,6 +2546,9 @@ mod tests {
                     figure_definition_id: Some(14),
                     source_energy: 0,
                     source_score_state: 0,
+                    source_kind6_policy_raw_slots: [0; 8],
+                    source_kind6_policy_ware_slots: [0; 8],
+                    source_kind6_target_descriptor_payload: None,
                     kind6_target_descriptor: None,
                     candidate_list_key: Some(10),
                     owner: 2,
@@ -2443,6 +2562,9 @@ mod tests {
                     figure_definition_id: Some(0x19),
                     source_energy: 195,
                     source_score_state: 10,
+                    source_kind6_policy_raw_slots: [0; 8],
+                    source_kind6_policy_ware_slots: [0; 8],
+                    source_kind6_target_descriptor_payload: None,
                     kind6_target_descriptor: None,
                     candidate_list_key: Some(3),
                     owner: 1,
@@ -2456,6 +2578,9 @@ mod tests {
                     figure_definition_id: Some(0x15),
                     source_energy: 150,
                     source_score_state: 4,
+                    source_kind6_policy_raw_slots: [0; 8],
+                    source_kind6_policy_ware_slots: [0; 8],
+                    source_kind6_target_descriptor_payload: None,
                     kind6_target_descriptor: None,
                     candidate_list_key: Some(5),
                     owner: 0,
@@ -2469,6 +2594,9 @@ mod tests {
                     figure_definition_id: Some(31),
                     source_energy: 320,
                     source_score_state: 0,
+                    source_kind6_policy_raw_slots: [0; 8],
+                    source_kind6_policy_ware_slots: [0; 8],
+                    source_kind6_target_descriptor_payload: None,
                     kind6_target_descriptor: Some(
                         SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
                     ),
@@ -2519,6 +2647,33 @@ mod tests {
             Some(SourceKind6TargetGeometry::Point(
                 crate::source_route::SourcePathTargetRect::new((-3, 5), 1, 1)
                     .expect("one-cell target footprint is valid"),
+            ))
+        );
+    }
+
+    #[test]
+    fn source_kind6_target_descriptor_matches_selector_cases() {
+        let mut static_target = source_candidate(1, 0x19, 195, 0);
+        static_target.source_kind6_target_descriptor_payload = Some([0xab, 0xcd]);
+        assert_eq!(
+            static_target.source_kind6_action_target_descriptor(),
+            Some(SourceTargetDescriptor::from_bytes([1, 0xab, 0xcd, 0]))
+        );
+
+        let mut dynamic_target = source_candidate(6, 0x1f, 285, 0);
+        dynamic_target.candidate_list_key = Some(9);
+        dynamic_target.runtime_slot = 0x1234;
+        dynamic_target.kind6_target_descriptor = Some(SourceTargetDescriptor::from_bytes([
+            0x37, 0, 60, 65,
+        ]));
+        assert_eq!(
+            dynamic_target.source_kind6_action_target_descriptor(),
+            Some(SourceTargetDescriptor::from_bytes([6, 9, 0x34, 0x12]))
+        );
+        assert_eq!(
+            dynamic_target.source_kind6_target_geometry(),
+            Some(SourceKind6TargetGeometry::Descriptor(
+                SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
             ))
         );
     }
@@ -2581,6 +2736,33 @@ mod tests {
             source_kind6_candidate_score(&attacker, &engaged_warship, 14),
             Some(87)
         );
+    }
+
+    #[test]
+    fn source_kind6_cooldown_uses_unsigned_timestamp_and_worktime_ticks() {
+        let attacker = source_candidate(6, 0x1f, 285, 0);
+        assert!(source_kind6_action_is_ready(19, 19));
+        assert!(!source_kind6_action_is_ready(18, 19));
+        assert_eq!(source_kind6_action_ready_at(19, &attacker), Some(69));
+
+        let non_category_six = source_candidate(4, 14, 90, 0);
+        assert_eq!(source_kind6_action_ready_at(19, &non_category_six), None);
+    }
+
+    #[test]
+    fn source_kind6_defeated_owner_policy_requires_a_compiled_soldier_slot() {
+        let mut target = source_candidate(1, 0x15, 150, 0);
+        assert!(!source_kind6_target_policy_allows(0x0e, &target));
+
+        target.source_kind6_policy_ware_slots[3] = 0x23;
+        assert!(source_kind6_target_policy_allows(0x0e, &target));
+
+        target.source_score_state = 1;
+        assert!(source_kind6_target_policy_allows(0x0e, &target));
+        target.source_score_state = 0;
+        target.figure_kind = 3;
+        assert!(source_kind6_target_policy_allows(0x0e, &target));
+        assert!(source_kind6_target_policy_allows(0x0c, &target));
     }
 
     #[test]
@@ -2693,6 +2875,7 @@ mod tests {
             selected,
             Some(SourceKind6SelectedTarget {
                 target,
+                target_descriptor: SourceTargetDescriptor::from_bytes([6, 4, 0, 0]),
                 metric: 8,
                 score: 40,
                 direction: 2,

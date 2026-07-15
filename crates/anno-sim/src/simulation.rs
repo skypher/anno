@@ -535,7 +535,7 @@ impl Simulation {
     /// the same source table slot replaces the represented live record.
     pub fn install_source_dynamic_combat_figure(
         &mut self,
-        figure: SourceDynamicCombatFigure,
+        mut figure: SourceDynamicCombatFigure,
     ) -> bool {
         let Some((table, capacity)) = combat::source_dynamic_slot_table(figure.figure_kind)
         else {
@@ -543,6 +543,9 @@ impl Simulation {
         };
         if figure.runtime_slot >= capacity {
             return false;
+        }
+        if figure.figure_kind == 6 {
+            figure.source_action_ready_at = self.source_time_ticks;
         }
 
         if let Some(index) = self
@@ -3199,6 +3202,7 @@ mod tests {
             source_payload: 0,
             position: (120.0, 130.0),
             source_energy: 320,
+            source_action_ready_at: 0,
             target_descriptor: SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             owner,
@@ -3219,6 +3223,7 @@ mod tests {
 
         assert!(sim.install_source_dynamic_combat_figure(figure(4, 399, 3)));
         assert!(!sim.install_source_dynamic_combat_figure(figure(4, 400, 0)));
+        sim.source_time_ticks = 47;
         assert!(sim.install_source_dynamic_combat_figure(figure(6, 349, 4)));
         assert!(!sim.install_source_dynamic_combat_figure(figure(6, 350, 0)));
         assert!(!sim.install_source_dynamic_combat_figure(figure(7, 0, 0)));
@@ -3230,6 +3235,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(3, 149), (4, 399), (6, 349)]
         );
+        assert_eq!(sim.source_dynamic_combat_figures[2].source_action_ready_at, 47);
     }
 
     #[test]
@@ -3244,6 +3250,7 @@ mod tests {
             source_payload: 0,
             position,
             source_energy: 285,
+            source_action_ready_at: 0,
             target_descriptor,
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             owner,
