@@ -576,6 +576,10 @@ pub struct SourceCombatDefinition {
     pub runtime_hit_points: u16,
     pub runtime_shot_radius: u16,
     pub runtime_work_time: f32,
+    /// Compiled `Shotfignr:` at definition offset `+0x48`. `FUN_00447880`
+    /// reads this after executing a category-6 action and creates a kind-15
+    /// figure only when it is nonzero.
+    pub runtime_shot_figure_id: Option<u16>,
 }
 
 impl SourceCombatDefinition {
@@ -591,25 +595,26 @@ impl SourceCombatDefinition {
                 runtime_hit_points: definition.source_runtime_hit_points(),
                 runtime_shot_radius: definition.source_runtime_shot_radius(),
                 runtime_work_time: definition.source_runtime_work_time(),
+                runtime_shot_figure_id: None,
             });
         }
 
         let definition = match id {
-            0x15 => ("HANDEL1", 150, 6, 14, 5.0),
-            0x16 => ("HANDELD1", 150, 6, 14, 5.0),
-            0x17 => ("HANDEL2", 240, 6, 14, 5.0),
-            0x18 => ("HANDELD2", 240, 6, 14, 5.0),
-            0x19 => ("KRIEG1", 195, 6, 14, 5.0),
-            0x1a => ("KRIEGD1", 195, 6, 14, 5.0),
-            0x1b => ("KRIEG2", 360, 6, 14, 5.0),
-            0x1c => ("KRIEGD2", 360, 6, 14, 5.0),
-            0x1d => ("HANDLER", 285, 6, 14, 5.0),
-            0x1e => ("HANDLERD", 285, 6, 14, 5.0),
-            0x1f => ("PIRAT", 285, 6, 14, 5.0),
-            0x20 => ("PIRATD", 285, 6, 14, 5.0),
-            0x25 => ("TRADER1", 42, 2, 8, 2.0),
-            0x26 => ("KANONTURM", 72, 12, 15, 3.0),
-            0x28 => ("PIRATTURM", 72, 12, 15, 3.0),
+            0x15 => ("HANDEL1", 150, 6, 14, 5.0, Some(113)),
+            0x16 => ("HANDELD1", 150, 6, 14, 5.0, Some(113)),
+            0x17 => ("HANDEL2", 240, 6, 14, 5.0, Some(112)),
+            0x18 => ("HANDELD2", 240, 6, 14, 5.0, Some(112)),
+            0x19 => ("KRIEG1", 195, 6, 14, 5.0, Some(113)),
+            0x1a => ("KRIEGD1", 195, 6, 14, 5.0, Some(113)),
+            0x1b => ("KRIEG2", 360, 6, 14, 5.0, Some(112)),
+            0x1c => ("KRIEGD2", 360, 6, 14, 5.0, Some(112)),
+            0x1d => ("HANDLER", 285, 6, 14, 5.0, Some(112)),
+            0x1e => ("HANDLERD", 285, 6, 14, 5.0, Some(112)),
+            0x1f => ("PIRAT", 285, 6, 14, 5.0, Some(112)),
+            0x20 => ("PIRATD", 285, 6, 14, 5.0, Some(112)),
+            0x25 => ("TRADER1", 42, 2, 8, 2.0, None),
+            0x26 => ("KANONTURM", 72, 12, 15, 3.0, Some(114)),
+            0x28 => ("PIRATTURM", 72, 12, 15, 3.0, Some(115)),
             _ => return None,
         };
         Some(Self {
@@ -619,6 +624,39 @@ impl SourceCombatDefinition {
             runtime_hit_points: definition.2,
             runtime_shot_radius: definition.3,
             runtime_work_time: definition.4,
+            runtime_shot_figure_id: definition.5,
+        })
+    }
+}
+
+/// The compiled kind-15 definition fields consumed by `FUN_00447f00` after a
+/// source category-6 action. The executable rotates `Fahnoffs.x` by the
+/// selected direction and adds `Fahnoffs.z` to the launcher's live height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceShotFigureDefinition {
+    pub id: u16,
+    pub source_figure_name: &'static str,
+    pub runtime_fahnoffs_x: f32,
+    pub runtime_fahnoffs_z: f32,
+}
+
+impl SourceShotFigureDefinition {
+    /// Resolve the four `Shotfignr:` targets used by the recovered ship and
+    /// tower definitions. The IDs are direct indices in the executable's
+    /// `figuren.cod` name table at `0x00498b98`.
+    pub const fn from_id(id: u16) -> Option<Self> {
+        let (source_figure_name, runtime_fahnoffs_x, runtime_fahnoffs_z) = match id {
+            112 => ("KANONSHOT1", 0.5, 4.0),
+            113 => ("KANONSHOT2", 0.35, 4.0),
+            114 => ("KANONSHOTTURM", 0.5, 2.0),
+            115 => ("KANONSHOTTURM2", 0.5, 0.8),
+            _ => return None,
+        };
+        Some(Self {
+            id,
+            source_figure_name,
+            runtime_fahnoffs_x,
+            runtime_fahnoffs_z,
         })
     }
 }
@@ -1821,22 +1859,22 @@ mod tests {
     #[test]
     fn source_combat_definitions_match_the_compiled_figure_table() {
         let cases = [
-            (1, "SOLDAT1", 60, 3, 1, 0.8),
-            (9, "MUSKETIER1", 45, 7, 8, 2.0),
-            (13, "KANONIER1", 36, 21, 14, 4.5),
-            (0x15, "HANDEL1", 150, 6, 14, 5.0),
-            (0x16, "HANDELD1", 150, 6, 14, 5.0),
-            (0x19, "KRIEG1", 195, 6, 14, 5.0),
-            (0x1c, "KRIEGD2", 360, 6, 14, 5.0),
-            (0x1d, "HANDLER", 285, 6, 14, 5.0),
-            (0x1f, "PIRAT", 285, 6, 14, 5.0),
-            (0x21, "SPEER1", 54, 3, 2, 0.8),
-            (0x25, "TRADER1", 42, 2, 8, 2.0),
-            (0x26, "KANONTURM", 72, 12, 15, 3.0),
-            (0x28, "PIRATTURM", 72, 12, 15, 3.0),
+            (1, "SOLDAT1", 60, 3, 1, 0.8, None),
+            (9, "MUSKETIER1", 45, 7, 8, 2.0, None),
+            (13, "KANONIER1", 36, 21, 14, 4.5, None),
+            (0x15, "HANDEL1", 150, 6, 14, 5.0, Some(113)),
+            (0x16, "HANDELD1", 150, 6, 14, 5.0, Some(113)),
+            (0x19, "KRIEG1", 195, 6, 14, 5.0, Some(113)),
+            (0x1c, "KRIEGD2", 360, 6, 14, 5.0, Some(112)),
+            (0x1d, "HANDLER", 285, 6, 14, 5.0, Some(112)),
+            (0x1f, "PIRAT", 285, 6, 14, 5.0, Some(112)),
+            (0x21, "SPEER1", 54, 3, 2, 0.8, None),
+            (0x25, "TRADER1", 42, 2, 8, 2.0, None),
+            (0x26, "KANONTURM", 72, 12, 15, 3.0, Some(114)),
+            (0x28, "PIRATTURM", 72, 12, 15, 3.0, Some(115)),
         ];
 
-        for (id, name, energy, hit_points, shot_radius, work_time) in cases {
+        for (id, name, energy, hit_points, shot_radius, work_time, shot_figure_id) in cases {
             assert_eq!(
                 SourceCombatDefinition::from_id(id),
                 Some(SourceCombatDefinition {
@@ -1846,12 +1884,54 @@ mod tests {
                     runtime_hit_points: hit_points,
                     runtime_shot_radius: shot_radius,
                     runtime_work_time: work_time,
+                    runtime_shot_figure_id: shot_figure_id,
                 })
             );
         }
         assert_eq!(SourceCombatDefinition::from_id(0), None);
         assert_eq!(SourceCombatDefinition::from_id(0x27), None);
         assert_eq!(SourceCombatDefinition::from_id(0x77), None);
+    }
+
+    #[test]
+    fn source_shot_definitions_match_compiled_fahnoffs() {
+        assert_eq!(
+            SourceShotFigureDefinition::from_id(112),
+            Some(SourceShotFigureDefinition {
+                id: 112,
+                source_figure_name: "KANONSHOT1",
+                runtime_fahnoffs_x: 0.5,
+                runtime_fahnoffs_z: 4.0,
+            })
+        );
+        assert_eq!(
+            SourceShotFigureDefinition::from_id(113),
+            Some(SourceShotFigureDefinition {
+                id: 113,
+                source_figure_name: "KANONSHOT2",
+                runtime_fahnoffs_x: 0.35,
+                runtime_fahnoffs_z: 4.0,
+            })
+        );
+        assert_eq!(
+            SourceShotFigureDefinition::from_id(114),
+            Some(SourceShotFigureDefinition {
+                id: 114,
+                source_figure_name: "KANONSHOTTURM",
+                runtime_fahnoffs_x: 0.5,
+                runtime_fahnoffs_z: 2.0,
+            })
+        );
+        assert_eq!(
+            SourceShotFigureDefinition::from_id(115),
+            Some(SourceShotFigureDefinition {
+                id: 115,
+                source_figure_name: "KANONSHOTTURM2",
+                runtime_fahnoffs_x: 0.5,
+                runtime_fahnoffs_z: 0.8,
+            })
+        );
+        assert_eq!(SourceShotFigureDefinition::from_id(111), None);
     }
 
     #[test]

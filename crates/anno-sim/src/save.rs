@@ -128,7 +128,9 @@ use std::path::Path;
 /// persist across save/load.
 /// v68: SHIP4 policy slots retain their executable-resolved Ware bytes.
 /// v69: source category-record target-descriptor bytes persist across saves.
-pub const SAVE_VERSION: u32 = 69;
+/// v70: immediate category-6 action records persist across saves.
+/// v71: executor-created kind-15 figure records persist across saves.
+pub const SAVE_VERSION: u32 = 71;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -142,7 +144,7 @@ pub const SAVE_VERSION: u32 = 69;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 69;
+pub const MIN_LOADABLE_VERSION: u32 = 71;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -162,6 +164,8 @@ pub struct SaveState {
     pub source_cities: SourceCityTable,
     pub source_kind4_occupants: Vec<SourceKind4Occupant>,
     pub source_dynamic_combat_figures: Vec<SourceDynamicCombatFigure>,
+    pub source_kind6_actions: Vec<crate::combat::SourceKind6Action>,
+    pub source_kind15_combat_figures: Vec<crate::combat::SourceKind15CombatFigure>,
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
     pub source_time_ticks: u32,
     pub source_time_remainder_ms: u32,
@@ -225,6 +229,8 @@ impl Simulation {
             source_cities: self.source_cities.clone(),
             source_kind4_occupants: self.source_kind4_occupants.clone(),
             source_dynamic_combat_figures: self.source_dynamic_combat_figures.clone(),
+            source_kind6_actions: self.source_kind6_actions.clone(),
+            source_kind15_combat_figures: self.source_kind15_combat_figures.clone(),
             source_kind4_dispatch: self.source_kind4_dispatch,
             source_time_ticks: self.source_time_ticks,
             source_time_remainder_ms: self.source_time_remainder_ms,
@@ -258,6 +264,8 @@ impl Simulation {
         self.source_cities = s.source_cities;
         self.source_kind4_occupants = s.source_kind4_occupants;
         self.source_dynamic_combat_figures = s.source_dynamic_combat_figures;
+        self.source_kind6_actions = s.source_kind6_actions;
+        self.source_kind15_combat_figures = s.source_kind15_combat_figures;
         self.source_kind4_dispatch = s.source_kind4_dispatch;
         self.source_time_ticks = s.source_time_ticks;
         self.source_time_remainder_ms = s.source_time_remainder_ms;
@@ -331,6 +339,8 @@ mod tests {
             source_cities: SourceCityTable::default(),
             source_kind4_occupants: vec![],
             source_dynamic_combat_figures: vec![],
+            source_kind6_actions: vec![],
+            source_kind15_combat_figures: vec![],
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
@@ -514,6 +524,7 @@ mod tests {
                 direction: 7,
                 source_payload: 0x1234_5678,
                 position: (18.5, 21.25),
+                position_z: 0.0,
                 source_energy: 320,
                 source_action_ready_at: 53,
                 target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
@@ -529,6 +540,29 @@ mod tests {
                 runtime_slot: 12,
                 auxiliary_kind: 2,
                 name_index: 6,
+            });
+        sim.source_kind6_actions
+            .push(crate::combat::SourceKind6Action {
+                attacker_position: (18.5, 21.25),
+                attacker_runtime_slot: 12,
+                raw_strength: 6,
+                attacker_figure_kind: 6,
+                direction: 7,
+                flags: crate::combat::SOURCE_KIND6_ACTION_EVENT_FLAGS,
+                target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    6, 1, 9, 0,
+                ]),
+                kind15_figure_definition_id: Some(112),
+            });
+        sim.source_kind15_combat_figures
+            .push(crate::combat::SourceKind15CombatFigure {
+                active: true,
+                figure_definition_id: 112,
+                position: (18.5, 20.75, 4.0),
+                direction: 0,
+                launcher_runtime_slot: 12,
+                source_step_amount: crate::combat::SOURCE_KIND15_STEP_AMOUNT,
+                source_flags: crate::combat::SOURCE_KIND15_EXECUTOR_FLAGS,
             });
         let mut source_spearman =
             crate::combat::MilitaryUnit::new(crate::combat::UnitType::NativeSpearman, 6, 12, 14);
@@ -670,6 +704,7 @@ mod tests {
                 direction: 7,
                 source_payload: 0x1234_5678,
                 position: (18.5, 21.25),
+                position_z: 0.0,
                 source_energy: 320,
                 source_action_ready_at: 53,
                 target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
@@ -685,6 +720,33 @@ mod tests {
                 runtime_slot: 12,
                 auxiliary_kind: 2,
                 name_index: 6,
+            }]
+        );
+        assert_eq!(
+            sim2.source_kind6_actions,
+            vec![crate::combat::SourceKind6Action {
+                attacker_position: (18.5, 21.25),
+                attacker_runtime_slot: 12,
+                raw_strength: 6,
+                attacker_figure_kind: 6,
+                direction: 7,
+                flags: crate::combat::SOURCE_KIND6_ACTION_EVENT_FLAGS,
+                target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    6, 1, 9, 0,
+                ]),
+                kind15_figure_definition_id: Some(112),
+            }]
+        );
+        assert_eq!(
+            sim2.source_kind15_combat_figures,
+            vec![crate::combat::SourceKind15CombatFigure {
+                active: true,
+                figure_definition_id: 112,
+                position: (18.5, 20.75, 4.0),
+                direction: 0,
+                launcher_runtime_slot: 12,
+                source_step_amount: crate::combat::SOURCE_KIND15_STEP_AMOUNT,
+                source_flags: crate::combat::SOURCE_KIND15_EXECUTOR_FLAGS,
             }]
         );
         assert_eq!(

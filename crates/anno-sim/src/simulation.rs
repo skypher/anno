@@ -8,7 +8,9 @@ use crate::ai::{AiAction, AiController};
 use crate::building::{BuildingDef, BuildingInstance};
 use crate::carrier;
 use crate::civilian;
-use crate::combat::{self, DiplomacyMatrix, MilitaryUnit, SourceDynamicCombatFigure};
+use crate::combat::{
+    self, DiplomacyMatrix, MilitaryUnit, SourceDynamicCombatFigure, SourceKind15CombatFigure,
+};
 use crate::coverage::CoverageMap;
 use crate::data_bridge::{
     SourceCityRecord, SourceCityTable, SourceKind4Occupant, SourceKind13LocationTable,
@@ -116,6 +118,12 @@ pub struct Simulation {
     /// equivalent local entity type. Categories 1 through 6 remain available
     /// to the common source candidate producer through these records.
     pub source_dynamic_combat_figures: Vec<SourceDynamicCombatFigure>,
+    /// Immediate category-6 action records emitted through `FUN_004546e0`.
+    /// This observability record is independent from compatibility damage.
+    pub source_kind6_actions: Vec<combat::SourceKind6Action>,
+    /// Kind-15 figures constructed by `FUN_00447f00` from emitted category-6
+    /// actions. They remain outside the category-1 through -6 candidate pool.
+    pub source_kind15_combat_figures: Vec<SourceKind15CombatFigure>,
     /// Source player globals that select type-4 terminal-route dispatch.
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
     /// `DAT_005b6040`: source simulation clock in 100-ms ticks.
@@ -414,6 +422,8 @@ impl Simulation {
             source_cities: SourceCityTable::default(),
             source_kind4_occupants: Vec::new(),
             source_dynamic_combat_figures: Vec::new(),
+            source_kind6_actions: Vec::new(),
+            source_kind15_combat_figures: Vec::new(),
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
@@ -527,6 +537,66 @@ impl Simulation {
         combat::source_kind6_select_target(attacker, &candidates, &self.diplomacy, |descriptor| {
             self.source_kind6_target_rect(descriptor)
         })
+    }
+
+    /// Dispatch one ready category-6 action through `FUN_00458ac0` and its
+    /// immediate `FUN_004546e0` record construction. The two external
+    /// arguments retain the source globals used by the entry owner gate; they
+    /// are deliberately independent of the type-4 dispatch state.
+    pub fn dispatch_source_kind6_action(
+        &mut self,
+        runtime_slot: u16,
+        active_owner: u8,
+        remote_owner_dispatch_enabled: bool,
+        attacker_owner_state: u8,
+    ) -> Option<combat::SourceKind6Action> {
+        let candidates = self.source_combat_candidates();
+        let attacker = *candidates.iter().find(|candidate| {
+            candidate.figure_kind == 6 && candidate.runtime_slot == runtime_slot
+        })?;
+        let combat::SourceCombatCandidateEntity::DynamicFigure(dynamic_index) = attacker.entity
+        else {
+            return None;
+        };
+        if !combat::source_kind6_owner_dispatch_allows(
+            attacker.owner,
+            active_owner,
+            remote_owner_dispatch_enabled,
+            attacker_owner_state,
+        ) {
+            return None;
+        }
+        let ready_at = self
+            .source_dynamic_combat_figures
+            .get(dynamic_index)?
+            .source_action_ready_at;
+        if !combat::source_kind6_action_is_ready(self.source_time_ticks, ready_at) {
+            return None;
+        }
+        let selected = combat::source_kind6_select_target(
+            &attacker,
+            &candidates,
+            &self.diplomacy,
+            |descriptor| self.source_kind6_target_rect(descriptor),
+        )?;
+        if !combat::source_kind6_target_policy_allows(attacker_owner_state, &selected.target) {
+            return None;
+        }
+        let action = combat::source_kind6_action(&attacker, selected)?;
+        let next_ready_at = combat::source_kind6_action_ready_at(self.source_time_ticks, &attacker)?;
+        let launcher_height = self
+            .source_dynamic_combat_figures
+            .get(dynamic_index)?
+            .position_z;
+        let kind15_figure = combat::source_kind15_figure_from_action(action, launcher_height);
+        let figure = self.source_dynamic_combat_figures.get_mut(dynamic_index)?;
+        figure.direction = action.direction;
+        figure.source_action_ready_at = next_ready_at;
+        self.source_kind6_actions.push(action);
+        if let Some(kind15_figure) = kind15_figure {
+            self.source_kind15_combat_figures.push(kind15_figure);
+        }
+        Some(action)
     }
 
     /// Install a live `0x84a`/`0x84b` figure in the category table selected
@@ -3201,6 +3271,7 @@ mod tests {
             direction: 1,
             source_payload: 0,
             position: (120.0, 130.0),
+            position_z: 0.0,
             source_energy: 320,
             source_action_ready_at: 0,
             target_descriptor: SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
@@ -3249,6 +3320,7 @@ mod tests {
             direction: 0,
             source_payload: 0,
             position,
+            position_z: 0.0,
             source_energy: 285,
             source_action_ready_at: 0,
             target_descriptor,
@@ -3287,6 +3359,83 @@ mod tests {
         assert_eq!(selected.metric, 8);
         assert_eq!(selected.score, 40);
         assert_eq!(selected.direction, 2);
+        assert_eq!(
+            selected.target_descriptor,
+            SourceTargetDescriptor::from_bytes([6, 4, 1, 0])
+        );
+    }
+
+    #[test]
+    fn source_kind6_dispatch_emits_the_executor_record_and_updates_launcher_state() {
+        let mut sim = Simulation::new();
+        let figure = |runtime_slot, owner, position, target_descriptor| SourceDynamicCombatFigure {
+            active: true,
+            figure_kind: 6,
+            candidate_list_key: 4,
+            figure_definition_id: 0x1f,
+            direction: 0,
+            source_payload: 0,
+            position,
+            position_z: 0.0,
+            source_energy: 285,
+            source_action_ready_at: 0,
+            target_descriptor,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            owner,
+            state: 0,
+            flags: 0,
+            notification: 0,
+            runtime_slot,
+            auxiliary_kind: 0,
+            name_index: 0,
+        };
+        let target_descriptor = SourceTargetDescriptor::from_world_coordinate(1, 0)
+            .expect("source coordinate fits the descriptor encoding");
+        assert!(sim.install_source_dynamic_combat_figure(figure(
+            0,
+            0,
+            (0.0, 0.0),
+            SourceTargetDescriptor::from_bytes([0; 4]),
+        )));
+        assert!(sim.install_source_dynamic_combat_figure(figure(
+            1,
+            1,
+            (1.0, 0.0),
+            target_descriptor,
+        )));
+        sim.source_dynamic_combat_figures[0].position_z = 3.0;
+        sim.source_time_ticks = 19;
+
+        let action = sim
+            .dispatch_source_kind6_action(0, 0, false, 0)
+            .expect("ready current-owner pirate has a selected target");
+        assert_eq!(action.attacker_position, (0.0, 0.0));
+        assert_eq!(action.attacker_runtime_slot, 0);
+        assert_eq!(action.raw_strength, 6);
+        assert_eq!(action.attacker_figure_kind, 6);
+        assert_eq!(action.direction, 2);
+        assert_eq!(action.flags, crate::combat::SOURCE_KIND6_ACTION_EVENT_FLAGS);
+        assert_eq!(
+            action.target_descriptor,
+            SourceTargetDescriptor::from_bytes([6, 4, 1, 0])
+        );
+        assert_eq!(action.kind15_figure_definition_id, Some(112));
+        assert_eq!(sim.source_kind6_actions, vec![action]);
+        assert_eq!(sim.source_dynamic_combat_figures[0].direction, 2);
+        assert_eq!(sim.source_dynamic_combat_figures[0].source_action_ready_at, 69);
+        assert_eq!(
+            sim.source_kind15_combat_figures,
+            vec![crate::combat::SourceKind15CombatFigure {
+                active: true,
+                figure_definition_id: 112,
+                position: (0.5, 0.0, 7.0),
+                direction: 2,
+                launcher_runtime_slot: 0,
+                source_step_amount: crate::combat::SOURCE_KIND15_STEP_AMOUNT,
+                source_flags: crate::combat::SOURCE_KIND15_EXECUTOR_FLAGS,
+            }]
+        );
+        assert!(sim.dispatch_source_kind6_action(0, 0, false, 0).is_none());
     }
 
     #[test]

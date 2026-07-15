@@ -17,7 +17,9 @@ use crate::source_rand::SourceRand;
 use crate::source_route::{
     SourcePathTargetRect, SourceTargetDescriptor, source_kind6_target_direction,
 };
-use anno_formats::szs::{LandFigureDefinition, SourceCombatDefinition};
+use anno_formats::szs::{
+    LandFigureDefinition, SourceCombatDefinition, SourceShotFigureDefinition,
+};
 
 /// `FUN_00446ca0` initializes byte zero of each newly allocated type-4
 /// runtime slot to `0x2d`; `FUN_004581f0` uses that byte as its raw-grid
@@ -184,6 +186,37 @@ pub struct SourceKind6SelectedTarget {
     pub direction: u8,
 }
 
+/// The action record populated by `FUN_004546e0` before it immediately calls
+/// `FUN_00447880`. The record preserves the launcher identity, raw source
+/// strength, selected descriptor, and the two action flags consumed by the
+/// category-6 executor.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind6Action {
+    /// Event offsets `+0x00/+0x04`: the attacker's unmodified live position.
+    pub attacker_position: (f32, f32),
+    /// Event offset `+0x08`: category-local runtime slot.
+    pub attacker_runtime_slot: u16,
+    /// Event offset `+0x0a`: un-normalized energy-adjusted hit-point term.
+    pub raw_strength: u16,
+    /// Event offset `+0x0c`: source category, which is six for this path.
+    pub attacker_figure_kind: u8,
+    /// Event offset `+0x0d`: direction selected by `FUN_00458d80`.
+    pub direction: u8,
+    /// Event offset `+0x0e`: `FUN_00458ac0` supplies bit zero and passes the
+    /// same direction twice, yielding bits zero and one (`0x03`).
+    pub flags: u8,
+    /// Event offsets `+0x10..+0x13`: exact selected target descriptor.
+    pub target_descriptor: SourceTargetDescriptor,
+    /// `FUN_00447880` reads the attacker's definition at `+0x48` after
+    /// receiving the event. A nonzero value selects the kind-15 figure
+    /// definition to spawn; its placement is handled by that executor.
+    pub kind15_figure_definition_id: Option<u16>,
+}
+
+/// The category-6 caller always sets the two event flag bits that its
+/// immediate executor receives.
+pub const SOURCE_KIND6_ACTION_EVENT_FLAGS: u8 = 0x03;
+
 /// `FUN_0045cd20` writes at most 32 rows for each source figure.
 const SOURCE_COMBAT_CANDIDATE_CAPACITY: usize = 0x20;
 
@@ -206,6 +239,10 @@ pub struct SourceDynamicCombatFigure {
     pub source_payload: u32,
     /// World position resolved by `FUN_004444c0` from the spawn descriptor.
     pub position: (f32, f32),
+    /// Live height at runtime offset `+0x30`, read by `FUN_00447f00` when a
+    /// category-6 launcher creates a kind-15 figure.
+    #[serde(default)]
+    pub position_z: f32,
     /// Source energy at spawn-record offset `+0x0a`.
     pub source_energy: u16,
     /// Category-6 table offset `+0x0c`: the unsigned source-clock timestamp
@@ -233,6 +270,29 @@ pub struct SourceDynamicCombatFigure {
     /// Source string-table index at spawn-record offset `+0x1b`.
     pub name_index: u8,
 }
+
+/// Live kind-15 figure initialized by `FUN_00447f00` after a category-6
+/// action. Kind-15 figures are not candidate producers, so they remain in a
+/// distinct collection from the category-1 through -6 dynamic figure tables.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind15CombatFigure {
+    pub active: bool,
+    /// Compiled `Shotfignr:` definition selected by the launcher at `+0x48`.
+    pub figure_definition_id: u16,
+    /// Runtime fields `+0x28/+0x2c/+0x30` initialized by `FUN_00446ca0`.
+    pub position: (f32, f32, f32),
+    /// Runtime field `+0x03`, copied from the launcher action direction.
+    pub direction: u8,
+    /// Runtime field `+0x44`, copied from the launcher's category-local slot.
+    pub launcher_runtime_slot: u16,
+    /// Runtime field `+0x18`, set to `0.02` by the executor.
+    pub source_step_amount: f32,
+    /// Runtime field `+0x11`: `FUN_00447f00` clears bit four and sets bit two.
+    pub source_flags: u8,
+}
+
+pub const SOURCE_KIND15_STEP_AMOUNT: f32 = 0.02;
+pub const SOURCE_KIND15_EXECUTOR_FLAGS: u8 = 0x04;
 
 /// `FUN_0045e170` scans this shared table for categories 1, 2, 3, and 5.
 pub(crate) const SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY: u16 = 150;
@@ -1430,6 +1490,21 @@ pub const fn source_kind6_action_is_ready(source_time_ticks: u32, ready_at: u32)
     ready_at <= source_time_ticks
 }
 
+/// Apply the owner gate at the entry to `FUN_00458ac0`. The executable
+/// admits the current owner directly; other owners require the recovered
+/// remote-dispatch global and a source player state in `0x0b..=0x0e`.
+pub const fn source_kind6_owner_dispatch_allows(
+    attacker_owner: u8,
+    active_owner: u8,
+    remote_owner_dispatch_enabled: bool,
+    attacker_owner_state: u8,
+) -> bool {
+    attacker_owner == active_owner
+        || (remote_owner_dispatch_enabled
+            && attacker_owner_state >= 0x0b
+            && attacker_owner_state <= 0x0e)
+}
+
 /// Apply `FUN_00458e60` after category-6 selection. A defeated player
 /// (`state == 0x0e`) may only target an idle category-1 figure that carries
 /// one of the sixteen compiled soldier-policy values.
@@ -1460,6 +1535,79 @@ pub fn source_kind6_action_ready_at(
         .map(|definition| {
             source_time_ticks.wrapping_add((definition.runtime_work_time * 10.0) as u32)
         })
+}
+
+/// Build the exact category-6 action input written by `FUN_004546e0` after
+/// target selection. This does not apply compatibility damage: the source
+/// executor updates launcher state and, when its definition has a nonzero
+/// `Shotfignr`, starts a separate kind-15 figure path.
+pub fn source_kind6_action(
+    attacker: &SourceCombatCandidate,
+    selected: SourceKind6SelectedTarget,
+) -> Option<SourceKind6Action> {
+    if attacker.figure_kind != 6 {
+        return None;
+    }
+    let definition = attacker.combat_definition()?;
+    let raw_strength = source_combat_raw_strength(
+        attacker.source_energy,
+        definition.runtime_energy_cap,
+        definition.runtime_hit_points,
+    );
+    Some(SourceKind6Action {
+        attacker_position: attacker.position,
+        attacker_runtime_slot: attacker.runtime_slot,
+        raw_strength: u16::try_from(raw_strength).ok()?,
+        attacker_figure_kind: attacker.figure_kind,
+        direction: selected.direction,
+        flags: SOURCE_KIND6_ACTION_EVENT_FLAGS,
+        target_descriptor: selected.target_descriptor,
+        kind15_figure_definition_id: definition.runtime_shot_figure_id,
+    })
+}
+
+/// Reproduce `FUN_00447f00`'s direction-scaled `Fahnoffs.x` transform. The
+/// executable masks the movement direction to three bits for this vector,
+/// while retaining the original direction byte in the resulting kind-15 live
+/// record.
+pub fn source_kind15_launch_offset(direction: u8, radius: f32) -> (f32, f32) {
+    let diagonal = radius * std::f32::consts::FRAC_1_SQRT_2;
+    match direction & 7 {
+        0 => (0.0, -radius),
+        1 => (diagonal, -diagonal),
+        2 => (radius, 0.0),
+        3 => (diagonal, diagonal),
+        4 => (0.0, radius),
+        5 => (-diagonal, diagonal),
+        6 => (-radius, 0.0),
+        _ => (-diagonal, -diagonal),
+    }
+}
+
+/// Materialize the kind-15 record constructed by `FUN_00447f00`. The action
+/// itself supplies only its two-dimensional event position; the executor
+/// separately reads the launcher's live height before adding `Fahnoffs.z`.
+pub fn source_kind15_figure_from_action(
+    action: SourceKind6Action,
+    launcher_height: f32,
+) -> Option<SourceKind15CombatFigure> {
+    let figure_definition_id = action.kind15_figure_definition_id?;
+    let definition = SourceShotFigureDefinition::from_id(figure_definition_id)?;
+    let (offset_x, offset_y) =
+        source_kind15_launch_offset(action.direction, definition.runtime_fahnoffs_x);
+    Some(SourceKind15CombatFigure {
+        active: true,
+        figure_definition_id,
+        position: (
+            action.attacker_position.0 + offset_x,
+            action.attacker_position.1 + offset_y,
+            launcher_height + definition.runtime_fahnoffs_z,
+        ),
+        direction: action.direction,
+        launcher_runtime_slot: action.attacker_runtime_slot,
+        source_step_amount: SOURCE_KIND15_STEP_AMOUNT,
+        source_flags: SOURCE_KIND15_EXECUTOR_FLAGS,
+    })
 }
 
 /// Apply `FUN_00458ac0`'s `metric < 0x61` row filter and rank the resulting
@@ -2522,6 +2670,7 @@ mod tests {
             direction: 1,
             source_payload: 0,
             position: (120.0, 130.0),
+            position_z: 0.0,
             source_energy: 320,
             source_action_ready_at: 0,
             target_descriptor: SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
@@ -2747,6 +2896,70 @@ mod tests {
 
         let non_category_six = source_candidate(4, 14, 90, 0);
         assert_eq!(source_kind6_action_ready_at(19, &non_category_six), None);
+    }
+
+    #[test]
+    fn source_kind6_owner_gate_matches_the_source_player_state_range() {
+        assert!(source_kind6_owner_dispatch_allows(3, 3, false, 0));
+        assert!(!source_kind6_owner_dispatch_allows(3, 2, false, 0x0c));
+        assert!(!source_kind6_owner_dispatch_allows(3, 2, true, 0x0a));
+        assert!(source_kind6_owner_dispatch_allows(3, 2, true, 0x0b));
+        assert!(source_kind6_owner_dispatch_allows(3, 2, true, 0x0e));
+        assert!(!source_kind6_owner_dispatch_allows(3, 2, true, 0x0f));
+    }
+
+    #[test]
+    fn source_kind6_action_preserves_the_immediate_executor_input() {
+        let attacker = source_candidate(6, 0x1f, 285, 0);
+        let selected = SourceKind6SelectedTarget {
+            target: source_candidate(1, 0x19, 195, 0),
+            target_descriptor: SourceTargetDescriptor::from_bytes([1, 0xab, 0xcd, 0]),
+            metric: 8,
+            score: 40,
+            direction: 2,
+        };
+
+        assert_eq!(
+            source_kind6_action(&attacker, selected),
+            Some(SourceKind6Action {
+                attacker_position: (0.0, 0.0),
+                attacker_runtime_slot: 0,
+                raw_strength: 6,
+                attacker_figure_kind: 6,
+                direction: 2,
+                flags: SOURCE_KIND6_ACTION_EVENT_FLAGS,
+                target_descriptor: SourceTargetDescriptor::from_bytes([1, 0xab, 0xcd, 0]),
+                kind15_figure_definition_id: Some(112),
+            })
+        );
+    }
+
+    #[test]
+    fn source_kind15_spawn_rotates_fahnoffs_and_preserves_launcher_identity() {
+        let action = SourceKind6Action {
+            attacker_position: (10.0, 20.0),
+            attacker_runtime_slot: 0x1234,
+            raw_strength: 6,
+            attacker_figure_kind: 6,
+            direction: 3,
+            flags: SOURCE_KIND6_ACTION_EVENT_FLAGS,
+            target_descriptor: SourceTargetDescriptor::from_bytes([6, 4, 1, 0]),
+            kind15_figure_definition_id: Some(112),
+        };
+        let diagonal = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        assert_eq!(
+            source_kind15_figure_from_action(action, 3.0),
+            Some(SourceKind15CombatFigure {
+                active: true,
+                figure_definition_id: 112,
+                position: (10.0 + diagonal, 20.0 + diagonal, 7.0),
+                direction: 3,
+                launcher_runtime_slot: 0x1234,
+                source_step_amount: SOURCE_KIND15_STEP_AMOUNT,
+                source_flags: SOURCE_KIND15_EXECUTOR_FLAGS,
+            })
+        );
+        assert_eq!(source_kind15_launch_offset(8, 0.5), (0.0, -0.5));
     }
 
     #[test]
