@@ -23,7 +23,8 @@ use crate::production;
 use crate::source_cell::SourceMapCellState;
 use crate::source_route::{
     SourceDynamicMapObject, SourceDynamicMapObjectTable, SourcePathBlockedCellDecision,
-    SourceResolvedDynamicTarget, SourceTargetDescriptor, source_route_positions,
+    SourcePathTargetRect, SourceResolvedDynamicTarget, SourceTargetDescriptor,
+    source_route_positions,
 };
 use crate::trade::{self, TradeRoute, TradeShip};
 use crate::types::{Good, TICKS_PER_MINUTE};
@@ -465,6 +466,67 @@ impl Simulation {
             &self.trade_ships,
             &self.source_dynamic_combat_figures,
         )
+    }
+
+    /// Resolve the `FUN_00444fe0` target footprint required by category-6
+    /// combat dispatch. Categories `0x35` and `0x36` name a live dynamic
+    /// map-object slot; the other source forms resolve from the retained
+    /// island map or their packed coordinate directly.
+    pub fn source_kind6_target_rect(
+        &self,
+        descriptor: SourceTargetDescriptor,
+    ) -> Option<SourcePathTargetRect> {
+        match descriptor.kind() {
+            SourceTargetDescriptor::WORLD_COORDINATE_KIND
+            | SourceTargetDescriptor::FIXED_POINT_COORDINATE_KIND => descriptor
+                .source_land_route_coordinate()
+                .and_then(|origin| SourcePathTargetRect::new(origin, 1, 1)),
+            0x32 | 0x33 | 0x34 => self
+                .island_maps
+                .iter()
+                .find_map(|map| map.source_land_target_rect(descriptor)),
+            0x35 | 0x36 => {
+                let island = descriptor.bytes()[1];
+                let slot = descriptor.bytes()[2];
+                let table = self.source_dynamic_map_object_table(island);
+                let object = table.objects().find(|object| object.slot == slot).copied()?;
+                let map = self.island_maps.iter().find(|map| map.island_id == island)?;
+                match descriptor.kind() {
+                    0x35 => map.source_land_target_rect(SourceTargetDescriptor::from_bytes([
+                        0x32,
+                        island,
+                        object.local_position.0,
+                        object.local_position.1,
+                    ])),
+                    0x36 => map
+                        .local_to_source_world((
+                            i32::from(object.local_position.0),
+                            i32::from(object.local_position.1),
+                        ))
+                        .and_then(|origin| SourcePathTargetRect::new(origin, 1, 1)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Run the recovered category-6 score order and `FUN_00458d80` geometry
+    /// gate for one live category-6 runtime slot. The action queue and the
+    /// `FUN_00458e60` player-state predicate remain dispatch responsibilities.
+    pub fn source_kind6_selected_target(
+        &self,
+        runtime_slot: u16,
+    ) -> Option<combat::SourceKind6SelectedTarget> {
+        let candidates = self.source_combat_candidates();
+        let attacker = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.figure_kind == 6 && candidate.runtime_slot == runtime_slot
+            })?;
+        combat::source_kind6_select_target(attacker, &candidates, &self.diplomacy, |descriptor| {
+            self.source_kind6_target_rect(descriptor)
+        })
     }
 
     /// Install a live `0x84a`/`0x84b` figure in the category table selected
@@ -3168,6 +3230,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(3, 149), (4, 399), (6, 349)]
         );
+    }
+
+    #[test]
+    fn source_kind6_selection_resolves_the_live_target_descriptor() {
+        let mut sim = Simulation::new();
+        let figure = |runtime_slot, owner, position, target_descriptor| SourceDynamicCombatFigure {
+            active: true,
+            figure_kind: 6,
+            candidate_list_key: 4,
+            figure_definition_id: 0x1f,
+            direction: 0,
+            source_payload: 0,
+            position,
+            source_energy: 285,
+            target_descriptor,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            owner,
+            state: 0,
+            flags: 0,
+            notification: 0,
+            runtime_slot,
+            auxiliary_kind: 0,
+            name_index: 0,
+        };
+        let target_descriptor = SourceTargetDescriptor::from_world_coordinate(1, 0)
+            .expect("source coordinate fits the descriptor encoding");
+
+        assert!(sim.install_source_dynamic_combat_figure(figure(
+            0,
+            0,
+            (0.0, 0.0),
+            SourceTargetDescriptor::from_bytes([0; 4]),
+        )));
+        assert!(sim.install_source_dynamic_combat_figure(figure(
+            1,
+            1,
+            (1.0, 0.0),
+            target_descriptor,
+        )));
+
+        let selected = sim
+            .source_kind6_selected_target(0)
+            .expect("the target descriptor resolves inside the source firing gate");
+        assert_eq!(
+            selected.target.entity,
+            crate::combat::SourceCombatCandidateEntity::DynamicFigure(1)
+        );
+        assert_eq!(selected.metric, 8);
+        assert_eq!(selected.score, 40);
+        assert_eq!(selected.direction, 2);
     }
 
     #[test]

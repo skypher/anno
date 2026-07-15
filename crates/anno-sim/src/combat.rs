@@ -14,7 +14,9 @@
 //! - Nation interaction matrix determines who can fight whom.
 
 use crate::source_rand::SourceRand;
-use crate::source_route::SourceTargetDescriptor;
+use crate::source_route::{
+    SourcePathTargetRect, SourceTargetDescriptor, source_kind6_target_direction,
+};
 use anno_formats::szs::{LandFigureDefinition, SourceCombatDefinition};
 
 /// `FUN_00446ca0` initializes byte zero of each newly allocated type-4
@@ -64,12 +66,26 @@ pub struct SourceCombatCandidate {
     /// raw record byte `0x42` here; `FUN_00454250` maps it to a target
     /// strength multiplier independently from the source movement direction.
     pub source_score_state: u8,
+    /// Category-6 table record `+0x0c`, copied from the `0x84a` spawn
+    /// descriptor. `FUN_00444fe0` dereferences this descriptor when a
+    /// category-6 figure itself is selected as a target; other categories
+    /// resolve from their live position instead.
+    pub kind6_target_descriptor: Option<SourceTargetDescriptor>,
     /// Live byte `+1`, used by `FUN_00453da0` to choose one of its candidate
     /// lists. This is independent from the faction byte at `+2`.
     pub candidate_list_key: Option<u8>,
     pub owner: u8,
     pub position: (f32, f32),
     pub direction: u8,
+}
+
+/// The two target forms consumed by `FUN_00458d80`. Ordinary candidate
+/// figures resolve to a one-cell footprint at their live position. A
+/// category-6 candidate redirects through its preserved table descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind6TargetGeometry {
+    Point(crate::source_route::SourcePathTargetRect),
+    Descriptor(SourceTargetDescriptor),
 }
 
 impl SourceCombatCandidate {
@@ -80,7 +96,56 @@ impl SourceCombatCandidate {
         self.figure_definition_id
             .and_then(SourceCombatDefinition::from_id)
     }
+
+    /// Recover `FUN_00444fe0`'s target form for the live candidate. The
+    /// executor must resolve [`SourceKind6TargetGeometry::Descriptor`] using
+    /// the current source map state before calling `FUN_00458d80`'s direction
+    /// gate.
+    pub fn source_kind6_target_geometry(&self) -> Option<SourceKind6TargetGeometry> {
+        if self.figure_kind == 6 {
+            return self
+                .kind6_target_descriptor
+                .map(SourceKind6TargetGeometry::Descriptor);
+        }
+
+        let origin = source_kind6_action_coordinate(self.position)?;
+        crate::source_route::SourcePathTargetRect::new(origin, 1, 1)
+            .map(SourceKind6TargetGeometry::Point)
+    }
 }
+
+/// One directed row written by `FUN_0045cd20` to an attacker's bounded
+/// candidate table. Its metric is the source `max(dx, dy) + floor(min(dx,
+/// dy) / 4)` value, after the executable converts its continuous positions
+/// to pair coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceCombatCandidatePair {
+    pub target: SourceCombatCandidate,
+    pub metric: u16,
+}
+
+/// One category-6 score row after `FUN_00458ac0` applies its common
+/// `FUN_00454250` scoring body. This is ordered by descending score by
+/// [`source_kind6_ranked_candidates`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceKind6RankedCandidate {
+    pub target: SourceCombatCandidate,
+    pub metric: u16,
+    pub score: u16,
+}
+
+/// A score-ranked category-6 row that also survived `FUN_00458d80`'s
+/// footprint and quarter-radius direction gate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceKind6SelectedTarget {
+    pub target: SourceCombatCandidate,
+    pub metric: u16,
+    pub score: u16,
+    pub direction: u8,
+}
+
+/// `FUN_0045cd20` writes at most 32 rows for each source figure.
+const SOURCE_COMBAT_CANDIDATE_CAPACITY: usize = 0x20;
 
 /// One live dynamic figure supplied by an `0x84a` spawn record and installed
 /// through `FUN_0045deb0`/`FUN_0045d380`. This retains the fields that the
@@ -147,8 +212,8 @@ pub(crate) fn source_dynamic_slot_table(figure_kind: u8) -> Option<(u8, u16)> {
 /// population. Static SHIP4 records supply categories 1 and 3, while
 /// SOLDAT3 supplies category 4. The source only accepts tags 1 through 6;
 /// malformed or non-source entities are excluded here before pair scoring.
-/// Runtime-created categories retain a missing `candidate_list_key` until their
-/// constructors are reconstructed.
+/// Runtime-created category records retain their candidate-list key directly
+/// from the `0x84a` spawn payload.
 pub fn source_combat_candidate_buffer(
     units: &[MilitaryUnit],
     trade_ships: &[crate::trade::TradeShip],
@@ -176,6 +241,7 @@ pub fn source_combat_candidate_buffer(
             figure_definition_id: unit.source_figure_definition_id,
             source_energy: unit.source_energy,
             source_score_state: unit.source_score_state,
+            kind6_target_descriptor: None,
             candidate_list_key: unit.source_candidate_list_key,
             owner: unit.owner,
             position,
@@ -198,6 +264,7 @@ pub fn source_combat_candidate_buffer(
             figure_definition_id: ship.source_figure_definition_id,
             source_energy: ship.source_energy,
             source_score_state: ship.source_score_state,
+            kind6_target_descriptor: None,
             candidate_list_key: ship.source_candidate_list_key,
             owner: ship.owner,
             position: (ship.world_x as f32, ship.world_y as f32),
@@ -215,6 +282,7 @@ pub fn source_combat_candidate_buffer(
             figure_definition_id: Some(u16::from(figure.figure_definition_id)),
             source_energy: figure.source_energy,
             source_score_state: 0,
+            kind6_target_descriptor: (figure.figure_kind == 6).then_some(figure.target_descriptor),
             candidate_list_key: Some(figure.candidate_list_key),
             owner: figure.owner,
             position: figure.position,
@@ -222,6 +290,93 @@ pub fn source_combat_candidate_buffer(
         });
     }
     candidates
+}
+
+/// Reconstruct the directed rows that `FUN_0045cd20` writes for one source
+/// figure. Its position fields are continuous runtime coordinates; the
+/// executable truncates each coordinate after multiplying by eight before
+/// the spatial sort and pair metric. The sign of the source y conversion is
+/// immaterial to pair differences, so this retains its magnitude only.
+pub fn source_combat_candidate_pairs(
+    attacker: &SourceCombatCandidate,
+    candidates: &[SourceCombatCandidate],
+    diplomacy: &DiplomacyMatrix,
+) -> Vec<SourceCombatCandidatePair> {
+    let Some(candidate_list_key) = attacker.candidate_list_key else {
+        return Vec::new();
+    };
+    let Some(attacker_position) = source_combat_candidate_pair_coordinates(attacker) else {
+        return Vec::new();
+    };
+
+    let mut pairs = candidates
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(source_order, target)| {
+            if target.entity == attacker.entity
+                || target.candidate_list_key != Some(candidate_list_key)
+                || target.owner == attacker.owner
+                || diplomacy.get(attacker.owner, target.owner) == Diplomacy::Allied
+                || ((1..=3).contains(&attacker.figure_kind)
+                    && (1..=3).contains(&target.figure_kind))
+            {
+                return None;
+            }
+
+            let target_position = source_combat_candidate_pair_coordinates(&target)?;
+            let dx = attacker_position.0.abs_diff(target_position.0);
+            let dy = attacker_position.1.abs_diff(target_position.1);
+            if dx > SOURCE_COMBAT_CANDIDATE_AXIS_LIMIT
+                || dy > SOURCE_COMBAT_CANDIDATE_AXIS_LIMIT
+            {
+                return None;
+            }
+
+            let metric = dx.max(dy) + dx.min(dy) / 4;
+            u16::try_from(metric).ok().map(|metric| {
+                (
+                    target_position.0,
+                    source_order,
+                    SourceCombatCandidatePair { target, metric },
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    // `FUN_00452190` orders each candidate-list population by the transformed
+    // x coordinate before `FUN_0045cd20` appends directed rows. Preserve the
+    // input order for an equal coordinate, matching the source list order.
+    pairs.sort_by_key(|(x, source_order, _)| (*x, *source_order));
+    pairs.truncate(SOURCE_COMBAT_CANDIDATE_CAPACITY);
+    pairs.into_iter().map(|(_, _, pair)| pair).collect()
+}
+
+fn source_combat_candidate_pair_coordinates(
+    candidate: &SourceCombatCandidate,
+) -> Option<(i32, i32)> {
+    Some((
+        source_combat_pair_coordinate(candidate.position.0)?,
+        source_combat_pair_coordinate(candidate.position.1)?,
+    ))
+}
+
+fn source_kind6_action_coordinate(position: (f32, f32)) -> Option<(i32, i32)> {
+    Some((
+        source_kind6_action_component(position.0)?,
+        source_kind6_action_component(position.1)?,
+    ))
+}
+
+fn source_kind6_action_component(value: f32) -> Option<i32> {
+    let scaled = value * 2.0;
+    (scaled.is_finite() && scaled >= i32::MIN as f32 && scaled < i32::MAX as f32)
+        .then_some(scaled as i32)
+}
+
+fn source_combat_pair_coordinate(value: f32) -> Option<i32> {
+    let scaled = value * 8.0;
+    (scaled.is_finite() && scaled >= i32::MIN as f32 && scaled < i32::MAX as f32)
+        .then_some(scaled as i32)
 }
 
 /// Source player globals read by `FUN_00456d00` before it decides whether a
@@ -296,9 +451,9 @@ const SOURCE_DIAGONAL_DISTANCE: f32 = std::f32::consts::SQRT_2;
 /// `UnitStats::attack_range` then decides how close the unit has
 /// to close before it can land hits.
 const DETECTION_RANGE: u32 = 6;
-/// `FUN_0045cd20` only pairs figures whose raw type-4 coordinates differ by
-/// at most `0x60` in either axis before it writes a candidate record.
-const SOURCE_KIND4_CANDIDATE_AXIS_LIMIT: u32 = 0x60;
+/// `FUN_0045cd20` only pairs figures whose transformed runtime coordinates
+/// differ by at most `0x60` in either axis before it writes a candidate row.
+const SOURCE_COMBAT_CANDIDATE_AXIS_LIMIT: u32 = 0x60;
 /// `FUN_00456d00` only scores source candidates within the attacker's raw
 /// `Shotradius + 0x40` envelope after `FUN_0045cd20` fills its broader list.
 const SOURCE_KIND4_CANDIDATE_SCORE_RADIUS_MARGIN: u32 = 0x40;
@@ -1032,8 +1187,8 @@ fn source_kind4_candidate_allowed(
         && target.source_island_id == source_island
         && target.owner != source_owner
         && diplomacy.get(source_owner, target.owner) != Diplomacy::Allied
-        && source_position.0.abs_diff(target.tile_x) <= SOURCE_KIND4_CANDIDATE_AXIS_LIMIT
-        && source_position.1.abs_diff(target.tile_y) <= SOURCE_KIND4_CANDIDATE_AXIS_LIMIT
+        && source_position.0.abs_diff(target.tile_x) <= SOURCE_COMBAT_CANDIDATE_AXIS_LIMIT
+        && source_position.1.abs_diff(target.tile_y) <= SOURCE_COMBAT_CANDIDATE_AXIS_LIMIT
 }
 
 /// Score a type-4 candidate exactly along the type-4 branch of
@@ -1054,8 +1209,8 @@ fn source_kind4_candidate_score(
 
     let attacker_max_energy = u32::from(attacker_definition.source_runtime_energy_cap());
     let target_max_energy = u32::from(target_definition.source_runtime_energy_cap());
-    let attacker_strength = source_kind4_strength(attacker, attacker_definition);
-    let target_strength = source_kind4_strength(target, target_definition);
+    let attacker_strength = source_kind4_attacker_strength(attacker, attacker_definition);
+    let target_strength = source_kind4_target_strength(target, target_definition);
     let target_energy = u32::from(target.source_energy);
     let target_shot_radius = u32::from(target_definition.source_runtime_shot_radius());
 
@@ -1085,15 +1240,173 @@ fn source_kind4_definition(unit: &MilitaryUnit) -> Option<LandFigureDefinition> 
         .and_then(LandFigureDefinition::from_id)
 }
 
-/// `FUN_00456d00` and the type-4 target branch of `FUN_00454250` compute
-/// effective strength from live energy, compiled energy cap, hitpoint, and
-/// work-time divisor.
-fn source_kind4_strength(unit: &MilitaryUnit, definition: LandFigureDefinition) -> u32 {
-    let energy_cap = u32::from(definition.source_runtime_energy_cap());
-    let energy_term = u32::from(unit.source_energy) * 0x55 / energy_cap;
-    let hit_point_term =
-        (energy_term + 0x2b) * u32::from(definition.source_runtime_hit_points()) / 128;
-    (hit_point_term as f32 / definition.source_runtime_work_time()) as u32
+/// `FUN_00456d00` computes this caller-side value before passing it as
+/// `param_3` to `FUN_00454250`. The caller does not divide by `Worktime`.
+fn source_kind4_attacker_strength(unit: &MilitaryUnit, definition: LandFigureDefinition) -> u32 {
+    source_combat_raw_strength(
+        unit.source_energy,
+        definition.source_runtime_energy_cap(),
+        definition.source_runtime_hit_points(),
+    )
+}
+
+/// The type-4 target branch inside `FUN_00454250` normalizes the raw
+/// energy-adjusted hit-point term by the compiled `Worktime` field.
+fn source_kind4_target_strength(unit: &MilitaryUnit, definition: LandFigureDefinition) -> u32 {
+    source_combat_work_time_strength(
+        unit.source_energy,
+        definition.source_runtime_energy_cap(),
+        definition.source_runtime_hit_points(),
+        definition.source_runtime_work_time(),
+    )
+}
+
+fn source_combat_raw_strength(source_energy: u16, energy_cap: u16, hit_points: u16) -> u32 {
+    let energy_term = u32::from(source_energy) * 0x55 / u32::from(energy_cap);
+    (energy_term + 0x2b) * u32::from(hit_points) / 128
+}
+
+fn source_combat_work_time_strength(
+    source_energy: u16,
+    energy_cap: u16,
+    hit_points: u16,
+    work_time: f32,
+) -> u32 {
+    (source_combat_raw_strength(source_energy, energy_cap, hit_points) as f32 / work_time) as u32
+}
+
+/// Compute `local_10`, the target-strength term in `FUN_00454250`, for any
+/// candidate whose compiled figure definition is currently recovered.
+pub fn source_combat_candidate_target_strength(candidate: &SourceCombatCandidate) -> Option<u16> {
+    let definition = candidate.combat_definition()?;
+    let strength = match candidate.figure_kind {
+        1..=3 => {
+            let multiplier = match candidate.source_score_state {
+                0 => 0,
+                1..=2 => 1,
+                3..=10 => 2,
+                11..=16 => 4,
+                _ => 6,
+            };
+            u32::from(definition.runtime_hit_points) * multiplier
+        }
+        4 | 6 => source_combat_work_time_strength(
+            candidate.source_energy,
+            definition.runtime_energy_cap,
+            definition.runtime_hit_points,
+            definition.runtime_work_time,
+        ),
+        5 => 0,
+        _ => return None,
+    };
+    u16::try_from(strength).ok()
+}
+
+/// Score one category-6 candidate through the common `FUN_00454250` body.
+/// `FUN_00458ac0` supplies its un-normalized caller strength, whereas the
+/// target branch is recovered by [`source_combat_candidate_target_strength`].
+/// The caller's `metric <= 0x60` candidate-list filter belongs to dispatch
+/// construction and is intentionally not imposed by this score primitive.
+pub fn source_kind6_candidate_score(
+    attacker: &SourceCombatCandidate,
+    target: &SourceCombatCandidate,
+    candidate_metric: u16,
+) -> Option<u16> {
+    if attacker.figure_kind != 6 {
+        return None;
+    }
+
+    let attacker_definition = attacker.combat_definition()?;
+    let target_definition = target.combat_definition()?;
+    let attacker_strength = source_combat_raw_strength(
+        attacker.source_energy,
+        attacker_definition.runtime_energy_cap,
+        attacker_definition.runtime_hit_points,
+    );
+    let target_strength = u32::from(source_combat_candidate_target_strength(target)?);
+    let attacker_max_energy = u32::from(attacker_definition.runtime_energy_cap);
+    let target_max_energy = u32::from(target_definition.runtime_energy_cap);
+    let attacker_shot_radius = u32::from(attacker_definition.runtime_shot_radius);
+    let target_shot_radius = u32::from(target_definition.runtime_shot_radius);
+    let candidate_metric = u32::from(candidate_metric);
+
+    let depleted_ratio = u32::from(target.source_energy).saturating_sub(attacker_strength) * 128
+        / target_max_energy;
+    let mut score = u32::from(source_kind4_curve_depleted(depleted_ratio as usize));
+    let attacker_ratio = attacker_strength * 128 / target_max_energy;
+    score += u32::from(source_kind4_curve_attacker(
+        attacker_ratio.min(0x100) as usize,
+    ));
+    if candidate_metric <= target_shot_radius {
+        let retaliation_ratio = target_strength * 128 / attacker_max_energy;
+        score += u32::from(source_kind4_curve_retaliation(
+            retaliation_ratio.min(0x100) as usize,
+        ));
+    }
+    score += u32::from(source_kind4_curve_approach(
+        candidate_metric.saturating_sub(attacker_shot_radius) as usize,
+    ));
+    if target_shot_radius < attacker_shot_radius {
+        score += 35;
+    }
+    u16::try_from(score).ok()
+}
+
+/// Apply `FUN_00458ac0`'s `metric < 0x61` row filter and rank the resulting
+/// `FUN_00454250` scores. Candidate rows arrive in the source pair-producer
+/// order, so equal scores retain that source row order until the executable's
+/// remaining action predicates are evaluated.
+pub fn source_kind6_ranked_candidates(
+    attacker: &SourceCombatCandidate,
+    candidates: &[SourceCombatCandidate],
+    diplomacy: &DiplomacyMatrix,
+) -> Vec<SourceKind6RankedCandidate> {
+    let mut ranked = source_combat_candidate_pairs(attacker, candidates, diplomacy)
+        .into_iter()
+        .filter(|pair| pair.metric <= SOURCE_COMBAT_CANDIDATE_AXIS_LIMIT as u16)
+        .filter_map(|pair| {
+            source_kind6_candidate_score(attacker, &pair.target, pair.metric).map(|score| {
+                SourceKind6RankedCandidate {
+                    target: pair.target,
+                    metric: pair.metric,
+                    score,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.score.cmp(&left.score));
+    ranked
+}
+
+/// Select the first score-ranked row whose target geometry passes
+/// `FUN_00458d80`. Descriptor-form targets are resolved through the caller's
+/// live map state; point targets use the direct one-cell source footprint.
+/// The `FUN_00458e60` player-state predicate and action cooldown are applied
+/// by the dispatch layer after this geometry gate.
+pub fn source_kind6_select_target(
+    attacker: &SourceCombatCandidate,
+    candidates: &[SourceCombatCandidate],
+    diplomacy: &DiplomacyMatrix,
+    mut resolve_descriptor: impl FnMut(SourceTargetDescriptor) -> Option<SourcePathTargetRect>,
+) -> Option<SourceKind6SelectedTarget> {
+    let attacker_position = source_kind6_action_coordinate(attacker.position)?;
+    let attacker_shot_radius = attacker.combat_definition()?.runtime_shot_radius;
+    source_kind6_ranked_candidates(attacker, candidates, diplomacy)
+        .into_iter()
+        .find_map(|candidate| {
+            let target = match candidate.target.source_kind6_target_geometry()? {
+                SourceKind6TargetGeometry::Point(target) => Some(target),
+                SourceKind6TargetGeometry::Descriptor(descriptor) => resolve_descriptor(descriptor),
+            }?;
+            source_kind6_target_direction(attacker_position, target, attacker_shot_radius).map(
+                |direction| SourceKind6SelectedTarget {
+                    target: candidate.target,
+                    metric: candidate.metric,
+                    score: candidate.score,
+                    direction,
+                },
+            )
+        })
 }
 
 fn source_kind4_curve_depleted(index: usize) -> u8 {
@@ -2037,6 +2350,27 @@ mod tests {
         unit
     }
 
+    fn source_candidate(
+        figure_kind: u8,
+        definition_id: u16,
+        source_energy: u16,
+        source_score_state: u8,
+    ) -> SourceCombatCandidate {
+        SourceCombatCandidate {
+            entity: SourceCombatCandidateEntity::DynamicFigure(0),
+            figure_kind,
+            runtime_slot: 0,
+            figure_definition_id: Some(definition_id),
+            source_energy,
+            source_score_state,
+            kind6_target_descriptor: None,
+            candidate_list_key: Some(0),
+            owner: 0,
+            position: (0.0, 0.0),
+            direction: 0,
+        }
+    }
+
     #[test]
     fn source_candidate_buffer_keeps_category_local_identity() {
         let mut land = source_kind4_unit(2, 14, 40, 60);
@@ -2096,6 +2430,7 @@ mod tests {
                     figure_definition_id: Some(14),
                     source_energy: 0,
                     source_score_state: 0,
+                    kind6_target_descriptor: None,
                     candidate_list_key: Some(10),
                     owner: 2,
                     position: (20.25, 30.25),
@@ -2108,6 +2443,7 @@ mod tests {
                     figure_definition_id: Some(0x19),
                     source_energy: 195,
                     source_score_state: 10,
+                    kind6_target_descriptor: None,
                     candidate_list_key: Some(3),
                     owner: 1,
                     position: (80.0, 90.0),
@@ -2120,6 +2456,7 @@ mod tests {
                     figure_definition_id: Some(0x15),
                     source_energy: 150,
                     source_score_state: 4,
+                    kind6_target_descriptor: None,
                     candidate_list_key: Some(5),
                     owner: 0,
                     position: (100.0, 110.0),
@@ -2132,6 +2469,9 @@ mod tests {
                     figure_definition_id: Some(31),
                     source_energy: 320,
                     source_score_state: 0,
+                    kind6_target_descriptor: Some(
+                        SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
+                    ),
                     candidate_list_key: Some(4),
                     owner: 3,
                     position: (120.0, 130.0),
@@ -2154,6 +2494,235 @@ mod tests {
         assert_eq!(
             candidates[3].combat_definition(),
             SourceCombatDefinition::from_id(31)
+        );
+        assert_eq!(
+            candidates[0].source_kind6_target_geometry(),
+            Some(SourceKind6TargetGeometry::Point(
+                crate::source_route::SourcePathTargetRect::new((40, 60), 1, 1)
+                    .expect("one-cell target footprint is valid"),
+            ))
+        );
+        assert_eq!(
+            candidates[3].source_kind6_target_geometry(),
+            Some(SourceKind6TargetGeometry::Descriptor(
+                SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
+            ))
+        );
+    }
+
+    #[test]
+    fn source_kind6_target_geometry_truncates_live_positions_toward_zero() {
+        let mut candidate = source_candidate(1, 0x19, 195, 0);
+        candidate.position = (-1.9, 2.9);
+        assert_eq!(
+            candidate.source_kind6_target_geometry(),
+            Some(SourceKind6TargetGeometry::Point(
+                crate::source_route::SourcePathTargetRect::new((-3, 5), 1, 1)
+                    .expect("one-cell target footprint is valid"),
+            ))
+        );
+    }
+
+    #[test]
+    fn source_candidate_target_strength_matches_fun_00454250_branches() {
+        // `FUN_00454250` reads the shared category-1/2/3 score-state byte
+        // and maps it to 0, 1, 2, 4, or 6 times the compiled hit-point term.
+        assert_eq!(
+            source_combat_candidate_target_strength(&source_candidate(1, 0x19, 195, 0)),
+            Some(0)
+        );
+        assert_eq!(
+            source_combat_candidate_target_strength(&source_candidate(1, 0x19, 195, 1)),
+            Some(6)
+        );
+        assert_eq!(
+            source_combat_candidate_target_strength(&source_candidate(1, 0x19, 195, 3)),
+            Some(12)
+        );
+        assert_eq!(
+            source_combat_candidate_target_strength(&source_candidate(1, 0x19, 195, 11)),
+            Some(24)
+        );
+        assert_eq!(
+            source_combat_candidate_target_strength(&source_candidate(1, 0x19, 195, 17)),
+            Some(36)
+        );
+
+        // Categories 4 and 6 divide their raw energy-adjusted hit-point
+        // strength by the compiled work time; category 5 is always zero.
+        assert_eq!(
+            source_combat_candidate_target_strength(&source_candidate(4, 13, 36, 0)),
+            Some(4)
+        );
+        assert_eq!(
+            source_combat_candidate_target_strength(&source_candidate(6, 0x1f, 285, 0)),
+            Some(1)
+        );
+        assert_eq!(
+            source_combat_candidate_target_strength(&source_candidate(5, 0x25, 42, 0)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn source_kind6_score_uses_target_score_state_and_raw_attacker_strength() {
+        let attacker = source_candidate(6, 0x1f, 285, 0);
+        let dormant_warship = source_candidate(1, 0x19, 195, 0);
+        let engaged_warship = source_candidate(1, 0x19, 195, 17);
+
+        // The raw category-6 caller strength is 6. At range 14, the shared
+        // score body yields the approach term alone for state zero and adds
+        // the source retaliation curve for the state-17 target.
+        assert_eq!(
+            source_kind6_candidate_score(&attacker, &dormant_warship, 14),
+            Some(40)
+        );
+        assert_eq!(
+            source_kind6_candidate_score(&attacker, &engaged_warship, 14),
+            Some(87)
+        );
+    }
+
+    #[test]
+    fn source_kind6_pair_producer_and_ranker_match_source_filters() {
+        let mut attacker = source_candidate(6, 0x1f, 285, 0);
+        attacker.candidate_list_key = Some(9);
+
+        let mut engaged_warship = source_candidate(1, 0x19, 195, 17);
+        engaged_warship.entity = SourceCombatCandidateEntity::DynamicFigure(1);
+        engaged_warship.candidate_list_key = Some(9);
+        engaged_warship.owner = 1;
+        engaged_warship.position = (1.0, 0.0);
+
+        let mut dormant_warship = source_candidate(1, 0x19, 195, 0);
+        dormant_warship.entity = SourceCombatCandidateEntity::DynamicFigure(2);
+        dormant_warship.candidate_list_key = Some(9);
+        dormant_warship.owner = 2;
+        dormant_warship.position = (2.0, 0.0);
+
+        let mut allied_warship = source_candidate(1, 0x19, 195, 17);
+        allied_warship.entity = SourceCombatCandidateEntity::DynamicFigure(3);
+        allied_warship.candidate_list_key = Some(9);
+        allied_warship.owner = 3;
+        allied_warship.position = (1.0, 1.0);
+
+        let mut same_owner_warship = source_candidate(1, 0x19, 195, 17);
+        same_owner_warship.entity = SourceCombatCandidateEntity::DynamicFigure(4);
+        same_owner_warship.candidate_list_key = Some(9);
+        same_owner_warship.position = (1.0, 2.0);
+
+        let mut distant_warship = source_candidate(1, 0x19, 195, 17);
+        distant_warship.entity = SourceCombatCandidateEntity::DynamicFigure(5);
+        distant_warship.candidate_list_key = Some(9);
+        distant_warship.owner = 4;
+        distant_warship.position = (13.0, 0.0);
+
+        let mut other_list_warship = source_candidate(1, 0x19, 195, 17);
+        other_list_warship.entity = SourceCombatCandidateEntity::DynamicFigure(6);
+        other_list_warship.candidate_list_key = Some(8);
+        other_list_warship.owner = 5;
+        other_list_warship.position = (1.0, 3.0);
+
+        let mut diplomacy = DiplomacyMatrix::new();
+        diplomacy.set(0, 3, Diplomacy::Allied);
+        let candidates = [
+            attacker,
+            engaged_warship,
+            dormant_warship,
+            allied_warship,
+            same_owner_warship,
+            distant_warship,
+            other_list_warship,
+        ];
+
+        assert_eq!(
+            source_combat_candidate_pairs(&attacker, &candidates, &diplomacy),
+            vec![
+                SourceCombatCandidatePair {
+                    target: engaged_warship,
+                    metric: 8,
+                },
+                SourceCombatCandidatePair {
+                    target: dormant_warship,
+                    metric: 16,
+                },
+            ]
+        );
+        assert_eq!(
+            source_kind6_ranked_candidates(&attacker, &candidates, &diplomacy),
+            vec![
+                SourceKind6RankedCandidate {
+                    target: engaged_warship,
+                    metric: 8,
+                    score: 87,
+                },
+                SourceKind6RankedCandidate {
+                    target: dormant_warship,
+                    metric: 16,
+                    score: 38,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn source_kind6_selection_resolves_category_six_target_descriptor_before_direction() {
+        let mut attacker = source_candidate(6, 0x1f, 285, 0);
+        attacker.candidate_list_key = Some(4);
+
+        let target_descriptor = SourceTargetDescriptor::from_world_coordinate(2, 0)
+            .expect("source descriptor encodes the target coordinate");
+        let mut target = source_candidate(6, 0x1f, 285, 0);
+        target.entity = SourceCombatCandidateEntity::DynamicFigure(1);
+        target.candidate_list_key = Some(4);
+        target.owner = 1;
+        target.position = (1.0, 0.0);
+        target.kind6_target_descriptor = Some(target_descriptor);
+
+        let selected = source_kind6_select_target(
+            &attacker,
+            &[attacker, target],
+            &DiplomacyMatrix::new(),
+            |descriptor| {
+                (descriptor == target_descriptor)
+                    .then(|| SourcePathTargetRect::new((2, 0), 1, 1))
+                    .flatten()
+            },
+        );
+        assert_eq!(
+            selected,
+            Some(SourceKind6SelectedTarget {
+                target,
+                metric: 8,
+                score: 40,
+                direction: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn source_combat_pair_producer_keeps_the_first_32_source_rows() {
+        let mut attacker = source_candidate(6, 0x1f, 285, 0);
+        attacker.candidate_list_key = Some(7);
+        let mut candidates = vec![attacker];
+        for index in 1..=33 {
+            let mut target = source_candidate(1, 0x19, 195, 0);
+            target.entity = SourceCombatCandidateEntity::DynamicFigure(index);
+            target.candidate_list_key = Some(7);
+            target.owner = 1;
+            target.position = (index as f32 / 8.0, 0.0);
+            candidates.push(target);
+        }
+
+        let pairs = source_combat_candidate_pairs(&attacker, &candidates, &DiplomacyMatrix::new());
+        assert_eq!(pairs.len(), SOURCE_COMBAT_CANDIDATE_CAPACITY);
+        assert_eq!(
+            pairs[0].target.entity,
+            SourceCombatCandidateEntity::DynamicFigure(1)
+        );
+        assert_eq!(
+            pairs[31].target.entity,
+            SourceCombatCandidateEntity::DynamicFigure(32)
         );
     }
 

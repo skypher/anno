@@ -649,6 +649,21 @@ impl Ship {
     pub fn heading(&self) -> u8 {
         self.heading_byte / 2
     }
+
+    /// Eight raw SHIP4 slots at `0x132 + 8i` consumed by the loader loop at
+    /// `FUN_0045f9b2`. It expands these records into the category-1 shared
+    /// state at `+0x1f4`; `FUN_00458e60` later tests the resulting low-byte
+    /// item IDs while deciding whether a category-6 figure may target it.
+    pub fn source_kind6_policy_raw_slots(&self) -> [u64; 8] {
+        std::array::from_fn(|index| {
+            let offset = 0x132 + index * 8;
+            u64::from_le_bytes(
+                self.raw_record[offset..offset + 8]
+                    .try_into()
+                    .expect("fixed SHIP4 policy slot lies inside its record"),
+            )
+        })
+    }
 }
 
 pub const SHIP4_RECORD_BYTES: usize = 436;
