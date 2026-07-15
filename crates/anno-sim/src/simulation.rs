@@ -3601,14 +3601,29 @@ impl Simulation {
             &self.diplomacy,
             &self.island_maps,
         );
+        let source_kind4_object_targets = self
+            .military_units
+            .iter()
+            .filter_map(|unit| unit.source_target_descriptor)
+            .filter(|descriptor| matches!(descriptor.kind(), 0x35 | 0x36))
+            .filter_map(|descriptor| {
+                self.source_kind6_target_rect(descriptor)
+                    .map(|target| (descriptor, target))
+            })
+            .collect::<Vec<_>>();
         let mut source_rand = std::mem::take(&mut self.rng_state);
-        combat::tick_unit_orders_with_maps_and_source_rand_and_dispatch_state(
+        combat::tick_unit_orders_with_maps_and_source_rand_and_dispatch_state_and_target_resolver(
             &mut self.military_units,
             dt_ms,
             self.ocean_map.as_ref(),
             &self.island_maps,
             &mut source_rand,
             self.source_kind4_dispatch,
+            |descriptor| {
+                source_kind4_object_targets
+                    .iter()
+                    .find_map(|(known, target)| (*known == descriptor).then_some(*target))
+            },
         );
         self.rng_state = source_rand;
         let dead = combat::tick_combat_with_maps(
@@ -8605,6 +8620,32 @@ mod tests {
                 target: crate::source_route::SourcePathTargetRect::new((111, 212), 1, 1).unwrap(),
                 owner: 6,
             })
+        );
+    }
+
+    #[test]
+    fn source_kind_four_dispatch_routes_to_a_live_dynamic_object_descriptor() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(7, 8, 1));
+        sim.source_dynamic_map_objects.push(SourceDynamicMapObject {
+            island: 7,
+            slot: 3,
+            owner: 2,
+            local_position: (1, 0),
+        });
+        let mut unit = crate::combat::MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 0, 0);
+        unit.source_island_id = Some(7);
+        unit.source_runtime_slot = Some(0);
+        unit.source_figure_definition_id = Some(1);
+        unit.source_target_descriptor = Some(SourceTargetDescriptor::from_bytes([0x36, 7, 3, 0]));
+        sim.military_units.push(unit);
+
+        sim.tick_source_land_figures(1);
+
+        assert!(sim.military_units[0].source_motion_target.is_some());
+        assert_eq!(
+            sim.military_units[0].source_target_descriptor,
+            Some(SourceTargetDescriptor::from_bytes([0x36, 7, 3, 0]))
         );
     }
 

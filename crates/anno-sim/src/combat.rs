@@ -76,10 +76,9 @@ pub struct SourceCombatCandidate {
     /// Low bytes resolved by `FUN_0045f9b2` from the raw SHIP4 policy slots.
     /// `FUN_00458e60` compares these against `0x19..=0x2c`.
     pub source_kind6_policy_ware_slots: [u8; 8],
-    /// Bytes at the backing category record's `+0x18/+0x19`. For target
-    /// kinds 1 through 5, `FUN_00445650` emits these as descriptor bytes
-    /// 1 and 2. SHIP4 supplies them from raw offsets `0x2c/0x2d`; SOLDAT3
-    /// supplies the last two bytes of its state descriptor.
+    /// Bytes at the backing category record's `+0x18/+0x19`, preserved from
+    /// the static source records for consumers that read that payload. They
+    /// do not identify a `FUN_00445650` figure target.
     pub source_kind6_target_descriptor_payload: Option<[u8; 2]>,
     /// Category-6 table descriptor at `+0x10`. `FUN_00444fe0` reaches this
     /// after `FUN_00445650` emits `[6, live+1, live+44]` for a category-6
@@ -129,22 +128,12 @@ impl SourceCombatCandidate {
     }
 
     /// Construct the descriptor written by `FUN_00445650` into the selected
-    /// category-6 score row. The fourth byte is not written by the category
-    /// 1 through 5 branch and is ignored by their descriptor decoder, so this
-    /// representation fixes it at zero.
+    /// category-6 score row. Every figure-table case writes its live byte
+    /// `+1` followed by its little-endian live `+0x44` runtime slot.
     pub fn source_kind6_action_target_descriptor(&self) -> Option<SourceTargetDescriptor> {
         match self.figure_kind {
-            1..=5 => {
-                let [byte_1, byte_2] = self.source_kind6_target_descriptor_payload?;
-                Some(SourceTargetDescriptor::from_bytes([
-                    self.figure_kind,
-                    byte_1,
-                    byte_2,
-                    0,
-                ]))
-            }
-            6 => Some(SourceTargetDescriptor::from_bytes([
-                6,
+            1..=6 => Some(SourceTargetDescriptor::from_bytes([
+                self.figure_kind,
                 self.candidate_list_key?,
                 self.runtime_slot as u8,
                 (self.runtime_slot >> 8) as u8,
@@ -152,6 +141,61 @@ impl SourceCombatCandidate {
             _ => None,
         }
     }
+}
+
+/// Resolve the figure-table cases of `FUN_00444fe0`. Kinds `1` through `5`
+/// identify one live table record by its category, list key, and runtime slot;
+/// kind `6` first redirects through that record's stored target descriptor.
+/// The caller resolves static-map and packed-coordinate forms separately.
+pub fn source_figure_target_rect(
+    descriptor: SourceTargetDescriptor,
+    candidates: &[SourceCombatCandidate],
+    mut resolve_non_figure: impl FnMut(SourceTargetDescriptor) -> Option<SourcePathTargetRect>,
+) -> Option<SourcePathTargetRect> {
+    source_figure_target_rect_with_resolver(descriptor, candidates, &mut resolve_non_figure)
+}
+
+fn source_figure_target_rect_with_resolver(
+    descriptor: SourceTargetDescriptor,
+    candidates: &[SourceCombatCandidate],
+    resolve_non_figure: &mut impl FnMut(SourceTargetDescriptor) -> Option<SourcePathTargetRect>,
+) -> Option<SourcePathTargetRect> {
+    match descriptor.kind() {
+        1..=5 => {
+            let candidate = candidates.iter().find(|candidate| {
+                candidate.source_kind6_action_target_descriptor() == Some(descriptor)
+            })?;
+            let origin = source_figure_descriptor_coordinate(candidate.position)?;
+            SourcePathTargetRect::new(origin, 1, 1)
+        }
+        6 => {
+            let candidate = candidates.iter().find(|candidate| {
+                candidate.figure_kind == 6
+                    && candidate.source_kind6_action_target_descriptor() == Some(descriptor)
+            })?;
+            candidate
+                .kind6_target_descriptor
+                .and_then(|target| {
+                    source_figure_target_rect_with_resolver(target, candidates, resolve_non_figure)
+                })
+        }
+        _ => resolve_non_figure(descriptor),
+    }
+}
+
+/// `FUN_00444af0` converts the live `+0x28/+0x2c` figure coordinates with
+/// its x87 integer conversion before `FUN_00444fe0` supplies a one-cell
+/// footprint.
+fn source_figure_descriptor_coordinate(position: (f32, f32)) -> Option<(i32, i32)> {
+    Some((
+        source_figure_descriptor_component(position.0)?,
+        source_figure_descriptor_component(position.1)?,
+    ))
+}
+
+fn source_figure_descriptor_component(value: f32) -> Option<i32> {
+    (value.is_finite() && value >= i32::MIN as f32 && value < i32::MAX as f32)
+        .then_some(value as i32)
 }
 
 /// One directed row written by `FUN_0045cd20` to an attacker's bounded
@@ -798,8 +842,8 @@ pub struct MilitaryUnit {
     /// each policy slot through the haeuser definition table.
     #[serde(default)]
     pub source_kind6_policy_ware_slots: [u8; 8],
-    /// Backing category-record bytes used by `FUN_00445650` when this unit
-    /// is selected as a category-6 combat target.
+    /// Backing category-record bytes `+0x18/+0x19`, retained from source
+    /// records for consumers that read the payload directly.
     #[serde(default)]
     pub source_kind6_target_descriptor_payload: Option<[u8; 2]>,
     /// Type-4 origin descriptor restored from `SOLDAT3`.
@@ -2021,11 +2065,41 @@ pub fn tick_unit_orders_with_maps_and_source_rand_and_dispatch_state(
     source_rand: &mut SourceRand,
     dispatch_state: SourceKind4DispatchState,
 ) {
+    tick_unit_orders_with_maps_and_source_rand_and_dispatch_state_and_target_resolver(
+        units,
+        dt_ms,
+        ocean_map,
+        island_maps,
+        source_rand,
+        dispatch_state,
+        |_| None,
+    );
+}
+
+/// As [`tick_unit_orders_with_maps_and_source_rand_and_dispatch_state`], with
+/// `FUN_00444fe0` geometry for target descriptors backed by live state outside
+/// an [`crate::island_map::IslandMap`].
+pub fn tick_unit_orders_with_maps_and_source_rand_and_dispatch_state_and_target_resolver(
+    units: &mut [MilitaryUnit],
+    dt_ms: u32,
+    ocean_map: Option<&crate::ocean_map::OceanMap>,
+    island_maps: &[crate::island_map::IslandMap],
+    source_rand: &mut SourceRand,
+    dispatch_state: SourceKind4DispatchState,
+    mut resolve_target: impl FnMut(SourceTargetDescriptor) -> Option<SourcePathTargetRect>,
+) {
     for u in units.iter_mut() {
         if !u.is_alive() {
             continue;
         }
-        if tick_source_kind4_order(u, dt_ms, island_maps, source_rand, dispatch_state) {
+        if tick_source_kind4_order(
+            u,
+            dt_ms,
+            island_maps,
+            source_rand,
+            dispatch_state,
+            &mut resolve_target,
+        ) {
             continue;
         }
         if u.combat_target >= 0 {
@@ -2085,6 +2159,7 @@ fn tick_source_kind4_order(
     island_maps: &[crate::island_map::IslandMap],
     source_rand: &mut SourceRand,
     dispatch_state: SourceKind4DispatchState,
+    resolve_target: &mut impl FnMut(SourceTargetDescriptor) -> Option<SourcePathTargetRect>,
 ) -> bool {
     if unit.source_runtime_slot.is_none() {
         return false;
@@ -2130,14 +2205,21 @@ fn tick_source_kind4_order(
                 unit.source_idle_remaining = SOURCE_KIND4_DEFERRED_IDLE_REMAINING;
                 continue;
             }
-            if source_kind4_terminal_target_reached(unit, map) {
+            if source_kind4_terminal_target_reached_with_target_resolver(
+                unit,
+                map,
+                &mut *resolve_target,
+            ) {
                 unit.source_target_descriptor = None;
                 unit.target_x = unit.tile_x;
                 unit.target_y = unit.tile_y;
             }
             let has_live_source_target = unit
                 .source_target_descriptor
-                .and_then(|descriptor| map.source_land_target_rect(descriptor))
+                .and_then(|descriptor| {
+                    map.source_land_target_rect(descriptor)
+                        .or_else(|| resolve_target(descriptor))
+                })
                 .is_some();
             if !has_live_source_target
                 && unit.tile_x == unit.target_x
@@ -2160,7 +2242,7 @@ fn tick_source_kind4_order(
             let next = match source_kind4_next_program_run_endpoint(unit) {
                 Some(next) => next,
                 None => {
-                    let Some(program) = source_kind4_route_program(
+                    let Some(program) = source_kind4_route_program_with_target_resolver(
                         unit,
                         map,
                         definition.source_speed_type(),
@@ -2168,6 +2250,7 @@ fn tick_source_kind4_order(
                         unit.source_route_radius,
                         unit.source_route_retry_count,
                         source_rand,
+                        &mut *resolve_target,
                     ) else {
                         unit.source_route_retry_count = unit.source_route_retry_count.wrapping_add(1);
                         unit.source_idle_remaining = SOURCE_KIND4_TERMINAL_IDLE_REMAINING;
@@ -2266,10 +2349,38 @@ fn source_kind4_route_program(
     retry_count: u8,
     source_rand: &mut SourceRand,
 ) -> Option<Vec<u8>> {
+    source_kind4_route_program_with_target_resolver(
+        unit,
+        map,
+        speed_type,
+        max_step_count,
+        route_radius,
+        retry_count,
+        source_rand,
+        |_| None,
+    )
+}
+
+/// `FUN_004581f0` routes against the rectangle resolved by `FUN_00444fe0`.
+/// Static and packed descriptors resolve from the island map; object-backed
+/// descriptors are supplied by the owning live-state table.
+fn source_kind4_route_program_with_target_resolver(
+    unit: &MilitaryUnit,
+    map: &crate::island_map::IslandMap,
+    speed_type: u8,
+    max_step_count: u8,
+    route_radius: u8,
+    retry_count: u8,
+    source_rand: &mut SourceRand,
+    mut resolve_target: impl FnMut(SourceTargetDescriptor) -> Option<SourcePathTargetRect>,
+) -> Option<Vec<u8>> {
     let start = (unit.tile_x, unit.tile_y);
     let target = unit
         .source_target_descriptor
-        .and_then(|descriptor| map.source_land_target_rect(descriptor))
+        .and_then(|descriptor| {
+            map.source_land_target_rect(descriptor)
+                .or_else(|| resolve_target(descriptor))
+        })
         .or_else(|| {
             crate::source_route::SourcePathTargetRect::new(
                 (unit.target_x, unit.target_y),
@@ -2383,22 +2494,48 @@ fn source_kind4_program_is_terminal(unit: &MilitaryUnit) -> bool {
         .map_or(true, |command| command & 0xf0 == 0xc0 || command & 0x0f == 0)
 }
 
-/// `FUN_00456d00` clears a resolved terminal descriptor when
-/// `FUN_00443440` reports weighted distance at most two. The local type-4
-/// state retains raw coordinates for packed `0x37`/`0x38` descriptors and
-/// for the `0x34` native-idle static cell written by `FUN_004458f0`.
+/// `FUN_00456d00` clears a resolved terminal descriptor only when
+/// `FUN_00443440` accepts its descriptor-specific weighted-distance limit.
+/// The local type-4 state retains raw coordinates for packed `0x37`/`0x38`
+/// descriptors and for the `0x34` native-idle static cell written by
+/// `FUN_004458f0`.
 fn source_kind4_terminal_target_reached(
     unit: &MilitaryUnit,
     map: &crate::island_map::IslandMap,
 ) -> bool {
+    source_kind4_terminal_target_reached_with_target_resolver(unit, map, |_| None)
+}
+
+/// Apply the terminal `FUN_00443440` gate after resolving an object-backed
+/// descriptor through the corresponding live source table.
+fn source_kind4_terminal_target_reached_with_target_resolver(
+    unit: &MilitaryUnit,
+    map: &crate::island_map::IslandMap,
+    mut resolve_target: impl FnMut(SourceTargetDescriptor) -> Option<SourcePathTargetRect>,
+) -> bool {
     unit.source_target_descriptor
-        .and_then(|descriptor| map.source_land_target_rect(descriptor))
-        .is_some_and(|target| {
+        .and_then(|descriptor| {
+            map.source_land_target_rect(descriptor)
+                .or_else(|| resolve_target(descriptor))
+                .map(|target| (descriptor, target))
+        })
+        .is_some_and(|(descriptor, target)| {
             crate::source_route::source_target_metric(
                 (unit.tile_x, unit.tile_y),
                 target.nearest_point((unit.tile_x, unit.tile_y)),
-            ) <= 2
+            ) <= source_kind4_terminal_distance_limit(descriptor)
         })
+}
+
+/// `FUN_00456d00` selects this `FUN_00443440` limit from the descriptor
+/// kind immediately before clearing the terminal state descriptor.
+const fn source_kind4_terminal_distance_limit(descriptor: SourceTargetDescriptor) -> u32 {
+    match descriptor.kind() {
+        1 => 9,
+        0x32 | 0x33 => 1,
+        0x34 => 2,
+        _ => 0,
+    }
 }
 
 /// Resolve only the first run of a freshly built source program. Tests use
@@ -2863,10 +3000,11 @@ mod tests {
     #[test]
     fn source_kind6_target_descriptor_matches_selector_cases() {
         let mut static_target = source_candidate(1, 0x19, 195, 0);
-        static_target.source_kind6_target_descriptor_payload = Some([0xab, 0xcd]);
+        static_target.candidate_list_key = Some(0xab);
+        static_target.runtime_slot = 0xcdef;
         assert_eq!(
             static_target.source_kind6_action_target_descriptor(),
-            Some(SourceTargetDescriptor::from_bytes([1, 0xab, 0xcd, 0]))
+            Some(SourceTargetDescriptor::from_bytes([1, 0xab, 0xef, 0xcd]))
         );
 
         let mut dynamic_target = source_candidate(6, 0x1f, 285, 0);
@@ -2884,6 +3022,35 @@ mod tests {
             Some(SourceKind6TargetGeometry::Descriptor(
                 SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
             ))
+        );
+    }
+
+    #[test]
+    fn source_figure_target_rect_matches_fun_00444fe0_live_table_cases() {
+        let mut target = source_candidate(1, 0x19, 195, 0);
+        target.candidate_list_key = Some(9);
+        target.runtime_slot = 0x1234;
+        target.position = (20.9, -2.9);
+        let descriptor = target
+            .source_kind6_action_target_descriptor()
+            .expect("source target identity is complete");
+
+        assert_eq!(
+            source_figure_target_rect(descriptor, &[target], |_| None),
+            SourcePathTargetRect::new((20, -2), 1, 1)
+        );
+
+        let mut launcher = source_candidate(6, 0x1f, 285, 0);
+        launcher.candidate_list_key = Some(4);
+        launcher.runtime_slot = 1;
+        launcher.kind6_target_descriptor = Some(descriptor);
+        let launcher_descriptor = launcher
+            .source_kind6_action_target_descriptor()
+            .expect("source launcher identity is complete");
+
+        assert_eq!(
+            source_figure_target_rect(launcher_descriptor, &[target, launcher], |_| None),
+            SourcePathTargetRect::new((20, -2), 1, 1)
         );
     }
 
@@ -4020,7 +4187,7 @@ mod tests {
     }
 
     #[test]
-    fn source_kind_four_clears_terminal_coordinate_within_source_radius() {
+    fn source_kind_four_coordinate_terminal_requires_exact_arrival() {
         let map = crate::island_map::IslandMap::new_open(7, 8, 8);
         let mut unit = MilitaryUnit::new(UnitType::Infantry, 0, 0, 0);
         unit.source_island_id = Some(7);
@@ -4038,8 +4205,12 @@ mod tests {
         );
 
         assert_eq!((unit.tile_x, unit.tile_y), (0, 0));
-        assert_eq!((unit.target_x, unit.target_y), (0, 0));
-        assert_eq!(unit.source_target_descriptor, None);
+        assert_eq!((unit.target_x, unit.target_y), (2, 0));
+        assert_eq!(
+            unit.source_target_descriptor,
+            SourceTargetDescriptor::from_source_land_route_coordinate(2, 0)
+        );
+        assert!(unit.source_motion_target.is_some());
     }
 
     #[test]
@@ -4060,6 +4231,55 @@ mod tests {
         assert!(source_kind4_terminal_target_reached(&unit, &map));
         unit.tile_x = 8;
         assert!(!source_kind4_terminal_target_reached(&unit, &map));
+    }
+
+    #[test]
+    fn source_kind_four_terminal_limits_match_fun_00456d00_descriptor_cases() {
+        let map = crate::island_map::IslandMap::new_open(7, 8, 1);
+        let mut unit = MilitaryUnit::new(UnitType::Infantry, 0, 7, 0);
+
+        unit.source_target_descriptor =
+            Some(SourceTargetDescriptor::from_source_kind34_island_cell(7, 2, 0));
+        assert!(source_kind4_terminal_target_reached(&unit, &map));
+
+        unit.source_target_descriptor = Some(SourceTargetDescriptor::from_bytes([0x33, 7, 2, 0]));
+        assert!(!source_kind4_terminal_target_reached(&unit, &map));
+
+        unit.tile_x = 1;
+        unit.source_target_descriptor = Some(SourceTargetDescriptor::from_bytes([0x38, 0, 2, 0]));
+        assert!(!source_kind4_terminal_target_reached(&unit, &map));
+
+        unit.tile_x = 2;
+        assert!(source_kind4_terminal_target_reached(&unit, &map));
+    }
+
+    #[test]
+    fn source_kind_four_resolves_live_object_target_geometry_for_route_and_terminal_gate() {
+        let map = crate::island_map::IslandMap::new_open(7, 8, 1);
+        let descriptor = SourceTargetDescriptor::from_bytes([0x36, 7, 3, 0]);
+        let target = SourcePathTargetRect::new((2, 0), 1, 1).unwrap();
+        let mut unit = MilitaryUnit::new(UnitType::Infantry, 0, 0, 0);
+        unit.source_target_descriptor = Some(descriptor);
+        let mut source_rand = SourceRand::default();
+
+        let route = source_kind4_route_program_with_target_resolver(
+            &unit,
+            &map,
+            0,
+            1,
+            45,
+            0,
+            &mut source_rand,
+            |resolved| (resolved == descriptor).then_some(target),
+        );
+        assert!(route.is_some());
+
+        unit.tile_x = 2;
+        assert!(source_kind4_terminal_target_reached_with_target_resolver(
+            &unit,
+            &map,
+            |resolved| (resolved == descriptor).then_some(target),
+        ));
     }
 
     #[test]
