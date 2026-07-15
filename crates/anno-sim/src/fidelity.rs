@@ -16,7 +16,6 @@ pub const POPULATION_TICK_MS: u32 = 10_000;
 pub const EVENT_TICK_MS: u32 = 10_000;
 pub const SHIP_TICK_MS: u32 = 1_000;
 pub const MARKET_TICK_MS: u32 = 1_000;
-pub const MILITARY_TICK_MS: u32 = 10_000;
 pub const DIPLOMACY_TICK_MS: u32 = 5_000;
 pub const BUILDING_CONTROL_TICK_MS: u32 = 4_999;
 
@@ -81,15 +80,23 @@ impl Subsystem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimingSpec {
     pub subsystem: Subsystem,
-    pub interval_ms: u32,
+    pub cadence: TimingCadence,
     pub status: FidelityStatus,
     pub source: SourceRef,
+}
+
+/// Source dispatcher cadence. Most subsystems decrement a persisted timer;
+/// entity processing instead receives every clamped engine-update delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingCadence {
+    Interval(u32),
+    PerUpdate,
 }
 
 pub const TIMING_SPECS: [TimingSpec; 8] = [
     TimingSpec {
         subsystem: Subsystem::Production,
-        interval_ms: crate::production::PRODUCTION_TICK_MS,
+        cadence: TimingCadence::Interval(crate::production::PRODUCTION_TICK_MS),
         status: FidelityStatus::BinaryVerified,
         source: SourceRef {
             source: "decompiled/1602_exe.c",
@@ -99,7 +106,7 @@ pub const TIMING_SPECS: [TimingSpec; 8] = [
     },
     TimingSpec {
         subsystem: Subsystem::BuildingControl,
-        interval_ms: BUILDING_CONTROL_TICK_MS,
+        cadence: TimingCadence::Interval(BUILDING_CONTROL_TICK_MS),
         status: FidelityStatus::BinaryVerified,
         source: SourceRef {
             source: "decompiled/1602_exe.c",
@@ -109,7 +116,7 @@ pub const TIMING_SPECS: [TimingSpec; 8] = [
     },
     TimingSpec {
         subsystem: Subsystem::Population,
-        interval_ms: POPULATION_TICK_MS,
+        cadence: TimingCadence::Interval(POPULATION_TICK_MS),
         status: FidelityStatus::BinaryVerified,
         source: SourceRef {
             source: "decompiled/1602_exe.c",
@@ -119,7 +126,7 @@ pub const TIMING_SPECS: [TimingSpec; 8] = [
     },
     TimingSpec {
         subsystem: Subsystem::Diplomacy,
-        interval_ms: DIPLOMACY_TICK_MS,
+        cadence: TimingCadence::Interval(DIPLOMACY_TICK_MS),
         status: FidelityStatus::BinaryVerified,
         source: SourceRef {
             source: "decompiled/1602_exe.c",
@@ -129,7 +136,7 @@ pub const TIMING_SPECS: [TimingSpec; 8] = [
     },
     TimingSpec {
         subsystem: Subsystem::MarketCoverage,
-        interval_ms: MARKET_TICK_MS,
+        cadence: TimingCadence::Interval(MARKET_TICK_MS),
         status: FidelityStatus::BinaryVerified,
         source: SourceRef {
             source: "decompiled/1602_exe.c",
@@ -139,7 +146,7 @@ pub const TIMING_SPECS: [TimingSpec; 8] = [
     },
     TimingSpec {
         subsystem: Subsystem::Ships,
-        interval_ms: SHIP_TICK_MS,
+        cadence: TimingCadence::Interval(SHIP_TICK_MS),
         status: FidelityStatus::BinaryVerified,
         source: SourceRef {
             source: "decompiled/1602_exe.c",
@@ -148,23 +155,23 @@ pub const TIMING_SPECS: [TimingSpec; 8] = [
         },
     },
     TimingSpec {
-        subsystem: Subsystem::Military,
-        interval_ms: MILITARY_TICK_MS,
-        status: FidelityStatus::StandIn,
-        source: SourceRef {
-            source: "decompiled/1602_exe.c",
-            location: "FUN_00451890 / main dispatcher:97979-97998",
-            note: "the executable advances entity state machines every engine update; the reported 10 s simulation value is not its combat cadence",
-        },
-    },
-    TimingSpec {
         subsystem: Subsystem::Events,
-        interval_ms: EVENT_TICK_MS,
+        cadence: TimingCadence::Interval(EVENT_TICK_MS),
         status: FidelityStatus::Heuristic,
         source: SourceRef {
             source: "implementation",
             location: "Simulation::tick_events",
             note: "shares the economy cadence pending exact event scheduler port",
+        },
+    },
+    TimingSpec {
+        subsystem: Subsystem::Military,
+        cadence: TimingCadence::PerUpdate,
+        status: FidelityStatus::BinaryVerified,
+        source: SourceRef {
+            source: "decompiled/1602_exe.c",
+            location: "FUN_00489670:97964-98001",
+            note: "FUN_00451890(iVar1) runs once after every clamped engine-update slice",
         },
     },
 ];
@@ -240,12 +247,12 @@ pub fn compare_trace(expected: &[TraceEvent], actual: &[TraceEvent]) -> Result<(
 #[derive(Debug, Clone)]
 pub struct TickScheduler {
     elapsed_ms: u32,
-    accumulators: [(Subsystem, u32, u32); TIMING_SPECS.len()],
+    accumulators: [(Subsystem, TimingCadence, u32); TIMING_SPECS.len()],
 }
 
 impl Default for TickScheduler {
     fn default() -> Self {
-        let accumulators = TIMING_SPECS.map(|spec| (spec.subsystem, spec.interval_ms, 0));
+        let accumulators = TIMING_SPECS.map(|spec| (spec.subsystem, spec.cadence, 0));
         Self {
             elapsed_ms: 0,
             accumulators,
@@ -269,14 +276,22 @@ impl TickScheduler {
             scaled_ms -= dt;
             self.elapsed_ms += dt;
 
-            for (subsystem, interval_ms, accumulator_ms) in &mut self.accumulators {
-                *accumulator_ms += dt;
-                if *accumulator_ms >= *interval_ms {
-                    *accumulator_ms -= *interval_ms;
-                    out.push(TraceEvent {
+            for (subsystem, cadence, accumulator_ms) in &mut self.accumulators {
+                match cadence {
+                    TimingCadence::Interval(interval_ms) => {
+                        *accumulator_ms += dt;
+                        if *accumulator_ms >= *interval_ms {
+                            *accumulator_ms -= *interval_ms;
+                            out.push(TraceEvent {
+                                at_ms: self.elapsed_ms,
+                                subsystem: *subsystem,
+                            });
+                        }
+                    }
+                    TimingCadence::PerUpdate => out.push(TraceEvent {
                         at_ms: self.elapsed_ms,
                         subsystem: *subsystem,
-                    });
+                    }),
                 }
             }
         }
@@ -326,7 +341,7 @@ mod tests {
         assert_eq!(count(&events, Subsystem::Ships), 10);
         assert_eq!(count(&events, Subsystem::Diplomacy), 2);
         assert_eq!(count(&events, Subsystem::Population), 1);
-        assert_eq!(count(&events, Subsystem::Military), 1);
+        assert_eq!(count(&events, Subsystem::Military), 50);
         assert_eq!(count(&events, Subsystem::Events), 1);
 
         assert!(events.contains(&TraceEvent {
@@ -362,11 +377,39 @@ mod tests {
                 },
                 TraceEvent {
                     at_ms: 10_000,
-                    subsystem: Subsystem::Military
+                    subsystem: Subsystem::Events
                 },
                 TraceEvent {
                     at_ms: 10_000,
-                    subsystem: Subsystem::Events
+                    subsystem: Subsystem::Military
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn military_cadence_emits_for_every_clamped_dispatch_slice() {
+        let mut scheduler = TickScheduler::new();
+        let events = scheduler.advance_scaled(450);
+        let military: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.subsystem == Subsystem::Military)
+            .collect();
+
+        assert_eq!(
+            military,
+            vec![
+                TraceEvent {
+                    at_ms: 200,
+                    subsystem: Subsystem::Military,
+                },
+                TraceEvent {
+                    at_ms: 400,
+                    subsystem: Subsystem::Military,
+                },
+                TraceEvent {
+                    at_ms: 450,
+                    subsystem: Subsystem::Military,
                 },
             ]
         );
@@ -378,7 +421,8 @@ mod tests {
         let snapshot = sim.subsystem_timing_snapshot();
         let expected: Vec<_> = TIMING_SPECS
             .iter()
-            .map(|spec| (spec.subsystem, spec.interval_ms))
+            .filter(|spec| spec.subsystem != Subsystem::BuildingControl)
+            .map(|spec| (spec.subsystem, spec.cadence))
             .collect();
         assert_eq!(snapshot, expected);
     }
@@ -416,7 +460,7 @@ mod tests {
             .into_iter()
             .map(|spec| spec.subsystem)
             .collect();
-        assert_eq!(timing, vec![Subsystem::Military, Subsystem::Events]);
+        assert_eq!(timing, vec![Subsystem::Events]);
 
         let probability: Vec<_> = unresolved_probability_specs()
             .into_iter()

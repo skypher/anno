@@ -6,12 +6,26 @@
 
 use anno_formats::cod::{BuildingDef, CodFile};
 
+use crate::building::SourceBuildingCommand;
+
 /// The renderer-relevant subset of one source 20-byte map-cell record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceMapCellState {
     pub island: u8,
     pub x: u8,
     pub y: u8,
+    /// Low 13 bits selecting this cell's compiled map definition. `Gfx:`
+    /// initializes the root index at definition offset `+0x84`, and
+    /// `FUN_00463b10` increments it through the oriented footprint.
+    #[serde(default)]
+    pub source_definition_offset: u16,
+    /// Anchor of the compiled source command which owns this destination
+    /// cell. `FUN_00463250` recovers these coordinates from a cell's
+    /// definition-offset and orientation before replaying a backing command.
+    #[serde(default)]
+    pub source_command_anchor_x: u8,
+    #[serde(default)]
+    pub source_command_anchor_y: u8,
     /// Oriented source-command footprint. `FUN_00463f40` uses these extents
     /// when its type-7 terminal handler replaces or clears the root.
     pub footprint_width: u8,
@@ -115,6 +129,9 @@ impl SourceMapCellState {
             island,
             x,
             y,
+            source_definition_offset: u16::try_from(definition.gfx).unwrap_or(0),
+            source_command_anchor_x: x,
+            source_command_anchor_y: y,
             footprint_width: u8::try_from(definition.size.0).unwrap_or(1).max(1),
             footprint_height: u8::try_from(definition.size.1).unwrap_or(1).max(1),
             source_definition_width: u8::try_from(definition.size.0).unwrap_or(1).max(1),
@@ -159,9 +176,51 @@ impl SourceMapCellState {
         self.footprint_height = u8::try_from(height).unwrap_or(1).max(1);
     }
 
+    /// Compiled definition index written at one oriented destination cell by
+    /// `FUN_00463b10`. `dx` and `dy` are measured in the oriented footprint
+    /// held by this state.
+    pub fn source_definition_offset_at(self, dx: u8, dy: u8) -> u16 {
+        let width = u16::from(self.source_definition_width.max(1));
+        let height = u16::from(self.source_definition_height.max(1));
+        let dx = u16::from(dx);
+        let dy = u16::from(dy);
+        let increment = match self.source_orientation & 3 {
+            0 => dy * width + dx,
+            1 => (height - 1 - dx) * width + dy,
+            2 => (height - 1 - dy) * width + (width - 1 - dx),
+            _ => dx * width + (width - 1 - dy),
+        };
+        self.source_definition_offset.wrapping_add(increment)
+    }
+
     /// Retain the low orientation bits passed to the terminal map writer.
     pub fn set_source_orientation(&mut self, orientation: u8) {
         self.source_orientation = orientation & 3;
+    }
+
+    /// Retain the packed source command used to seed this root. This is
+    /// required when a `Ruinenr = NORUINE` terminal event restores a backing
+    /// command to the visible INSELHAUS stream.
+    pub fn set_source_command(&mut self, command: SourceBuildingCommand) {
+        self.source_definition_offset = command.definition_offset;
+        self.source_orientation = command.orientation & 3;
+        self.source_variant = command.variant & 0x0f;
+        self.source_map_owner_slot = command.map_owner_slot & 7;
+    }
+
+    /// Encode the root fields retained by the terminal map writer as an
+    /// INSELHAUS command at the supplied anchored position.
+    pub fn to_source_island_tile(self) -> anno_formats::szs::IslandTile {
+        SourceBuildingCommand {
+            definition_offset: self.source_definition_offset,
+            orientation: self.source_orientation,
+            variant: self.source_variant,
+            metadata: 0,
+            map_owner_slot: self.source_map_owner_slot,
+            random_seed: 0,
+            dynamic_object_owner: 0,
+        }
+        .to_island_tile(self.x, self.y)
     }
 
     /// Preserve the root fields that `FUN_00463f40` forwards unchanged to
@@ -373,6 +432,39 @@ mod tests {
         assert_eq!(state.activity_frame_selector(4), 0);
         state.set_activity(0);
         assert_eq!(state.frame_selector, 0);
+    }
+
+    #[test]
+    fn definition_indices_follow_fun_00463b10_oriented_write_order() {
+        let definition = BuildingDef {
+            kind: "HANDWERK".into(),
+            gfx: 100,
+            size: (2, 3),
+            ..Default::default()
+        };
+        let mut state = SourceMapCellState::new_static(0, 0, 0, &definition, 0)
+            .expect("static source command");
+
+        let cases = [
+            (0, 2, 3, [[100, 101, 0], [102, 103, 0], [104, 105, 0]]),
+            (1, 3, 2, [[104, 102, 100], [105, 103, 101], [0, 0, 0]]),
+            (2, 2, 3, [[105, 104, 0], [103, 102, 0], [101, 100, 0]]),
+            (3, 3, 2, [[101, 103, 105], [100, 102, 104], [0, 0, 0]]),
+        ];
+
+        for (orientation, width, height, expected) in cases {
+            state.set_source_orientation(orientation);
+            state.set_footprint(width, height);
+            for dy in 0..height {
+                for dx in 0..width {
+                    assert_eq!(
+                        state.source_definition_offset_at(dx, dy),
+                        expected[usize::from(dy)][usize::from(dx)],
+                        "orientation {orientation}, destination ({dx}, {dy})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

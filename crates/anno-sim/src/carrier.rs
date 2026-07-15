@@ -10,7 +10,6 @@
 use crate::building::{BuildingDef, BuildingInstance};
 use crate::entity::{ActionType, CargoRoute, Figure};
 use crate::island_map::IslandMap;
-use crate::pathfinding;
 use crate::source_cell::SourceMapCellState;
 use crate::source_route::{
     SourcePathBlockedCellDecision, SourcePathTargetRect, source_route_positions,
@@ -961,12 +960,7 @@ pub fn handle_arrival(
                     .iter()
                     .find(|map| map.island_id == figure.origin_island)
                 {
-                    Some(map) => match pathfinding::find_path_for_carrier(
-                        map,
-                        start,
-                        goal,
-                        pathfinding::CarrierLoad::Loaded,
-                    ) {
+                    Some(map) => match source_carrier_return_path(map, start, goal, CargoRoute::CityCart) {
                         Some(path) => path,
                         None => return true,
                     },
@@ -997,11 +991,11 @@ pub fn handle_arrival(
                 .iter()
                 .find(|map| map.island_id == building.island_id)
             {
-                Some(map) => match pathfinding::find_path_for_carrier(
+                Some(map) => match source_carrier_return_path(
                     map,
                     start,
                     goal,
-                    pathfinding::CarrierLoad::Loaded,
+                    CargoRoute::InputCarrier,
                 ) {
                     Some(path) => path,
                     None => return true,
@@ -1020,6 +1014,25 @@ pub fn handle_arrival(
         ActionType::Returning => true,
         _ => true,
     }
+}
+
+/// Rebuild the loaded return route with the same fixed-cost wave that creates
+/// the outbound type-8/type-11 route. `FUN_0046c7d0` accepts the return root
+/// through its blocked-cell callback, so a root need not be a traversable
+/// static terrain cell for this search to complete.
+fn source_carrier_return_path(
+    map: &IslandMap,
+    start: (i32, i32),
+    goal: (i32, i32),
+    cargo_route: CargoRoute,
+) -> Option<Vec<(i32, i32)>> {
+    let mut grid = match cargo_route {
+        CargoRoute::InputCarrier => map.carrier_path_grid(),
+        CargoRoute::CityCart => map.city_cart_path_grid(),
+    };
+    let steps = grid.route_to(start, goal).ok()?;
+    let path = source_route_positions(start, &steps)?;
+    (path.last().copied() == Some(goal) || (start == goal && path.is_empty())).then_some(path)
 }
 
 /// Generate a direct path (no obstacles) from start to goal.
@@ -1482,6 +1495,38 @@ mod tests {
         assert_eq!((figure.target_x, figure.target_y), (2, 5));
         assert_eq!(figure.anim_frame, 0);
         assert_eq!(figure.source_animation_elapsed_ms, 0);
+    }
+
+    #[test]
+    fn loaded_city_cart_return_keeps_the_source_wave_grid() {
+        let mut figure = Figure::new();
+        figure.action = ActionType::CarryingGoods;
+        figure.cargo_route = CargoRoute::CityCart;
+        figure.origin_island = 0;
+        figure.origin_x = 0;
+        figure.origin_y = 0;
+        figure.tile_x = 2;
+        let mut map = IslandMap::new_open(0, 3, 1);
+        map.set_walkable(1, 0, false);
+
+        assert!(!handle_arrival(&mut figure, &[], &[map]));
+        assert_eq!(figure.action, ActionType::Returning);
+        assert_eq!(figure.path, vec![(1, 0), (0, 0)]);
+    }
+
+    #[test]
+    fn loaded_input_carrier_return_keeps_the_source_wave_grid() {
+        let mut figure = Figure::new();
+        figure.action = ActionType::CarryingGoods;
+        figure.building_idx = 0;
+        figure.tile_x = 2;
+        let buildings = [BuildingInstance::new(0, 0, 0, 0, 0)];
+        let mut map = IslandMap::new_open(0, 3, 1);
+        map.set_walkable(1, 0, false);
+
+        assert!(!handle_arrival(&mut figure, &buildings, &[map]));
+        assert_eq!(figure.action, ActionType::Returning);
+        assert_eq!(figure.path, vec![(1, 0), (0, 0)]);
     }
 
     #[test]

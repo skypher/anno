@@ -997,6 +997,98 @@ pub fn source_static_map_roots_from_scenario(
     source_map_roots_from_scenario(szs, cod, true)
 }
 
+/// Replay the source loader's `+0xafc` backing map. `FUN_00468550` copies
+/// only owner-slot-7 non-live definitions through `FUN_00463e10`; later
+/// `FUN_004641d0` uses this map when a `Ruinenr = 0xff` command is removed.
+pub fn source_static_map_backing_cells_from_scenario(
+    szs: &SzsFile,
+    cod: &CodFile,
+) -> Vec<SourceMapCellState> {
+    let mut cells = HashMap::new();
+    for island in &szs.islands {
+        for tile in &island.tiles {
+            let Some(definition) = cod.building_by_source_id(tile.source_id()) else {
+                continue;
+            };
+            if !source_loader_copies_static_backing(cod, *tile, definition) {
+                continue;
+            }
+            let (width, height) = if matches!(tile.orientation & 3, 1 | 3) {
+                (definition.size.1, definition.size.0)
+            } else {
+                definition.size
+            };
+            if width <= 0 || height <= 0 {
+                continue;
+            }
+            let command = crate::building::SourceBuildingCommand::from_island_tile(*tile);
+            let Some(mut root) = SourceMapCellState::new_static(
+                island.number,
+                tile.x,
+                tile.y,
+                definition,
+                0,
+            ) else {
+                continue;
+            };
+            root.set_footprint(width, height);
+            root.set_source_command(command);
+            root.configure_terminal_replacement(cod);
+            for dy in 0..height {
+                for dx in 0..width {
+                    let x = i32::from(tile.x) + dx;
+                    let y = i32::from(tile.y) + dy;
+                    let (Ok(x), Ok(y)) = (u8::try_from(x), u8::try_from(y)) else {
+                        continue;
+                    };
+                    let mut cell = root;
+                    cell.x = x;
+                    cell.y = y;
+                    cell.source_definition_offset =
+                        root.source_definition_offset_at(dx as u8, dy as u8);
+                    cells.insert((island.number, u16::from(x), u16::from(y)), cell);
+                }
+            }
+        }
+    }
+    cells.into_values().collect()
+}
+
+/// `FUN_00468550` copies only owner-slot-7 definitions whose outer `Kind`
+/// code is neither 12 nor 29 and for which `FUN_00480b70` returns zero.
+/// That helper switches on the nested production-kind code. Kinds 9 and 10
+/// use their compiled `Ware` byte as the source helper's special case; kind
+/// 0 checks the outer kind code directly.
+fn source_loader_copies_static_backing(
+    cod: &CodFile,
+    tile: anno_formats::szs::IslandTile,
+    definition: &CodBuilding,
+) -> bool {
+    if tile.source_owner() != 7 {
+        return false;
+    }
+    let outer_kind = definition.source_kind_code();
+    if matches!(outer_kind, Some(12 | 29)) {
+        return false;
+    }
+    match definition.source_production_kind_code() {
+        Some(9) => definition
+            .source_ware_slot()
+            .is_some_and(|slot| matches!(slot, 0x34 | 0x35 | 0x39)),
+        Some(10) => cod
+            .buildings
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, definition))
+            .and_then(|index| cod.buildings.get(index + 1))
+            .and_then(CodBuilding::source_ware_slot)
+            .is_some_and(|slot| matches!(slot, 0x34 | 0x35 | 0x39)),
+        Some(1..=8 | 13..=15 | 17..=27 | 30 | 31) | None => false,
+        Some(12 | 29) => false,
+        Some(0) => !matches!(outer_kind, Some(1 | 30)),
+        Some(_) => true,
+    }
+}
+
 fn source_map_roots_from_scenario(
     szs: &SzsFile,
     cod: &CodFile,
@@ -1051,8 +1143,7 @@ fn source_map_roots_from_scenario(
             )
             .map(|mut state| {
                 state.set_footprint(width, height);
-                state.set_source_orientation(tile.orientation);
-                state.set_terminal_command_fields(command.variant, command.map_owner_slot);
+                state.set_source_command(command);
                 state.configure_terminal_replacement(cod);
                 state
             });
@@ -1068,6 +1159,8 @@ fn source_map_roots_from_scenario(
                             let mut cell = state;
                             cell.x = x;
                             cell.y = y;
+                            cell.source_definition_offset =
+                                state.source_definition_offset_at(dx as u8, dy as u8);
                             static_cells.insert((island.number, u16::from(x), u16::from(y)), cell);
                         }
                     }
@@ -1081,7 +1174,7 @@ fn source_map_roots_from_scenario(
             }
             if let Some(mut state) = static_state {
                 state.set_footprint(width, height);
-                state.set_source_orientation(tile.orientation);
+                state.set_source_command(command);
                 states.push(state);
             }
         }
@@ -1973,6 +2066,198 @@ mod tests {
         assert!(static_cells.iter().any(|state| {
             state.matches(6, 3, 4) && state.kind_code == 14
         }));
+    }
+
+    #[test]
+    fn source_backing_cells_follow_loader_filter_and_command_overwrites() {
+        use anno_formats::szs::{Island, IslandTile, ScenarioMeta};
+
+        let base = anno_formats::szs::INSELHAUS_SOURCE_ID_BASE;
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![
+                CodBuilding {
+                    source_id: base + 1,
+                    kind: "BODEN".into(),
+                    gfx: 1,
+                    size: (2, 1),
+                    properties: std::collections::HashMap::from([(
+                        "ProdKind".into(),
+                        "UNUSED".into(),
+                    )]),
+                    ..Default::default()
+                },
+                CodBuilding {
+                    source_id: base + 2,
+                    kind: "GEBAEUDE".into(),
+                    gfx: 2,
+                    properties: std::collections::HashMap::from([(
+                        "ProdKind".into(),
+                        "HANDWERK".into(),
+                    )]),
+                    ..Default::default()
+                },
+                CodBuilding {
+                    source_id: base + 3,
+                    kind: "FLUSS".into(),
+                    gfx: 3,
+                    properties: std::collections::HashMap::from([(
+                        "ProdKind".into(),
+                        "UNUSED".into(),
+                    )]),
+                    ..Default::default()
+                },
+            ],
+        };
+        let owner_seven = |building_id, x, y| IslandTile {
+            building_id,
+            x,
+            y,
+            orientation: 0,
+            anim_count: 0xc0,
+            flags: 1,
+        };
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![Island {
+                number: 6,
+                width: 16,
+                height: 16,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: vec![
+                    owner_seven(1, 2, 3),
+                    owner_seven(2, 2, 3),
+                    owner_seven(3, 3, 3),
+                ],
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: ScenarioMeta::default(),
+            ships: Vec::new(),
+            land_figures: Vec::new(),
+        };
+
+        let backing = source_static_map_backing_cells_from_scenario(&szs, &cod);
+
+        assert_eq!(backing.len(), 2);
+        let left = backing
+            .iter()
+            .find(|cell| cell.matches(6, 2, 3))
+            .expect("retained Boden backing cell");
+        assert_eq!(left.kind_code, 11);
+        assert_eq!(left.source_definition_offset, 1);
+        assert_eq!(
+            (left.source_command_anchor_x, left.source_command_anchor_y),
+            (2, 3)
+        );
+        let right = backing
+            .iter()
+            .find(|cell| cell.matches(6, 3, 3))
+            .expect("later Fluss overwrite");
+        assert_eq!(right.kind_code, 16);
+        assert_eq!(right.source_definition_offset, 3);
+        assert_eq!(
+            (right.source_command_anchor_x, right.source_command_anchor_y),
+            (3, 3)
+        );
+    }
+
+    #[test]
+    fn source_backing_loader_filter_separates_outer_and_production_kind_gates() {
+        use anno_formats::szs::IslandTile;
+
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![
+                CodBuilding {
+                    kind: "BODEN".into(),
+                    properties: std::collections::HashMap::from([(
+                        "ProdKind".into(),
+                        "UNUSED".into(),
+                    )]),
+                    ..Default::default()
+                },
+                CodBuilding {
+                    kind: "STRASSE".into(),
+                    properties: std::collections::HashMap::from([(
+                        "ProdKind".into(),
+                        "UNUSED".into(),
+                    )]),
+                    ..Default::default()
+                },
+                CodBuilding {
+                    kind: "PIER".into(),
+                    properties: std::collections::HashMap::from([(
+                        "ProdKind".into(),
+                        "UNUSED".into(),
+                    )]),
+                    ..Default::default()
+                },
+                CodBuilding {
+                    kind: "RUINE".into(),
+                    properties: std::collections::HashMap::from([(
+                        "ProdKind".into(),
+                        "UNUSED".into(),
+                    )]),
+                    ..Default::default()
+                },
+                CodBuilding {
+                    kind: "STRANDRUINE".into(),
+                    properties: std::collections::HashMap::from([(
+                        "ProdKind".into(),
+                        "UNUSED".into(),
+                    )]),
+                    ..Default::default()
+                },
+                CodBuilding {
+                    kind: "BODEN".into(),
+                    properties: std::collections::HashMap::from([(
+                        "ProdKind".into(),
+                        "HANDWERK".into(),
+                    )]),
+                    ..Default::default()
+                },
+            ],
+        };
+        let tile = IslandTile {
+            anim_count: 0xc0,
+            flags: 1,
+            ..Default::default()
+        };
+
+        assert!(source_loader_copies_static_backing(
+            &cod,
+            tile,
+            &cod.buildings[0]
+        ));
+        assert!(!source_loader_copies_static_backing(
+            &cod,
+            tile,
+            &cod.buildings[1]
+        ));
+        assert!(!source_loader_copies_static_backing(
+            &cod,
+            tile,
+            &cod.buildings[2]
+        ));
+        assert!(!source_loader_copies_static_backing(
+            &cod,
+            tile,
+            &cod.buildings[3]
+        ));
+        assert!(!source_loader_copies_static_backing(
+            &cod,
+            tile,
+            &cod.buildings[4]
+        ));
+        assert!(!source_loader_copies_static_backing(
+            &cod,
+            tile,
+            &cod.buildings[5]
+        ));
     }
 
     #[test]

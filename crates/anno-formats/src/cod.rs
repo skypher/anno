@@ -234,12 +234,25 @@ impl BuildingDef {
             .and_then(source_ware_slot)
     }
 
-    /// Runtime kind code assigned by the `FUN_00460750` symbol table before
-    /// haeuser.cod is parsed. The table deliberately aliases terrain and
+    /// Runtime code at compiled definition offset `+0x04`, parsed from the
+    /// outer `HAUS Kind:` field. The table deliberately aliases terrain and
     /// production labels into one code space; for example `STRASSE` and
     /// `HANDWERK` both resolve to 1.
     pub fn source_kind_code(&self) -> Option<u8> {
-        match self.kind.as_str() {
+        Self::source_kind_code_for(&self.kind)
+    }
+
+    /// Runtime code at compiled definition offset `+0x1c`, parsed from the
+    /// nested `HAUS_PRODTYP Kind:` field. `FUN_00480b70` switches on this
+    /// field after `FUN_00468550` has applied its outer-kind exclusions.
+    pub fn source_production_kind_code(&self) -> Option<u8> {
+        self.properties
+            .get("ProdKind")
+            .and_then(|kind| Self::source_kind_code_for(kind))
+    }
+
+    fn source_kind_code_for(kind: &str) -> Option<u8> {
+        match kind {
             "UNUSED" => Some(0),
             "STRASSE" | "HANDWERK" => Some(1),
             "PLANTAGE" => Some(2),

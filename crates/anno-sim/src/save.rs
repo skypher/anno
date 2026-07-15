@@ -151,7 +151,10 @@ use std::path::Path;
 ///      selection in source write order.
 /// v83: all static map roots retain category-6 terminal accumulators outside
 ///      the renderer's selector-state subset.
-pub const SAVE_VERSION: u32 = 83;
+/// v84: static backing map cells persist for `Ruinenr = 0xff` terminal replay.
+/// v85: source map-cell records retain the backing command definition offset
+///      needed to reconstruct visible NORUINE terminal replay.
+pub const SAVE_VERSION: u32 = 85;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -165,7 +168,7 @@ pub const SAVE_VERSION: u32 = 83;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 83;
+pub const MIN_LOADABLE_VERSION: u32 = 85;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -182,6 +185,7 @@ pub struct SaveState {
     pub source_dynamic_map_objects: Vec<SourceDynamicMapObject>,
     pub source_map_cell_states: Vec<SourceMapCellState>,
     pub source_static_map_roots: Vec<SourceMapCellState>,
+    pub source_static_map_backing_cells: Vec<SourceMapCellState>,
     pub source_kind13_locations: SourceKind13LocationTable,
     pub source_cities: SourceCityTable,
     pub source_kind4_occupants: Vec<SourceKind4Occupant>,
@@ -251,6 +255,7 @@ impl Simulation {
             source_dynamic_map_objects: self.source_dynamic_map_objects.clone(),
             source_map_cell_states: self.source_map_cell_states.clone(),
             source_static_map_roots: self.source_static_map_roots.clone(),
+            source_static_map_backing_cells: self.source_static_map_backing_cells.clone(),
             source_kind13_locations: self.source_kind13_locations.clone(),
             source_cities: self.source_cities.clone(),
             source_kind4_occupants: self.source_kind4_occupants.clone(),
@@ -290,6 +295,7 @@ impl Simulation {
         self.source_dynamic_map_objects = s.source_dynamic_map_objects;
         self.source_map_cell_states = s.source_map_cell_states;
         self.source_static_map_roots = s.source_static_map_roots;
+        self.source_static_map_backing_cells = s.source_static_map_backing_cells;
         self.source_kind13_locations = s.source_kind13_locations;
         self.source_cities = s.source_cities;
         self.source_kind4_occupants = s.source_kind4_occupants;
@@ -369,6 +375,7 @@ mod tests {
             source_dynamic_map_objects: vec![],
             source_map_cell_states: vec![],
             source_static_map_roots: vec![],
+            source_static_map_backing_cells: vec![],
             source_kind13_locations: SourceKind13LocationTable::default(),
             source_cities: SourceCityTable::default(),
             source_kind4_occupants: vec![],
@@ -476,6 +483,9 @@ mod tests {
                 island: 1,
                 x: 10,
                 y: 20,
+                source_definition_offset: 21,
+                source_command_anchor_x: 10,
+                source_command_anchor_y: 20,
                 footprint_width: 2,
                 footprint_height: 3,
                 source_definition_width: 2,
@@ -510,12 +520,20 @@ mod tests {
         let mut static_root = sim.source_map_cell_states[0];
         static_root.x = 14;
         static_root.y = 16;
+        static_root.source_command_anchor_x = 14;
+        static_root.source_command_anchor_y = 16;
         static_root.source_variant = 3;
         static_root.source_map_owner_slot = 5;
         static_root.fallback_strand_cells = 0b10_101;
         static_root.source_damage_accumulator = 511;
         static_root.kind_code = 35;
         sim.source_static_map_roots.push(static_root);
+        let mut backing_cell = static_root;
+        backing_cell.x = 12;
+        backing_cell.y = 18;
+        backing_cell.source_command_anchor_x = 12;
+        backing_cell.source_command_anchor_y = 18;
+        sim.source_static_map_backing_cells.push(backing_cell);
         assert!(
             sim.source_kind13_locations
                 .insert(crate::data_bridge::SourceKind13Location {
@@ -735,6 +753,9 @@ mod tests {
                 island: 1,
                 x: 10,
                 y: 20,
+                source_definition_offset: 21,
+                source_command_anchor_x: 10,
+                source_command_anchor_y: 20,
                 footprint_width: 2,
                 footprint_height: 3,
                 source_definition_width: 2,
@@ -773,8 +794,18 @@ mod tests {
         assert_eq!(sim2.source_static_map_roots[0].kind_code, 35);
         assert_eq!(sim2.source_static_map_roots[0].source_variant, 3);
         assert_eq!(sim2.source_static_map_roots[0].source_map_owner_slot, 5);
+        assert_eq!(sim2.source_static_map_roots[0].source_definition_offset, 21);
         assert_eq!(sim2.source_static_map_roots[0].fallback_strand_cells, 0b10_101);
         assert_eq!(sim2.source_static_map_roots[0].source_damage_accumulator, 511);
+        assert_eq!(sim2.source_static_map_backing_cells.len(), 1);
+        assert!(sim2.source_static_map_backing_cells[0].matches(1, 12, 18));
+        assert_eq!(
+            (
+                sim2.source_static_map_backing_cells[0].source_command_anchor_x,
+                sim2.source_static_map_backing_cells[0].source_command_anchor_y,
+            ),
+            (12, 18)
+        );
         assert_eq!(
             sim2.tile_clears,
             vec![crate::simulation::TileClear {

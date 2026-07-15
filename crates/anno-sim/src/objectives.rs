@@ -34,6 +34,10 @@ pub enum Objective {
     /// `target_population` total inhabitants. Used for cooperative
     /// missions where the human is asked to bootstrap an AI ally.
     SupportFellowPlayer { who: u8, target_population: u32 },
+    /// The named cooperative player has reached the required settlement tier.
+    /// AUFTRAG4 stores this separately from its population threshold at goal
+    /// slot 19, so both conditions must complete independently.
+    SupportFellowPlayerTier { who: u8, tier: u8 },
 }
 
 impl Objective {
@@ -70,6 +74,16 @@ impl Objective {
                 target_population,
             } => {
                 format!("Help player {} reach {} pop", who, target_population)
+            }
+            Objective::SupportFellowPlayerTier { who, tier } => {
+                let name = match *tier {
+                    0 => "Pioneers",
+                    1 => "Settlers",
+                    2 => "Citizens",
+                    3 => "Merchants",
+                    _ => "Aristocrats",
+                };
+                format!("Help player {} reach {} tier", who, name)
             }
         }
     }
@@ -146,6 +160,10 @@ impl ObjectiveSet {
                         all_players[who_idx].total_population >= *target_population
                     }
                 }
+                Objective::SupportFellowPlayerTier { who, tier } => all_players
+                    .get(*who as usize)
+                    .and_then(|player| player.population.get(*tier as usize))
+                    .is_some_and(|&population| population > 0),
                 Objective::Monopolies { goods } => {
                     // For every listed good: the owner produces it
                     // somewhere, and no other player does.
@@ -217,9 +235,9 @@ impl ObjectiveSet {
     ///     Aristocrats", both of which must clear before the
     ///     scenario is won.
     ///
-    /// `MISSION_FLAG_COOPERATIVE` adds a
-    /// `SupportFellowPlayer { who: 1, .. }` (the conventional
-    /// cooperative neighbour slot is the first AI rival, slot 1).
+    /// `MISSION_FLAG_COOPERATIVE` adds its population condition and,
+    /// when present, a separate tier condition for the conventional
+    /// cooperative neighbour slot 1.
     ///
     /// Returns an empty set when the mission carries no flagged
     /// goals.
@@ -243,6 +261,9 @@ impl ObjectiveSet {
                 who: 1,
                 target_population: target,
             });
+        }
+        if let Some(tier) = goals.cooperative_tier {
+            items.push(Objective::SupportFellowPlayerTier { who: 1, tier });
         }
         Self::new(items)
     }
@@ -297,7 +318,8 @@ mod tests {
         ));
 
         // Good-Neighbors: primary tier sub-goal + cooperative
-        // neighbour. Three objectives: total, at-tier, support.
+        // neighbour. Four objectives: total, at-tier, support population,
+        // and the parsed cooperative settlement tier.
         let s = ObjectiveSet::from_mission_goals(&MissionGoals {
             primary: Some(PopulationGoal {
                 total: 1_000,
@@ -305,9 +327,10 @@ mod tests {
                 at_tier: 500,
             }),
             cooperative_population: Some(1_000),
+            cooperative_tier: Some(3),
             ..Default::default()
         });
-        assert_eq!(s.items.len(), 3);
+        assert_eq!(s.items.len(), 4);
         assert!(matches!(
             s.items[0].0,
             Objective::ReachTotalPopulation { count: 1_000 }
@@ -325,6 +348,10 @@ mod tests {
                 who: 1,
                 target_population: 1_000
             }
+        ));
+        assert!(matches!(
+            s.items[3].0,
+            Objective::SupportFellowPlayerTier { who: 1, tier: 3 }
         ));
 
         // The Continent: three city goals, each a triple with
@@ -474,6 +501,25 @@ mod tests {
         let players = vec![p.clone(), ally.clone()];
         let done = set.evaluate(&p, &[], &[], &[], &players, 0);
         assert_eq!(done, vec![0]);
+    }
+
+    #[test]
+    fn support_fellow_player_tier_requires_the_decoded_settlement_level() {
+        let mut set = ObjectiveSet::new(vec![Objective::SupportFellowPlayerTier {
+            who: 1,
+            tier: 3,
+        }]);
+        let p = Player::new_human(0);
+        let mut ally = Player::new_ai(1, 0);
+
+        assert!(set
+            .evaluate(&p, &[], &[], &[], &[p.clone(), ally.clone()], 0)
+            .is_empty());
+        ally.population[3] = 1;
+        assert_eq!(
+            set.evaluate(&p, &[], &[], &[], &[p.clone(), ally], 0),
+            vec![0]
+        );
     }
 
     #[test]

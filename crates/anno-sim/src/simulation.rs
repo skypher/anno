@@ -128,9 +128,6 @@ pub struct Simulation {
     timer_events: SubsystemTimer,     // 10_000
     timer_ships: SubsystemTimer,      // 1_000
     timer_market: SubsystemTimer,     // 1_000
-    // Retained for the timing-status surface. Source land figures are
-    // dispatched by the per-update entity loop, not this legacy 10 s value.
-    timer_military: SubsystemTimer,
     timer_diplomacy: SubsystemTimer, // 5_000
 
     // Game state
@@ -141,9 +138,12 @@ pub struct Simulation {
     pub source_dynamic_map_objects: Vec<SourceDynamicMapObject>,
     /// Renderer-relevant state for source INSELHAUS command roots.
     pub source_map_cell_states: Vec<SourceMapCellState>,
-    /// Final-overwrite static roots addressed by `FUN_0047a650`, including
+    /// Final-overwrite static cells addressed by `FUN_0047a650`, including
     /// map kinds that have no live selector record.
     pub source_static_map_roots: Vec<SourceMapCellState>,
+    /// Loader-preserved static backing cells from source map array `+0xafc`.
+    /// `FUN_004641d0` replays these when a terminal command has no ruin.
+    pub source_static_map_backing_cells: Vec<SourceMapCellState>,
     /// Placement anchors retained by the source kind-13 location table.
     pub source_kind13_locations: SourceKind13LocationTable,
     /// Fixed source city-record pool read by `FUN_0047f8a0`.
@@ -453,7 +453,6 @@ impl Simulation {
             timer_events: SubsystemTimer::new(crate::fidelity::EVENT_TICK_MS),
             timer_ships: SubsystemTimer::new(crate::fidelity::SHIP_TICK_MS),
             timer_market: SubsystemTimer::new(crate::fidelity::MARKET_TICK_MS),
-            timer_military: SubsystemTimer::new(crate::fidelity::MILITARY_TICK_MS),
             timer_diplomacy: SubsystemTimer::new(crate::fidelity::DIPLOMACY_TICK_MS),
 
             players: Vec::new(),
@@ -461,6 +460,7 @@ impl Simulation {
             source_dynamic_map_objects: Vec::new(),
             source_map_cell_states: Vec::new(),
             source_static_map_roots: Vec::new(),
+            source_static_map_backing_cells: Vec::new(),
             source_kind13_locations: SourceKind13LocationTable::default(),
             source_cities: SourceCityTable::default(),
             source_kind4_occupants: Vec::new(),
@@ -799,16 +799,18 @@ impl Simulation {
         crate::prices::price_of(good)
     }
 
-    pub fn subsystem_timing_snapshot(&self) -> Vec<(crate::fidelity::Subsystem, u32)> {
-        use crate::fidelity::Subsystem;
+    pub fn subsystem_timing_snapshot(
+        &self,
+    ) -> Vec<(crate::fidelity::Subsystem, crate::fidelity::TimingCadence)> {
+        use crate::fidelity::{Subsystem, TimingCadence};
         vec![
-            (Subsystem::Production, self.timer_production.interval_ms),
-            (Subsystem::Population, self.timer_population.interval_ms),
-            (Subsystem::Diplomacy, self.timer_diplomacy.interval_ms),
-            (Subsystem::MarketCoverage, self.timer_market.interval_ms),
-            (Subsystem::Ships, self.timer_ships.interval_ms),
-            (Subsystem::Military, self.timer_military.interval_ms),
-            (Subsystem::Events, self.timer_events.interval_ms),
+            (Subsystem::Production, TimingCadence::Interval(self.timer_production.interval_ms)),
+            (Subsystem::Population, TimingCadence::Interval(self.timer_population.interval_ms)),
+            (Subsystem::Diplomacy, TimingCadence::Interval(self.timer_diplomacy.interval_ms)),
+            (Subsystem::MarketCoverage, TimingCadence::Interval(self.timer_market.interval_ms)),
+            (Subsystem::Ships, TimingCadence::Interval(self.timer_ships.interval_ms)),
+            (Subsystem::Events, TimingCadence::Interval(self.timer_events.interval_ms)),
+            (Subsystem::Military, TimingCadence::PerUpdate),
         ]
     }
 
@@ -1057,6 +1059,45 @@ impl Simulation {
         }
     }
 
+    /// Replay one source map-command write into the final static-cell table.
+    /// Each destination cell retains the compiled command metadata because
+    /// `FUN_0047a650` can target any cell in an oriented command footprint.
+    pub fn replace_source_static_map_footprint(&mut self, root: SourceMapCellState) {
+        let origin_x = u16::from(root.x);
+        let origin_y = u16::from(root.y);
+        let width = root.footprint_width.max(1);
+        let height = root.footprint_height.max(1);
+        let right = origin_x.saturating_add(u16::from(width));
+        let bottom = origin_y.saturating_add(u16::from(height));
+        self.source_static_map_roots.retain(|cell| {
+            cell.island != root.island
+                || u16::from(cell.x) < origin_x
+                || u16::from(cell.x) >= right
+                || u16::from(cell.y) < origin_y
+                || u16::from(cell.y) >= bottom
+        });
+
+        let mut wrote_cell = false;
+        for dy in 0..height {
+            for dx in 0..width {
+                let x = origin_x + u16::from(dx);
+                let y = origin_y + u16::from(dy);
+                let (Ok(x), Ok(y)) = (u8::try_from(x), u8::try_from(y)) else {
+                    continue;
+                };
+                let mut cell = root;
+                cell.x = x;
+                cell.y = y;
+                cell.source_definition_offset = root.source_definition_offset_at(dx, dy);
+                self.source_static_map_roots.push(cell);
+                wrote_cell = true;
+            }
+        }
+        if wrote_cell {
+            self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+        }
+    }
+
     /// Materialize a drained terminal ruin command into the static-cell table.
     /// The frozen random draws were consumed when the source event fired, so
     /// this reconstruction never advances the simulation RNG.
@@ -1066,6 +1107,7 @@ impl Simulation {
         clear: &TileClear,
     ) {
         if clear.ruin_id == crate::building::NO_RUIN_ID {
+            self.apply_source_terminal_no_ruin_static_replacement(cod, clear);
             return;
         }
         let Some(base) = cod.ruin_building(clear.ruin_id, clear.ruin_uses_strand_table) else {
@@ -1088,11 +1130,7 @@ impl Simulation {
             ) else {
                 return;
             };
-            for dy in 0..clear.height {
-                for dx in 0..clear.width {
-                    writes.push((clear.tile_x + u16::from(dx), clear.tile_y + u16::from(dy), definition));
-                }
-            }
+            writes.push((clear.tile_x, clear.tile_y, definition));
         } else {
             for dy in 0..clear.height {
                 for dx in (0..clear.width).rev() {
@@ -1112,23 +1150,80 @@ impl Simulation {
                 }
             }
         }
-        if writes.is_empty() {
-            return;
-        }
         for (x, y, definition) in writes {
             let (Ok(x), Ok(y)) = (u8::try_from(x), u8::try_from(y)) else {
                 continue;
             };
-            let Some(mut state) = SourceMapCellState::new_static(clear.island_id, x, y, definition, 0) else {
+            let Some(mut root) = SourceMapCellState::new_static(clear.island_id, x, y, definition, 0) else {
                 continue;
             };
-            state.set_source_orientation(clear.source_orientation);
-            state.set_terminal_command_fields(clear.source_variant, clear.source_map_owner_slot);
-            state.configure_terminal_replacement(cod);
-            self.source_static_map_roots.retain(|cell| !cell.matches(clear.island_id, u16::from(x), u16::from(y)));
-            self.source_static_map_roots.push(state);
+            let (width, height) = if matches!(clear.source_orientation & 3, 1 | 3) {
+                (definition.size.1, definition.size.0)
+            } else {
+                definition.size
+            };
+            root.set_footprint(width, height);
+            root.set_source_orientation(clear.source_orientation);
+            root.set_terminal_command_fields(clear.source_variant, clear.source_map_owner_slot);
+            root.configure_terminal_replacement(cod);
+            self.replace_source_static_map_footprint(root);
         }
-        self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+    }
+
+    /// Replay `FUN_004641d0` when the destroyed definition has
+    /// `Ruinenr = 0xff`. The backing map is scanned top-to-bottom and
+    /// right-to-left. Non-kind-10 commands are replayed only at their
+    /// recovered source anchors; kind 10 becomes fixed definition `0x58c2`.
+    fn apply_source_terminal_no_ruin_static_replacement(
+        &mut self,
+        cod: &anno_formats::cod::CodFile,
+        clear: &TileClear,
+    ) {
+        let right = clear.tile_x.saturating_add(u16::from(clear.width));
+        let bottom = clear.tile_y.saturating_add(u16::from(clear.height));
+        let mut backing_cells: Vec<_> = self
+            .source_static_map_backing_cells
+            .iter()
+            .copied()
+            .filter(|cell| {
+                cell.island == clear.island_id
+                    && u16::from(cell.x) >= clear.tile_x
+                    && u16::from(cell.x) < right
+                    && u16::from(cell.y) >= clear.tile_y
+                    && u16::from(cell.y) < bottom
+            })
+            .collect();
+        backing_cells.sort_by_key(|cell| (cell.y, std::cmp::Reverse(cell.x)));
+
+        for cell in backing_cells {
+            if cell.kind_code == 10 {
+                let Some(definition) = cod.building_by_source_id(0x58c2) else {
+                    continue;
+                };
+                let Some(mut root) =
+                    SourceMapCellState::new_static(cell.island, cell.x, cell.y, definition, 0)
+                else {
+                    continue;
+                };
+                let (width, height) = if matches!(clear.source_orientation & 3, 1 | 3) {
+                    (definition.size.1, definition.size.0)
+                } else {
+                    definition.size
+                };
+                root.set_footprint(width, height);
+                root.set_source_orientation(clear.source_orientation);
+                root.set_terminal_command_fields(0, clear.source_map_owner_slot);
+                root.configure_terminal_replacement(cod);
+                self.replace_source_static_map_footprint(root);
+            } else if cell.source_command_anchor_x == cell.x
+                && cell.source_command_anchor_y == cell.y
+            {
+                let mut root = cell;
+                root.set_terminal_command_fields(0, clear.source_map_owner_slot);
+                root.source_damage_accumulator = 0;
+                self.replace_source_static_map_footprint(root);
+            }
+        }
     }
 
     /// Resolve the static command-root descriptor consumed by the deferred
@@ -3879,6 +3974,45 @@ mod tests {
     }
 
     #[test]
+    fn static_map_write_expands_oriented_footprint_and_replaces_destination_cells() {
+        let definition = anno_formats::cod::BuildingDef {
+            kind: "HANDWERK".into(),
+            size: (2, 3),
+            ..Default::default()
+        };
+        let mut root = SourceMapCellState::new_static(2, 7, 9, &definition, 0)
+            .expect("static source command");
+        root.set_footprint(3, 2);
+        root.set_source_orientation(1);
+        root.set_terminal_command_fields(6, 5);
+        let mut overwritten = root;
+        overwritten.x = 8;
+        overwritten.y = 10;
+        let mut survivor = root;
+        survivor.x = 10;
+        let mut sim = Simulation::new();
+        sim.source_static_map_roots = vec![overwritten, survivor];
+
+        sim.replace_source_static_map_footprint(root);
+
+        assert_eq!(sim.source_static_map_roots.len(), 7);
+        for y in 9..11 {
+            for x in 7..10 {
+                let cell = sim
+                    .source_static_map_roots
+                    .iter()
+                    .find(|cell| cell.matches(2, x, y))
+                    .expect("oriented destination cell");
+                assert_eq!(cell.source_orientation, 1);
+                assert_eq!((cell.footprint_width, cell.footprint_height), (3, 2));
+                assert_eq!((cell.source_variant, cell.source_map_owner_slot), (6, 5));
+            }
+        }
+        assert!(sim.source_static_map_roots.contains(&survivor));
+        assert_eq!(sim.source_map_cell_revision, 1);
+    }
+
+    #[test]
     fn terminal_replacement_repopulates_targetable_static_ruin_cells() {
         let base = anno_formats::szs::INSELHAUS_SOURCE_ID_BASE;
         let mut constants = std::collections::HashMap::new();
@@ -3917,6 +4051,103 @@ mod tests {
         assert_eq!(state.source_orientation, 1);
         assert_eq!(state.source_variant, 3);
         assert_eq!(state.source_map_owner_slot, 5);
+    }
+
+    #[test]
+    fn no_ruin_terminal_replays_backing_command_from_its_anchor() {
+        let backing_definition = anno_formats::cod::BuildingDef {
+            source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 1,
+            kind: "BODEN".into(),
+            size: (2, 1),
+            ..Default::default()
+        };
+        let cod = anno_formats::cod::CodFile {
+            constants: Default::default(),
+            buildings: vec![backing_definition.clone()],
+        };
+        let mut backing_root = SourceMapCellState::new_static(2, 7, 9, &backing_definition, 0)
+            .expect("backing source command");
+        backing_root.set_footprint(2, 1);
+        backing_root.set_source_orientation(0);
+        let mut backing_cell = backing_root;
+        backing_cell.x = 8;
+        let clear = TileClear {
+            island_id: 2,
+            tile_x: 7,
+            tile_y: 9,
+            width: 2,
+            height: 1,
+            source_orientation: 1,
+            source_variant: 9,
+            source_map_owner_slot: 5,
+            ruin_id: crate::building::NO_RUIN_ID,
+            ruin_uses_strand_table: false,
+            fallback_strand_cells: 0,
+            source_ruin_draws: vec![],
+        };
+        let mut sim = Simulation::new();
+        sim.source_static_map_backing_cells = vec![backing_root, backing_cell];
+
+        sim.apply_source_terminal_static_replacement(&cod, &clear);
+
+        assert_eq!(sim.source_static_map_roots.len(), 2);
+        for x in 7..9 {
+            let cell = sim
+                .source_static_map_roots
+                .iter()
+                .find(|cell| cell.matches(2, x, 9))
+                .expect("replayed backing destination");
+            assert_eq!(cell.kind_code, 11);
+            assert_eq!(
+                (cell.source_command_anchor_x, cell.source_command_anchor_y),
+                (7, 9)
+            );
+            assert_eq!((cell.source_variant, cell.source_map_owner_slot), (0, 5));
+        }
+    }
+
+    #[test]
+    fn no_ruin_terminal_replaces_backing_kind_ten_with_fixed_definition() {
+        let special_definition = anno_formats::cod::BuildingDef {
+            source_id: 0x58c2,
+            kind: "BODEN".into(),
+            ..Default::default()
+        };
+        let backing_definition = anno_formats::cod::BuildingDef {
+            source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 1,
+            kind: "WALD".into(),
+            ..Default::default()
+        };
+        let cod = anno_formats::cod::CodFile {
+            constants: Default::default(),
+            buildings: vec![backing_definition.clone(), special_definition],
+        };
+        let backing = SourceMapCellState::new_static(2, 7, 9, &backing_definition, 0)
+            .expect("kind-ten backing cell");
+        let clear = TileClear {
+            island_id: 2,
+            tile_x: 7,
+            tile_y: 9,
+            width: 1,
+            height: 1,
+            source_orientation: 1,
+            source_variant: 9,
+            source_map_owner_slot: 5,
+            ruin_id: crate::building::NO_RUIN_ID,
+            ruin_uses_strand_table: false,
+            fallback_strand_cells: 0,
+            source_ruin_draws: vec![],
+        };
+        let mut sim = Simulation::new();
+        sim.source_static_map_backing_cells.push(backing);
+
+        sim.apply_source_terminal_static_replacement(&cod, &clear);
+
+        assert_eq!(sim.source_static_map_roots.len(), 1);
+        let restored = sim.source_static_map_roots[0];
+        assert_eq!(restored.kind_code, 11);
+        assert_eq!(restored.source_orientation, 1);
+        assert_eq!((restored.source_variant, restored.source_map_owner_slot), (0, 5));
     }
 
     #[test]

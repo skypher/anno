@@ -935,8 +935,7 @@ fn try_place_building(
             cod_b.size
         };
         state.set_footprint(footprint_width, footprint_height);
-        state.set_source_orientation(orient);
-        state.set_terminal_command_fields(command.variant, command.map_owner_slot);
+        state.set_source_command(command);
         state.configure_terminal_replacement(cod);
         Some(state)
     });
@@ -954,8 +953,7 @@ fn try_place_building(
             cod_b.size
         };
         state.set_footprint(footprint_width, footprint_height);
-        state.set_source_orientation(orient);
-        state.set_terminal_command_fields(command.variant, command.map_owner_slot);
+        state.set_source_command(command);
         state.configure_terminal_replacement(cod);
         Some(state)
     });
@@ -964,7 +962,7 @@ fn try_place_building(
         sim.source_map_cell_states.push(state);
     }
     if let Some(root) = source_static_root {
-        sim.source_static_map_roots.push(root);
+        sim.replace_source_static_map_footprint(root);
     }
     let building_index = sim.buildings.len() - 1;
     if def.kind == "HQ" {
@@ -1080,6 +1078,63 @@ fn apply_tile_clear_event(islands: &mut [Island], cod: &CodFile, clear: TileClea
     });
 
     push_ruin_tiles(island, cod, clear);
+}
+
+/// Materialize the roots rebuilt by `FUN_004641d0` after a `NORUINE`
+/// terminal event. The static-cell table has already applied the source
+/// writer's overwrite sequence; emitting only command anchors reconstructs
+/// the INSELHAUS records the renderer consumes.
+fn push_no_ruin_backing_tiles(
+    islands: &mut [Island],
+    static_cells: &[anno_sim::source_cell::SourceMapCellState],
+    clear: &TileClear,
+) {
+    if clear.ruin_id != anno_sim::building::NO_RUIN_ID {
+        return;
+    }
+    let Some(island) = islands.iter_mut().find(|island| island.number == clear.island_id) else {
+        return;
+    };
+    let right = clear.tile_x.saturating_add(u16::from(clear.width));
+    let bottom = clear.tile_y.saturating_add(u16::from(clear.height));
+    let mut roots: Vec<_> = static_cells
+        .iter()
+        .copied()
+        .filter(|cell| {
+            cell.island == clear.island_id
+                && cell.source_command_anchor_x == cell.x
+                && cell.source_command_anchor_y == cell.y
+                && u16::from(cell.x) >= clear.tile_x
+                && u16::from(cell.x) < right
+                && u16::from(cell.y) >= clear.tile_y
+                && u16::from(cell.y) < bottom
+        })
+        .collect();
+    roots.sort_by_key(|cell| (cell.y, std::cmp::Reverse(cell.x)));
+    island
+        .tiles
+        .extend(roots.into_iter().map(|cell| cell.to_source_island_tile()));
+}
+
+/// Rebuild the local path and terrain replay after a terminal map write has
+/// changed an island's INSELHAUS command stream.
+fn refresh_simulation_island_map(
+    sim: &mut Simulation,
+    islands: &[Island],
+    cod: &CodFile,
+    island_id: u8,
+) {
+    let Some(island) = islands.iter().find(|island| island.number == island_id) else {
+        return;
+    };
+    let Some(map) = sim
+        .island_maps
+        .iter_mut()
+        .find(|map| map.island_id == island_id)
+    else {
+        return;
+    };
+    *map = IslandMap::from_island(island, &cod.buildings);
 }
 
 fn main() {
@@ -2606,6 +2661,16 @@ fn main() {
                                 let by = b.tile_y;
                                 let bw = def.width;
                                 let bh = def.height;
+                                let source_orientation = b
+                                    .source_placement_command
+                                    .map(|command| command.orientation)
+                                    .unwrap_or(0);
+                                let (source_width, source_height) =
+                                    if source_orientation & 1 == 0 {
+                                        (bw, bh)
+                                    } else {
+                                        (bh, bw)
+                                    };
                                 let refund = def.cost_gold / 2;
                                 let name = cod.buildings[b.def_id as usize]
                                     .properties
@@ -2635,7 +2700,13 @@ fn main() {
 
                                 // Remove building from simulation
                                 let _ = sim.release_source_dynamic_map_object_for_building(bi);
-                                sim.remove_source_map_root(island_id, bx, by);
+                                sim.remove_source_map_footprint(
+                                    island_id,
+                                    bx,
+                                    by,
+                                    source_width,
+                                    source_height,
+                                );
                                 sim.buildings.remove(bi);
 
                                 println!(
@@ -3344,7 +3415,13 @@ fn main() {
                 let drained: Vec<_> = sim.tile_clears.drain(..).collect();
                 for clear in drained {
                     sim.apply_source_terminal_static_replacement(&cod, &clear);
-                    apply_tile_clear_event(&mut islands, &cod, clear);
+                    apply_tile_clear_event(&mut islands, &cod, clear.clone());
+                    push_no_ruin_backing_tiles(
+                        &mut islands,
+                        &sim.source_static_map_roots,
+                        &clear,
+                    );
+                    refresh_simulation_island_map(&mut sim, &islands, &cod, clear.island_id);
                 }
                 if speech_enabled {
                     if let (Some(sfx), Some(handle)) = (
@@ -6315,6 +6392,71 @@ mod tests {
     }
 
     #[test]
+    fn no_ruin_terminal_replays_backing_root_into_visible_island_tiles() {
+        let cod = load_test_cod();
+        let definition_offset = cod.constants["GFXBODEN"] as u16;
+        let definition = cod
+            .building_by_source_id(anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + i32::from(definition_offset))
+            .expect("BODEN definition");
+        let mut backing = anno_sim::source_cell::SourceMapCellState::new_static(
+            0, 3, 4, definition, 0,
+        )
+        .expect("static BODEN command");
+        backing.set_source_orientation(3);
+        backing.set_terminal_command_fields(0, 5);
+        let clear = TileClear {
+            island_id: 0,
+            tile_x: 3,
+            tile_y: 4,
+            width: 1,
+            height: 1,
+            source_orientation: 1,
+            source_variant: 8,
+            source_map_owner_slot: 5,
+            ruin_id: anno_sim::building::NO_RUIN_ID,
+            ruin_uses_strand_table: false,
+            fallback_strand_cells: 0,
+            source_ruin_draws: Vec::new(),
+        };
+        let mut islands = vec![test_island(10, [7; 8])];
+        islands[0].tiles.push(
+            anno_sim::building::SourceBuildingCommand {
+                definition_offset: cod.constants["GFXHANDW"] as u16,
+                orientation: 0,
+                variant: 0,
+                metadata: 0,
+                map_owner_slot: 0,
+                random_seed: 0,
+                dynamic_object_owner: 0,
+            }
+            .to_island_tile(3, 4),
+        );
+        let mut sim = Simulation::new();
+        sim.island_maps
+            .push(IslandMap::from_island(&islands[0], &cod.buildings));
+        assert!(!sim.island_maps[0].is_walkable(3, 4));
+
+        apply_tile_clear_event(&mut islands, &cod, clear.clone());
+        push_no_ruin_backing_tiles(&mut islands, &[backing], &clear);
+        refresh_simulation_island_map(&mut sim, &islands, &cod, 0);
+
+        assert_eq!(islands[0].tiles.len(), 1);
+        assert!(sim.island_maps[0].is_walkable(3, 4));
+        assert_eq!(
+            anno_sim::building::SourceBuildingCommand::from_island_tile(islands[0].tiles[0]),
+            anno_sim::building::SourceBuildingCommand {
+                definition_offset,
+                orientation: 3,
+                variant: 0,
+                metadata: 0,
+                map_owner_slot: 5,
+                random_seed: 0,
+                dynamic_object_owner: 0,
+            }
+        );
+    }
+
+    #[test]
     fn tile_clear_event_uses_strand_ruin_table_shift() {
         let cod = load_test_cod();
         let strand_gfx = cod
@@ -6864,6 +7006,54 @@ mod tests {
                 local_position: (1, 1),
             })
         );
+    }
+
+    #[test]
+    fn rotated_placement_expands_the_source_static_cell_footprint() {
+        let mut def = test_building_def(None);
+        def.width = 2;
+        def.height = 3;
+        let defs = vec![def];
+        let ground = anno_formats::cod::BuildingDef {
+            source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE,
+            kind: "BODEN".into(),
+            ..Default::default()
+        };
+        let mut source_building = test_cod_processing_building(0);
+        source_building.source_id = anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 1;
+        source_building.size = (2, 3);
+        source_building.rotate = 4;
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![source_building, ground],
+        };
+        let mut islands = vec![flat_test_island(4)];
+        for tile in &mut islands[0].tiles {
+            tile.building_id = 0;
+        }
+        let island_map = IslandMap::from_island(&islands[0], &cod.buildings);
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.island_maps.push(island_map);
+        let mut placer = BuildingPlacer::new(&cod, &defs);
+        placer.active = true;
+        placer.orientation = 1;
+
+        let outcome = try_place_building(&mut sim, &mut islands, 0, &defs, &cod, &placer, 1, 1);
+
+        assert!(matches!(outcome, PlaceOutcome::Placed));
+        assert_eq!(sim.source_static_map_roots.len(), 6);
+        for y in 1..3 {
+            for x in 1..4 {
+                let cell = sim
+                    .source_static_map_roots
+                    .iter()
+                    .find(|cell| cell.matches(4, x, y))
+                    .expect("oriented source static cell");
+                assert_eq!((cell.footprint_width, cell.footprint_height), (3, 2));
+                assert_eq!(cell.source_orientation, 1);
+            }
+        }
     }
 
     #[test]
@@ -7907,6 +8097,8 @@ fn init_simulation(
         anno_sim::data_bridge::source_map_cell_states_from_scenario(szs, cod);
     sim.source_static_map_roots =
         anno_sim::data_bridge::source_static_map_roots_from_scenario(szs, cod);
+    sim.source_static_map_backing_cells =
+        anno_sim::data_bridge::source_static_map_backing_cells_from_scenario(szs, cod);
     sim.source_kind13_locations =
         anno_sim::data_bridge::source_kind13_locations_from_scenario(szs, cod);
     sim.source_cities = anno_sim::data_bridge::source_cities_from_scenario(szs);
