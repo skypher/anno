@@ -291,7 +291,8 @@ pub struct SourceCityRecord {
     pub owner_slot: u8,
     /// Low-three-bit phase byte at `+0x1b`, updated after city processing.
     pub phase: u8,
-    /// The five BGRUPPE populations summed by `FUN_0047f1f0(city, 1)`.
+    /// The five BGRUPPE populations; `FUN_0047f1f0(city, 1)` sums entries
+    /// one through four for the kind-12 city-dispatch threshold.
     pub tier_population: [u32; 5],
     /// Source city bytes `+0x164 + 0x0c * i` sampled by `FUN_0047f0c0` for
     /// luxury ware slots `0x0f + i`.

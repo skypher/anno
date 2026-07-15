@@ -8211,6 +8211,7 @@ fn init_simulation(
     sim.buildings = instances;
     sim.warehouses = warehouses;
     sim.island_maps = island_maps;
+    sim.mark_loaded_source_islands_visible();
     sim.coverage_maps = coverage_maps;
     sim.ocean_map = Some(ocean_map);
     sim.ship_cargo_config = ship_cargo_config;

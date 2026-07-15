@@ -28,6 +28,7 @@ pub mod replay;
 pub mod save;
 pub mod simulation;
 pub mod source_cell;
+pub mod source_figure_event;
 pub mod source_rand;
 pub mod source_route;
 pub mod trade;

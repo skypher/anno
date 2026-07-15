@@ -428,6 +428,17 @@ impl IslandMap {
         grid
     }
 
+    /// `FUN_0044b140` resolves the oriented static footprint at a kind-13
+    /// root and allocates its kind-12 figure at the integer center
+    /// `(width - 1) / 2, (height - 1) / 2` from that root.
+    pub fn source_kind12_anchor_center(&self, root: (i32, i32)) -> Option<(i32, i32)> {
+        let index = self.local_index(root)?;
+        let (raw_width, raw_height) = *self.source_land_target_sizes.get(index)?.as_ref()?;
+        let width = i32::from(raw_width / 2).max(1);
+        let height = i32::from(raw_height / 2).max(1);
+        Some((root.0 + (width - 1) / 2, root.1 + (height - 1) / 2))
+    }
+
     /// Rebuild the source type-3 path window used by `FUN_0047bbc0` and
     /// `FUN_0047c080` while they redistribute a kind-13 residence amount.
     ///
@@ -1022,6 +1033,15 @@ mod tests {
             ),
             Some((564, 256))
         );
+    }
+
+    #[test]
+    fn kind12_anchor_uses_the_oriented_footprint_center() {
+        let mut map = IslandMap::new_open(3, 8, 8);
+        let root = (2, 3);
+        let index = map.local_index(root).unwrap();
+        map.source_land_target_sizes[index] = Some((6, 4));
+        assert_eq!(map.source_kind12_anchor_center(root), Some((3, 3)));
     }
 
     #[test]

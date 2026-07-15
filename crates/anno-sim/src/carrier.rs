@@ -898,44 +898,55 @@ pub fn advance_source_carrier(figure: &mut Figure, elapsed_ms: u32, terrain_wegs
         figure.initialize_source_position();
     }
 
-    let next = figure
-        .path
-        .get(figure.path_idx)
-        .copied()
-        .unwrap_or((figure.target_x, figure.target_y));
-    let dx = next.0 - figure.tile_x;
-    let dy = next.1 - figure.tile_y;
-    if dx == 0 && dy == 0 {
-        return step_carrier(figure);
-    }
-    if figure.source_step_remaining <= 0.0 {
-        figure.source_step_remaining = if dx != 0 && dy != 0 {
-            SOURCE_DIAGONAL_DISTANCE
-        } else {
-            1.0
-        };
-    }
-
     let terrain_wegspeed = terrain_wegspeed.max(1) as f32;
-    let traversal = elapsed_ms as f32
+    let mut traversal = elapsed_ms as f32
         * SOURCE_MOTION_TIME_SCALE
         * (figure.source_move_speed as f32 * SOURCE_FIGURE_SPEED_SCALE * 32.0 / terrain_wegspeed);
-    if traversal < figure.source_step_remaining {
+
+    // `FUN_00451890` retains the unspent frame time after a movement segment
+    // reaches zero and immediately dispatches the next route segment. Keep
+    // consuming it here instead of dropping the overrun at a cell boundary.
+    loop {
+        let next = figure
+            .path
+            .get(figure.path_idx)
+            .copied()
+            .unwrap_or((figure.target_x, figure.target_y));
+        let dx = next.0 - figure.tile_x;
+        let dy = next.1 - figure.tile_y;
+        if dx == 0 && dy == 0 {
+            return step_carrier(figure);
+        }
+        // The source-routed figures represented here enter `FUN_0044a690`'s
+        // direct direction case, which changes facing before integrating the
+        // first fraction of a route segment.
+        figure.direction = direction_from_delta(dx, dy);
         let distance = if dx != 0 && dy != 0 {
             SOURCE_DIAGONAL_DISTANCE
         } else {
             1.0
         };
-        figure.source_position_x += dx as f32 * traversal / distance;
-        figure.source_position_y += dy as f32 * traversal / distance;
-        figure.source_step_remaining -= traversal;
-        return false;
-    }
+        if figure.source_step_remaining <= 0.0 {
+            figure.source_step_remaining = distance;
+        }
+        if traversal < figure.source_step_remaining {
+            figure.source_position_x += dx as f32 * traversal / distance;
+            figure.source_position_y += dy as f32 * traversal / distance;
+            figure.source_step_remaining -= traversal;
+            return false;
+        }
 
-    figure.source_step_remaining = 0.0;
-    let arrived = step_carrier(figure);
-    figure.initialize_source_position();
-    arrived
+        traversal -= figure.source_step_remaining;
+        figure.source_step_remaining = 0.0;
+        if step_carrier(figure) {
+            figure.initialize_source_position();
+            return true;
+        }
+        figure.initialize_source_position();
+        if traversal <= 0.0 {
+            return false;
+        }
+    }
 }
 
 fn direction_from_delta(dx: i32, dy: i32) -> u8 {
@@ -1141,7 +1152,11 @@ mod tests {
         carrier.target_x = 1;
         carrier.path = vec![(1, 0)];
 
-        for _ in 0..28 {
+        assert!(!advance_source_carrier(&mut carrier, 100, 100));
+        assert_eq!(carrier.direction, 2);
+        assert_eq!((carrier.tile_x, carrier.tile_y), (0, 0));
+
+        for _ in 0..27 {
             assert!(!advance_source_carrier(&mut carrier, 100, 100));
         }
         assert_eq!((carrier.tile_x, carrier.tile_y), (0, 0));
@@ -1177,6 +1192,25 @@ mod tests {
         assert_eq!(
             (carrier.source_position_x, carrier.source_position_y),
             (1.5, 1.5)
+        );
+    }
+
+    #[test]
+    fn source_carrier_carries_overrun_into_the_next_route_cell() {
+        let mut carrier = Figure::new();
+        carrier.action = ActionType::CarryingGoods;
+        carrier.speed = CARRIER_SPEED;
+        carrier.source_move_speed = 12_500;
+        carrier.target_x = 3;
+        carrier.path = vec![(1, 0), (2, 0), (3, 0)];
+
+        assert!(!advance_source_carrier(&mut carrier, 100, 100));
+        assert_eq!((carrier.tile_x, carrier.tile_y), (2, 0));
+        assert_eq!(carrier.path_idx, 2);
+        assert_eq!(carrier.source_step_remaining, 0.0);
+        assert_eq!(
+            (carrier.source_position_x, carrier.source_position_y),
+            (2.5, 0.5)
         );
     }
 

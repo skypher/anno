@@ -118,6 +118,12 @@ pub struct Figure {
     #[serde(default)]
     pub source_position_initialized: bool,
 
+    /// Source event-table slot at figure offset `+0x44` for categories that
+    /// allocate through `DAT_00505e38`. `None` means this figure has no such
+    /// shared map-event ownership.
+    #[serde(default)]
+    pub source_event_slot: Option<u16>,
+
     /// Movement direction (0-7, compass directions).
     pub direction: u8,
 
@@ -206,6 +212,7 @@ impl Figure {
             source_position_y: 0.0,
             source_position_z: 0.0,
             source_position_initialized: false,
+            source_event_slot: None,
             direction: 0,
             target_x: 0,
             target_y: 0,

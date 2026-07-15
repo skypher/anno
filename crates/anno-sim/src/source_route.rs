@@ -251,6 +251,49 @@ pub fn encode_source_route(
     Ok(program)
 }
 
+/// Encode a route with the fixed output-buffer behavior of `FUN_0046cf70`.
+///
+/// The source writes as many complete runs as fit before its reserved
+/// terminator byte, then writes `0xc1`; it does not reject a long route.
+/// Callers with a source-owned bounded route field use this form.
+pub fn encode_source_route_truncated(
+    steps: &[SourceRouteStep],
+    max_run_length: u8,
+    capacity: usize,
+) -> Result<Vec<u8>, SourceRouteError> {
+    if max_run_length == 0 || max_run_length > 0x0f {
+        return Err(SourceRouteError::InvalidRunLimit(max_run_length));
+    }
+    if capacity == 0 {
+        return Err(SourceRouteError::CapacityExceeded);
+    }
+
+    let mut program = Vec::new();
+    let mut index = 0;
+    while index < steps.len() {
+        let step = steps[index];
+        if source_direction_delta(step.direction).is_none() {
+            return Err(SourceRouteError::InvalidDirection(step.direction));
+        }
+
+        let mut length = 1usize;
+        while length < max_run_length as usize
+            && index + length < steps.len()
+            && steps[index + length].direction == step.direction
+            && (steps[index + length].metadata & 0x7f) == (step.metadata & 0x7f)
+        {
+            length += 1;
+        }
+        if program.len() + 1 >= capacity {
+            break;
+        }
+        program.push((step.direction << 4) | length as u8);
+        index += length;
+    }
+    program.push(SOURCE_ROUTE_TERMINATOR);
+    Ok(program)
+}
+
 /// Route-program validation or capacity failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceRouteError {
@@ -2557,6 +2600,28 @@ mod tests {
 
         let program = encode_source_route(&steps, 15, 100).unwrap();
         assert_eq!(program, [0x22, 0x21, 0xc1]);
+    }
+
+    #[test]
+    fn bounded_source_route_keeps_the_terminator_after_the_last_fitting_run() {
+        let steps = [
+            SourceRouteStep {
+                direction: 1,
+                metadata: 1,
+            },
+            SourceRouteStep {
+                direction: 2,
+                metadata: 1,
+            },
+            SourceRouteStep {
+                direction: 3,
+                metadata: 1,
+            },
+        ];
+        assert_eq!(
+            encode_source_route_truncated(&steps, 15, 3),
+            Ok(vec![0x11, 0x21, SOURCE_ROUTE_TERMINATOR])
+        );
     }
 
     #[test]

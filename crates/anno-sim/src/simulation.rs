@@ -18,13 +18,14 @@ use crate::data_bridge::{
     SourceKind13PromotionDefinition,
 };
 use crate::economy;
-use crate::entity::{ActionType, CargoRoute, Figure};
+use crate::entity::{ActionType, CargoRoute, Figure, SourceFigureRecordLayout};
 use crate::island_map::IslandMap;
 use crate::ocean_map::OceanMap;
 use crate::player::{Player, PlayerState};
 use crate::population;
 use crate::production;
 use crate::source_cell::SourceMapCellState;
+use crate::source_figure_event::SourceFigureEventRegistry;
 use crate::source_route::{
     SourceDynamicMapObject, SourceDynamicMapObjectTable, SourcePathBlockedCellDecision,
     SourcePathTargetRect, SourceResolvedDynamicTarget, SourceTargetDescriptor,
@@ -36,6 +37,8 @@ use crate::warehouse::Warehouse;
 
 /// Auto-save interval in game ticks (~10 minutes of game time).
 pub const AUTOSAVE_INTERVAL_MS: u32 = 599_999;
+/// Physical entry count of the source `DAT_005b6060` visible-island table.
+pub const SOURCE_VISIBLE_ISLAND_SLOTS: usize = 0x32;
 
 /// Timer state for each subsystem.
 #[derive(Debug, Clone)]
@@ -124,6 +127,14 @@ pub struct SourceKind6TerminalEvent {
     pub event_kind: u8,
 }
 
+#[derive(Clone, Copy)]
+struct SourceTransferEventCandidate {
+    slot: u16,
+    x: i16,
+    y: i16,
+    owner: u8,
+}
+
 /// The main game simulation state.
 pub struct Simulation {
     /// Game clock in centiseconds (600 = 1 displayed minute).
@@ -171,6 +182,8 @@ pub struct Simulation {
     pub source_kind13_dispatch: SourceKind13DispatchState,
     /// Fixed source city-record pool read by `FUN_0047f8a0`.
     pub source_cities: SourceCityTable,
+    /// Shared `DAT_00505e38` event table used by map-anchored source figures.
+    pub source_figure_events: SourceFigureEventRegistry,
     /// Live kind-4 occupancy reconstructed from authored `SOLDAT3` figures.
     pub source_kind4_occupants: Vec<SourceKind4Occupant>,
     /// Live `0x84a`/`0x84b` source figure records that do not have an
@@ -202,6 +215,11 @@ pub struct Simulation {
     pub source_city_dispatch_phase: u8,
     /// Physical source city-record cursor. Each dispatch visits two slots.
     pub source_city_dispatch_cursor: usize,
+    /// `DAT_005b6060`: renderer-maintained visible-island flags. The source
+    /// rebuilds this 50-slot table from the current map viewport before
+    /// `FUN_0047f8a0` reaches the city kind-12 dispatcher; it is display
+    /// state rather than save-state data.
+    pub source_visible_islands: Vec<bool>,
     /// Monotone revision of the renderer-relevant source map-cell table.
     pub source_map_cell_revision: u64,
     pub building_defs: Vec<BuildingDef>,
@@ -489,6 +507,7 @@ impl Simulation {
             source_kind13_replacement_commands: Vec::new(),
             source_kind13_dispatch: SourceKind13DispatchState::default(),
             source_cities: SourceCityTable::default(),
+            source_figure_events: SourceFigureEventRegistry::default(),
             source_kind4_occupants: Vec::new(),
             source_dynamic_combat_figures: Vec::new(),
             source_kind6_actions: Vec::new(),
@@ -501,6 +520,7 @@ impl Simulation {
             source_city_dispatch_elapsed_ms: 0,
             source_city_dispatch_phase: 0,
             source_city_dispatch_cursor: 0,
+            source_visible_islands: vec![false; SOURCE_VISIBLE_ISLAND_SLOTS],
             source_map_cell_revision: 0,
             building_defs: Vec::new(),
             figures: Vec::new(),
@@ -535,6 +555,26 @@ impl Simulation {
             last_treasury_warn_gold: i32::MAX,
             outcome: GameOutcome::Pending,
             native_villages: Vec::new(),
+        }
+    }
+
+    /// Set one `DAT_005b6060`-equivalent renderer visibility entry. The
+    /// original table has exactly fifty island slots and surrounding source
+    /// traversal ignores island IDs outside that range.
+    pub fn set_source_island_visible(&mut self, island_id: u8, visible: bool) {
+        if let Some(slot) = self.source_visible_islands.get_mut(usize::from(island_id)) {
+            *slot = visible;
+        }
+    }
+
+    /// Rebuild the source visible-island table for a whole-world renderer.
+    /// `anno-game` currently renders every loaded island into one texture, so
+    /// every loaded source island intersects its display extent.
+    pub fn mark_loaded_source_islands_visible(&mut self) {
+        self.source_visible_islands.fill(false);
+        let island_ids: Vec<_> = self.island_maps.iter().map(|map| map.island_id).collect();
+        for island_id in island_ids {
+            self.set_source_island_visible(island_id, true);
         }
     }
 
@@ -673,7 +713,9 @@ impl Simulation {
                 });
         }
         if let Some(kind15_figure) = kind15_figure {
-            self.source_kind15_combat_figures.push(kind15_figure);
+            if self.source_figure_pool_has_capacity() {
+                self.source_kind15_combat_figures.push(kind15_figure);
+            }
         }
         Some(action)
     }
@@ -695,6 +737,9 @@ impl Simulation {
         }
         if figure.figure_kind == 6 {
             figure.source_action_ready_at = self.source_time_ticks;
+        }
+        if !self.source_figure_pool_has_capacity() {
+            return false;
         }
 
         if let Some(index) = self
@@ -1313,9 +1358,7 @@ impl Simulation {
                 city.refresh_group_satisfaction();
             }
             let city = *city;
-            if city.tier_population.iter().copied().sum::<u32>() > 29
-                && self.source_city_activity_allows(city)
-            {
+            if self.source_city_kind12_dispatch_allows(city) {
                 self.spawn_source_kind12_figures(city);
             }
         }
@@ -1516,6 +1559,18 @@ impl Simulation {
         ))
     }
 
+    /// The outer `FUN_0047f8a0` gate and the seven-player guard at the start
+    /// of `FUN_00480370`. `FUN_0047f1f0(city, 1)` sums BGRUPPE 1 through 4,
+    /// while `FUN_00486b50` reads the renderer's visible-island table.
+    fn source_city_kind12_dispatch_allows(&self, city: SourceCityRecord) -> bool {
+        self.source_visible_islands
+            .get(usize::from(city.island_id))
+            .copied()
+            .unwrap_or(false)
+            && city.tier_population[1..].iter().copied().sum::<u32>() > 29
+            && self.source_city_activity_allows(city)
+    }
+
     /// The seven-player guard at the start of `FUN_00480370`. Source island
     /// bytes `+0x4a..=+0x50` count live kind-4 land figures by owner; an
     /// active human or AI owner other than this city owner blocks the whole
@@ -1604,9 +1659,9 @@ impl Simulation {
         changed
     }
 
-    /// `FUN_00480370`: consume its discarded rand draws, sample at most ten
-    /// physical kind-13 slots, and submit every matching source anchor to
-    /// the kind-12 route allocator.
+    /// `FUN_00480370`: consume its discarded rand draws, then keep sampling
+    /// physical kind-13 slots until either ten nonmatching samples or one
+    /// quarter of the island slice has reached the allocator.
     fn spawn_source_kind12_figures(&mut self, city: SourceCityRecord) {
         for _ in 0..15 {
             self.next_source_rand();
@@ -1616,12 +1671,23 @@ impl Simulation {
             .source_kind13_locations
             .city_slice(city.island_id)
             .to_vec();
-        for _ in 0..10 {
+        let mut nonmatching_samples = 0usize;
+        let mut matching_calls = 0usize;
+        let matching_limit = locations.len() / 4;
+        loop {
             let location_index = usize::from(self.next_source_rand()) % locations.len();
             let Some(location) = locations[location_index] else {
+                nonmatching_samples += 1;
+                if nonmatching_samples > 9 {
+                    return;
+                }
                 continue;
             };
             if location.island_id != city.island_id || location.source_owner != city.source_owner {
+                nonmatching_samples += 1;
+                if nonmatching_samples > 9 {
+                    return;
+                }
                 continue;
             }
 
@@ -1629,24 +1695,53 @@ impl Simulation {
             if let Some(figure) = self.allocate_source_kind12_figure(location, permission_branch) {
                 self.figures.push(figure);
             }
+            matching_calls += 1;
+            if matching_calls >= matching_limit {
+                return;
+            }
         }
     }
 
-    /// `FUN_0044b140`: initialize a kind-12 figure at one kind-13 anchor,
-    /// then retain only the route that its threshold callback reaches.
+    /// `FUN_0044b140`: claim the shared source event slot at one kind-13
+    /// anchor, initialize a kind-12 figure, then replace its initial
+    /// definition only when the threshold callback reaches a route target.
     fn allocate_source_kind12_figure(
         &mut self,
         location: crate::data_bridge::SourceKind13Location,
         permission_branch: u8,
     ) -> Option<Figure> {
-        let _initial_definition =
-            civilian::source_kind12_initial_definition(self.next_source_rand());
-        let threshold = (u32::from(self.next_source_rand() & 7) + 5) * 0x40;
         let map = self
             .island_maps
             .iter()
             .find(|map| map.island_id == location.island_id)?;
-        let start = (i32::from(location.tile_x), i32::from(location.tile_y));
+        let root = (i32::from(location.tile_x), i32::from(location.tile_y));
+        let start = map.source_kind12_anchor_center(root)?;
+        let event_position = (
+            map.source_world_origin.0.div_euclid(2).checked_add(start.0)?,
+            map.source_world_origin.1.div_euclid(2).checked_add(start.1)?,
+        );
+        let (Ok(event_x), Ok(event_y)) = (
+            i16::try_from(event_position.0),
+            i16::try_from(event_position.1),
+        ) else {
+            return None;
+        };
+        let event_slot = self.source_figure_events.prepare_kind12_if_absent(
+            event_x,
+            event_y,
+            location.source_owner,
+        )?;
+        let mut definition = civilian::source_kind12_initial_definition(self.next_source_rand());
+        if !self.source_figure_pool_has_capacity() {
+            return None;
+        }
+        if !self
+            .source_figure_events
+            .activate_kind12(event_slot, event_x, event_y)
+        {
+            return None;
+        }
+        let threshold = (u32::from(self.next_source_rand() & 7) + 5) * 0x40;
         let mut grid = map.civilian_path_grid(start, location.source_owner, permission_branch);
         let route = grid
             .search_with_blocked_cell_callback(start, |_, elapsed_cost| {
@@ -1656,10 +1751,26 @@ impl Simulation {
                     SourcePathBlockedCellDecision::Expand
                 }
             })
-            .ok()?;
-        let target_kind = map.civilian_path_kind(route.position)?;
-        let definition = civilian::source_kind12_definition(target_kind, self.next_source_rand());
-        let path = source_route_positions(start, &route.steps)?;
+            .ok();
+        let (target, path) = if let Some(route) = route {
+            let route_written = self
+                .source_figure_events
+                .write_kind12_route(event_slot, &route.steps);
+            let preserved_steps = route_written
+                .then(|| self.source_figure_events.kind12_route_step_count(event_slot))
+                .flatten()
+                .unwrap_or(0)
+                .min(route.steps.len());
+            let path = source_route_positions(start, &route.steps[..preserved_steps])
+                .unwrap_or_default();
+            let target = path.last().copied().unwrap_or(start);
+            if let Some(target_kind) = map.civilian_path_kind(route.position) {
+                definition = civilian::source_kind12_definition(target_kind, self.next_source_rand());
+            }
+            (target, path)
+        } else {
+            (start, Vec::new())
+        };
 
         let mut figure = Figure::new();
         figure.action = ActionType::Walking;
@@ -1667,8 +1778,9 @@ impl Simulation {
         figure.origin_island = location.island_id;
         figure.tile_x = start.0;
         figure.tile_y = start.1;
-        figure.target_x = route.position.0;
-        figure.target_y = route.position.1;
+        figure.target_x = target.0;
+        figure.target_y = target.1;
+        figure.source_event_slot = Some(event_slot);
         figure.speed = carrier::CARRIER_SPEED;
         figure.source_move_speed = self
             .civilian_config
@@ -1683,8 +1795,32 @@ impl Simulation {
         Some(figure)
     }
 
+    /// Count the live source records represented by the generic
+    /// `FUN_00446ca0` figure pool. The simulator keeps the ordinary figure,
+    /// dynamic-combat, and kind-15 projections in separate collections, but
+    /// the executable allocates all of them from its 2,550-record pool.
+    fn source_figure_pool_occupancy(&self) -> usize {
+        self.figures.iter().filter(|figure| figure.is_active()).count()
+            + self
+                .source_dynamic_combat_figures
+                .iter()
+                .filter(|figure| figure.active)
+                .count()
+            + self
+                .source_kind15_combat_figures
+                .iter()
+                .filter(|figure| figure.active)
+                .count()
+    }
+
+    fn source_figure_pool_has_capacity(&self) -> bool {
+        self.source_figure_pool_occupancy() < SourceFigureRecordLayout::CAPACITY
+    }
+
     fn tick_production(&mut self) {
         let mut new_carriers = Vec::new();
+        let mut source_figure_slots_remaining = SourceFigureRecordLayout::CAPACITY
+            .saturating_sub(self.source_figure_pool_occupancy());
         let carrier_suppliers: Vec<_> = self
             .buildings
             .iter()
@@ -1796,6 +1932,17 @@ impl Simulation {
                 });
 
                 if !has_carrier {
+                    let event = match self.prepare_source_transfer_event_for_root(
+                        self.buildings[i].island_id,
+                        self.buildings[i].tile_x,
+                        self.buildings[i].tile_y,
+                    ) {
+                        Ok(event) => event,
+                        Err(()) => continue,
+                    };
+                    if source_figure_slots_remaining == 0 {
+                        continue;
+                    }
                     if let Some(mut c) = carrier::try_spawn_carrier(
                         &self.buildings[i],
                         &def,
@@ -1806,7 +1953,13 @@ impl Simulation {
                         self.carrier_config,
                     ) {
                         c.building_idx = i as u16;
+                        if let Some(event) = event {
+                            if self.activate_source_transfer_event(event) {
+                                c.source_event_slot = Some(event.slot);
+                            }
+                        }
                         new_carriers.push(c);
+                        source_figure_slots_remaining -= 1;
                     }
                 }
             }
@@ -1861,6 +2014,13 @@ impl Simulation {
             if has_cart {
                 continue;
             }
+            let event = match self.prepare_source_transfer_event(origin) {
+                Ok(event) => event,
+                Err(()) => continue,
+            };
+            if source_figure_slots_remaining == 0 {
+                continue;
+            }
             if let Some(cart) = carrier::try_spawn_city_cart(
                 origin,
                 city,
@@ -1869,11 +2029,77 @@ impl Simulation {
                 &self.island_maps,
                 self.city_cart_config,
             ) {
+                let mut cart = cart;
+                if let Some(event) = event {
+                    if self.activate_source_transfer_event(event) {
+                        cart.source_event_slot = Some(event.slot);
+                    }
+                }
                 new_carriers.push(cart);
+                source_figure_slots_remaining -= 1;
             }
         }
 
         self.figures.extend(new_carriers);
+    }
+
+    /// `FUN_0044ab60` / `FUN_0044ad50`: locate the source root's oriented
+    /// center, reject a matching live event, and initialize a free transfer
+    /// event before generic-figure allocation. A missing root only occurs in
+    /// the simulator's synthetic-map fallback, which has no source event
+    /// coordinate to register.
+    fn prepare_source_transfer_event_for_root(
+        &mut self,
+        island: u8,
+        x: u16,
+        y: u16,
+    ) -> Result<Option<SourceTransferEventCandidate>, ()> {
+        let (Ok(x), Ok(y)) = (u8::try_from(x), u8::try_from(y)) else {
+            return Ok(None);
+        };
+        let Some(root) = self.source_map_cell_states.iter().copied().find(|root| {
+            root.island == island && root.x == x && root.y == y
+        }) else {
+            return Ok(None);
+        };
+        self.prepare_source_transfer_event(root)
+    }
+
+    fn prepare_source_transfer_event(
+        &mut self,
+        root: SourceMapCellState,
+    ) -> Result<Option<SourceTransferEventCandidate>, ()> {
+        let Some(map) = self
+            .island_maps
+            .iter()
+            .find(|map| map.island_id == root.island)
+        else {
+            return Ok(None);
+        };
+        let center_x = i32::from(root.x) + (i32::from(root.footprint_width.max(1)) - 1) / 2;
+        let center_y = i32::from(root.y) + (i32::from(root.footprint_height.max(1)) - 1) / 2;
+        let (Some(world_x), Some(world_y)) = (
+            map.source_world_origin.0.div_euclid(2).checked_add(center_x),
+            map.source_world_origin.1.div_euclid(2).checked_add(center_y),
+        ) else {
+            return Ok(None);
+        };
+        let (Ok(x), Ok(y)) = (i16::try_from(world_x), i16::try_from(world_y)) else {
+            return Ok(None);
+        };
+        let owner = root.source_map_owner_slot;
+        let Some(slot) = self
+            .source_figure_events
+            .prepare_transfer_if_absent(x, y, owner)
+        else {
+            return Err(());
+        };
+        Ok(Some(SourceTransferEventCandidate { slot, x, y, owner }))
+    }
+
+    fn activate_source_transfer_event(&mut self, event: SourceTransferEventCandidate) -> bool {
+        self.source_figure_events
+            .activate_transfer(event.slot, event.x, event.y, event.owner)
     }
 
     fn city_cart_supplier_view(
@@ -3294,6 +3520,14 @@ impl Simulation {
                     | ActionType::Patrolling
                     | ActionType::Exploring => {
                         if civilian_config.is_kind12(figure) && figure.source_move_speed > 0 {
+                            if figure.source_event_slot.is_some_and(|slot| {
+                                self.source_figure_events
+                                    .kind12_is_terminal(slot)
+                                    .unwrap_or(true)
+                            }) {
+                                despawn_indices.push(idx);
+                                continue;
+                            }
                             let terrain_wegspeed = self
                                 .island_maps
                                 .iter()
@@ -3318,7 +3552,11 @@ impl Simulation {
                                 frame_duration_ms,
                                 civilian_config.frames_per_dir,
                             );
-                            if carrier::advance_source_carrier(figure, 100, terrain_wegspeed) {
+                            let arrived = carrier::advance_source_carrier(figure, 100, terrain_wegspeed);
+                            if let Some(slot) = figure.source_event_slot {
+                                self.source_figure_events
+                                    .set_kind12_route_progress(slot, figure.path_idx);
+                            } else if arrived {
                                 despawn_indices.push(idx);
                             }
                             continue;
@@ -3370,7 +3608,10 @@ impl Simulation {
 
         // Remove despawned figures (iterate in reverse to preserve indices)
         for &idx in despawn_indices.iter().rev() {
-            self.figures.swap_remove(idx);
+            let figure = self.figures.swap_remove(idx);
+            if let Some(slot) = figure.source_event_slot {
+                self.source_figure_events.release(slot);
+            }
         }
     }
 
@@ -4085,6 +4326,11 @@ mod tests {
         assert!(!sim.install_source_dynamic_combat_figure(figure(6, 350, 0)));
         assert!(!sim.install_source_dynamic_combat_figure(figure(7, 0, 0)));
 
+        let mut occupied = Figure::new();
+        occupied.action = ActionType::Walking;
+        sim.figures = vec![occupied; SourceFigureRecordLayout::CAPACITY];
+        assert!(!sim.install_source_dynamic_combat_figure(figure(1, 148, 0)));
+
         assert_eq!(
             sim.source_combat_candidates()
                 .iter()
@@ -4622,6 +4868,32 @@ mod tests {
         assert!(!sim.military_units[0].active);
         assert!(sim.source_city_activity_allows(city));
         assert!(!sim.deactivate_source_kind4_figure(42));
+    }
+
+    #[test]
+    fn source_city_kind12_gate_uses_visible_island_and_upper_tier_population() {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        let mut city = SourceCityRecord {
+            island_id: 3,
+            source_owner: 0,
+            owner_slot: 0,
+            phase: 0,
+            tier_population: [30, 0, 0, 0, 0],
+            ..Default::default()
+        };
+
+        assert!(!sim.source_city_kind12_dispatch_allows(city));
+        sim.set_source_island_visible(3, true);
+        assert!(!sim.source_city_kind12_dispatch_allows(city));
+
+        city.tier_population = [0, 29, 0, 0, 0];
+        assert!(!sim.source_city_kind12_dispatch_allows(city));
+        city.tier_population = [0, 30, 0, 0, 0];
+        assert!(sim.source_city_kind12_dispatch_allows(city));
+
+        sim.set_source_island_visible(3, false);
+        assert!(!sim.source_city_kind12_dispatch_allows(city));
     }
 
     #[test]
@@ -7534,6 +7806,127 @@ mod tests {
         sim.assign_next_port(&mut trader);
 
         assert_eq!(trader.target_warehouse, Some(5));
+    }
+
+    #[test]
+    fn kind12_figure_claims_and_releases_its_source_event_slot() {
+        let mut sim = Simulation::new();
+        let mut map = IslandMap::new_open(3, 16, 16);
+        map.source_world_origin = (220, 260);
+        sim.island_maps.push(map);
+        sim.seed_source_rand(1);
+        let location = SourceKind13Location {
+            island_id: 3,
+            tile_x: 5,
+            tile_y: 7,
+            orientation: 0,
+            variant: 0,
+            source_owner: 0,
+            phase: 0,
+            state_bits: 0,
+            population_group: 0,
+            amount: 0x40,
+            lifecycle_flags: 0,
+        };
+
+        let figure = sim
+            .allocate_source_kind12_figure(location, 0)
+            .expect("source registry admits an unused anchor");
+        let slot = figure.source_event_slot.expect("kind-12 event slot");
+        assert_eq!(
+            sim.source_figure_events.slot(slot),
+            Some(crate::source_figure_event::SourceFigureEventSlot {
+                x: 115,
+                y: 137,
+                lifecycle: 0,
+                owner: 0,
+                route_cursor: 0,
+                state: 0xc0,
+                route_program: [0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            })
+        );
+        assert!(sim.allocate_source_kind12_figure(location, 0).is_none());
+
+        sim.figures.push(figure);
+        sim.tick_entities(100);
+        assert!(sim.figures.is_empty());
+        assert!(sim.source_figure_events.slot(slot).unwrap().is_free());
+        assert!(sim.allocate_source_kind12_figure(location, 0).is_some());
+    }
+
+    #[test]
+    fn transfer_event_uses_the_oriented_source_root_center() {
+        let mut sim = Simulation::new();
+        let mut map = IslandMap::new_open(3, 16, 16);
+        map.source_world_origin = (220, 260);
+        sim.island_maps.push(map);
+        let mut root = SourceMapCellState::new_static(
+            3,
+            5,
+            7,
+            &anno_formats::cod::BuildingDef {
+                kind: "MARKT".into(),
+                size: (3, 2),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        root.source_map_owner_slot = 4;
+
+        let event = sim.prepare_source_transfer_event(root).unwrap().unwrap();
+        assert_eq!((event.x, event.y, event.owner), (116, 137, 4));
+        assert!(sim.source_figure_events.slot(event.slot).unwrap().is_free());
+        assert!(sim.activate_source_transfer_event(event));
+        assert_eq!(
+            sim.source_figure_events.slot(event.slot),
+            Some(crate::source_figure_event::SourceFigureEventSlot {
+                x: 116,
+                y: 137,
+                lifecycle: 1,
+                owner: 4,
+                route_cursor: 0,
+                state: 0xc0,
+                route_program: [0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            })
+        );
+    }
+
+    #[test]
+    fn kind12_pool_exhaustion_leaves_its_event_candidate_coordinate_free() {
+        let mut sim = Simulation::new();
+        let mut map = IslandMap::new_open(3, 16, 16);
+        map.source_world_origin = (220, 260);
+        sim.island_maps.push(map);
+        sim.seed_source_rand(1);
+        let location = SourceKind13Location {
+            island_id: 3,
+            tile_x: 5,
+            tile_y: 7,
+            orientation: 0,
+            variant: 0,
+            source_owner: 0,
+            phase: 0,
+            state_bits: 0,
+            population_group: 0,
+            amount: 0x40,
+            lifecycle_flags: 0,
+        };
+        let mut occupied = Figure::new();
+        occupied.action = ActionType::Walking;
+        sim.figures = vec![occupied; SourceFigureRecordLayout::CAPACITY];
+
+        assert!(sim.allocate_source_kind12_figure(location, 0).is_none());
+        let candidate_slot = SourceFigureEventRegistry::source_index(115, 137) as u16;
+        let candidate = sim.source_figure_events.slot(candidate_slot).unwrap();
+        assert!(candidate.is_free());
+        assert_eq!(candidate.lifecycle, 0);
+        assert_eq!(candidate.route_cursor, 0);
+        assert_eq!(candidate.state, 0xc0);
+        assert_eq!(candidate.route_program[0], 0xc0);
+
+        sim.figures.clear();
+        assert!(sim.allocate_source_kind12_figure(location, 0).is_some());
     }
 
     #[test]

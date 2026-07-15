@@ -164,7 +164,9 @@ use std::path::Path;
 ///      that BGruppe promotion subtracts from available construction stock.
 /// v90: completed kind-13 BGruppe replacements persist until the map-command
 ///      consumer has replayed their INSELHAUS writes.
-pub const SAVE_VERSION: u32 = 90;
+/// v91: source figures retain their shared event slots and the corresponding
+///      `DAT_00505e38` coordinate registry survives save/load.
+pub const SAVE_VERSION: u32 = 91;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -200,6 +202,7 @@ pub struct SaveState {
     pub source_kind13_dispatch: SourceKind13DispatchState,
     pub source_kind13_replacement_commands: Vec<crate::simulation::SourceKind13ReplacementCommand>,
     pub source_cities: SourceCityTable,
+    pub source_figure_events: crate::source_figure_event::SourceFigureEventRegistry,
     pub source_kind4_occupants: Vec<SourceKind4Occupant>,
     pub source_dynamic_combat_figures: Vec<SourceDynamicCombatFigure>,
     pub source_kind6_actions: Vec<crate::combat::SourceKind6Action>,
@@ -272,6 +275,7 @@ impl Simulation {
             source_kind13_dispatch: self.source_kind13_dispatch.clone(),
             source_kind13_replacement_commands: self.source_kind13_replacement_commands.clone(),
             source_cities: self.source_cities.clone(),
+            source_figure_events: self.source_figure_events.clone(),
             source_kind4_occupants: self.source_kind4_occupants.clone(),
             source_dynamic_combat_figures: self.source_dynamic_combat_figures.clone(),
             source_kind6_actions: self.source_kind6_actions.clone(),
@@ -314,6 +318,7 @@ impl Simulation {
         self.source_kind13_dispatch = s.source_kind13_dispatch;
         self.source_kind13_replacement_commands = s.source_kind13_replacement_commands;
         self.source_cities = s.source_cities;
+        self.source_figure_events = s.source_figure_events;
         self.source_kind4_occupants = s.source_kind4_occupants;
         self.source_dynamic_combat_figures = s.source_dynamic_combat_figures;
         self.source_kind6_actions = s.source_kind6_actions;
@@ -410,7 +415,9 @@ mod tests {
             source_static_map_backing_cells: vec![],
             source_kind13_locations: SourceKind13LocationTable::default(),
             source_kind13_dispatch: SourceKind13DispatchState::default(),
+            source_kind13_replacement_commands: vec![],
             source_cities: SourceCityTable::default(),
+            source_figure_events: crate::source_figure_event::SourceFigureEventRegistry::default(),
             source_kind4_occupants: vec![],
             source_dynamic_combat_figures: vec![],
             source_kind6_actions: vec![],
