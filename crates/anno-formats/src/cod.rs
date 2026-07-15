@@ -175,6 +175,13 @@ pub struct BuildingDef {
     /// Compiled `Workmenge` at definition offset `0x28`, in 1/32-unit
     /// map-cell storage scale.
     pub source_work_material_amount: u16,
+    /// Compiled `Maxnorohst` at definition offset `0x36`. `FUN_0047daf0`
+    /// compares it with a root's saturated no-raw-material counter before
+    /// its production-kind-specific notification branch.
+    pub source_max_no_raw_material_count: u16,
+    /// Compiled `Interval` at definition offset `0x3a`. `FUN_0047daf0`
+    /// reloads a root's scheduler cooldown from this authored tick count.
+    pub source_scheduler_interval: u16,
     /// Compiled definition offset `+0x64`, populated from `Maxenergy:` by
     /// `FUN_0046248d..0x004624c4` as `round(Maxenergy * 32)`. The deferred
     /// category-6 hit handler accumulates raw strength against this value.
@@ -220,6 +227,8 @@ impl Default for BuildingDef {
             source_production_amount: 0,
             source_raw_material_amount: 0,
             source_work_material_amount: 0,
+            source_max_no_raw_material_count: 0,
+            source_scheduler_interval: 0,
             source_damage_threshold: 0,
             source_transfer_radius: 0,
             source_transfer_figure_limit: 0,
@@ -650,6 +659,24 @@ impl CodFile {
                 );
                 continue;
             }
+            if let Some(val_str) = line.strip_prefix("Maxnorohst:") {
+                current.source_max_no_raw_material_count =
+                    Self::eval(&constants, val_str.trim()).clamp(0, i32::from(u16::MAX)) as u16;
+                current.properties.insert(
+                    "Maxnorohst".to_string(),
+                    current.source_max_no_raw_material_count.to_string(),
+                );
+                continue;
+            }
+            if let Some(val_str) = line.strip_prefix("Interval:") {
+                current.source_scheduler_interval =
+                    Self::eval(&constants, val_str.trim()).clamp(0, i32::from(u16::MAX)) as u16;
+                current.properties.insert(
+                    "Interval".to_string(),
+                    current.source_scheduler_interval.to_string(),
+                );
+                continue;
+            }
 
             // Parse NoShotFlg. The executable stores bit zero at runtime
             // definition offset 0x6a, bit 0x10; ship routing consults it in
@@ -992,7 +1019,7 @@ mod tests {
     #[test]
     fn parses_source_cell_animation_flags() {
         let cod = CodFile::parse(
-            b"HIGHBODEN = 20\n@Nummer: 1\nId: 20001\nPosoffs: HIGHBODEN\nAnicontflg: 1\nLagAniFlg: 1\nMaxlager: 5\nProdmenge: 0.75\nRohmenge: 0.5\nWorkmenge: 2\n",
+            b"HIGHBODEN = 20\n@Nummer: 1\nId: 20001\nPosoffs: HIGHBODEN\nAnicontflg: 1\nLagAniFlg: 1\nMaxlager: 5\nProdmenge: 0.75\nRohmenge: 0.5\nWorkmenge: 2\nMaxnorohst: 9\nInterval: 7\n",
         )
         .expect("parse plaintext COD");
 
@@ -1003,6 +1030,8 @@ mod tests {
         assert_eq!(cod.buildings[0].source_production_amount, 24);
         assert_eq!(cod.buildings[0].source_raw_material_amount, 16);
         assert_eq!(cod.buildings[0].source_work_material_amount, 64);
+        assert_eq!(cod.buildings[0].source_max_no_raw_material_count, 9);
+        assert_eq!(cod.buildings[0].source_scheduler_interval, 7);
     }
 
     #[test]

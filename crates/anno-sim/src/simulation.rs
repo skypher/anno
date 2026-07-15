@@ -208,6 +208,10 @@ pub struct Simulation {
     pub source_time_ticks: u32,
     /// Milliseconds not yet promoted into `source_time_ticks`.
     pub source_time_remainder_ms: u32,
+    /// `DAT_005a6aec`: shared source map-root dispatch accumulator.
+    pub source_map_dispatch_elapsed_ms: u32,
+    /// `DAT_005a6c12`: low-three-bit phase consumed by `FUN_0047daf0`.
+    pub source_map_dispatch_phase: u8,
     /// `DAT_0054a3b4`: shared source city-dispatch time accumulator.
     pub source_city_dispatch_elapsed_ms: u32,
     /// Low-three-bit phase incremented after the source accumulator exceeds
@@ -521,6 +525,8 @@ impl Simulation {
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
+            source_map_dispatch_elapsed_ms: 0,
+            source_map_dispatch_phase: 0,
             source_city_dispatch_elapsed_ms: 0,
             source_city_dispatch_phase: 0,
             source_city_dispatch_cursor: 0,
@@ -983,6 +989,7 @@ impl Simulation {
     /// Single simulation step (max 200ms).
     fn step(&mut self, dt_ms: u32) {
         self.advance_source_clock(dt_ms);
+        self.tick_source_map_dispatch(dt_ms);
         self.tick_source_kind6_deferred_hits();
         self.tick_source_kind15_combat_figures(dt_ms);
 
@@ -1390,6 +1397,19 @@ impl Simulation {
             if self.source_city_kind12_dispatch_allows(city) {
                 self.spawn_source_kind12_figures(city);
             }
+        }
+    }
+
+    /// Advance `DAT_005a6aec` / `DAT_005a6c12` exactly as the leading block
+    /// of `FUN_0047daf0`. Root-local phase and cooldown updates occur in
+    /// `tick_production`, where this simulator executes the corresponding
+    /// source production and transfer branches.
+    fn tick_source_map_dispatch(&mut self, dt_ms: u32) {
+        self.source_map_dispatch_elapsed_ms =
+            self.source_map_dispatch_elapsed_ms.saturating_add(dt_ms);
+        if self.source_map_dispatch_elapsed_ms > 999 {
+            self.source_map_dispatch_elapsed_ms = 0;
+            self.source_map_dispatch_phase = self.source_map_dispatch_phase.wrapping_add(1) & 7;
         }
     }
 
@@ -1869,12 +1889,12 @@ impl Simulation {
         self.source_figure_pool_occupancy() < SourceFigureRecordLayout::CAPACITY
     }
 
-    fn tick_production(&mut self) {
-        self.sync_source_city_populations_to_warehouses();
-        let mut new_carriers = Vec::new();
-        let mut source_figure_slots_remaining =
-            SourceFigureRecordLayout::CAPACITY.saturating_sub(self.source_figure_pool_occupancy());
-        let carrier_suppliers: Vec<_> = self
+    /// Derive the generic figure-8 source search view from the live root
+    /// buffers. `FUN_0047daf0` updates one root before entering its transfer
+    /// switch, so each dispatch observes output from roots already processed
+    /// in the same scheduler pass.
+    fn carrier_suppliers(&self) -> Vec<carrier::CarrierSupplier> {
+        let mut suppliers: Vec<_> = self
             .buildings
             .iter()
             .filter(|building| building.active && building.output_stock != 0)
@@ -1902,8 +1922,7 @@ impl Simulation {
                 })
             })
             .collect();
-        let mut carrier_suppliers = carrier_suppliers;
-        carrier_suppliers.extend(
+        suppliers.extend(
             self.warehouses
                 .iter()
                 .filter(|warehouse| warehouse.active)
@@ -1924,7 +1943,21 @@ impl Simulation {
                     })
                 }),
         );
+        suppliers
+    }
 
+    fn tick_production(&mut self) {
+        self.sync_source_city_populations_to_warehouses();
+        let mut new_carriers = Vec::new();
+        let mut source_figure_slots_remaining =
+            SourceFigureRecordLayout::CAPACITY.saturating_sub(self.source_figure_pool_occupancy());
+        let source_dispatch_phase = self.source_map_dispatch_phase;
+        let mut source_dispatch_roots = Vec::new();
+        for state in &mut self.source_map_cell_states {
+            if state.source_scheduler_due(source_dispatch_phase) {
+                source_dispatch_roots.push(*state);
+            }
+        }
         for i in 0..self.buildings.len() {
             let def_id = self.buildings[i].def_id;
             if def_id as usize >= self.building_defs.len() {
@@ -1934,11 +1967,15 @@ impl Simulation {
             let source_raw_material_stock = self.buildings[i].input_1_stock.saturating_mul(32);
             let source_work_material_stock = self.buildings[i].input_2_stock.saturating_mul(32);
             let source_storage_fill = self.buildings[i].output_stock.saturating_mul(32);
-            let produced = production::tick_building(
-                &mut self.buildings[i],
-                &def,
-                self.timer_production.interval_ms,
-            );
+            let source_dispatch_due = source_dispatch_roots.iter().any(|root| {
+                root.matches(
+                    self.buildings[i].island_id,
+                    self.buildings[i].tile_x,
+                    self.buildings[i].tile_y,
+                )
+            });
+            let building_runs_source_scheduler =
+                self.buildings[i].active && self.buildings[i].is_built() && source_dispatch_due;
             let state_changed = if let Some(state) =
                 self.source_map_cell_states.iter_mut().find(|state| {
                     state.matches(
@@ -1960,23 +1997,45 @@ impl Simulation {
                 if state.storage_fill == 0 && source_storage_fill != 0 {
                     state.storage_fill = source_storage_fill;
                 }
-                if produced != 0 {
-                    state.advance_source_scheduler(self.buildings[i].efficiency);
-                } else {
-                    state.set_activity(self.buildings[i].efficiency);
+                self.buildings[i].input_1_stock = state.raw_material_stock / 32;
+                self.buildings[i].input_2_stock = state.work_material_stock / 32;
+                self.buildings[i].output_stock = state.storage_fill / 32;
+                if building_runs_source_scheduler {
+                    state.advance_source_scheduler();
+                    self.buildings[i].efficiency = state.activity;
                 }
                 self.buildings[i].input_1_stock = state.raw_material_stock / 32;
                 self.buildings[i].input_2_stock = state.work_material_stock / 32;
                 self.buildings[i].output_stock = state.storage_fill / 32;
                 *state != before
             } else {
+                production::tick_building(
+                    &mut self.buildings[i],
+                    &def,
+                    self.timer_production.interval_ms,
+                );
                 false
             };
             if state_changed {
                 self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
             }
 
-            if self.buildings[i].active {
+            let source_type8_transfer_input = source_dispatch_due
+                .then(|| {
+                    self.source_map_cell_states
+                        .iter()
+                        .copied()
+                        .find(|state| {
+                            state.matches(
+                                self.buildings[i].island_id,
+                                self.buildings[i].tile_x,
+                                self.buildings[i].tile_y,
+                            )
+                        })
+                        .and_then(SourceMapCellState::source_type8_transfer_input)
+                })
+                .flatten();
+            if self.buildings[i].active && source_type8_transfer_input.is_some() {
                 // Check if this building already has an active carrier
                 let has_carrier = self.figures.iter().any(|f| {
                     f.is_active()
@@ -1996,9 +2055,11 @@ impl Simulation {
                     if source_figure_slots_remaining == 0 {
                         continue;
                     }
-                    if let Some(mut c) = carrier::try_spawn_carrier(
+                    let carrier_suppliers = self.carrier_suppliers();
+                    if let Some(mut c) = carrier::try_spawn_carrier_for_source_input(
                         &self.buildings[i],
                         &def,
+                        source_type8_transfer_input.expect("checked above"),
                         &carrier_suppliers,
                         &mut self.source_map_cell_states,
                         &mut self.warehouses,
@@ -2022,14 +2083,21 @@ impl Simulation {
         // production-building loop. MARKT and KONTOR roots use their city's
         // inventory to build the FUN_00480610 capacity eligibility bytes
         // before selecting and reserving a producer root.
+        let city_origins: Vec<_> = source_dispatch_roots
+            .iter()
+            .filter_map(|root| {
+                self.source_map_cell_states
+                    .iter()
+                    .copied()
+                    .find(|state| state.matches(root.island, u16::from(root.x), u16::from(root.y)))
+            })
+            .filter(|state| {
+                state.is_type11_transfer_root() && state.allows_source_transfer_dispatch()
+            })
+            .collect();
+        let carrier_suppliers = self.carrier_suppliers();
         let city_cart_suppliers =
             Self::city_cart_supplier_view(&carrier_suppliers, &self.buildings, &self.building_defs);
-        let city_origins: Vec<_> = self
-            .source_map_cell_states
-            .iter()
-            .copied()
-            .filter(|state| state.is_type11_transfer_root())
-            .collect();
         for origin in city_origins {
             let Some(city_cart_config) = self.city_cart_config_for(origin.source_transfer_figure)
             else {
@@ -2089,6 +2157,16 @@ impl Simulation {
                 }
                 new_carriers.push(cart);
                 source_figure_slots_remaining -= 1;
+            }
+        }
+
+        for root in &source_dispatch_roots {
+            if let Some(state) = self
+                .source_map_cell_states
+                .iter_mut()
+                .find(|state| state.matches(root.island, u16::from(root.x), u16::from(root.y)))
+            {
+                state.complete_source_scheduler_run();
             }
         }
 
@@ -3423,6 +3501,11 @@ impl Simulation {
                             } else {
                                 figure.cargo_fixed
                             };
+                            let max_load_fixed = if figure.source_transfer_max_load_fixed == 0 {
+                                carrier_config.max_load.saturating_mul(32)
+                            } else {
+                                figure.source_transfer_max_load_fixed
+                            };
                             let origin_idx = figure.building_idx as usize;
                             let should_despawn =
                                 carrier::handle_arrival(figure, &self.buildings, &self.island_maps);
@@ -3512,6 +3595,7 @@ impl Simulation {
                                             })
                                             .unwrap_or(0);
                                         let mut remaining_source_fill = None;
+                                        let mut collected_fixed = requested_fixed;
                                         let collected = if picked == 0 {
                                             false
                                         } else if let Some(island) = island {
@@ -3548,17 +3632,18 @@ impl Simulation {
                                                                 supplier_target.1,
                                                             )
                                                     })
-                                                    .is_some_and(|state| {
-                                                        let collected = state
-                                                            .collect_reserved_storage(
+                                                    .map(|state| {
+                                                        let top_up = state
+                                                            .collect_reserved_storage_with_top_up(
                                                                 requested_fixed,
+                                                                max_load_fixed,
                                                             );
-                                                        if collected {
-                                                            remaining_source_fill =
-                                                                Some(state.storage_fill);
-                                                        }
-                                                        collected
+                                                        collected_fixed =
+                                                            requested_fixed.saturating_add(top_up);
+                                                        remaining_source_fill =
+                                                            Some(state.storage_fill);
                                                     })
+                                                    .is_some()
                                             }
                                         } else {
                                             false
@@ -3569,8 +3654,8 @@ impl Simulation {
                                                     remaining_source_fill.unwrap_or(0) / 32;
                                                 self.source_map_cell_revision =
                                                     self.source_map_cell_revision.wrapping_add(1);
-                                                figure.carried_amount = picked;
-                                                figure.cargo_fixed = requested_fixed;
+                                                figure.carried_amount = collected_fixed / 32;
+                                                figure.cargo_fixed = collected_fixed;
                                             } else {
                                                 figure.carried_amount = 0;
                                                 figure.cargo_fixed = 0;
@@ -3589,11 +3674,8 @@ impl Simulation {
                                             figure.carried_amount = 0;
                                             figure.cargo_fixed = 0;
                                         }
-                                        let uncollected_fixed = if collected {
-                                            requested_fixed.saturating_sub(figure.cargo_fixed)
-                                        } else {
-                                            requested_fixed
-                                        };
+                                        let uncollected_fixed =
+                                            (!collected).then_some(requested_fixed).unwrap_or(0);
                                         if uncollected_fixed != 0 {
                                             if matches!(supplier_kind, 7 | 8) {
                                                 if let Some(warehouse) =
@@ -3660,16 +3742,19 @@ impl Simulation {
                                             )
                                         });
                                     if let Some((input_1, input_2)) = inputs {
+                                        // FUN_0047d940 tests Workstoff first; if both
+                                        // selectors name one ware, that ware fills work.
+                                        let work_input = good == input_2;
                                         let (island, x, y, accepted) = {
                                             let building = &mut self.buildings[origin_idx];
-                                            let accepted = if good == input_1 {
-                                                building.input_1_stock = building
-                                                    .input_1_stock
-                                                    .saturating_add(delivered);
-                                                true
-                                            } else if good == input_2 {
+                                            let accepted = if work_input {
                                                 building.input_2_stock = building
                                                     .input_2_stock
+                                                    .saturating_add(delivered);
+                                                true
+                                            } else if good == input_1 {
+                                                building.input_1_stock = building
+                                                    .input_1_stock
                                                     .saturating_add(delivered);
                                                 true
                                             } else {
@@ -3688,13 +3773,13 @@ impl Simulation {
                                                 .iter_mut()
                                                 .find(|state| state.matches(island, x, y))
                                             {
-                                                if good == input_1 {
-                                                    state.raw_material_stock = state
-                                                        .raw_material_stock
-                                                        .saturating_add(delivered_fixed);
-                                                } else {
+                                                if work_input {
                                                     state.work_material_stock = state
                                                         .work_material_stock
+                                                        .saturating_add(delivered_fixed);
+                                                } else {
+                                                    state.raw_material_stock = state
+                                                        .raw_material_stock
                                                         .saturating_add(delivered_fixed);
                                                 }
                                                 self.source_map_cell_revision =
@@ -5337,6 +5422,29 @@ mod tests {
     }
 
     #[test]
+    fn source_map_dispatch_phase_advances_after_each_thousand_ms_boundary() {
+        let mut sim = Simulation::new();
+
+        sim.tick_source_map_dispatch(999);
+        assert_eq!(
+            (
+                sim.source_map_dispatch_elapsed_ms,
+                sim.source_map_dispatch_phase,
+            ),
+            (999, 0)
+        );
+
+        sim.tick_source_map_dispatch(1);
+        assert_eq!(
+            (
+                sim.source_map_dispatch_elapsed_ms,
+                sim.source_map_dispatch_phase,
+            ),
+            (0, 1)
+        );
+    }
+
+    #[test]
     fn production_completion_preserves_matching_source_cell_fixed_point_state() {
         use anno_formats::cod::{BuildingDef as CodBuilding, CodFile};
         use std::collections::HashMap;
@@ -5346,12 +5454,13 @@ mod tests {
             source_production_amount: 16,
             source_raw_material_amount: 64,
             storage_animation_capacity: 160,
+            source_scheduler_interval: 2,
             properties: HashMap::from([
                 ("ProdKind".into(), "HANDWERK".into()),
                 ("Ware".into(), "WERKZEUG".into()),
                 ("Rohstoff".into(), "EISEN".into()),
                 ("Rohmenge".into(), "2".into()),
-                ("Interval".into(), "1".into()),
+                ("Interval".into(), "2".into()),
                 ("Maxlager".into(), "5".into()),
             ]),
             ..Default::default()
@@ -5368,6 +5477,26 @@ mod tests {
         sim.source_map_cell_states
             .push(SourceMapCellState::new(2, 7, 9, &cod_building, 0).unwrap());
 
+        sim.tick_source_map_dispatch(1_000);
+        sim.tick_production();
+
+        let state = sim.source_map_cell_states[0];
+        assert_eq!(state.raw_material_stock, 160);
+        assert_eq!(state.storage_fill, 0);
+        assert_eq!(state.progress, 0);
+        assert_eq!(state.activity, 128);
+        assert_eq!(sim.source_map_cell_revision, 1);
+        assert_eq!(state.scheduler_cooldown, 2);
+
+        sim.tick_source_map_dispatch(1_000);
+        sim.tick_production();
+
+        let state = sim.source_map_cell_states[0];
+        assert_eq!(state.raw_material_stock, 160);
+        assert_eq!(state.storage_fill, 0);
+        assert_eq!(state.scheduler_cooldown, 1);
+
+        sim.tick_source_map_dispatch(1_000);
         sim.tick_production();
 
         let state = sim.source_map_cell_states[0];
@@ -5375,16 +5504,66 @@ mod tests {
         assert_eq!(state.storage_fill, 16);
         assert_eq!(state.progress, 16);
         assert_eq!(state.activity, 128);
-        assert_eq!(sim.source_map_cell_revision, 1);
+        assert_eq!(sim.buildings[0].input_1_stock, 3);
+        assert_eq!(sim.buildings[0].output_stock, 0);
+    }
 
+    #[test]
+    fn generic_transfer_requires_the_post_update_source_storage_gate() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let mut sim = Simulation::new();
+        sim.building_defs = vec![
+            BuildingDef {
+                input_good_1: Good::Iron,
+                input_1_rate: 2,
+                ..Default::default()
+            },
+            BuildingDef {
+                output_good: Good::Iron,
+                ..Default::default()
+            },
+        ];
+        sim.buildings.push(BuildingInstance::new(0, 0, 0, 0, 0));
+        let mut supplier = BuildingInstance::new(1, 0, 2, 0, 0);
+        supplier.output_stock = 4;
+        sim.buildings.push(supplier);
+
+        let transfer_root = CodBuilding {
+            kind: "HANDWERK".into(),
+            storage_animation_capacity: 64,
+            source_raw_material_amount: 64,
+            properties: [
+                ("ProdKind".into(), "HANDWERK".into()),
+                ("Rohstoff".into(), "EISEN".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let supplier_root = CodBuilding {
+            kind: "HANDWERK".into(),
+            storage_animation_capacity: 320,
+            ..Default::default()
+        };
+        let mut root = SourceMapCellState::new(0, 0, 0, &transfer_root, 0).unwrap();
+        root.storage_fill = 64;
+        let mut supplier_state = SourceMapCellState::new(0, 2, 0, &supplier_root, 0).unwrap();
+        supplier_state.storage_fill = 128;
+        sim.source_map_cell_states = vec![root, supplier_state];
+
+        sim.tick_source_map_dispatch(1_000);
+        sim.tick_production();
+        assert!(sim.figures.is_empty());
+
+        sim.source_map_cell_states[0].storage_fill = 0;
+        sim.source_map_cell_states[0].scheduler_cooldown = 0;
+        sim.buildings[0].output_stock = 0;
+        sim.tick_source_map_dispatch(1_000);
         sim.tick_production();
 
-        let state = sim.source_map_cell_states[0];
-        assert_eq!(state.raw_material_stock, 32);
-        assert_eq!(state.storage_fill, 32);
-        assert_eq!(state.progress, 32);
-        assert_eq!(sim.buildings[0].input_1_stock, 1);
-        assert_eq!(sim.buildings[0].output_stock, 1);
+        assert_eq!(sim.figures.len(), 1);
+        assert_eq!(sim.figures[0].carried_good, Good::Iron as u8);
+        assert_eq!(sim.source_map_cell_states[1].reserved_storage, 128);
     }
 
     #[test]
@@ -5529,6 +5708,7 @@ mod tests {
 
         let kontor = CodBuilding {
             kind: "HQ".into(),
+            storage_animation_capacity: 160,
             source_transfer_radius: 16,
             source_transfer_figure_limit: 1,
             properties: [
@@ -5547,15 +5727,22 @@ mod tests {
         root.source_map_owner_slot = 2;
         let mut supplier_state = SourceMapCellState::new(2, 2, 0, &workshop, 0).unwrap();
         supplier_state.source_map_owner_slot = 2;
-        supplier_state.storage_fill = 65;
+        supplier_state.storage_fill = 128;
         sim.source_map_cell_states = vec![root, supplier_state];
 
+        sim.tick_production();
+
+        assert!(sim.figures.is_empty());
+        assert_eq!(sim.source_map_cell_states[0].phase, 0);
+
+        sim.tick_source_map_dispatch(1_000);
         sim.tick_production();
 
         assert_eq!(sim.figures.len(), 1);
         assert_eq!(sim.figures[0].cargo_route, CargoRoute::CityCart);
         assert_eq!(sim.figures[0].owner, 4);
         assert_eq!(sim.figures[0].origin_source_map_owner_slot, 2);
+        assert_eq!(sim.source_map_cell_states[0].scheduler_cooldown, 11);
 
         for _ in 0..100 {
             if sim.figures.is_empty() {
@@ -5569,7 +5756,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_carrier_collects_from_supplier_anchor_after_reaching_footprint_edge() {
+    fn generic_carrier_collects_and_tops_up_at_supplier_anchor_after_reaching_footprint_edge() {
         use crate::types::Good;
         use anno_formats::cod::BuildingDef as CodBuilding;
 
@@ -5578,6 +5765,8 @@ mod tests {
             BuildingDef {
                 input_good_1: Good::Iron,
                 input_1_rate: 2,
+                input_good_2: Good::Iron,
+                input_2_rate: 2,
                 ..Default::default()
             },
             BuildingDef {
@@ -5596,7 +5785,7 @@ mod tests {
         sim.source_map_cell_states
             .push(SourceMapCellState::new(4, 1, 1, &source_definition, 0).unwrap());
         let mut supplier_state = SourceMapCellState::new(4, 3, 2, &source_definition, 0).unwrap();
-        supplier_state.storage_fill = 65;
+        supplier_state.storage_fill = 128;
         supplier_state.reserved_storage = 65;
         sim.source_map_cell_states.push(supplier_state);
         let mut carrier = Figure::new();
@@ -5623,8 +5812,10 @@ mod tests {
         assert_eq!(sim.buildings[1].output_stock, 0);
         assert_eq!(sim.source_map_cell_states[1].storage_fill, 0);
         assert_eq!(sim.source_map_cell_states[1].reserved_storage, 0);
-        assert_eq!(sim.buildings[0].input_1_stock, 2);
-        assert_eq!(sim.source_map_cell_states[0].raw_material_stock, 65);
+        assert_eq!(sim.buildings[0].input_1_stock, 0);
+        assert_eq!(sim.buildings[0].input_2_stock, 4);
+        assert_eq!(sim.source_map_cell_states[0].raw_material_stock, 0);
+        assert_eq!(sim.source_map_cell_states[0].work_material_stock, 128);
         assert!(sim.figures.is_empty());
     }
 
@@ -5645,6 +5836,7 @@ mod tests {
 
         let market = CodBuilding {
             kind: "GEBAEUDE".into(),
+            storage_animation_capacity: 160,
             source_transfer_figure_limit: 1,
             properties: [
                 ("ProdKind".into(), "MARKT".into()),
@@ -5673,6 +5865,7 @@ mod tests {
             city_capacity as u16 - 32
         );
 
+        sim.tick_source_map_dispatch(1_000);
         sim.tick_production();
         assert_eq!(sim.figures.len(), 1);
         assert_eq!(sim.figures[0].cargo_route, CargoRoute::CityCart);

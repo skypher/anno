@@ -190,7 +190,7 @@ pub struct Figure {
     /// units. `carried_amount` remains the whole-good display quantity.
     #[serde(default)]
     pub cargo_fixed: u16,
-    /// Authored type-11 `Maxtrag`, retained in the source 1/32-good scale.
+    /// Authored type-8/type-11 `Maxtrag`, retained in the source 1/32-good scale.
     /// `FUN_0047d640` uses it at supplier arrival to top up the reservation
     /// with output produced while the figure was walking to that supplier.
     #[serde(default)]

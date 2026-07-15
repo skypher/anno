@@ -178,7 +178,15 @@ use std::path::Path;
 ///      to address the origin city's inventory and root count.
 /// v97: in-flight type-11 figures retain their authored `Maxtrag`, needed for
 ///      the source supplier-arrival top-up in `FUN_0047d640`.
-pub const SAVE_VERSION: u32 = 97;
+/// v98: source roots retain the `FUN_0047daf0` enable/cooldown gate and
+///      authored interval, and the global source map-dispatch phase and
+///      accumulator survive save/load.
+/// v99: source roots retain the `FUN_0047daf0` byte-`+0x0f` blocked flag.
+/// v100: source roots retain the compiled `Ware` selector used by scheduler
+///       activity.
+/// v101: source roots retain the compiled `Maxnorohst` threshold and their
+///       saturated no-raw-material counter.
+pub const SAVE_VERSION: u32 = 101;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -192,7 +200,7 @@ pub const SAVE_VERSION: u32 = 97;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 97;
+pub const MIN_LOADABLE_VERSION: u32 = 101;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -225,6 +233,8 @@ pub struct SaveState {
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
     pub source_time_ticks: u32,
     pub source_time_remainder_ms: u32,
+    pub source_map_dispatch_elapsed_ms: u32,
+    pub source_map_dispatch_phase: u8,
     pub source_city_dispatch_elapsed_ms: u32,
     pub source_city_dispatch_phase: u8,
     pub source_city_dispatch_cursor: usize,
@@ -298,6 +308,8 @@ impl Simulation {
             source_kind4_dispatch: self.source_kind4_dispatch,
             source_time_ticks: self.source_time_ticks,
             source_time_remainder_ms: self.source_time_remainder_ms,
+            source_map_dispatch_elapsed_ms: self.source_map_dispatch_elapsed_ms,
+            source_map_dispatch_phase: self.source_map_dispatch_phase,
             source_city_dispatch_elapsed_ms: self.source_city_dispatch_elapsed_ms,
             source_city_dispatch_phase: self.source_city_dispatch_phase,
             source_city_dispatch_cursor: self.source_city_dispatch_cursor,
@@ -341,6 +353,8 @@ impl Simulation {
         self.source_kind4_dispatch = s.source_kind4_dispatch;
         self.source_time_ticks = s.source_time_ticks;
         self.source_time_remainder_ms = s.source_time_remainder_ms;
+        self.source_map_dispatch_elapsed_ms = s.source_map_dispatch_elapsed_ms;
+        self.source_map_dispatch_phase = s.source_map_dispatch_phase;
         self.source_city_dispatch_elapsed_ms = s.source_city_dispatch_elapsed_ms;
         self.source_city_dispatch_phase = s.source_city_dispatch_phase;
         self.source_city_dispatch_cursor = s.source_city_dispatch_cursor;
@@ -442,6 +456,8 @@ mod tests {
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
+            source_map_dispatch_elapsed_ms: 0,
+            source_map_dispatch_phase: 0,
             source_city_dispatch_elapsed_ms: 0,
             source_city_dispatch_phase: 0,
             source_city_dispatch_cursor: 0,
@@ -565,6 +581,9 @@ mod tests {
                 ruin_uses_strand_table: false,
                 fallback_strand_cells: 0,
                 phase: 3,
+                scheduler_enabled: false,
+                scheduler_cooldown: 2,
+                scheduler_blocked: true,
                 frame_selector: 12,
                 activity: 96,
                 work_material_stock: 64,
@@ -575,6 +594,10 @@ mod tests {
                 source_production_amount: 32,
                 source_raw_material_amount: 64,
                 source_work_material_amount: 16,
+                source_max_no_raw_material_count: 9,
+                source_scheduler_interval: 7,
+                source_no_raw_material_count: 6,
+                source_output_ware_slot: 0x16,
                 source_damage_threshold: 640,
                 source_damage_accumulator: 192,
                 progress: 512,
@@ -637,6 +660,8 @@ mod tests {
         sim.source_city_dispatch_cursor = 17;
         sim.source_time_ticks = 19;
         sim.source_time_remainder_ms = 99;
+        sim.source_map_dispatch_elapsed_ms = 800;
+        sim.source_map_dispatch_phase = 5;
         sim.source_kind4_dispatch = crate::combat::SourceKind4DispatchState {
             active_player_slot: 2,
             single_player: false,
@@ -853,6 +878,9 @@ mod tests {
                 ruin_uses_strand_table: false,
                 fallback_strand_cells: 0,
                 phase: 3,
+                scheduler_enabled: false,
+                scheduler_cooldown: 2,
+                scheduler_blocked: true,
                 frame_selector: 12,
                 activity: 96,
                 work_material_stock: 64,
@@ -863,6 +891,10 @@ mod tests {
                 source_production_amount: 32,
                 source_raw_material_amount: 64,
                 source_work_material_amount: 16,
+                source_max_no_raw_material_count: 9,
+                source_scheduler_interval: 7,
+                source_no_raw_material_count: 6,
+                source_output_ware_slot: 0x16,
                 source_damage_threshold: 640,
                 source_damage_accumulator: 192,
                 progress: 512,
@@ -947,6 +979,8 @@ mod tests {
         assert_eq!(sim2.source_city_dispatch_cursor, 17);
         assert_eq!(sim2.source_time_ticks, 19);
         assert_eq!(sim2.source_time_remainder_ms, 99);
+        assert_eq!(sim2.source_map_dispatch_elapsed_ms, 800);
+        assert_eq!(sim2.source_map_dispatch_phase, 5);
         assert_eq!(
             sim2.source_dynamic_combat_figures,
             vec![crate::combat::SourceDynamicCombatFigure {

@@ -10,7 +10,7 @@
 use crate::building::{BuildingDef, BuildingInstance};
 use crate::entity::{ActionType, CargoRoute, Figure};
 use crate::island_map::IslandMap;
-use crate::source_cell::SourceMapCellState;
+use crate::source_cell::{SourceMapCellState, SourceType8TransferInput};
 use crate::source_route::{
     source_route_positions, SourcePathBlockedCellDecision, SourcePathTargetRect, SourceRouteStep,
 };
@@ -382,6 +382,34 @@ fn carrier_request(
     })
 }
 
+/// Construct a carrier request for the exact input selected by
+/// `FUN_0047daf0` case 1. This preserves the source root's fixed-point
+/// choice instead of recomputing priority from rounded building stock.
+fn carrier_request_for_source_input(
+    building: &BuildingInstance,
+    def: &BuildingDef,
+    input: SourceType8TransferInput,
+    max_load: u16,
+) -> Option<CarrierRequest> {
+    let (good, stock, rate) = match input {
+        SourceType8TransferInput::RawMaterial => {
+            (def.input_good_1, building.input_1_stock, def.input_1_rate)
+        }
+        SourceType8TransferInput::WorkMaterial => {
+            (def.input_good_2, building.input_2_stock, def.input_2_rate)
+        }
+    };
+    if good == Good::None {
+        return None;
+    }
+    let batch = rate.max(1);
+    let target = batch.saturating_mul(2);
+    (stock <= target).then_some(CarrierRequest {
+        good,
+        amount: target.saturating_sub(stock).min(max_load).max(1),
+    })
+}
+
 /// Run FUN_00471380's first-reservable type-8 supplier search. The callback
 /// accepts the first same-owner root whose requested input has at least half
 /// a TRAEGER load available, reserving up to the full fixed-point load.
@@ -505,6 +533,50 @@ pub fn try_spawn_carrier(
     config: CarrierConfig,
 ) -> Option<Figure> {
     let request = carrier_request(building, def, config.max_load)?;
+    try_spawn_carrier_for_request(
+        building,
+        request,
+        suppliers,
+        source_cells,
+        warehouses,
+        island_maps,
+        config,
+    )
+}
+
+/// Spawn a type-8 carrier for the input selector already chosen from a source
+/// root's fixed-point transfer branch.
+pub fn try_spawn_carrier_for_source_input(
+    building: &BuildingInstance,
+    def: &BuildingDef,
+    input: SourceType8TransferInput,
+    suppliers: &[CarrierSupplier],
+    source_cells: &mut [SourceMapCellState],
+    warehouses: &mut [Warehouse],
+    island_maps: &[IslandMap],
+    config: CarrierConfig,
+) -> Option<Figure> {
+    let request = carrier_request_for_source_input(building, def, input, config.max_load)?;
+    try_spawn_carrier_for_request(
+        building,
+        request,
+        suppliers,
+        source_cells,
+        warehouses,
+        island_maps,
+        config,
+    )
+}
+
+fn try_spawn_carrier_for_request(
+    building: &BuildingInstance,
+    request: CarrierRequest,
+    suppliers: &[CarrierSupplier],
+    source_cells: &mut [SourceMapCellState],
+    warehouses: &mut [Warehouse],
+    island_maps: &[IslandMap],
+    config: CarrierConfig,
+) -> Option<Figure> {
     let start = (i32::from(building.tile_x), i32::from(building.tile_y));
     let map = island_maps
         .iter()
@@ -623,6 +695,7 @@ pub fn try_spawn_carrier(
     carrier.carried_good = request.good as u8;
     carrier.carried_amount = cargo;
     carrier.cargo_fixed = cargo_fixed;
+    carrier.source_transfer_max_load_fixed = config.max_load.saturating_mul(SOURCE_STORAGE_UNIT);
     carrier.speed = CARRIER_SPEED;
     carrier.source_move_speed = config.movement_speed;
     carrier.base_sprite = config.sprite_base;
@@ -1233,6 +1306,26 @@ mod tests {
             )
             .unwrap()
         }
+    }
+
+    #[test]
+    fn source_selected_input_accepts_the_inclusive_two_batch_boundary() {
+        let mut consumer = BuildingInstance::new(0, 0, 5, 5, 0);
+        consumer.input_1_stock = 4;
+        let definition = consumer_def();
+
+        assert_eq!(
+            carrier_request_for_source_input(
+                &consumer,
+                &definition,
+                SourceType8TransferInput::RawMaterial,
+                4,
+            ),
+            Some(CarrierRequest {
+                good: Good::Iron,
+                amount: 1,
+            })
+        );
     }
 
     #[test]

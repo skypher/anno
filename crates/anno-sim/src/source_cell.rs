@@ -23,6 +23,20 @@ pub enum SourceTransferFigure {
     Traeger2 = 2,
 }
 
+/// Input selector passed by production-kind case 1 to `FUN_0044ab60`.
+/// The allocator receives the compiled `Rohstoff` selector for `RawMaterial`
+/// and `Workstoff` for `WorkMaterial`; figure-8 later deposits its cargo into
+/// the matching source buffer through `FUN_0047d940`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceType8TransferInput {
+    RawMaterial,
+    WorkMaterial,
+}
+
+const fn source_scheduler_enabled_default() -> bool {
+    true
+}
+
 impl SourceTransferFigure {
     fn from_definition(definition: &BuildingDef) -> Self {
         match definition.properties.get("Figurnr").map(String::as_str) {
@@ -99,6 +113,20 @@ pub struct SourceMapCellState {
     pub fallback_strand_cells: u64,
     /// Low three bits of source byte `+0x03`, scheduled by `FUN_0047daf0`.
     pub phase: u8,
+    /// Bit 3 of source byte `+0x03`. `FUN_00481fc0` initializes a new
+    /// root with this bit set; `FUN_0047daf0` does not run production or
+    /// transfer dispatch while it is clear.
+    #[serde(default = "source_scheduler_enabled_default")]
+    pub scheduler_enabled: bool,
+    /// Source u16 `+0x04`. After a phase transition `FUN_0047daf0` decrements
+    /// this timer and runs the root only on the transition that reaches zero.
+    #[serde(default)]
+    pub scheduler_cooldown: u16,
+    /// Bit 7 of source byte `+0x0f`. The map-state transition path clears
+    /// activity when it changes this bit; `FUN_0047daf0` excludes a blocked
+    /// root from production while preserving its transfer handling.
+    #[serde(default)]
+    pub scheduler_blocked: bool,
     /// High four bits of source byte `+0x03`.
     pub frame_selector: u8,
     /// Source byte `+0x0e`, the current 0..=128 activity ratio.
@@ -122,6 +150,22 @@ pub struct SourceMapCellState {
     pub source_raw_material_amount: u16,
     /// Compiled `Workmenge` at definition offset `+0x28`.
     pub source_work_material_amount: u16,
+    /// Compiled `Maxnorohst` at definition offset `+0x36`.
+    #[serde(default)]
+    pub source_max_no_raw_material_count: u16,
+    /// Compiled `Interval` at definition offset `+0x3a`, measured in source
+    /// map-scheduler phase transitions.
+    #[serde(default)]
+    pub source_scheduler_interval: u16,
+    /// Low four bits of source byte `+0x0f`. `FUN_0047daf0` increments this
+    /// counter while a non-full root cannot produce, saturating at 15, and
+    /// clears it after a productive scheduler run.
+    #[serde(default)]
+    pub source_no_raw_material_count: u8,
+    /// Compiled `Ware` selector at definition offset `+0x21`. A zero selector
+    /// prevents `FUN_0047daf0` from deriving a nonzero production activity.
+    #[serde(default)]
+    pub source_output_ware_slot: u8,
     /// Compiled `Maxenergy` at definition offset `+0x64`. The deferred
     /// category-6 source hit handler compares its map-cell accumulator with
     /// this fixed-point threshold before emitting the terminal type-7 event.
@@ -203,6 +247,9 @@ impl SourceMapCellState {
             ruin_uses_strand_table: matches!(kind_code, 23..=27),
             fallback_strand_cells: 0,
             phase: phase & 7,
+            scheduler_enabled: true,
+            scheduler_cooldown: 0,
+            scheduler_blocked: false,
             frame_selector: 0,
             activity: 0,
             work_material_stock: 0,
@@ -213,6 +260,10 @@ impl SourceMapCellState {
             source_production_amount: definition.source_production_amount,
             source_raw_material_amount: definition.source_raw_material_amount,
             source_work_material_amount: definition.source_work_material_amount,
+            source_max_no_raw_material_count: definition.source_max_no_raw_material_count,
+            source_scheduler_interval: definition.source_scheduler_interval,
+            source_no_raw_material_count: 0,
+            source_output_ware_slot: definition.source_ware_slot().unwrap_or_default(),
             source_damage_threshold: definition.source_damage_threshold,
             source_damage_accumulator: 0,
             progress: 0,
@@ -230,6 +281,101 @@ impl SourceMapCellState {
     #[inline]
     pub const fn is_type11_transfer_root(self) -> bool {
         matches!(self.source_production_kind_code, 7 | 8 | 30)
+    }
+
+    /// `FUN_0047daf0` dispatches the generic figure-8 transfer only through
+    /// production-kind case 1, which calls `FUN_0044ab60`.
+    #[inline]
+    pub const fn is_type8_transfer_root(self) -> bool {
+        self.source_production_kind_code == 1
+    }
+
+    /// The scheduler reaches its transfer switch only when its newly written
+    /// activity is nonzero or its storage has room below `Maxlager`.
+    #[inline]
+    pub const fn allows_source_transfer_dispatch(self) -> bool {
+        self.activity != 0 || self.storage_fill < self.storage_animation_capacity
+    }
+
+    /// Decode case 1 of `FUN_0047daf0`'s figure-8 transfer switch. The
+    /// executable compares the raw and work buffers in 128-scaled units,
+    /// without capping their ratios, and admits a selected input through the
+    /// inclusive 256 boundary.
+    pub fn source_type8_transfer_input(self) -> Option<SourceType8TransferInput> {
+        if !self.is_type8_transfer_root() || !self.allows_source_transfer_dispatch() {
+            return None;
+        }
+
+        let work_ratio = if self.source_work_material_amount == 0 {
+            0x180
+        } else {
+            (u32::from(self.work_material_stock) << 7) / u32::from(self.source_work_material_amount)
+        };
+        if self.source_raw_material_amount == 0 {
+            return (work_ratio <= 0x100).then_some(SourceType8TransferInput::WorkMaterial);
+        }
+
+        let raw_ratio =
+            (u32::from(self.raw_material_stock) << 7) / u32::from(self.source_raw_material_amount);
+        if raw_ratio > 0x100 || work_ratio < raw_ratio {
+            (work_ratio <= 0x100).then_some(SourceType8TransferInput::WorkMaterial)
+        } else {
+            Some(SourceType8TransferInput::RawMaterial)
+        }
+    }
+
+    /// Apply `FUN_0047daf0`'s per-root phase and cooldown gate. The phase
+    /// write precedes both predicates in the executable, so disabled and
+    /// cooling roots retain the current global phase without running work.
+    pub fn source_scheduler_due(&mut self, global_phase: u8) -> bool {
+        let global_phase = global_phase & 7;
+        if self.phase == global_phase {
+            return false;
+        }
+        self.phase = global_phase;
+        if !self.scheduler_enabled {
+            return false;
+        }
+        if self.scheduler_cooldown == 0 {
+            return true;
+        }
+        self.scheduler_cooldown -= 1;
+        self.scheduler_cooldown == 0
+    }
+
+    /// Complete one executed `FUN_0047daf0` root branch. Idle and
+    /// storage-blocked roots receive its fixed 11-phase retry; an active root
+    /// reloads `ceil(Interval × activity / 128)` from definition offset
+    /// `+0x3a`.
+    pub fn complete_source_scheduler_run(&mut self) {
+        if self.activity != 0 {
+            self.source_no_raw_material_count = 0;
+        } else if self.storage_fill < self.storage_animation_capacity {
+            self.source_no_raw_material_count =
+                self.source_no_raw_material_count.saturating_add(1).min(15);
+        }
+        self.scheduler_cooldown = if self.activity < 64 {
+            11
+        } else {
+            ((u32::from(self.source_scheduler_interval) * u32::from(self.activity) + 127) >> 7)
+                as u16
+        };
+    }
+
+    /// Apply the source byte `+0x0f` transition used by the map-state
+    /// handler: the first transition from an unblocked root clears its
+    /// activity before setting the blocked bit.
+    pub fn block_source_scheduler(&mut self) {
+        if !self.scheduler_blocked {
+            self.set_activity(0);
+        }
+        self.scheduler_blocked = true;
+    }
+
+    /// `FUN_0047ce60` clears bit 7 after it removes the corresponding
+    /// blocked dynamic record; it does not alter the root activity byte.
+    pub fn unblock_source_scheduler(&mut self) {
+        self.scheduler_blocked = false;
     }
 
     #[inline]
@@ -460,31 +606,57 @@ impl SourceMapCellState {
         true
     }
 
-    /// Apply the stock and progress arithmetic in `FUN_0047daf0` after its
-    /// input-kind and stock predicates select `activity`. The source uses
-    /// 1/32-unit amounts and only works at ratios at least 64/128.
-    pub fn advance_source_scheduler(&mut self, activity: u8) {
-        let activity = activity.min(128);
-        let activity = if (self.storage_animation_capacity != 0
-            && self.storage_fill >= self.storage_animation_capacity)
-            || activity < 64
-        {
-            0
+    /// Compute `FUN_0047daf0`'s source fixed-point activity ratio from the
+    /// live `Rohmenge` and `Workmenge` buffers. The executable caps each
+    /// operand at 128 and cancels work below 64/128.
+    pub fn source_scheduler_activity(self) -> u8 {
+        if self.storage_fill >= self.storage_animation_capacity {
+            return 0;
+        }
+        if self.scheduler_blocked {
+            return 0;
+        }
+        if self.source_output_ware_slot == 0 {
+            return 0;
+        }
+        if self.raw_material_stock == 0 {
+            return 0;
+        }
+        let mut activity = if self.source_raw_material_amount == 0 {
+            128
         } else {
-            activity
+            ((u32::from(self.raw_material_stock) << 7) / u32::from(self.source_raw_material_amount))
+                .min(128) as u8
         };
-        if activity != 0 {
-            self.work_material_stock = self
-                .work_material_stock
-                .wrapping_sub(scaled_amount(self.source_work_material_amount, activity));
-            self.raw_material_stock = self
-                .raw_material_stock
-                .wrapping_sub(scaled_amount(self.source_raw_material_amount, activity));
-            let output = scaled_amount(self.source_production_amount, activity);
+        if self.source_work_material_amount != 0 {
+            activity = activity.min(
+                ((u32::from(self.work_material_stock) << 7)
+                    / u32::from(self.source_work_material_amount))
+                .min(128) as u8,
+            );
+        }
+        (activity >= 64).then_some(activity).unwrap_or(0)
+    }
+
+    /// Apply one `FUN_0047daf0` root update. The source first consumes the
+    /// stored activity byte, then derives and stores the next activity from
+    /// the resulting fixed-point buffers.
+    pub fn advance_source_scheduler(&mut self) {
+        let previous_activity = self.activity;
+        if previous_activity != 0 {
+            self.work_material_stock = self.work_material_stock.wrapping_sub(scaled_amount(
+                self.source_work_material_amount,
+                previous_activity,
+            ));
+            self.raw_material_stock = self.raw_material_stock.wrapping_sub(scaled_amount(
+                self.source_raw_material_amount,
+                previous_activity,
+            ));
+            let output = scaled_amount(self.source_production_amount, previous_activity);
             self.storage_fill = self.storage_fill.wrapping_add(output);
             self.progress = self.progress.wrapping_add(output);
         }
-        self.set_activity(activity);
+        self.set_activity(self.source_scheduler_activity());
     }
 }
 
@@ -510,6 +682,7 @@ mod tests {
             kind: "HANDWERK".into(),
             anim_anz: 4,
             anim_frame: 3,
+            properties: [("Ware".into(), "WERKZEUG".into())].into(),
             ..Default::default()
         }
     }
@@ -525,11 +698,159 @@ mod tests {
     }
 
     #[test]
+    fn source_scheduler_gate_writes_phase_before_enable_and_cooldown_checks() {
+        let mut state = SourceMapCellState::new(1, 2, 3, &definition(), 0).unwrap();
+        state.scheduler_enabled = false;
+        assert!(!state.source_scheduler_due(1));
+        assert_eq!(state.phase, 1);
+
+        state.scheduler_enabled = true;
+        state.scheduler_cooldown = 2;
+        assert!(!state.source_scheduler_due(2));
+        assert_eq!(state.scheduler_cooldown, 1);
+        assert!(state.source_scheduler_due(3));
+        assert_eq!(state.scheduler_cooldown, 0);
+        assert!(!state.source_scheduler_due(3));
+
+        state.activity = 0;
+        state.complete_source_scheduler_run();
+        assert_eq!(state.scheduler_cooldown, 11);
+        state.source_scheduler_interval = 5;
+        state.activity = 64;
+        state.complete_source_scheduler_run();
+        assert_eq!(state.scheduler_cooldown, 3);
+
+        state.activity = 128;
+        state.block_source_scheduler();
+        assert!(state.scheduler_blocked);
+        assert_eq!(state.activity, 0);
+        state.unblock_source_scheduler();
+        assert!(!state.scheduler_blocked);
+        assert_eq!(state.activity, 0);
+    }
+
+    #[test]
+    fn scheduler_counts_nonfull_no_raw_material_runs_in_four_bits() {
+        let mut state = SourceMapCellState::new(
+            1,
+            2,
+            3,
+            &BuildingDef {
+                kind: "HANDWERK".into(),
+                storage_animation_capacity: 128,
+                source_max_no_raw_material_count: 9,
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        state.source_no_raw_material_count = 14;
+        state.complete_source_scheduler_run();
+        assert_eq!(state.source_no_raw_material_count, 15);
+        state.complete_source_scheduler_run();
+        assert_eq!(state.source_no_raw_material_count, 15);
+
+        state.storage_fill = 128;
+        state.source_no_raw_material_count = 3;
+        state.complete_source_scheduler_run();
+        assert_eq!(state.source_no_raw_material_count, 3);
+
+        state.storage_fill = 0;
+        state.activity = 64;
+        state.complete_source_scheduler_run();
+        assert_eq!(state.source_no_raw_material_count, 0);
+        assert_eq!(state.source_max_no_raw_material_count, 9);
+    }
+
+    #[test]
+    fn transfer_dispatch_uses_the_post_update_activity_or_storage_gate() {
+        let mut state = SourceMapCellState::new(
+            1,
+            2,
+            3,
+            &BuildingDef {
+                kind: "HANDWERK".into(),
+                storage_animation_capacity: 64,
+                properties: [("ProdKind".into(), "HANDWERK".into())].into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+
+        assert!(state.is_type8_transfer_root());
+        assert!(state.allows_source_transfer_dispatch());
+
+        state.storage_fill = 64;
+        assert!(!state.allows_source_transfer_dispatch());
+
+        state.activity = 64;
+        assert!(state.allows_source_transfer_dispatch());
+    }
+
+    #[test]
+    fn type8_transfer_selector_admits_raw_at_the_inclusive_two_batch_boundary() {
+        let definition = BuildingDef {
+            kind: "HANDWERK".into(),
+            storage_animation_capacity: 320,
+            source_raw_material_amount: 64,
+            properties: [
+                ("ProdKind".into(), "HANDWERK".into()),
+                ("Ware".into(), "WERKZEUG".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let state = SourceMapCellState {
+            raw_material_stock: 128,
+            ..SourceMapCellState::new(0, 0, 0, &definition, 0).unwrap()
+        };
+
+        assert_eq!(
+            state.source_type8_transfer_input(),
+            Some(SourceType8TransferInput::RawMaterial)
+        );
+    }
+
+    #[test]
+    fn type8_transfer_selector_uses_the_lower_eligible_fixed_point_input_ratio() {
+        let definition = BuildingDef {
+            kind: "HANDWERK".into(),
+            storage_animation_capacity: 320,
+            source_raw_material_amount: 64,
+            source_work_material_amount: 64,
+            properties: [
+                ("ProdKind".into(), "HANDWERK".into()),
+                ("Ware".into(), "WERKZEUG".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let state = SourceMapCellState {
+            raw_material_stock: 192,
+            work_material_stock: 128,
+            ..SourceMapCellState::new(0, 0, 0, &definition, 0).unwrap()
+        };
+
+        assert_eq!(
+            state.source_type8_transfer_input(),
+            Some(SourceType8TransferInput::WorkMaterial)
+        );
+
+        let ineligible = SourceMapCellState {
+            work_material_stock: 129,
+            ..state
+        };
+        assert_eq!(ineligible.source_type8_transfer_input(), None);
+    }
+
+    #[test]
     fn source_root_retains_compiled_figuranz_for_type11_admission() {
         let definition = BuildingDef {
             kind: "MARKT".into(),
             source_transfer_figure_limit: 2,
             source_transfer_radius: 16,
+            source_scheduler_interval: 7,
             ..Default::default()
         };
 
@@ -544,6 +865,12 @@ mod tests {
                 .unwrap()
                 .source_transfer_radius,
             16
+        );
+        assert_eq!(
+            SourceMapCellState::new_static(1, 2, 3, &definition, 0)
+                .unwrap()
+                .source_scheduler_interval,
+            7
         );
     }
 
@@ -824,6 +1151,7 @@ mod tests {
             source_production_amount: 32,
             source_raw_material_amount: 64,
             source_work_material_amount: 32,
+            properties: [("Ware".into(), "WERKZEUG".into())].into(),
             ..Default::default()
         };
         let mut state = SourceMapCellState {
@@ -832,13 +1160,61 @@ mod tests {
             ..SourceMapCellState::new(0, 0, 0, &definition, 0).unwrap()
         };
 
-        state.advance_source_scheduler(64);
+        assert_eq!(state.source_scheduler_activity(), 64);
+        state.advance_source_scheduler();
 
         assert_eq!(state.activity, 64);
+        assert_eq!(state.raw_material_stock, 64);
+        assert_eq!(state.work_material_stock, 16);
+        assert_eq!(state.storage_fill, 0);
+        assert_eq!(state.progress, 0);
+
+        state.advance_source_scheduler();
+
+        assert_eq!(state.activity, 0);
         assert_eq!(state.raw_material_stock, 32);
         assert_eq!(state.work_material_stock, 0);
         assert_eq!(state.storage_fill, 16);
         assert_eq!(state.progress, 16);
+    }
+
+    #[test]
+    fn scheduler_requires_a_nonzero_compiled_ware_selector() {
+        let inactive_definition = BuildingDef {
+            kind: "HANDWERK".into(),
+            source_raw_material_amount: 64,
+            ..Default::default()
+        };
+        let inactive = SourceMapCellState {
+            raw_material_stock: 64,
+            ..SourceMapCellState::new(0, 0, 0, &inactive_definition, 0).unwrap()
+        };
+        assert_eq!(inactive.source_output_ware_slot, 0);
+        assert_eq!(inactive.source_scheduler_activity(), 0);
+
+        let zero_capacity_definition = BuildingDef {
+            properties: [("Ware".into(), "WERKZEUG".into())].into(),
+            ..inactive_definition
+        };
+        let mut zero_capacity = SourceMapCellState {
+            raw_material_stock: 64,
+            ..SourceMapCellState::new(0, 0, 0, &zero_capacity_definition, 0).unwrap()
+        };
+        assert_eq!(zero_capacity.source_scheduler_activity(), 0);
+        zero_capacity.advance_source_scheduler();
+        assert_eq!(zero_capacity.raw_material_stock, 64);
+        assert_eq!(zero_capacity.storage_fill, 0);
+
+        let active_definition = BuildingDef {
+            storage_animation_capacity: 64,
+            ..zero_capacity_definition
+        };
+        let active = SourceMapCellState {
+            raw_material_stock: 64,
+            ..SourceMapCellState::new(0, 0, 0, &active_definition, 0).unwrap()
+        };
+        assert_eq!(active.source_output_ware_slot, 0x16);
+        assert_eq!(active.source_scheduler_activity(), 128);
     }
 
     #[test]
@@ -851,7 +1227,7 @@ mod tests {
         };
         let mut state = SourceMapCellState::new(0, 0, 0, &definition, 0).unwrap();
 
-        state.advance_source_scheduler(63);
+        state.advance_source_scheduler();
 
         assert_eq!(state.activity, 0);
         assert_eq!(state.storage_fill, 0);
