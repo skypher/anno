@@ -192,6 +192,20 @@ impl SourceKind13Location {
         };
         -decay_score - state_penalty - lifecycle_penalty
     }
+
+    /// Convert `FUN_0047b410`'s score into the fixed-point amount passed to
+    /// `FUN_0047bbc0` or `FUN_0047c080` by the phase dispatcher. The source
+    /// scales decay by four and growth by six, both over 128, after replacing
+    /// the root amount with its whole-resident count.
+    pub fn source_dispatch_amount_delta(self, inputs: SourceKind13TransferInputs) -> i32 {
+        let score = self.source_transfer_delta(inputs);
+        let residents = i32::from(self.amount >> 6);
+        if score < 0 {
+            -((residents * -score * 4) / 128)
+        } else {
+            (residents * score * 6) / 128
+        }
+    }
 }
 
 fn source_kind13_linear_curve(index: u8, pieces: &[(u8, u8, i32, i32)]) -> u8 {
@@ -507,6 +521,17 @@ impl SourceCityTable {
         self.slots.get_mut(slot)?.as_mut()
     }
 
+    /// Resolve the active city record selected by a kind-13 root. The source
+    /// lookup keys both the island table id and the map-owner byte retained
+    /// in the root record.
+    pub fn slot_for_root(&self, island_id: u8, source_owner: u8) -> Option<usize> {
+        self.slots.iter().position(|record| {
+            record.is_some_and(|city| {
+                city.island_id == island_id && city.source_owner == source_owner
+            })
+        })
+    }
+
     /// Restore one physical source city slot. Runtime scenario loading fills
     /// records in order; save replay and focused source audits may restore a
     /// specific slot directly.
@@ -686,9 +711,9 @@ pub enum SourceKind13DecreaseResult {
         redistributed_amount: u16,
     },
     /// The source selected a lower BGruppe and must emit an INSELHAUS
-    /// replacement command. Definition selection and command emission are
-    /// owned by the map-transition layer, so this table operation leaves all
-    /// records unchanged for that branch.
+    /// replacement command. The root and city totals have already been
+    /// changed in place; definition selection and command emission remain
+    /// owned by the map-transition layer.
     DowngradeRequired {
         target_group: u8,
         remaining_amount: u16,
@@ -733,6 +758,12 @@ pub struct SourceKind13PromotionDefinition {
     pub tools_cost_fixed: u16,
     pub wood_cost_fixed: u16,
     pub bricks_cost_fixed: u16,
+    /// `Kanon` at compiled definition offset `+0x52`, charged by
+    /// `FUN_0047b160` without participating in the promotion gate.
+    pub cannons_cost_fixed: u16,
+    /// Raw `Money` at compiled definition offset `+0x54`, subtracted from
+    /// the owning player's balance after the city-store debits.
+    pub money_cost: u32,
     /// Entries are ordered by `rand() % RandAnz`; each is an INSELHAUS
     /// definition offset, namely compiled `Id - 20000`.
     pub variant_definition_offsets: Vec<u16>,
@@ -901,9 +932,9 @@ impl SourceKind13LocationTable {
     ///
     /// `neighbors` must be the ordered coordinate buffer from
     /// `LAB_00472ad0`; only records matching the origin BGruppe participate.
-    /// When the source would emit a lower-tier map replacement, this returns
-    /// [`SourceKind13DecreaseResult::DowngradeRequired`] without mutating
-    /// either table or city state.
+    /// When the source emits a lower-tier map replacement, this updates the
+    /// root and city state before returning
+    /// [`SourceKind13DecreaseResult::DowngradeRequired`] to the map writer.
     pub fn apply_source_kind13_decrease(
         &mut self,
         city: &mut SourceCityRecord,
@@ -922,8 +953,20 @@ impl SourceKind13LocationTable {
             || city.satisfaction_by_group[group] < 0x58;
         if low_satisfaction && group != 0 && remaining <= SOURCE_KIND13_AMOUNT_CAPACITIES[group - 1]
         {
+            let target_group = origin.population_group - 1;
+            let target = usize::from(target_group);
+            city.tier_population[group] = city.tier_population[group]
+                .wrapping_sub(u32::from(origin.amount >> 6));
+            city.tier_population[target] = city.tier_population[target]
+                .wrapping_add_signed(source_kind13_population_units(i32::from(remaining)));
+            let origin = self.location_at_mut(island_id, tile_x, tile_y)?;
+            origin.population_group = target_group;
+            origin.amount = remaining;
+            let transition_active = origin.source_transition_active_for_group(target_group);
+            origin.state_bits =
+                (origin.state_bits & !0x40) | (u8::from(transition_active) << 6);
             return Some(SourceKind13DecreaseResult::DowngradeRequired {
-                target_group: origin.population_group - 1,
+                target_group,
                 remaining_amount: remaining,
             });
         }
@@ -1185,6 +1228,17 @@ impl SourceKind13DispatchState {
     /// Advance phase clocks and replay `FUN_0047b9c0`'s 70-record phase batch.
     /// Returns the count of records whose source byte `+0x03` changed.
     pub fn advance(&mut self, table: &mut SourceKind13LocationTable, dt_ms: u32) -> usize {
+        self.advance_batch(table, dt_ms).len()
+    }
+
+    /// Advance phase clocks and return the exact physical records whose phase
+    /// byte changed in this 70-record `FUN_0047b9c0` batch. Callers process
+    /// each returned snapshot only after the source phase write is visible.
+    pub fn advance_batch(
+        &mut self,
+        table: &mut SourceKind13LocationTable,
+        dt_ms: u32,
+    ) -> Vec<SourceKind13Location> {
         for selector in 0..SOURCE_KIND13_PHASE_CLOCKS {
             let threshold = SOURCE_KIND13_PHASE_BASE_MS
                 + u32::try_from(selector).unwrap_or(0) * SOURCE_KIND13_PHASE_STRIDE_MS;
@@ -1197,7 +1251,7 @@ impl SourceKind13DispatchState {
             }
         }
 
-        let mut changed = 0;
+        let mut changed = Vec::new();
         for _ in 0..SOURCE_KIND13_DISPATCH_RECORDS_PER_UPDATE {
             let slot = self.cursor;
             self.cursor = (self.cursor + 1) % SOURCE_KIND13_LOCATION_TABLE_SLOTS;
@@ -1207,7 +1261,7 @@ impl SourceKind13DispatchState {
             let phase = self.phases[usize::from(location.variant & 0x0f)];
             if location.phase != phase {
                 location.set_phase(phase);
-                changed += 1;
+                changed.push(*location);
             }
         }
         changed
@@ -2054,8 +2108,9 @@ fn source_map_roots_from_scenario(
 /// `FUN_0047bbc0` and `FUN_0047c080`.
 ///
 /// The haeuser loader stores the first parsed nested `WOHNUNG` definition for
-/// each BGruppe. Its `HAUS_BAUKOST` fields are shifted left five when compiled
-/// (`1602_exe.c:67386-67451`), while its `RandAnz/RandAdd` layout selects the
+/// each BGruppe. `Werkzeug`, `Holz`, `Ziegel`, and `Kanon` are shifted left
+/// five when compiled at offsets `+0x4c..+0x52`; raw `Money` occupies `+0x54`
+/// (`1602_exe.c:67386-67531`). Its `RandAnz/RandAdd` layout selects the
 /// contiguous replacement definition before `FUN_004631b0` writes the map
 /// command.
 pub fn source_kind13_promotion_definitions(
@@ -2073,6 +2128,12 @@ pub fn source_kind13_promotion_definitions(
                 as u16)
                 .wrapping_shl(5)
         };
+        let money_cost = base
+            .properties
+            .get("Money")
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(0)
+            .max(0) as u32;
         let variant_count = base.rand_anz.max(1);
         let source_size = (
             u8::try_from(base.size.0).ok()?.max(1),
@@ -2093,6 +2154,8 @@ pub fn source_kind13_promotion_definitions(
             tools_cost_fixed: fixed_cost("Werkzeug"),
             wood_cost_fixed: fixed_cost("Holz"),
             bricks_cost_fixed: fixed_cost("Ziegel"),
+            cannons_cost_fixed: fixed_cost("Kanon"),
+            money_cost,
             variant_definition_offsets,
         })
     })
@@ -3316,6 +3379,8 @@ mod tests {
             ("Werkzeug".into(), "3".into()),
             ("Holz".into(), "4".into()),
             ("Ziegel".into(), "5".into()),
+            ("Kanon".into(), "6".into()),
+            ("Money".into(), "7".into()),
         ]);
         let variant = std::collections::HashMap::from([
             ("ProdKind".into(), "WOHNUNG".into()),
@@ -3339,6 +3404,8 @@ mod tests {
                 tools_cost_fixed: 96,
                 wood_cost_fixed: 128,
                 bricks_cost_fixed: 160,
+                cannons_cost_fixed: 192,
+                money_cost: 7,
                 variant_definition_offsets: vec![11, 12, 13],
             })
         );
@@ -3523,8 +3590,15 @@ mod tests {
                 remaining_amount: 70,
             })
         );
-        assert_eq!(downgrade_city.tier_population, [0, 1, 0, 0, 0]);
-        assert_eq!(downgrade_table.location_at(2, 8, 9), Some(downgrade_origin));
+        assert_eq!(downgrade_city.tier_population, [1, 0, 0, 0, 0]);
+        assert_eq!(
+            downgrade_table.location_at(2, 8, 9),
+            Some(SourceKind13Location {
+                population_group: 0,
+                amount: 70,
+                ..downgrade_origin
+            })
+        );
     }
 
     #[test]

@@ -70,11 +70,18 @@ pub struct Warehouse {
     /// Inventory: good → (current_stock, max_capacity)
     inventory: HashMap<Good, (u16, u16)>,
 
-    /// Goods reserved by in-flight generic carriers. The executable keeps
-    /// this accounting in the per-city, per-good transfer table used by
-    /// `FUN_0047d810` and `FUN_0047d640`.
+    /// Integral compatibility reservations for in-flight generic carriers.
+    /// Exact source city-record reservations are retained separately below.
     #[serde(default)]
     reservations: HashMap<Good, u16>,
+
+    /// Exact source city-record reservations at `ware * 0x0c + 0x00`.
+    /// `FUN_0047d810` creates these while a type-8 carrier has committed a
+    /// city-root load; `FUN_0047d640` releases them when that carrier collects
+    /// or abandons the load. Unlike the compatibility reservation above, this
+    /// map retains the source's 1/32-good amount used by `FUN_0047c080`.
+    #[serde(default)]
+    city_reserved_fixed: HashMap<Good, u16>,
 
     /// Exact 1/32-good city-store balances written by type-11 transfers.
     /// Ordinary warehouse stock remains integral and initializes a balance
@@ -150,6 +157,7 @@ impl Warehouse {
             city_population: [0; 5],
             inventory: HashMap::new(),
             reservations: HashMap::new(),
+            city_reserved_fixed: HashMap::new(),
             city_fixed_inventory: HashMap::new(),
             sliders: HashMap::new(),
         }
@@ -317,6 +325,50 @@ impl Warehouse {
         }
     }
 
+    /// Withdraw an exact source city-store amount in 1/32-good units.
+    /// `FUN_0047b160` uses this scale for kind-13 housing replacements after
+    /// its caller has checked the city record's stock-minus-reserved balance.
+    pub fn withdraw_city_good_fixed(&mut self, good: Good, amount_fixed: u16) -> u16 {
+        let current_fixed = self.city_stock_fixed(good);
+        let withdrawn = current_fixed.min(amount_fixed);
+        let updated_fixed = current_fixed - withdrawn;
+        self.city_fixed_inventory.insert(good, updated_fixed);
+
+        let capacity = self.capacity(good);
+        let entry = self.inventory.entry(good).or_insert((0, capacity));
+        entry.0 = updated_fixed / 32;
+        withdrawn
+    }
+
+    /// Amount currently committed out of a source city store, in 1/32-good
+    /// units. Housing promotion subtracts this before testing its material
+    /// requirements.
+    pub fn city_reserved_fixed(&self, good: Good) -> u16 {
+        self.city_reserved_fixed.get(&good).copied().unwrap_or(0)
+    }
+
+    /// Reserve an exact city-store amount for a source type-8 carrier.
+    pub fn reserve_city_good_fixed(&mut self, good: Good, amount_fixed: u16) -> bool {
+        let reserved = self.city_reserved_fixed(good);
+        if amount_fixed == 0
+            || self
+                .city_stock_fixed(good)
+                .saturating_sub(reserved)
+                < amount_fixed
+        {
+            return false;
+        }
+        *self.city_reserved_fixed.entry(good).or_default() = reserved.saturating_add(amount_fixed);
+        true
+    }
+
+    /// Release a source type-8 city-store commitment without changing stock.
+    pub fn release_city_good_reservation_fixed(&mut self, good: Good, amount_fixed: u16) {
+        if let Some(reserved) = self.city_reserved_fixed.get_mut(&good) {
+            *reserved = reserved.saturating_sub(amount_fixed);
+        }
+    }
+
     /// Reserve available stock for an in-flight carrier without withdrawing it.
     pub fn reserve(&mut self, good: Good, amount: u16) -> bool {
         if amount == 0 || self.stock(good).saturating_sub(self.reserved(good)) < amount {
@@ -460,6 +512,30 @@ mod tests {
         assert_eq!(wh.stock(Good::Cloth), 2);
         assert_eq!(wh.deposit(Good::Cloth, 1), 1);
         assert_eq!(wh.city_stock_fixed(Good::Cloth), 97);
+    }
+
+    #[test]
+    fn city_fixed_withdrawal_preserves_the_source_fractional_balance() {
+        let mut wh = Warehouse::with_capacity(0, 0, 10, 10, 50);
+        let capacity = wh.city_storage_capacity_fixed(1);
+        assert_eq!(wh.deposit_city_good_fixed(Good::Tools, 97, capacity), 97);
+
+        assert_eq!(wh.withdraw_city_good_fixed(Good::Tools, 64), 64);
+        assert_eq!(wh.city_stock_fixed(Good::Tools), 33);
+        assert_eq!(wh.stock(Good::Tools), 1);
+    }
+
+    #[test]
+    fn city_fixed_reservation_tracks_the_promotion_debit_field() {
+        let mut wh = Warehouse::with_capacity(0, 0, 10, 10, 50);
+        let capacity = wh.city_storage_capacity_fixed(1);
+        assert_eq!(wh.deposit_city_good_fixed(Good::Bricks, 96, capacity), 96);
+
+        assert!(wh.reserve_city_good_fixed(Good::Bricks, 64));
+        assert_eq!(wh.city_reserved_fixed(Good::Bricks), 64);
+        assert!(!wh.reserve_city_good_fixed(Good::Bricks, 33));
+        wh.release_city_good_reservation_fixed(Good::Bricks, 32);
+        assert_eq!(wh.city_reserved_fixed(Good::Bricks), 32);
     }
 
     #[test]

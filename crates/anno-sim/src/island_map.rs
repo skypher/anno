@@ -30,6 +30,15 @@ struct SourceCivilianPathCell {
     path_class: u8,
 }
 
+/// Compiled outer kind retained for every INSELHAUS footprint cell. Unlike
+/// the civilian route overlay, this exists even when the definition has no
+/// type-3 path class, because `FUN_00467940` only inspects map kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceMapKindCell {
+    kind_code: u8,
+    kind3_center_cell: bool,
+}
+
 /// Walkability grid for a single island.
 #[derive(Debug, Clone)]
 pub struct IslandMap {
@@ -59,6 +68,7 @@ pub struct IslandMap {
     /// scenario's oriented INSELHAUS commands. `FUN_0044b140` samples an
     /// 11 x 11 window from this state for its kind-12 civilian route.
     civilian_path_cells: Vec<Option<SourceCivilianPathCell>>,
+    source_map_kind_cells: Vec<Option<SourceMapKindCell>>,
     /// Raw type-2 `Wegspeed` values used by KARREN movement.
     city_cart_movement_speeds: Vec<u16>,
     /// Raw type-0 `Wegspeed` values used by TRAEGER movement.
@@ -113,6 +123,7 @@ impl IslandMap {
         let mut cavalry_movement_speeds = vec![100; size];
         let mut civilian_movement_speeds = vec![100; size];
         let mut civilian_path_cells = vec![None; size];
+        let mut source_map_kind_cells = vec![None; size];
         let mut source_terrain_heights = vec![0.0; size];
         let mut source_land_target_sizes = vec![None; size];
         let source_world_origin = (i32::from(island.x_pos) * 2, i32::from(island.y_pos) * 2);
@@ -164,6 +175,20 @@ impl IslandMap {
                             continue;
                         }
                         let idx = y as usize * width as usize + x as usize;
+                        let source_cell_index = match tile.orientation & 3 {
+                            0 => dy * def.size.0 + dx,
+                            1 => (def.size.1 - 1 - dx) * def.size.0 + dy,
+                            2 => {
+                                (def.size.1 - 1 - dy) * def.size.0 + (def.size.0 - 1 - dx)
+                            }
+                            _ => dx * def.size.0 + (def.size.0 - 1 - dy),
+                        };
+                        source_map_kind_cells[idx] = Some(SourceMapKindCell {
+                            kind_code: def.source_kind_code().unwrap_or(u8::MAX),
+                            kind3_center_cell: def.source_kind_code() == Some(3)
+                                && source_cell_index
+                                    == def.size.0.saturating_mul(def.size.1) / 2,
+                        });
                         walkable[idx] = is_walkable;
                         road[idx] = is_road;
                         if let Some(speeds) = movement_speeds {
@@ -173,14 +198,6 @@ impl IslandMap {
                             civilian_movement_speeds[idx] = u16::from(speeds[3].max(1));
                         }
                         if let Some(path_classes) = def.source_path_classes() {
-                            let source_cell_index = match tile.orientation & 3 {
-                                0 => dy * def.size.0 + dx,
-                                1 => (def.size.1 - 1 - dx) * def.size.0 + dy,
-                                2 => {
-                                    (def.size.1 - 1 - dy) * def.size.0 + (def.size.0 - 1 - dx)
-                                }
-                                _ => dx * def.size.0 + (def.size.0 - 1 - dy),
-                            };
                             civilian_path_cells[idx] = Some(SourceCivilianPathCell {
                                 kind_code: def.source_kind_code().unwrap_or(u8::MAX),
                                 production_kind_code: def
@@ -238,6 +255,7 @@ impl IslandMap {
             city_cart_path_template,
             carrier_path_template,
             civilian_path_cells,
+            source_map_kind_cells,
             city_cart_movement_speeds,
             carrier_movement_speeds,
             cavalry_movement_speeds,
@@ -503,7 +521,7 @@ impl IslandMap {
         };
         let (x, y) = origin;
         let edge_cell_allowed = |position| {
-            self.civilian_path_cell(position).is_some_and(|cell| {
+            self.source_map_kind_cell(position).is_some_and(|cell| {
                 matches!(cell.kind_code, 1 | 18) || cell.kind3_center_cell
             })
         };
@@ -661,6 +679,13 @@ impl IslandMap {
 
     fn civilian_path_cell(&self, position: (i32, i32)) -> Option<SourceCivilianPathCell> {
         self.civilian_path_cells
+            .get(self.local_index(position)?)
+            .copied()
+            .flatten()
+    }
+
+    fn source_map_kind_cell(&self, position: (i32, i32)) -> Option<SourceMapKindCell> {
+        self.source_map_kind_cells
             .get(self.local_index(position)?)
             .copied()
             .flatten()
@@ -858,6 +883,13 @@ impl IslandMap {
                     kind3_center_cell: false,
                     owner: 0,
                     path_class: 32,
+                });
+                size
+            ],
+            source_map_kind_cells: vec![
+                Some(SourceMapKindCell {
+                    kind_code: 11,
+                    kind3_center_cell: false,
                 });
                 size
             ],
@@ -1307,43 +1339,40 @@ mod tests {
     fn kind13_replacement_orientation_replays_source_edge_priority() {
         let mut map = IslandMap::new_open(1, 6, 6);
         let cell = |kind_code, kind3_center_cell| {
-            Some(SourceCivilianPathCell {
+            Some(SourceMapKindCell {
                 kind_code,
-                production_kind_code: u8::MAX,
                 kind3_center_cell,
-                owner: 0,
-                path_class: 0,
             })
         };
         let index = |x, y| y * 6 + x;
 
-        map.civilian_path_cells[index(2, 1)] = cell(1, false);
-        map.civilian_path_cells[index(1, 2)] = cell(18, false);
+        map.source_map_kind_cells[index(2, 1)] = cell(1, false);
+        map.source_map_kind_cells[index(1, 2)] = cell(18, false);
         assert_eq!(
             map.source_kind13_replacement_orientation((2, 2), 0, (2, 2)),
             2
         );
 
-        map.civilian_path_cells[index(2, 1)] = cell(11, false);
-        map.civilian_path_cells[index(2, 4)] = cell(18, false);
+        map.source_map_kind_cells[index(2, 1)] = cell(11, false);
+        map.source_map_kind_cells[index(2, 4)] = cell(18, false);
         assert_eq!(
             map.source_kind13_replacement_orientation((2, 2), 0, (2, 2)),
             0
         );
 
-        map.civilian_path_cells[index(2, 4)] = cell(11, false);
+        map.source_map_kind_cells[index(2, 4)] = cell(11, false);
         assert_eq!(
             map.source_kind13_replacement_orientation((2, 2), 0, (2, 2)),
             3
         );
 
-        map.civilian_path_cells[index(1, 2)] = cell(11, false);
-        map.civilian_path_cells[index(4, 3)] = cell(3, true);
+        map.source_map_kind_cells[index(1, 2)] = cell(11, false);
+        map.source_map_kind_cells[index(4, 3)] = cell(3, true);
         assert_eq!(
             map.source_kind13_replacement_orientation((2, 2), 0, (2, 2)),
             1
         );
-        map.civilian_path_cells[index(4, 3)] = cell(3, false);
+        map.source_map_kind_cells[index(4, 3)] = cell(3, false);
         assert_eq!(
             map.source_kind13_replacement_orientation((2, 2), 3, (2, 2)),
             3

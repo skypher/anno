@@ -160,7 +160,11 @@ use std::path::Path;
 ///      weights, pressure, and the resulting kind-13 transfer inputs.
 /// v88: source city records retain pending kind-13 BGruppe promotion
 ///      reservations, their origin coordinates, and the promotion block bit.
-pub const SAVE_VERSION: u32 = 88;
+/// v89: warehouses retain the source city's 1/32-good carrier commitments
+///      that BGruppe promotion subtracts from available construction stock.
+/// v90: completed kind-13 BGruppe replacements persist until the map-command
+///      consumer has replayed their INSELHAUS writes.
+pub const SAVE_VERSION: u32 = 90;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -174,7 +178,7 @@ pub const SAVE_VERSION: u32 = 88;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 88;
+pub const MIN_LOADABLE_VERSION: u32 = 90;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -194,6 +198,7 @@ pub struct SaveState {
     pub source_static_map_backing_cells: Vec<SourceMapCellState>,
     pub source_kind13_locations: SourceKind13LocationTable,
     pub source_kind13_dispatch: SourceKind13DispatchState,
+    pub source_kind13_replacement_commands: Vec<crate::simulation::SourceKind13ReplacementCommand>,
     pub source_cities: SourceCityTable,
     pub source_kind4_occupants: Vec<SourceKind4Occupant>,
     pub source_dynamic_combat_figures: Vec<SourceDynamicCombatFigure>,
@@ -265,6 +270,7 @@ impl Simulation {
             source_static_map_backing_cells: self.source_static_map_backing_cells.clone(),
             source_kind13_locations: self.source_kind13_locations.clone(),
             source_kind13_dispatch: self.source_kind13_dispatch.clone(),
+            source_kind13_replacement_commands: self.source_kind13_replacement_commands.clone(),
             source_cities: self.source_cities.clone(),
             source_kind4_occupants: self.source_kind4_occupants.clone(),
             source_dynamic_combat_figures: self.source_dynamic_combat_figures.clone(),
@@ -306,6 +312,7 @@ impl Simulation {
         self.source_static_map_backing_cells = s.source_static_map_backing_cells;
         self.source_kind13_locations = s.source_kind13_locations;
         self.source_kind13_dispatch = s.source_kind13_dispatch;
+        self.source_kind13_replacement_commands = s.source_kind13_replacement_commands;
         self.source_cities = s.source_cities;
         self.source_kind4_occupants = s.source_kind4_occupants;
         self.source_dynamic_combat_figures = s.source_dynamic_combat_figures;

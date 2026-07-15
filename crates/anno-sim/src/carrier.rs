@@ -591,7 +591,16 @@ pub fn try_spawn_carrier(
         CarrierSupplierStorage::SourceRoot => supplier.reserve_storage(cargo_fixed),
         CarrierSupplierStorage::Warehouse(warehouse_idx) => warehouses
             .get_mut(warehouse_idx)
-            .is_some_and(|warehouse| warehouse.reserve(request.good, cargo)),
+            .is_some_and(|warehouse| {
+                if !warehouse.reserve(request.good, cargo) {
+                    return false;
+                }
+                if warehouse.reserve_city_good_fixed(request.good, cargo_fixed) {
+                    return true;
+                }
+                warehouse.release_reservation(request.good, cargo);
+                false
+            }),
     };
     if !reserved {
         return None;

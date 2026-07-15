@@ -5,7 +5,7 @@
 //! Dispatches to 12 subsystem update functions on independent timers.
 
 use crate::ai::{AiAction, AiController};
-use crate::building::{BuildingDef, BuildingInstance};
+use crate::building::{BuildingDef, BuildingInstance, SourceBuildingCommand};
 use crate::carrier;
 use crate::civilian;
 use crate::combat::{
@@ -14,7 +14,8 @@ use crate::combat::{
 use crate::coverage::CoverageMap;
 use crate::data_bridge::{
     SourceCityRecord, SourceCityTable, SourceKind4Occupant, SourceKind13DispatchState,
-    SourceKind13LocationTable, SourceKind13PromotionDefinition,
+    SourceKind13Location, SourceKind13LocationTable,
+    SourceKind13PromotionDefinition,
 };
 use crate::economy;
 use crate::entity::{ActionType, CargoRoute, Figure};
@@ -92,6 +93,19 @@ pub struct TileClear {
     pub source_ruin_draws: Vec<u16>,
 }
 
+/// Replacement command emitted by a completed kind-13 BGruppe transition.
+/// The simulation has already updated the city and location tables; the game
+/// layer drains this event to replay `FUN_00463ef0`/`FUN_004631b0` against its
+/// authoritative INSELHAUS command stream and refresh the static map overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind13ReplacementCommand {
+    pub island_id: u8,
+    pub tile_x: u8,
+    pub tile_y: u8,
+    pub target_group: u8,
+    pub command: SourceBuildingCommand,
+}
+
 impl TileClear {
     #[inline]
     pub fn fallback_uses_strand_table(&self, source_order_index: usize) -> bool {
@@ -151,6 +165,8 @@ pub struct Simulation {
     /// The executable reloads this table at startup; save snapshots retain
     /// only the mutable kind-13 city and location records that refer to it.
     pub source_kind13_promotion_definitions: [Option<SourceKind13PromotionDefinition>; 5],
+    /// Queued INSELHAUS replacements emitted by completed kind-13 transitions.
+    pub source_kind13_replacement_commands: Vec<SourceKind13ReplacementCommand>,
     /// Phase clocks and physical source-table cursor for `FUN_0047b9c0`.
     pub source_kind13_dispatch: SourceKind13DispatchState,
     /// Fixed source city-record pool read by `FUN_0047f8a0`.
@@ -470,6 +486,7 @@ impl Simulation {
             source_static_map_backing_cells: Vec::new(),
             source_kind13_locations: SourceKind13LocationTable::default(),
             source_kind13_promotion_definitions: std::array::from_fn(|_| None),
+            source_kind13_replacement_commands: Vec::new(),
             source_kind13_dispatch: SourceKind13DispatchState::default(),
             source_cities: SourceCityTable::default(),
             source_kind4_occupants: Vec::new(),
@@ -927,8 +944,7 @@ impl Simulation {
         }
 
         self.tick_source_city_dispatch(dt_ms);
-        self.source_kind13_dispatch
-            .advance(&mut self.source_kind13_locations, dt_ms);
+        self.tick_source_kind13_dispatch(dt_ms);
 
         // Entity movement (every step)
         self.tick_entities(dt_ms);
@@ -1303,6 +1319,201 @@ impl Simulation {
                 self.spawn_source_kind12_figures(city);
             }
         }
+    }
+
+    /// Execute the city-facing half of `FUN_0047b9c0` for each phase-changed
+    /// kind-13 root. The phase state itself is advanced by
+    /// [`SourceKind13DispatchState`]; this method supplies the source city's
+    /// satisfaction, ordered route neighbors, construction balances, and
+    /// deferred INSELHAUS command emission.
+    fn tick_source_kind13_dispatch(&mut self, dt_ms: u32) {
+        let changed = self
+            .source_kind13_dispatch
+            .advance_batch(&mut self.source_kind13_locations, dt_ms);
+        for location in changed {
+            self.apply_source_kind13_dispatch_location(location);
+        }
+    }
+
+    fn apply_source_kind13_dispatch_location(&mut self, location: SourceKind13Location) {
+        let Some(city_slot) = self
+            .source_cities
+            .slot_for_root(location.island_id, location.source_owner)
+        else {
+            return;
+        };
+        let Some(city) = self.source_cities.record(city_slot) else {
+            return;
+        };
+        let city_owner = city.owner_slot;
+        let delta = location.source_dispatch_amount_delta(city.source_kind13_transfer_inputs());
+        if delta == 0 {
+            return;
+        }
+
+        let neighbors = self
+            .island_maps
+            .iter()
+            .find(|map| map.island_id == location.island_id)
+            .and_then(|map| {
+                map.source_kind13_transfer_neighbor_cells((
+                    i32::from(location.tile_x),
+                    i32::from(location.tile_y),
+                ))
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(x, y)| u8::try_from(x).ok().zip(u8::try_from(y).ok()))
+            .collect::<Vec<_>>();
+
+        if delta < 0 {
+            let Some(city) = self.source_cities.record_mut(city_slot) else {
+                return;
+            };
+            let result = self.source_kind13_locations.apply_source_kind13_decrease(
+                city,
+                location.island_id,
+                location.tile_x,
+                location.tile_y,
+                delta.unsigned_abs().min(u32::from(u16::MAX)) as u16,
+                &neighbors,
+            );
+            let Some(crate::data_bridge::SourceKind13DecreaseResult::DowngradeRequired {
+                target_group,
+                ..
+            }) = result
+            else {
+                return;
+            };
+            let Some(definition) = self
+                .source_kind13_promotion_definitions
+                .get(usize::from(target_group))
+                .and_then(Option::as_ref)
+                .cloned()
+            else {
+                return;
+            };
+            let Some(updated_location) = self.source_kind13_locations.location_at(
+                location.island_id,
+                location.tile_x,
+                location.tile_y,
+            ) else {
+                return;
+            };
+            self.enqueue_source_kind13_replacement(updated_location, target_group, &definition, city_owner);
+            return;
+        }
+
+        let Some(target_group) = location.population_group.checked_add(1) else {
+            return;
+        };
+        let Some(definition) = self
+            .source_kind13_promotion_definitions
+            .get(usize::from(target_group))
+            .and_then(Option::as_ref)
+            .cloned()
+        else {
+            return;
+        };
+        let materials = self.source_kind13_promotion_materials(city, &definition);
+        let Some(city) = self.source_cities.record_mut(city_slot) else {
+            return;
+        };
+        let Some(result) = self.source_kind13_locations.apply_source_kind13_increase(
+            city,
+            location.island_id,
+            location.tile_x,
+            location.tile_y,
+            delta,
+            &neighbors,
+            materials,
+        ) else {
+            return;
+        };
+        if result.promotion.is_none() {
+            return;
+        }
+
+        let Some(warehouse) = self.warehouses.iter_mut().find(|warehouse| {
+            warehouse.active
+                && warehouse.island_id == location.island_id
+                && warehouse.owner == city_owner
+        }) else {
+            return;
+        };
+        // `FUN_0047b160` commits in this order. The three gated materials
+        // are known to be available; cannon withdrawal deliberately takes
+        // the source minimum and never blocks the completed promotion.
+        warehouse.withdraw_city_good_fixed(Good::Tools, definition.tools_cost_fixed);
+        warehouse.withdraw_city_good_fixed(Good::Bricks, definition.bricks_cost_fixed);
+        warehouse.withdraw_city_good_fixed(Good::Wood, definition.wood_cost_fixed);
+        warehouse.withdraw_city_good_fixed(Good::Cannons, definition.cannons_cost_fixed);
+        if let Some(player) = self.players.get_mut(usize::from(city_owner)) {
+            player.gold = player.gold.wrapping_sub(definition.money_cost as i32);
+        }
+        self.enqueue_source_kind13_replacement(location, target_group, &definition, city_owner);
+    }
+
+    fn enqueue_source_kind13_replacement(
+        &mut self,
+        location: SourceKind13Location,
+        target_group: u8,
+        definition: &SourceKind13PromotionDefinition,
+        city_owner: u8,
+    ) {
+        let orientation = self
+            .island_maps
+            .iter()
+            .find(|map| map.island_id == location.island_id)
+            .map(|map| {
+                map.source_kind13_replacement_orientation(
+                    definition.source_size,
+                    location.orientation,
+                    (i32::from(location.tile_x), i32::from(location.tile_y)),
+                )
+            })
+            .unwrap_or(location.orientation & 3);
+        let variant_random = self.next_source_rand();
+        let command_random = self.next_source_rand();
+        if let Some(command) = definition.source_promotion_command(
+            location,
+            orientation,
+            variant_random,
+            command_random,
+            city_owner,
+        ) {
+            self.source_kind13_replacement_commands
+                .push(SourceKind13ReplacementCommand {
+                    island_id: location.island_id,
+                    tile_x: location.tile_x,
+                    tile_y: location.tile_y,
+                    target_group,
+                    command,
+                });
+        }
+    }
+
+    fn source_kind13_promotion_materials(
+        &self,
+        city: SourceCityRecord,
+        definition: &SourceKind13PromotionDefinition,
+    ) -> Option<crate::data_bridge::SourceKind13PromotionMaterials> {
+        let warehouse = self.warehouses.iter().find(|warehouse| {
+            warehouse.active
+                && warehouse.island_id == city.island_id
+                && warehouse.owner == city.owner_slot
+        })?;
+        Some(definition.materials(
+            warehouse
+                .city_stock_fixed(Good::Tools)
+                .saturating_sub(warehouse.city_reserved_fixed(Good::Tools)),
+            warehouse
+                .city_stock_fixed(Good::Wood)
+                .saturating_sub(warehouse.city_reserved_fixed(Good::Wood)),
+            warehouse
+                .city_stock_fixed(Good::Bricks)
+                .saturating_sub(warehouse.city_reserved_fixed(Good::Bricks)),
+        ))
     }
 
     /// The seven-player guard at the start of `FUN_00480370`. Source island
@@ -2810,6 +3021,10 @@ impl Simulation {
                                                 })
                                             {
                                                 warehouse.release_reservation(good, requested);
+                                                warehouse.release_city_good_reservation_fixed(
+                                                    good,
+                                                    requested_fixed,
+                                                );
                                             }
                                         } else if let Some(island) = island {
                                             if let Some(state) = self
@@ -2886,7 +3101,16 @@ impl Simulation {
                                                             && warehouse.tile_y == supplier_target.1
                                                     })
                                                     .is_some_and(|warehouse| {
-                                                        warehouse.collect_reserved(good, picked)
+                                                        if !warehouse.collect_reserved(good, picked)
+                                                        {
+                                                            return false;
+                                                        }
+                                                        warehouse
+                                                            .release_city_good_reservation_fixed(
+                                                                good,
+                                                                picked.saturating_mul(32),
+                                                            );
+                                                        true
                                                     })
                                             } else {
                                                 self.source_map_cell_states
@@ -2962,6 +3186,10 @@ impl Simulation {
                                                     warehouse.release_reservation(
                                                         good,
                                                         uncollected_fixed / 32,
+                                                    );
+                                                    warehouse.release_city_good_reservation_fixed(
+                                                        good,
+                                                        uncollected_fixed,
                                                     );
                                                 }
                                             } else if let Some(island) = island {
@@ -3678,6 +3906,145 @@ impl Simulation {
 mod tests {
     use super::*;
     use crate::ai::{AiController, AiPersonality, Difficulty};
+
+    #[test]
+    fn kind13_dispatch_promotion_debits_city_store_and_emits_replacement_command() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(2, 16, 16));
+        let mut warehouse = Warehouse::with_capacity(2, 3, 8, 9, 50);
+        warehouse.deposit(Good::Tools, 1);
+        warehouse.deposit(Good::Wood, 1);
+        warehouse.deposit(Good::Bricks, 1);
+        warehouse.deposit(Good::Cannons, 1);
+        sim.warehouses.push(warehouse);
+        for color in 0..4 {
+            sim.players.push(Player::new_human(color));
+        }
+        sim.players[3].gold = 5;
+        sim.source_kind13_promotion_definitions[1] = Some(SourceKind13PromotionDefinition {
+            target_group: 1,
+            source_size: (1, 1),
+            tools_cost_fixed: 32,
+            wood_cost_fixed: 32,
+            bricks_cost_fixed: 32,
+            cannons_cost_fixed: 64,
+            money_cost: 17,
+            variant_definition_offsets: vec![77],
+        });
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 2,
+                source_owner: 3,
+                owner_slot: 3,
+                phase: 1,
+                tier_population: [2, 0, 0, 0, 0],
+                satisfaction_by_group: [0x80, 0x80, 0, 0, 0],
+                overall_satisfaction: 0x80,
+                promotion_reservations: [0, 3, 0, 0, 0],
+                promotion_reservation_positions: [(0, 0), (8, 9), (0, 0), (0, 0), (0, 0)],
+                ..SourceCityRecord::default()
+            })
+        ));
+        let location = SourceKind13Location {
+            island_id: 2,
+            tile_x: 8,
+            tile_y: 9,
+            orientation: 2,
+            variant: 0,
+            source_owner: 3,
+            phase: 0,
+            state_bits: 0xc0,
+            population_group: 0,
+            amount: 0x80,
+            lifecycle_flags: 0x000c,
+        };
+        assert!(sim.source_kind13_locations.insert(location));
+        sim.seed_source_rand(1);
+
+        sim.apply_source_kind13_dispatch_location(location);
+
+        assert_eq!(sim.warehouses[0].city_stock_fixed(Good::Tools), 0);
+        assert_eq!(sim.warehouses[0].city_stock_fixed(Good::Wood), 0);
+        assert_eq!(sim.warehouses[0].city_stock_fixed(Good::Bricks), 0);
+        assert_eq!(sim.warehouses[0].city_stock_fixed(Good::Cannons), 0);
+        assert_eq!(sim.players[3].gold, -12);
+        assert_eq!(
+            sim.source_kind13_locations
+                .location_at(2, 8, 9)
+                .map(|root| (root.population_group, root.amount)),
+            Some((1, 143))
+        );
+        assert_eq!(sim.source_kind13_replacement_commands.len(), 1);
+        let replacement = sim.source_kind13_replacement_commands[0];
+        assert_eq!((replacement.island_id, replacement.tile_x, replacement.tile_y), (2, 8, 9));
+        assert_eq!(replacement.target_group, 1);
+        assert_eq!(replacement.command.definition_offset, 77);
+        assert_eq!(replacement.command.orientation, 2);
+        assert_eq!(replacement.command.variant, 0);
+        assert_eq!(replacement.command.metadata, 2);
+        assert_eq!(replacement.command.map_owner_slot, 3);
+        assert!(replacement.command.random_seed < 32);
+        assert_eq!(replacement.command.dynamic_object_owner, 3);
+    }
+
+    #[test]
+    fn kind13_dispatch_downgrade_mutates_root_and_emits_replacement_command() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(2, 16, 16));
+        sim.source_kind13_promotion_definitions[0] = Some(SourceKind13PromotionDefinition {
+            target_group: 0,
+            source_size: (1, 1),
+            tools_cost_fixed: 0,
+            wood_cost_fixed: 0,
+            bricks_cost_fixed: 0,
+            cannons_cost_fixed: 0,
+            money_cost: 0,
+            variant_definition_offsets: vec![66],
+        });
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 2,
+                source_owner: 3,
+                owner_slot: 3,
+                tier_population: [0, 1, 0, 0, 0],
+                ..SourceCityRecord::default()
+            })
+        ));
+        let location = SourceKind13Location {
+            island_id: 2,
+            tile_x: 8,
+            tile_y: 9,
+            orientation: 1,
+            variant: 0,
+            source_owner: 3,
+            phase: 0,
+            state_bits: 0,
+            population_group: 1,
+            amount: 90,
+            lifecycle_flags: 0,
+        };
+        assert!(sim.source_kind13_locations.insert(location));
+        sim.seed_source_rand(2);
+
+        sim.apply_source_kind13_dispatch_location(location);
+
+        let root = sim.source_kind13_locations.location_at(2, 8, 9).unwrap();
+        assert_eq!(root.population_group, 0);
+        assert!(root.amount < 90);
+        assert_eq!(sim.source_cities.record(0).unwrap().tier_population[1], 0);
+        assert_eq!(
+            sim.source_cities.record(0).unwrap().tier_population[0],
+            u32::from(root.amount >> 6)
+        );
+        assert_eq!(sim.source_kind13_replacement_commands.len(), 1);
+        let replacement = sim.source_kind13_replacement_commands[0];
+        assert_eq!(replacement.target_group, 0);
+        assert_eq!(replacement.command.definition_offset, 66);
+        assert_eq!(replacement.command.orientation, 1);
+        assert_eq!(replacement.command.dynamic_object_owner, 3);
+    }
 
     #[test]
     fn source_dynamic_figure_loader_enforces_source_category_tables() {
