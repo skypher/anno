@@ -74,6 +74,19 @@ impl SourceKind13Location {
     pub fn set_phase(&mut self, phase: u8) {
         self.phase = phase & 7;
     }
+
+    /// `DAT_0061fa4c[BGruppe]`, the fixed-point maximum admitted by
+    /// `FUN_0047bbc0` and `FUN_0047c080` for this record's current tier.
+    pub const fn source_amount_capacity(self) -> Option<u16> {
+        match self.population_group {
+            0 => Some(SOURCE_KIND13_AMOUNT_CAPACITIES[0]),
+            1 => Some(SOURCE_KIND13_AMOUNT_CAPACITIES[1]),
+            2 => Some(SOURCE_KIND13_AMOUNT_CAPACITIES[2]),
+            3 => Some(SOURCE_KIND13_AMOUNT_CAPACITIES[3]),
+            4 => Some(SOURCE_KIND13_AMOUNT_CAPACITIES[4]),
+            _ => None,
+        }
+    }
 }
 
 /// City operands read by `FUN_0047b410` before it changes one kind-13
@@ -192,6 +205,11 @@ pub const SOURCE_KIND13_PHASE_CLOCKS: usize = 16;
 pub const SOURCE_KIND13_PHASE_BASE_MS: u32 = 15_000;
 pub const SOURCE_KIND13_PHASE_STRIDE_MS: u32 = 64;
 pub const SOURCE_KIND13_DISPATCH_RECORDS_PER_UPDATE: usize = 0x46;
+/// `BGRUPPE.Maxwohn` from the five shipped `haeuser.cod` population rows.
+pub const SOURCE_KIND13_MAX_RESIDENTS: [u16; 5] = [2, 6, 15, 25, 40];
+/// Source `DAT_0061fa4c` values produced by `Maxwohn << 6` during the
+/// BGRUPPE loader. Kind-13 record amounts use this 1/64-resident scale.
+pub const SOURCE_KIND13_AMOUNT_CAPACITIES: [u16; 5] = [0x80, 0x180, 0x3c0, 0x640, 0xa00];
 
 /// Fixed count of city records at `DAT_005dbae0`.
 pub const SOURCE_CITY_RECORD_SLOTS: usize = 0x4b;
@@ -499,6 +517,14 @@ impl SourceKind13LocationTable {
         start..end
     }
 
+    fn lookup_range(island_id: u8, tile_x: u8, tile_y: u8) -> std::ops::Range<usize> {
+        let start = Self::source_index(island_id, tile_x, tile_y);
+        let end = start
+            .saturating_add(Self::PROBE_LENGTH)
+            .min(SOURCE_KIND13_LOCATION_TABLE_SLOTS);
+        start..end
+    }
+
     /// Insert one location by the source first-free-slot probe policy.
     pub fn insert(&mut self, location: SourceKind13Location) -> bool {
         let Some(slot) = Self::insertion_range(location).find(|&slot| self.slots[slot].is_none())
@@ -507,6 +533,42 @@ impl SourceKind13LocationTable {
         };
         self.slots[slot] = Some(location);
         true
+    }
+
+    /// Resolve a physical kind-13 entry using `FUN_00479f70`'s bounded
+    /// hash-probe order.
+    pub fn location_at(
+        &self,
+        island_id: u8,
+        tile_x: u8,
+        tile_y: u8,
+    ) -> Option<SourceKind13Location> {
+        Self::lookup_range(island_id, tile_x, tile_y)
+            .find_map(|slot| {
+                self.slots[slot].filter(|location| {
+                location.island_id == island_id
+                    && location.tile_x == tile_x
+                    && location.tile_y == tile_y
+                })
+            })
+    }
+
+    /// Mutable form of [`Self::location_at`] retaining the source's first
+    /// coordinate match in its 64-slot probe window.
+    pub fn location_at_mut(
+        &mut self,
+        island_id: u8,
+        tile_x: u8,
+        tile_y: u8,
+    ) -> Option<&mut SourceKind13Location> {
+        let slot = Self::lookup_range(island_id, tile_x, tile_y).find(|&slot| {
+            self.slots[slot].is_some_and(|location| {
+                location.island_id == island_id
+                    && location.tile_x == tile_x
+                    && location.tile_y == tile_y
+            })
+        })?;
+        self.slots[slot].as_mut()
     }
 
     /// Remove source roots overwritten by a later oriented INSELHAUS command.
@@ -2669,8 +2731,46 @@ mod tests {
         let start = SourceKind13LocationTable::source_index(2, 8, 9);
         assert_eq!(table.city_slice(2)[start - 2 * 0x400], Some(first));
         assert_eq!(table.city_slice(2)[start - 2 * 0x400 + 1], Some(colliding));
+        assert_eq!(table.location_at(2, 9, 8), Some(colliding));
+        table.location_at_mut(2, 9, 8).unwrap().amount = 0x123;
+        assert_eq!(table.location_at(2, 9, 8).unwrap().amount, 0x123);
         table.remove_roots_in_footprint(2, 8, 9, 1, 1);
-        assert_eq!(table.active_locations(), vec![colliding]);
+        assert_eq!(
+            table.active_locations(),
+            vec![SourceKind13Location {
+                amount: 0x123,
+                ..colliding
+            }]
+        );
+    }
+
+    #[test]
+    fn kind13_amount_capacities_match_shipped_bgruppe_maxwohn_rows() {
+        assert_eq!(SOURCE_KIND13_MAX_RESIDENTS, [2, 6, 15, 25, 40]);
+        assert_eq!(SOURCE_KIND13_AMOUNT_CAPACITIES, [0x80, 0x180, 0x3c0, 0x640, 0xa00]);
+
+        let location = SourceKind13Location {
+            island_id: 0,
+            tile_x: 0,
+            tile_y: 0,
+            orientation: 0,
+            variant: 0,
+            source_owner: 0,
+            phase: 0,
+            state_bits: 0,
+            population_group: 3,
+            amount: 0x40,
+            lifecycle_flags: 0,
+        };
+        assert_eq!(location.source_amount_capacity(), Some(0x640));
+        assert_eq!(
+            SourceKind13Location {
+                population_group: 5,
+                ..location
+            }
+            .source_amount_capacity(),
+            None
+        );
     }
 
     #[test]

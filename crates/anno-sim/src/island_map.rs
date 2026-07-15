@@ -15,7 +15,8 @@ use anno_formats::szs::Island;
 use std::collections::HashSet;
 
 use crate::source_route::{
-    source_static_map_direction, SourcePathGrid, SourcePathTargetRect, SourceTargetDescriptor,
+    source_static_map_direction, SourcePathBlockedCellDecision, SourcePathGrid,
+    SourcePathTargetRect, SourceTargetDescriptor,
 };
 
 /// Static source-map data needed to rebuild the short type-3 civilian route
@@ -393,6 +394,81 @@ impl IslandMap {
         grid
     }
 
+    /// Rebuild the source type-3 path window used by `FUN_0047bbc0` and
+    /// `FUN_0047c080` while they redistribute a kind-13 residence amount.
+    ///
+    /// `FUN_004722f0` centers this window on the selected map definition's
+    /// oriented footprint and extends each axis by `0x28`; `FUN_004724d0`
+    /// then admits its fixed terrain kinds plus source kind 13 when the
+    /// target map-owner selector matches the center cell. The `0x2000`
+    /// mask supplied by both callers contains only that dynamic kind-13
+    /// permission.
+    pub fn source_kind13_transfer_path_grid(
+        &self,
+        center: (i32, i32),
+    ) -> Option<SourcePathGrid> {
+        const RADIUS: i32 = 0x28;
+        let center_cell = self.civilian_path_cell(center)?;
+        let center_index = self.local_index(center)?;
+        let (raw_width, raw_height) = *self.source_land_target_sizes.get(center_index)?.as_ref()?;
+        let footprint_width = i32::from(raw_width / 2).max(1);
+        let footprint_height = i32::from(raw_height / 2).max(1);
+        let origin = (
+            center.0 + (footprint_width - 1) / 2 - RADIUS,
+            center.1 + (footprint_height - 1) / 2 - RADIUS,
+        );
+        let width = usize::try_from(footprint_width + RADIUS * 2).ok()?;
+        let height = usize::try_from(footprint_height + RADIUS * 2).ok()?;
+        let mut grid = SourcePathGrid::new(origin, width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                let position = (origin.0 + x as i32, origin.1 + y as i32);
+                grid.mark_direction_blocker(position);
+                let Some(cell) = self.civilian_path_cell(position) else {
+                    continue;
+                };
+                let owner_matched_kind13 = cell.kind_code == 13
+                    && (center_cell.owner == 7 || cell.owner == center_cell.owner);
+                let fixed_kind = matches!(cell.kind_code, 1 | 11 | 12 | 13 | 18 | 29 | 30);
+                if fixed_kind || owner_matched_kind13 {
+                    grid.set_traversable_cell(
+                        position,
+                        cell.path_class | (u8::from(owner_matched_kind13) << 7),
+                    );
+                }
+            }
+        }
+        Some(grid)
+    }
+
+    /// Collect the source map coordinates written through `LAB_00472ad0` by
+    /// `FUN_00471fb0` for a kind-13 amount transfer.
+    ///
+    /// The callback records only high-bit path cells, so this yields
+    /// owner-matched kind-13 locations in weighted-wave order. Its fixed
+    /// output buffer holds at most forty coordinates.
+    pub fn source_kind13_transfer_neighbor_cells(
+        &self,
+        center: (i32, i32),
+    ) -> Option<Vec<(i32, i32)>> {
+        const OUTPUT_CAPACITY: usize = 0x28;
+        let mut grid = self.source_kind13_transfer_path_grid(center)?;
+        let mut neighbors = Vec::new();
+        let result = grid.search_with_blocked_cell_callback(center, |position, _| {
+            neighbors.push(position);
+            if neighbors.len() == OUTPUT_CAPACITY {
+                SourcePathBlockedCellDecision::Complete
+            } else {
+                SourcePathBlockedCellDecision::Expand
+            }
+        });
+        match result {
+            Ok(_) | Err(crate::source_route::SourcePathSearchError::NoRoute) => Some(neighbors),
+            Err(crate::source_route::SourcePathSearchError::OutOfBounds) => None,
+        }
+    }
+
     /// Raw type-0 terrain speed for `FUN_0044a690` TRAEGER movement.
     pub fn carrier_movement_speed(&self, position: (i32, i32)) -> Option<u16> {
         self.movement_speed(&self.carrier_movement_speeds, position)
@@ -521,6 +597,13 @@ impl IslandMap {
             .get(y as usize * self.width as usize + x as usize)
             .copied()
             .filter(|speed| *speed != 0)
+    }
+
+    fn civilian_path_cell(&self, position: (i32, i32)) -> Option<SourceCivilianPathCell> {
+        self.civilian_path_cells
+            .get(self.local_index(position)?)
+            .copied()
+            .flatten()
     }
 
     fn local_index(&self, position: (i32, i32)) -> Option<usize> {
@@ -1037,6 +1120,100 @@ mod tests {
         assert!(map.source_native_idle_target_allowed((0, 0)));
         assert!(map.source_native_idle_target_allowed((1, 0)));
         assert!(IslandMap::new_open(3, 1, 1).source_native_idle_target_allowed((0, 0)));
+    }
+
+    #[test]
+    fn kind13_transfer_grid_replays_radius_fixed_kinds_and_owner_overlay() {
+        let island = Island {
+            number: 3,
+            width: 6,
+            height: 1,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles: vec![
+                IslandTile {
+                    building_id: 1,
+                    x: 1,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0x80,
+                    flags: 0,
+                },
+                IslandTile {
+                    building_id: 1,
+                    x: 2,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0x80,
+                    flags: 0,
+                },
+                IslandTile {
+                    building_id: 1,
+                    x: 3,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0x40,
+                    flags: 0,
+                },
+                IslandTile {
+                    building_id: 2,
+                    x: 4,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0x40,
+                    flags: 0,
+                },
+                IslandTile {
+                    building_id: 3,
+                    x: 5,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0x80,
+                    flags: 0,
+                },
+            ],
+            city: None,
+        };
+        let path_properties = || {
+            std::collections::HashMap::from([("Wegspeed".to_owned(), "100,100,100,100".to_owned())])
+        };
+        let residences = CodBuilding {
+            source_id: 20_001,
+            kind: "PLATZ".to_owned(),
+            size: (1, 1),
+            properties: path_properties(),
+            ..Default::default()
+        };
+        let ground = CodBuilding {
+            source_id: 20_002,
+            kind: "BODEN".to_owned(),
+            size: (1, 1),
+            properties: path_properties(),
+            ..Default::default()
+        };
+        let blocked = CodBuilding {
+            source_id: 20_003,
+            kind: "GEBAEUDE".to_owned(),
+            size: (1, 1),
+            properties: path_properties(),
+            ..Default::default()
+        };
+        let map = IslandMap::from_island(&island, &[residences, ground, blocked]);
+        let grid = map.source_kind13_transfer_path_grid((1, 0)).unwrap();
+
+        assert_eq!(grid.metadata((-39, 0)), Some(0));
+        assert_eq!(grid.metadata((41, 0)), Some(0));
+        assert_eq!(grid.metadata((-40, 0)), None);
+        assert_eq!(grid.metadata((42, 0)), None);
+        assert_eq!(grid.metadata((2, 0)), Some(0xa0));
+        assert_eq!(grid.metadata((3, 0)), Some(0x20));
+        assert_eq!(grid.metadata((4, 0)), Some(0x20));
+        assert_eq!(grid.metadata((5, 0)), Some(0));
+        assert_eq!(
+            map.source_kind13_transfer_neighbor_cells((1, 0)),
+            Some(vec![(2, 0)])
+        );
     }
 
     #[test]
