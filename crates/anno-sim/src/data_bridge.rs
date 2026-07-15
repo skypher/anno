@@ -984,7 +984,27 @@ pub fn source_map_cell_states_from_scenario(
     szs: &SzsFile,
     cod: &CodFile,
 ) -> Vec<SourceMapCellState> {
+    source_map_roots_from_scenario(szs, cod, false)
+}
+
+/// Replay final INSELHAUS overwrite order into the static roots consumed by
+/// `FUN_0047a650`. This includes non-selector map kinds that are absent from
+/// the renderer's live source-cell table.
+pub fn source_static_map_roots_from_scenario(
+    szs: &SzsFile,
+    cod: &CodFile,
+) -> Vec<SourceMapCellState> {
+    source_map_roots_from_scenario(szs, cod, true)
+}
+
+fn source_map_roots_from_scenario(
+    szs: &SzsFile,
+    cod: &CodFile,
+    include_all_static_kinds: bool,
+) -> Vec<SourceMapCellState> {
     let mut states = Vec::new();
+    let mut final_kind_cells = HashMap::new();
+    let mut static_cells = HashMap::new();
 
     for island in &szs.islands {
         for tile in &island.tiles {
@@ -1009,18 +1029,105 @@ pub fn source_map_cell_states_from_scenario(
                     || i32::from(state.y) >= bottom
             });
 
-            if !matches!(definition.source_kind_code(), Some(1..=8 | 30)) {
-                continue;
+            let kind_code = definition.source_kind_code().unwrap_or(u8::MAX);
+            for dy in 0..height {
+                for dx in 0..width {
+                    let x = i32::from(tile.x) + dx;
+                    let y = i32::from(tile.y) + dy;
+                    let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) else {
+                        continue;
+                    };
+                    final_kind_cells.insert((island.number, x, y), kind_code);
+                }
             }
-            if let Some(mut state) =
-                SourceMapCellState::new(island.number, tile.x, tile.y, definition, 0)
-            {
+
+            let command = crate::building::SourceBuildingCommand::from_island_tile(*tile);
+            let static_state = SourceMapCellState::new_static(
+                island.number,
+                tile.x,
+                tile.y,
+                definition,
+                0,
+            )
+            .map(|mut state| {
                 state.set_footprint(width, height);
                 state.set_source_orientation(tile.orientation);
+                state.set_terminal_command_fields(command.variant, command.map_owner_slot);
                 state.configure_terminal_replacement(cod);
+                state
+            });
+            if include_all_static_kinds {
+                if let Some(state) = static_state {
+                    for dy in 0..height {
+                        for dx in 0..width {
+                            let x = i32::from(tile.x) + dx;
+                            let y = i32::from(tile.y) + dy;
+                            let (Ok(x), Ok(y)) = (u8::try_from(x), u8::try_from(y)) else {
+                                continue;
+                            };
+                            let mut cell = state;
+                            cell.x = x;
+                            cell.y = y;
+                            static_cells.insert((island.number, u16::from(x), u16::from(y)), cell);
+                        }
+                    }
+                }
+            }
+
+            if !include_all_static_kinds
+                && !matches!(definition.source_kind_code(), Some(1..=8 | 30))
+            {
+                continue;
+            }
+            if let Some(mut state) = static_state {
+                state.set_footprint(width, height);
+                state.set_source_orientation(tile.orientation);
                 states.push(state);
             }
         }
+    }
+
+    if include_all_static_kinds {
+        for state in static_cells.values_mut() {
+            let mut selectors = 0_u64;
+            for dy in 0..usize::from(state.footprint_height) {
+                for dx in 0..usize::from(state.footprint_width) {
+                    let source_order_index = dy * usize::from(state.footprint_width)
+                        + (usize::from(state.footprint_width) - 1 - dx);
+                    let x = u16::from(state.x) + dx as u16;
+                    let y = u16::from(state.y) + dy as u16;
+                    if source_order_index < u64::BITS as usize
+                        && final_kind_cells
+                            .get(&(state.island, x, y))
+                            .is_some_and(|kind| matches!(*kind, 23..=27))
+                    {
+                        selectors |= 1_u64 << source_order_index;
+                    }
+                }
+            }
+            state.set_fallback_strand_cells(selectors);
+        }
+        return static_cells.into_values().collect();
+    }
+
+    for state in &mut states {
+        let mut selectors = 0_u64;
+        for dy in 0..usize::from(state.footprint_height) {
+            for dx in 0..usize::from(state.footprint_width) {
+                let source_order_index = dy * usize::from(state.footprint_width)
+                    + (usize::from(state.footprint_width) - 1 - dx);
+                let x = u16::from(state.x) + dx as u16;
+                let y = u16::from(state.y) + dy as u16;
+                if source_order_index < u64::BITS as usize
+                    && final_kind_cells
+                        .get(&(state.island, x, y))
+                        .is_some_and(|kind| matches!(*kind, 23..=27))
+                {
+                    selectors |= 1_u64 << source_order_index;
+                }
+            }
+        }
+        state.set_fallback_strand_cells(selectors);
     }
 
     states
@@ -1857,6 +1964,83 @@ mod tests {
         assert!(states.iter().any(|state| state.matches(6, 1, 1)));
         assert!(states.iter().any(|state| state.matches(6, 8, 9)));
         assert!(!states.iter().any(|state| state.matches(6, 3, 4)));
+
+        let static_cells = source_static_map_roots_from_scenario(&szs, &cod);
+        assert_eq!(static_cells.len(), 4);
+        assert!(static_cells.iter().any(|state| {
+            state.matches(6, 2, 4) && state.kind_code == 14
+        }));
+        assert!(static_cells.iter().any(|state| {
+            state.matches(6, 3, 4) && state.kind_code == 14
+        }));
+    }
+
+    #[test]
+    fn source_cell_seeder_retains_terminal_fallback_cell_selectors() {
+        use anno_formats::szs::{Island, IslandTile, ScenarioMeta};
+
+        let base = anno_formats::szs::INSELHAUS_SOURCE_ID_BASE;
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![
+                CodBuilding {
+                    source_id: base + 1,
+                    kind: "HANDWERK".into(),
+                    size: (2, 2),
+                    ..Default::default()
+                },
+                CodBuilding {
+                    source_id: base + 2,
+                    kind: "STRAND".into(),
+                    size: (1, 1),
+                    ..Default::default()
+                },
+            ],
+        };
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![Island {
+                number: 6,
+                width: 16,
+                height: 16,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: vec![
+                    IslandTile {
+                        building_id: 1,
+                        x: 1,
+                        y: 1,
+                        orientation: 7 << 2,
+                        anim_count: 2 << 6,
+                        flags: 0,
+                    },
+                    // This overwrites source fallback cell zero: (2, 1).
+                    IslandTile {
+                        building_id: 2,
+                        x: 2,
+                        y: 1,
+                        orientation: 0,
+                        anim_count: 0,
+                        flags: 0,
+                    },
+                ],
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: ScenarioMeta::default(),
+            ships: Vec::new(),
+            land_figures: Vec::new(),
+        };
+
+        let states = source_map_cell_states_from_scenario(&szs, &cod);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].source_variant, 7);
+        assert_eq!(states[0].source_map_owner_slot, 2);
+        assert_eq!(states[0].fallback_strand_cells, 1);
+        assert!(states[0].fallback_uses_strand_table(0));
+        assert!(!states[0].fallback_uses_strand_table(1));
     }
 
     #[test]

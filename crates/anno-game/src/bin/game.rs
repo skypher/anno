@@ -921,7 +921,7 @@ fn try_place_building(
     instance.wood_needed = def.cost_wood;
     instance.tools_needed = def.cost_tools;
     instance.bricks_needed = def.cost_bricks;
-    let source_cell_state = instance.source_placement_command.and_then(|_| {
+    let source_cell_state = instance.source_placement_command.and_then(|command| {
         let mut state = anno_sim::source_cell::SourceMapCellState::new(
             island_number,
             tile_x as u8,
@@ -936,12 +936,35 @@ fn try_place_building(
         };
         state.set_footprint(footprint_width, footprint_height);
         state.set_source_orientation(orient);
+        state.set_terminal_command_fields(command.variant, command.map_owner_slot);
+        state.configure_terminal_replacement(cod);
+        Some(state)
+    });
+    let source_static_root = instance.source_placement_command.and_then(|command| {
+        let mut state = anno_sim::source_cell::SourceMapCellState::new_static(
+            island_number,
+            tile_x as u8,
+            tile_y as u8,
+            cod_b,
+            ((sim.game_clock / 10) & 7) as u8,
+        )?;
+        let (footprint_width, footprint_height) = if matches!(orient & 3, 1 | 3) {
+            (cod_b.size.1, cod_b.size.0)
+        } else {
+            cod_b.size
+        };
+        state.set_footprint(footprint_width, footprint_height);
+        state.set_source_orientation(orient);
+        state.set_terminal_command_fields(command.variant, command.map_owner_slot);
         state.configure_terminal_replacement(cod);
         Some(state)
     });
     sim.buildings.push(instance);
     if let Some(state) = source_cell_state {
         sim.source_map_cell_states.push(state);
+    }
+    if let Some(root) = source_static_root {
+        sim.source_static_map_roots.push(root);
     }
     let building_index = sim.buildings.len() - 1;
     if def.kind == "HQ" {
@@ -987,24 +1010,16 @@ fn push_ruin_tiles(
         let command = anno_sim::building::SourceBuildingCommand {
             definition_offset,
             orientation: clear.source_orientation,
-            variant: 0,
+            variant: clear.source_variant,
             metadata: 0,
-            map_owner_slot: 0,
+            map_owner_slot: clear.source_map_owner_slot,
             random_seed: 0,
             dynamic_object_owner: 0,
         };
-        for (_, x, y, sprite) in
-            source_command_gfx_tiles(clear.island_id, clear.tile_x, clear.tile_y, command, cod)
-        {
-            island.tiles.push(IslandTile {
-                building_id: sprite,
-                x: x as u8,
-                y: y as u8,
-                orientation: 0,
-                anim_count: 0,
-                flags: 0,
-            });
-        }
+        let (Ok(x), Ok(y)) = (u8::try_from(clear.tile_x), u8::try_from(clear.tile_y)) else {
+            return;
+        };
+        island.tiles.push(command.to_island_tile(x, y));
         return;
     }
 
@@ -1019,19 +1034,32 @@ fn push_ruin_tiles(
             };
             let Some(ruin) = cod.ruin_variant_building(
                 clear.ruin_id,
-                clear.ruin_uses_strand_table,
+                clear.fallback_uses_strand_table(draw_index),
                 rand_value,
             ) else {
                 continue;
             };
-            island.tiles.push(IslandTile {
-                building_id: ruin.gfx as u16,
-                x: x as u8,
-                y: y as u8,
-                orientation: 0,
-                anim_count: 0,
-                flags: 0,
-            });
+            let definition_offset = ruin
+                .source_id
+                .checked_sub(anno_formats::szs::INSELHAUS_SOURCE_ID_BASE)
+                .and_then(|offset| u16::try_from(offset).ok());
+            let (Some(definition_offset), Ok(x), Ok(y)) =
+                (definition_offset, u8::try_from(x), u8::try_from(y))
+            else {
+                continue;
+            };
+            island.tiles.push(
+                anno_sim::building::SourceBuildingCommand {
+                    definition_offset,
+                    orientation: clear.source_orientation,
+                    variant: clear.source_variant,
+                    metadata: 0,
+                    map_owner_slot: clear.source_map_owner_slot,
+                    random_seed: 0,
+                    dynamic_object_owner: 0,
+                }
+                .to_island_tile(x, y),
+            );
         }
     }
 }
@@ -2607,6 +2635,7 @@ fn main() {
 
                                 // Remove building from simulation
                                 let _ = sim.release_source_dynamic_map_object_for_building(bi);
+                                sim.remove_source_map_root(island_id, bx, by);
                                 sim.buildings.remove(bi);
 
                                 println!(
@@ -3314,6 +3343,7 @@ fn main() {
             if !sim.tile_clears.is_empty() {
                 let drained: Vec<_> = sim.tile_clears.drain(..).collect();
                 for clear in drained {
+                    sim.apply_source_terminal_static_replacement(&cod, &clear);
                     apply_tile_clear_event(&mut islands, &cod, clear);
                 }
                 if speech_enabled {
@@ -6261,16 +6291,26 @@ mod tests {
                 width: 1,
                 height: 1,
                 source_orientation: 0,
+                source_variant: 0,
+                source_map_owner_slot: 0,
                 ruin_id: 0,
                 ruin_uses_strand_table: false,
+                fallback_strand_cells: 0,
                 source_ruin_draws: vec![seeded_draw(3)],
             },
         );
 
         assert_eq!(islands[0].tiles.len(), 1);
+        let expected = cod
+            .ruin_variant_building(0, false, seeded_draw(3))
+            .expect("ordinary land ruin variant");
         assert_eq!(
-            islands[0].tiles[0].building_id,
-            (cod.constants["GFXBODEN"] + 400) as u16
+            islands[0].tiles[0].source_id(),
+            expected.source_id
+        );
+        assert_eq!(
+            authored_island_gfx_tiles(&islands[0], &cod, &[]),
+            vec![(3, 4, expected.gfx as u16)]
         );
     }
 
@@ -6303,16 +6343,26 @@ mod tests {
                 width: 1,
                 height: 1,
                 source_orientation: 0,
+                source_variant: 0,
+                source_map_owner_slot: 0,
                 ruin_id: 0,
                 ruin_uses_strand_table: true,
+                fallback_strand_cells: 0,
                 source_ruin_draws: vec![seeded_draw(3)],
             },
         );
 
         assert_eq!(islands[0].tiles.len(), 1);
+        let expected = cod
+            .ruin_variant_building(0, true, seeded_draw(3))
+            .expect("strand land ruin variant");
         assert_eq!(
-            islands[0].tiles[0].building_id,
-            (cod.constants["GFXBODEN"] + 413) as u16
+            islands[0].tiles[0].source_id(),
+            expected.source_id
+        );
+        assert_eq!(
+            authored_island_gfx_tiles(&islands[0], &cod, &[]),
+            vec![(2, 2, expected.gfx as u16)]
         );
     }
 
@@ -6339,18 +6389,18 @@ mod tests {
                 width: 2,
                 height: 3,
                 source_orientation: 0,
+                source_variant: 0,
+                source_map_owner_slot: 0,
                 ruin_id: 8,
                 ruin_uses_strand_table: false,
+                fallback_strand_cells: 0,
                 source_ruin_draws: vec![seeded_draw(1)],
             },
         );
 
+        assert_eq!(islands[0].tiles.len(), 1);
         let base = (cod.constants["GFXKONTOR"] + 144) as u16;
-        let mut got: Vec<_> = islands[0]
-            .tiles
-            .iter()
-            .map(|t| (t.x, t.y, t.building_id))
-            .collect();
+        let mut got = authored_island_gfx_tiles(&islands[0], &cod, &[]);
         got.sort_unstable();
         assert_eq!(
             got,
@@ -6388,17 +6438,127 @@ mod tests {
                 width: 1,
                 height: 1,
                 source_orientation: 0,
+                source_variant: 0,
+                source_map_owner_slot: 0,
                 ruin_id: 4,
                 ruin_uses_strand_table: false,
+                fallback_strand_cells: 0,
                 source_ruin_draws: vec![seeded_draw(1)],
             },
         );
 
         assert_eq!(islands[0].tiles.len(), 1);
+        let expected = cod
+            .ruin_variant_building(4, false, seeded_draw(1))
+            .expect("raw-material ruin variant");
         assert_eq!(
-            islands[0].tiles[0].building_id,
-            (cod.constants["GFXROHST"] + 89) as u16
+            islands[0].tiles[0].source_id(),
+            expected.source_id
         );
+        assert_eq!(
+            authored_island_gfx_tiles(&islands[0], &cod, &[]),
+            vec![(4, 4, expected.gfx as u16)]
+        );
+    }
+
+    #[test]
+    fn tile_clear_event_uses_per_cell_strand_table_in_fallback_order() {
+        let cod = load_test_cod();
+        let mut islands = vec![test_island(10, [7; 8])];
+        let draws = vec![seeded_draw(1), seeded_draw(2), seeded_draw(3), seeded_draw(4)];
+
+        apply_tile_clear_event(
+            &mut islands,
+            &cod,
+            TileClear {
+                island_id: 0,
+                tile_x: 1,
+                tile_y: 1,
+                width: 2,
+                height: 2,
+                source_orientation: 0,
+                source_variant: 0,
+                source_map_owner_slot: 0,
+                ruin_id: 0,
+                ruin_uses_strand_table: false,
+                // The source visits (2,1), (1,1), (2,2), (1,2).
+                fallback_strand_cells: 1,
+                source_ruin_draws: draws.clone(),
+            },
+        );
+
+        assert_eq!(islands[0].tiles.len(), 4);
+        let first = islands[0]
+            .tiles
+            .iter()
+            .find(|tile| (tile.x, tile.y) == (2, 1))
+            .expect("first source-order fallback cell");
+        let second = islands[0]
+            .tiles
+            .iter()
+            .find(|tile| (tile.x, tile.y) == (1, 1))
+            .expect("second source-order fallback cell");
+        assert_eq!(
+            first.source_id(),
+            cod.ruin_variant_building(0, true, draws[0])
+                .expect("strand fallback ruin")
+                .source_id
+        );
+        assert_eq!(
+            second.source_id(),
+            cod.ruin_variant_building(0, false, draws[1])
+                .expect("ordinary fallback ruin")
+                .source_id
+        );
+    }
+
+    #[test]
+    fn tile_clear_event_preserves_orientation_for_kontor_ruin_command() {
+        let cod = load_test_cod();
+        let mut islands = vec![test_island(10, [7; 8])];
+        islands[0].tiles.push(IslandTile {
+            building_id: cod.constants["GFXKONTOR"] as u16,
+            x: 1,
+            y: 1,
+            orientation: 0,
+            anim_count: 0,
+            flags: 0,
+        });
+
+        apply_tile_clear_event(
+            &mut islands,
+            &cod,
+            TileClear {
+                island_id: 0,
+                tile_x: 1,
+                tile_y: 1,
+                width: 3,
+                height: 2,
+                source_orientation: 1,
+                source_variant: 2,
+                source_map_owner_slot: 5,
+                ruin_id: 8,
+                ruin_uses_strand_table: false,
+                fallback_strand_cells: 0,
+                source_ruin_draws: vec![seeded_draw(1)],
+            },
+        );
+
+        assert_eq!(islands[0].tiles.len(), 1);
+        let expected = cod
+            .ruin_variant_building(8, false, seeded_draw(1))
+            .expect("Kontor ruin variant");
+        assert_eq!(islands[0].tiles[0].source_id(), expected.source_id);
+        assert_eq!(islands[0].tiles[0].orientation & 3, 1);
+        let command = anno_sim::building::SourceBuildingCommand::from_island_tile(islands[0].tiles[0]);
+        assert_eq!(command.variant, 2);
+        assert_eq!(command.map_owner_slot, 5);
+        let mut got: Vec<_> = authored_island_gfx_tiles(&islands[0], &cod, &[])
+            .into_iter()
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2)]);
     }
 
     #[test]
@@ -6679,6 +6839,10 @@ mod tests {
 
         assert!(matches!(outcome, PlaceOutcome::Placed));
         assert_eq!(sim.buildings[0].source_dynamic_object_slot, Some(0));
+        assert_eq!(sim.source_static_map_roots.len(), 1);
+        assert!(sim.source_static_map_roots[0].matches(4, 1, 1));
+        assert_eq!(sim.source_static_map_roots[0].kind_code, 35);
+        assert!(sim.source_map_cell_states.is_empty());
         assert_eq!(
             sim.buildings[0].source_placement_command,
             Some(anno_sim::building::SourceBuildingCommand {
@@ -7741,6 +7905,8 @@ fn init_simulation(
         anno_sim::data_bridge::source_dynamic_map_objects_from_scenario(szs, cod);
     sim.source_map_cell_states =
         anno_sim::data_bridge::source_map_cell_states_from_scenario(szs, cod);
+    sim.source_static_map_roots =
+        anno_sim::data_bridge::source_static_map_roots_from_scenario(szs, cod);
     sim.source_kind13_locations =
         anno_sim::data_bridge::source_kind13_locations_from_scenario(szs, cod);
     sim.source_cities = anno_sim::data_bridge::source_cities_from_scenario(szs);

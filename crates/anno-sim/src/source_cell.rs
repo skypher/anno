@@ -24,6 +24,12 @@ pub struct SourceMapCellState {
     /// Low two orientation bits of the original map command. The terminal
     /// writer forwards these bits to the selected ruin replacement.
     pub source_orientation: u8,
+    /// Packed frame selector (`bits 15..=18`) from the root command. The
+    /// terminal writer forwards it to `FUN_00463ef0` for every replacement.
+    pub source_variant: u8,
+    /// Packed map-owner selector (`bits 19..=21`) from the root command.
+    /// The terminal writer retains it while rewriting the root footprint.
+    pub source_map_owner_slot: u8,
     /// Source `Ruinenr` selected by `FUN_00463f40`; `0xff` enters its
     /// per-tile clear branch instead of issuing a ruin replacement command.
     pub ruin_id: u8,
@@ -34,6 +40,11 @@ pub struct SourceMapCellState {
     pub ruin_footprint_height: u8,
     /// Source kinds 23 through 27 select the shifted strand-ruin table.
     pub ruin_uses_strand_table: bool,
+    /// Per-cell strand-table selectors for `FUN_00463f40`'s mismatched-size
+    /// fallback. Bit `dy × width + (width - 1 - dx)` follows the source
+    /// right-to-left write order; extracted haeuser.cod footprints occupy at
+    /// most 36 cells, so one u64 retains every selector.
+    pub fallback_strand_cells: u64,
     /// Low three bits of source byte `+0x03`, scheduled by `FUN_0047daf0`.
     pub phase: u8,
     /// High four bits of source byte `+0x03`.
@@ -85,10 +96,21 @@ impl SourceMapCellState {
     /// Construct the selector-bearing subset of a zeroed
     /// `FUN_00481fc0` map-cell record.
     pub fn new(island: u8, x: u8, y: u8, definition: &BuildingDef, phase: u8) -> Option<Self> {
+        let state = Self::new_static(island, x, y, definition, phase)?;
+        matches!(state.kind_code, 1..=8 | 30).then_some(state)
+    }
+
+    /// Construct terminal metadata for any compiled static map root. Unlike
+    /// [`Self::new`], this retains kinds outside the selector-state subset so
+    /// `FUN_0047a650` can accumulate category-6 damage at every map target.
+    pub fn new_static(
+        island: u8,
+        x: u8,
+        y: u8,
+        definition: &BuildingDef,
+        phase: u8,
+    ) -> Option<Self> {
         let kind_code = definition.source_kind_code()?;
-        if !matches!(kind_code, 1..=8 | 30) {
-            return None;
-        }
         Some(Self {
             island,
             x,
@@ -98,10 +120,13 @@ impl SourceMapCellState {
             source_definition_width: u8::try_from(definition.size.0).unwrap_or(1).max(1),
             source_definition_height: u8::try_from(definition.size.1).unwrap_or(1).max(1),
             source_orientation: 0,
+            source_variant: 0,
+            source_map_owner_slot: 0,
             ruin_id: definition.ruinenr.clamp(0, 255) as u8,
             ruin_footprint_width: 0,
             ruin_footprint_height: 0,
             ruin_uses_strand_table: matches!(kind_code, 23..=27),
+            fallback_strand_cells: 0,
             phase: phase & 7,
             frame_selector: 0,
             activity: 0,
@@ -137,6 +162,25 @@ impl SourceMapCellState {
     /// Retain the low orientation bits passed to the terminal map writer.
     pub fn set_source_orientation(&mut self, orientation: u8) {
         self.source_orientation = orientation & 3;
+    }
+
+    /// Preserve the root fields that `FUN_00463f40` forwards unchanged to
+    /// the replacement map and draw writers.
+    pub fn set_terminal_command_fields(&mut self, variant: u8, map_owner_slot: u8) {
+        self.source_variant = variant & 0x0f;
+        self.source_map_owner_slot = map_owner_slot & 7;
+    }
+
+    /// Record the source-order strand selectors sampled by the terminal
+    /// fallback branch after the scenario's final INSELHAUS overwrite pass.
+    pub fn set_fallback_strand_cells(&mut self, selectors: u64) {
+        self.fallback_strand_cells = selectors;
+    }
+
+    #[inline]
+    pub fn fallback_uses_strand_table(self, source_order_index: usize) -> bool {
+        source_order_index < u64::BITS as usize
+            && (self.fallback_strand_cells & (1_u64 << source_order_index)) != 0
     }
 
     /// Resolve the terminal handler's ruin table entry from the parsed COD

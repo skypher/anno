@@ -75,13 +75,28 @@ pub struct TileClear {
     pub height: u8,
     /// Low source-command orientation bits forwarded to the ruin writer.
     pub source_orientation: u8,
+    /// Packed root frame selector forwarded to the replacement draw writer.
+    pub source_variant: u8,
+    /// Packed root map-owner selector forwarded to the replacement map writer.
+    pub source_map_owner_slot: u8,
     pub ruin_id: u8,
     /// The terminal handler's source-kind 23..=27 branch selects a shifted
     /// strand ruin table instead of the ordinary ruin table.
     pub ruin_uses_strand_table: bool,
+    /// Per-cell shifted-table selectors for a mismatched-footprint rewrite,
+    /// indexed in the source writer's right-to-left cell order.
+    pub fallback_strand_cells: u64,
     /// MSVC `rand()` outputs consumed synchronously by `FUN_00463f40`.
     /// Renderer replay uses these values without advancing simulation RNG.
     pub source_ruin_draws: Vec<u16>,
+}
+
+impl TileClear {
+    #[inline]
+    pub fn fallback_uses_strand_table(&self, source_order_index: usize) -> bool {
+        source_order_index < u64::BITS as usize
+            && (self.fallback_strand_cells & (1_u64 << source_order_index)) != 0
+    }
 }
 
 /// Terminal map command emitted by `FUN_0047a650` after a deferred
@@ -126,6 +141,9 @@ pub struct Simulation {
     pub source_dynamic_map_objects: Vec<SourceDynamicMapObject>,
     /// Renderer-relevant state for source INSELHAUS command roots.
     pub source_map_cell_states: Vec<SourceMapCellState>,
+    /// Final-overwrite static roots addressed by `FUN_0047a650`, including
+    /// map kinds that have no live selector record.
+    pub source_static_map_roots: Vec<SourceMapCellState>,
     /// Placement anchors retained by the source kind-13 location table.
     pub source_kind13_locations: SourceKind13LocationTable,
     /// Fixed source city-record pool read by `FUN_0047f8a0`.
@@ -442,6 +460,7 @@ impl Simulation {
             buildings: Vec::new(),
             source_dynamic_map_objects: Vec::new(),
             source_map_cell_states: Vec::new(),
+            source_static_map_roots: Vec::new(),
             source_kind13_locations: SourceKind13LocationTable::default(),
             source_cities: SourceCityTable::default(),
             source_kind4_occupants: Vec::new(),
@@ -928,7 +947,7 @@ impl Simulation {
                 continue;
             };
             let terminal_root = self
-                .source_map_cell_states
+                .source_static_map_roots
                 .iter_mut()
                 .find(|state| {
                     state.matches(
@@ -972,14 +991,20 @@ impl Simulation {
             width: root.footprint_width,
             height: root.footprint_height,
             source_orientation: root.source_orientation,
+            source_variant: root.source_variant,
+            source_map_owner_slot: root.source_map_owner_slot,
             ruin_id: root.ruin_id,
             ruin_uses_strand_table: root.ruin_uses_strand_table,
+            fallback_strand_cells: root.fallback_strand_cells,
             source_ruin_draws,
         });
-        self.source_map_cell_states.retain(|state| {
-            !state.matches(root.island, u16::from(root.x), u16::from(root.y))
-        });
-        self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+        self.remove_source_map_footprint(
+            root.island,
+            u16::from(root.x),
+            u16::from(root.y),
+            root.footprint_width,
+            root.footprint_height,
+        );
 
         for building in &mut self.buildings {
             if building.active
@@ -992,6 +1017,118 @@ impl Simulation {
                 building.source_dynamic_object_slot = None;
             }
         }
+    }
+
+    /// Remove one source command root from both the renderer selector table
+    /// and the all-static category-6 inventory after a live map command
+    /// erases it.
+    pub fn remove_source_map_root(&mut self, island: u8, x: u16, y: u16) {
+        self.remove_source_map_footprint(island, x, y, 1, 1);
+    }
+
+    /// Remove every static cell and selector root whose anchor lies in an
+    /// oriented map-write footprint. `FUN_00463f40` applies this replacement
+    /// before later category-6 impacts can resolve the old cell definitions.
+    pub fn remove_source_map_footprint(
+        &mut self,
+        island: u8,
+        x: u16,
+        y: u16,
+        width: u8,
+        height: u8,
+    ) {
+        let selector_count = self.source_map_cell_states.len();
+        let static_count = self.source_static_map_roots.len();
+        let right = x.saturating_add(u16::from(width));
+        let bottom = y.saturating_add(u16::from(height));
+        let inside = |state: &SourceMapCellState| {
+            state.island == island
+                && u16::from(state.x) >= x
+                && u16::from(state.x) < right
+                && u16::from(state.y) >= y
+                && u16::from(state.y) < bottom
+        };
+        self.source_map_cell_states.retain(|state| !inside(state));
+        self.source_static_map_roots.retain(|state| !inside(state));
+        if self.source_map_cell_states.len() != selector_count
+            || self.source_static_map_roots.len() != static_count
+        {
+            self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+        }
+    }
+
+    /// Materialize a drained terminal ruin command into the static-cell table.
+    /// The frozen random draws were consumed when the source event fired, so
+    /// this reconstruction never advances the simulation RNG.
+    pub fn apply_source_terminal_static_replacement(
+        &mut self,
+        cod: &anno_formats::cod::CodFile,
+        clear: &TileClear,
+    ) {
+        if clear.ruin_id == crate::building::NO_RUIN_ID {
+            return;
+        }
+        let Some(base) = cod.ruin_building(clear.ruin_id, clear.ruin_uses_strand_table) else {
+            return;
+        };
+        let base_size = if matches!(clear.source_orientation & 3, 1 | 3) {
+            (base.size.1, base.size.0)
+        } else {
+            base.size
+        };
+        let mut writes = Vec::new();
+        if base_size == (i32::from(clear.width), i32::from(clear.height)) {
+            let Some(&draw) = clear.source_ruin_draws.first() else {
+                return;
+            };
+            let Some(definition) = cod.ruin_variant_building(
+                clear.ruin_id,
+                clear.ruin_uses_strand_table,
+                draw,
+            ) else {
+                return;
+            };
+            for dy in 0..clear.height {
+                for dx in 0..clear.width {
+                    writes.push((clear.tile_x + u16::from(dx), clear.tile_y + u16::from(dy), definition));
+                }
+            }
+        } else {
+            for dy in 0..clear.height {
+                for dx in (0..clear.width).rev() {
+                    let index = usize::from(dy) * usize::from(clear.width)
+                        + usize::from(clear.width - 1 - dx);
+                    let Some(&draw) = clear.source_ruin_draws.get(index) else {
+                        continue;
+                    };
+                    let Some(definition) = cod.ruin_variant_building(
+                        clear.ruin_id,
+                        clear.fallback_uses_strand_table(index),
+                        draw,
+                    ) else {
+                        continue;
+                    };
+                    writes.push((clear.tile_x + u16::from(dx), clear.tile_y + u16::from(dy), definition));
+                }
+            }
+        }
+        if writes.is_empty() {
+            return;
+        }
+        for (x, y, definition) in writes {
+            let (Ok(x), Ok(y)) = (u8::try_from(x), u8::try_from(y)) else {
+                continue;
+            };
+            let Some(mut state) = SourceMapCellState::new_static(clear.island_id, x, y, definition, 0) else {
+                continue;
+            };
+            state.set_source_orientation(clear.source_orientation);
+            state.set_terminal_command_fields(clear.source_variant, clear.source_map_owner_slot);
+            state.configure_terminal_replacement(cod);
+            self.source_static_map_roots.retain(|cell| !cell.matches(clear.island_id, u16::from(x), u16::from(y)));
+            self.source_static_map_roots.push(state);
+        }
+        self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
     }
 
     /// Resolve the static command-root descriptor consumed by the deferred
@@ -3639,8 +3776,10 @@ mod tests {
         sim.buildings
             .push(crate::building::BuildingInstance::new(0, 3, 4, 5, 1));
         let mut state = SourceMapCellState::new(3, 4, 5, &definition, 0).unwrap();
+        state.set_terminal_command_fields(9, 6);
         state.ruin_footprint_width = 2;
         state.ruin_footprint_height = 3;
+        sim.source_static_map_roots.push(state);
         sim.source_map_cell_states.push(state);
         let action = crate::combat::SourceKind6Action {
             attacker_position: (0.0, 0.0),
@@ -3686,12 +3825,98 @@ mod tests {
                 width: 2,
                 height: 3,
                 source_orientation: 0,
+                source_variant: 9,
+                source_map_owner_slot: 6,
                 ruin_id: 4,
                 ruin_uses_strand_table: false,
+                fallback_strand_cells: 0,
                 source_ruin_draws: vec![expected_ruin_draw],
             }]
         );
         assert_eq!(sim.next_source_rand(), expected_rng.next_source_rand());
+    }
+
+    #[test]
+    fn source_root_removal_clears_selector_and_static_inventories_once() {
+        let definition = anno_formats::cod::BuildingDef {
+            kind: "HANDWERK".into(),
+            ..Default::default()
+        };
+        let state = SourceMapCellState::new(2, 7, 9, &definition, 0)
+            .expect("selector-bearing source root");
+        let mut sim = Simulation::new();
+        sim.source_map_cell_states.push(state);
+        sim.source_static_map_roots.push(state);
+
+        sim.remove_source_map_root(2, 7, 9);
+
+        assert!(sim.source_map_cell_states.is_empty());
+        assert!(sim.source_static_map_roots.is_empty());
+        assert_eq!(sim.source_map_cell_revision, 1);
+        sim.remove_source_map_root(2, 7, 9);
+        assert_eq!(sim.source_map_cell_revision, 1);
+    }
+
+    #[test]
+    fn source_footprint_removal_erases_every_overwritten_static_cell() {
+        let definition = anno_formats::cod::BuildingDef {
+            kind: "HANDWERK".into(),
+            ..Default::default()
+        };
+        let first = SourceMapCellState::new_static(2, 7, 9, &definition, 0)
+            .expect("static source cell");
+        let mut second = first;
+        second.x = 8;
+        let mut survivor = first;
+        survivor.x = 9;
+        let mut sim = Simulation::new();
+        sim.source_static_map_roots = vec![first, second, survivor];
+
+        sim.remove_source_map_footprint(2, 7, 9, 2, 1);
+
+        assert_eq!(sim.source_static_map_roots, vec![survivor]);
+        assert_eq!(sim.source_map_cell_revision, 1);
+    }
+
+    #[test]
+    fn terminal_replacement_repopulates_targetable_static_ruin_cells() {
+        let base = anno_formats::szs::INSELHAUS_SOURCE_ID_BASE;
+        let mut constants = std::collections::HashMap::new();
+        constants.insert("IDRUINE".into(), base + 1);
+        let cod = anno_formats::cod::CodFile {
+            constants,
+            buildings: vec![anno_formats::cod::BuildingDef {
+                source_id: base + 1,
+                kind: "RUINE".into(),
+                size: (1, 1),
+                ..Default::default()
+            }],
+        };
+        let clear = TileClear {
+            island_id: 2,
+            tile_x: 7,
+            tile_y: 9,
+            width: 1,
+            height: 1,
+            source_orientation: 1,
+            source_variant: 3,
+            source_map_owner_slot: 5,
+            ruin_id: 0,
+            ruin_uses_strand_table: false,
+            fallback_strand_cells: 0,
+            source_ruin_draws: vec![12],
+        };
+        let mut sim = Simulation::new();
+
+        sim.apply_source_terminal_static_replacement(&cod, &clear);
+
+        assert_eq!(sim.source_static_map_roots.len(), 1);
+        let state = sim.source_static_map_roots[0];
+        assert!(state.matches(2, 7, 9));
+        assert_eq!(state.kind_code, 12);
+        assert_eq!(state.source_orientation, 1);
+        assert_eq!(state.source_variant, 3);
+        assert_eq!(state.source_map_owner_slot, 5);
     }
 
     #[test]
