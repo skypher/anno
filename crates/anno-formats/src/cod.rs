@@ -257,6 +257,30 @@ impl BuildingDef {
             .and_then(source_ware_slot)
     }
 
+    /// Compiled `Rohstoff` selector at definition offset `+0x22`. Production
+    /// kind 2 passes this byte to `FUN_0044b7e0`, whose type-12 worker selects
+    /// a matching raw-resource map cell through `FUN_0046f920`.
+    pub fn source_raw_resource_ware_slot(&self) -> Option<u8> {
+        self.properties
+            .get("Rohstoff")
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .and_then(source_ware_slot)
+    }
+
+    /// Compiled figure definition passed by plantation production kind 2 to
+    /// `FUN_00446ca0` through `FUN_0044b7e0`.
+    pub fn source_plantation_worker_definition(&self) -> Option<u8> {
+        match self.properties.get("Figurnr").map(String::as_str) {
+            Some("MAEHER") => Some(0x60),
+            Some("STEINKLOPFER") => Some(0x61),
+            Some("HOLZFAELLER") => Some(0x62),
+            Some("PFLUECKER") => Some(0x63),
+            Some("PFLUECKER2") => Some(0x64),
+            _ => None,
+        }
+    }
+
     /// Runtime code at compiled definition offset `+0x04`, parsed from the
     /// outer `HAUS Kind:` field. The table deliberately aliases terrain and
     /// production labels into one code space; for example `STRASSE` and
@@ -1051,6 +1075,20 @@ mod tests {
         assert_eq!(cod.buildings[0].source_max_no_raw_material_count, 9);
         assert_eq!(cod.buildings[0].source_scheduler_interval, 7);
         assert_eq!(cod.buildings[0].source_resource_growth_factor, 96);
+    }
+
+    #[test]
+    fn plantation_raw_ware_and_worker_definition_follow_haus_prodtyp() {
+        let cod = CodFile::parse(
+            b"@Nummer: 1\nKind: GEBAEUDE\nObjekt: HAUS_PRODTYP\nKind: PLANTAGE\nRohstoff: GETREIDE\nFigurnr: MAEHER\nEndObj;\n",
+        )
+        .expect("parse plantation COD");
+
+        assert_eq!(cod.buildings[0].source_raw_resource_ware_slot(), Some(0x2d));
+        assert_eq!(
+            cod.buildings[0].source_plantation_worker_definition(),
+            Some(0x60)
+        );
     }
 
     #[test]

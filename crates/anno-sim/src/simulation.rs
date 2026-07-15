@@ -17,13 +17,15 @@ use crate::data_bridge::{
     SourceKind13LocationTable, SourceKind13PromotionDefinition, SourceKind4Occupant,
 };
 use crate::economy;
-use crate::entity::{ActionType, CargoRoute, Figure, SourceFigureRecordLayout};
+use crate::entity::{ActionType, CargoRoute, Figure, SourceFigureRecordLayout, SourceWorkerRoute};
 use crate::island_map::IslandMap;
 use crate::ocean_map::OceanMap;
 use crate::player::{Player, PlayerState};
 use crate::population;
 use crate::production;
-use crate::source_cell::{SourceMapCellState, SourceTransferFigure};
+use crate::source_cell::{
+    source_resource_harvest_transition, SourceMapCellState, SourceTransferFigure,
+};
 use crate::source_figure_event::SourceFigureEventRegistry;
 use crate::source_route::{
     source_route_positions, SourceDynamicMapObject, SourceDynamicMapObjectTable,
@@ -1889,6 +1891,223 @@ impl Simulation {
         self.source_figure_pool_occupancy() < SourceFigureRecordLayout::CAPACITY
     }
 
+    /// `FUN_0044b7e0`: create a production-kind-2 worker at its root. The
+    /// initial `FUN_0045afd0` handler pass performs target selection later.
+    fn try_spawn_source_plantation_worker(&mut self, root: SourceMapCellState) -> Option<Figure> {
+        if !root.is_type12_plantation_root() || !self.source_figure_pool_has_capacity() {
+            return None;
+        }
+        if self.figures.iter().any(|figure| {
+            figure.is_active()
+                && figure.source_worker_route != SourceWorkerRoute::None
+                && figure.origin_island == root.island
+                && figure.origin_x == u16::from(root.x)
+                && figure.origin_y == u16::from(root.y)
+        }) {
+            return None;
+        }
+        let map = self
+            .island_maps
+            .iter()
+            .find(|map| map.island_id == root.island)?;
+        let start = (
+            i32::from(root.x) + (i32::from(root.footprint_width.max(1)) - 1) / 2,
+            i32::from(root.y) + (i32::from(root.footprint_height.max(1)) - 1) / 2,
+        );
+
+        let event = self
+            .prepare_source_transfer_event_with_limit(root, 1)
+            .ok()
+            .flatten()?;
+        if !self.activate_source_transfer_event(event) {
+            self.source_figure_events.release(event.slot);
+            return None;
+        }
+
+        let definition = root.source_plantation_worker_definition;
+        let mut figure = Figure::new();
+        figure.action = ActionType::Walking;
+        figure.owner = root.source_map_owner_slot;
+        figure.origin_island = root.island;
+        figure.origin_x = u16::from(root.x);
+        figure.origin_y = u16::from(root.y);
+        figure.origin_kind = root.kind_code;
+        figure.origin_source_map_owner_slot = root.source_map_owner_slot;
+        figure.origin_production_kind = root.source_production_kind_code;
+        figure.tile_x = start.0;
+        figure.tile_y = start.1;
+        figure.target_x = start.0;
+        figure.target_y = start.1;
+        figure.source_worker_home_x = start.0;
+        figure.source_worker_home_y = start.1;
+        figure.select_source_animation_state(1);
+        figure.carried_good = root.source_raw_resource_ware_slot;
+        figure.source_worker_route = SourceWorkerRoute::Searching;
+        figure.speed = carrier::CARRIER_SPEED;
+        figure.source_move_speed = self
+            .civilian_config
+            .movement_speed_for_definition(definition);
+        figure.sprite_set = definition;
+        figure.base_sprite = self.civilian_config.sprite_base_for_definition(definition);
+        figure.source_position_z = map.source_terrain_height(start).unwrap_or(0.0);
+        figure.initialize_source_position();
+        figure.source_event_slot = Some(event.slot);
+        Some(figure)
+    }
+
+    /// `FUN_0045b200`: populate the source path grid around a newly spawned
+    /// worker, claim its selected raw-resource cell, and install the outbound
+    /// route. A failed search leaves the worker active at its root for a
+    /// later handler pass.
+    fn try_assign_source_plantation_worker_target(&mut self, figure_index: usize) -> bool {
+        let Some(figure) = self.figures.get(figure_index).cloned() else {
+            return false;
+        };
+        if figure.source_worker_route != SourceWorkerRoute::Searching {
+            return false;
+        }
+        let Some(root) =
+            self.source_map_cell_states.iter().copied().find(|state| {
+                state.matches(figure.origin_island, figure.origin_x, figure.origin_y)
+            })
+        else {
+            return false;
+        };
+        let candidates: Vec<_> = self
+            .source_static_map_roots
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| {
+                cell.island == figure.origin_island
+                    && cell.kind_code == 9
+                    && cell.source_output_ware_slot == figure.carried_good
+                    && cell.source_map_owner_slot == figure.origin_source_map_owner_slot
+                    && !cell.source_resource_reserved
+            })
+            .map(|(index, cell)| {
+                (
+                    index,
+                    (i32::from(cell.x), i32::from(cell.y)),
+                    cell.source_path_class,
+                )
+            })
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
+        let start = (figure.tile_x, figure.tile_y);
+        let Some((target_index, route, path)) = (|| {
+            let map = self
+                .island_maps
+                .iter()
+                .find(|map| map.island_id == figure.origin_island)?;
+            let mut grid = map.plantation_worker_path_grid(
+                start,
+                (i32::from(root.x), i32::from(root.y)),
+                (root.footprint_width, root.footprint_height),
+                root.source_transfer_radius,
+                figure.origin_source_map_owner_slot,
+                figure.carried_good,
+            );
+            for &(_, position, path_class) in &candidates {
+                let target = SourcePathTargetRect::new(position, 1, 1)?;
+                grid.set_target_region_metadata(target, (path_class & 0x7f) | 0x80);
+            }
+            let route = grid.search_source_high_metadata_target(start, 0).ok()?;
+            let target_index = candidates
+                .iter()
+                .rev()
+                .find(|(_, candidate, _)| *candidate == route.position)
+                .map(|(index, _, _)| *index)?;
+            let path = source_route_positions(start, &route.steps)?;
+            (path.last().copied() == Some(route.position)).then_some((target_index, route, path))
+        })() else {
+            return false;
+        };
+
+        self.source_static_map_roots[target_index].source_resource_reserved = true;
+        self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+        let figure = &mut self.figures[figure_index];
+        figure.target_x = route.position.0;
+        figure.target_y = route.position.1;
+        figure.supplier_x = route.position.0 as u16;
+        figure.supplier_y = route.position.1 as u16;
+        figure.source_worker_route = SourceWorkerRoute::ToResource;
+        figure.select_source_animation_state(2);
+        figure.path = path;
+        figure.path_idx = 0;
+        figure.source_step_remaining = 0.0;
+        figure.source_event_route_steps = route.steps;
+        if let Some(slot) = figure.source_event_slot {
+            self.source_figure_events
+                .write_kind12_route(slot, &figure.source_event_route_steps);
+        }
+        true
+    }
+
+    /// `FUN_0045b430` first clears the route and records the root target;
+    /// its following `FUN_0045afd0` pass computes the worker's return route.
+    fn try_assign_source_plantation_worker_return_route(&mut self, figure_index: usize) -> bool {
+        let Some(figure) = self.figures.get(figure_index).cloned() else {
+            return false;
+        };
+        if figure.source_worker_route != SourceWorkerRoute::ReturningSearch {
+            return false;
+        }
+        let start = (figure.tile_x, figure.tile_y);
+        let goal = (figure.source_worker_home_x, figure.source_worker_home_y);
+        let Some(root) =
+            self.source_map_cell_states.iter().copied().find(|state| {
+                state.matches(figure.origin_island, figure.origin_x, figure.origin_y)
+            })
+        else {
+            return false;
+        };
+        let Some((route_steps, path)) = self
+            .island_maps
+            .iter()
+            .find(|map| map.island_id == figure.origin_island)
+            .and_then(|map| {
+                let mut grid = map.plantation_worker_path_grid(
+                    start,
+                    (i32::from(root.x), i32::from(root.y)),
+                    (root.footprint_width, root.footprint_height),
+                    root.source_transfer_radius,
+                    figure.origin_source_map_owner_slot,
+                    figure.carried_good,
+                );
+                let root_target = SourcePathTargetRect::new(
+                    (
+                        i32::from(root.source_command_anchor_x),
+                        i32::from(root.source_command_anchor_y),
+                    ),
+                    usize::from(root.footprint_width.max(1)),
+                    usize::from(root.footprint_height.max(1)),
+                )?;
+                grid.set_target_region_metadata(root_target, 0x28);
+                grid.route_to(start, goal).ok()
+            })
+            .and_then(|steps| source_route_positions(start, &steps).map(|path| (steps, path)))
+        else {
+            return false;
+        };
+        if path.last().copied() != Some(goal) {
+            return false;
+        }
+
+        let figure = &mut self.figures[figure_index];
+        figure.source_worker_route = SourceWorkerRoute::Returning;
+        figure.path = path;
+        figure.path_idx = 0;
+        figure.source_step_remaining = 0.0;
+        figure.source_event_route_steps = route_steps;
+        if let Some(slot) = figure.source_event_slot {
+            self.source_figure_events
+                .write_kind12_route(slot, &figure.source_event_route_steps);
+        }
+        true
+    }
+
     /// Derive the generic figure-8 source search view from the live root
     /// buffers. `FUN_0047daf0` updates one root before entering its transfer
     /// switch, so each dispatch observes output from roots already processed
@@ -2156,6 +2375,26 @@ impl Simulation {
                     }
                 }
                 new_carriers.push(cart);
+                source_figure_slots_remaining -= 1;
+            }
+        }
+
+        let plantation_roots: Vec<_> = source_dispatch_roots
+            .iter()
+            .filter_map(|root| {
+                self.source_map_cell_states
+                    .iter()
+                    .copied()
+                    .find(|state| state.matches(root.island, u16::from(root.x), u16::from(root.y)))
+            })
+            .filter(|root| root.is_type12_plantation_root())
+            .collect();
+        for root in plantation_roots {
+            if source_figure_slots_remaining == 0 {
+                break;
+            }
+            if let Some(worker) = self.try_spawn_source_plantation_worker(root) {
+                new_carriers.push(worker);
                 source_figure_slots_remaining -= 1;
             }
         }
@@ -3192,9 +3431,41 @@ impl Simulation {
         }
 
         let mut despawn_indices = Vec::new();
+        let mut source_worker_harvests = Vec::new();
         let carrier_config = self.carrier_config;
         let city_cart_config = self.city_cart_config;
         let civilian_config = self.civilian_config;
+
+        let searching_worker_indices: Vec<_> = self
+            .figures
+            .iter()
+            .enumerate()
+            .filter_map(|(index, figure)| {
+                (figure.is_active()
+                    && figure.speed > 0
+                    && figure.move_timer_ms.saturating_add(dt_ms) >= 100
+                    && figure.source_worker_route == SourceWorkerRoute::Searching)
+                    .then_some(index)
+            })
+            .collect();
+        for index in searching_worker_indices {
+            self.try_assign_source_plantation_worker_target(index);
+        }
+        let returning_worker_indices: Vec<_> = self
+            .figures
+            .iter()
+            .enumerate()
+            .filter_map(|(index, figure)| {
+                (figure.is_active()
+                    && figure.speed > 0
+                    && figure.move_timer_ms.saturating_add(dt_ms) >= 100
+                    && figure.source_worker_route == SourceWorkerRoute::ReturningSearch)
+                    .then_some(index)
+            })
+            .collect();
+        for index in returning_worker_indices {
+            self.try_assign_source_plantation_worker_return_route(index);
+        }
 
         for (idx, figure) in self.figures.iter_mut().enumerate() {
             if !figure.is_active() {
@@ -3204,6 +3475,55 @@ impl Simulation {
             figure.move_timer_ms += dt_ms;
             while figure.speed > 0 && figure.move_timer_ms >= 100 {
                 figure.move_timer_ms -= 100;
+
+                if figure.source_worker_route == SourceWorkerRoute::Harvesting {
+                    let Some(map) = self
+                        .island_maps
+                        .iter()
+                        .find(|map| map.island_id == figure.origin_island)
+                    else {
+                        despawn_indices.push(idx);
+                        continue;
+                    };
+                    let target = (figure.supplier_x, figure.supplier_y);
+                    if let Some(cell) = self.source_static_map_roots.iter().find(|cell| {
+                        cell.matches(figure.origin_island, target.0, target.1)
+                            && cell.source_resource_reserved
+                    }) {
+                        source_worker_harvests.push((
+                            figure.origin_island,
+                            target.0,
+                            target.1,
+                            source_resource_harvest_transition(
+                                map.source_resource_strength(figure.carried_good),
+                                cell.source_resource_growth_factor,
+                                map.source_resource_attenuation(),
+                                figure.carried_good,
+                                figure.origin_island,
+                                target.0,
+                                target.1,
+                            ),
+                        ));
+                    }
+                    figure.action = ActionType::Walking;
+                    figure.target_x = figure.source_worker_home_x;
+                    figure.target_y = figure.source_worker_home_y;
+                    figure.source_worker_route = SourceWorkerRoute::ReturningSearch;
+                    figure.path.clear();
+                    figure.path_idx = 0;
+                    figure.source_step_remaining = 0.0;
+                    figure.source_event_route_steps.clear();
+                    if let Some(slot) = figure.source_event_slot {
+                        self.source_figure_events
+                            .write_kind12_route(slot, &figure.source_event_route_steps);
+                    }
+                    figure.select_source_animation_state(0);
+                    continue;
+                }
+
+                if figure.source_worker_route == SourceWorkerRoute::ReturningSearch {
+                    continue;
+                }
 
                 match figure.action {
                     ActionType::CarryingGoods | ActionType::Returning => {
@@ -3803,6 +4123,78 @@ impl Simulation {
                     | ActionType::Sailing
                     | ActionType::Patrolling
                     | ActionType::Exploring => {
+                        if figure.source_worker_route != SourceWorkerRoute::None {
+                            let Some(map) = self
+                                .island_maps
+                                .iter()
+                                .find(|map| map.island_id == figure.origin_island)
+                            else {
+                                despawn_indices.push(idx);
+                                continue;
+                            };
+                            let terrain_wegspeed = map
+                                .civilian_movement_speed((figure.tile_x, figure.tile_y))
+                                .unwrap_or(100);
+                            let next = figure
+                                .path
+                                .get(figure.path_idx)
+                                .copied()
+                                .unwrap_or((figure.target_x, figure.target_y));
+                            let moving = next != (figure.tile_x, figure.tile_y);
+                            let frame_duration_ms = carrier::source_animation_frame_duration_ms(
+                                civilian_config.frame_speed_for(figure) as u16,
+                                terrain_wegspeed,
+                                moving,
+                            );
+                            figure.advance_source_animation(
+                                100,
+                                frame_duration_ms,
+                                civilian_config.frames_per_dir,
+                            );
+                            let arrived =
+                                carrier::advance_source_carrier(figure, 100, terrain_wegspeed);
+                            if let Some(slot) = figure.source_event_slot {
+                                self.source_figure_events
+                                    .set_kind12_route_progress(slot, figure.path_idx);
+                            }
+                            if !arrived {
+                                continue;
+                            }
+
+                            match figure.source_worker_route {
+                                SourceWorkerRoute::ToResource => {
+                                    figure.action = ActionType::CarryingGoods;
+                                    figure.source_worker_route = SourceWorkerRoute::Harvesting;
+                                    figure.select_source_animation_state(2);
+                                    if let Some(slot) = figure.source_event_slot {
+                                        self.source_figure_events.set_lifecycle(slot, 2);
+                                    }
+                                }
+                                SourceWorkerRoute::Searching => {}
+                                SourceWorkerRoute::Harvesting => {}
+                                SourceWorkerRoute::Returning => {
+                                    if let Some(state) =
+                                        self.source_map_cell_states.iter_mut().find(|state| {
+                                            state.matches(
+                                                figure.origin_island,
+                                                figure.origin_x,
+                                                figure.origin_y,
+                                            )
+                                        })
+                                    {
+                                        if state.complete_zero_amount_source_delivery() {
+                                            self.source_map_cell_revision =
+                                                self.source_map_cell_revision.wrapping_add(1);
+                                        }
+                                    }
+                                    despawn_indices.push(idx);
+                                }
+                                SourceWorkerRoute::ReturningSearch => {}
+                                SourceWorkerRoute::None => {}
+                            }
+                            continue;
+                        }
+
                         if civilian_config.is_kind12(figure) && figure.source_move_speed > 0 {
                             if figure.source_event_slot.is_some_and(|slot| {
                                 self.source_figure_events
@@ -3887,6 +4279,18 @@ impl Simulation {
                         // tick_ships, free-trader, production).
                         // No-op here.
                     }
+                }
+            }
+        }
+
+        for (island, x, y, transition) in source_worker_harvests {
+            if let Some(cell) = self
+                .source_static_map_roots
+                .iter_mut()
+                .find(|cell| cell.matches(island, x, y))
+            {
+                if cell.replace_harvested_raw_resource(transition) {
+                    self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
                 }
             }
         }
@@ -5906,6 +6310,204 @@ mod tests {
                 .transfer_amount_fixed,
             129
         );
+    }
+
+    #[test]
+    fn plantation_worker_reserves_harvests_and_returns_to_its_root() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(0, 5, 1));
+
+        let plantation = CodBuilding {
+            kind: "GEBAEUDE".into(),
+            source_transfer_radius: 3,
+            properties: [
+                ("ProdKind".into(), "PLANTAGE".into()),
+                ("Rohstoff".into(), "GETREIDE".into()),
+                ("Figurnr".into(), "MAEHER".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let raw_resource = CodBuilding {
+            kind: "ROHSTOFF".into(),
+            gfx: 100,
+            source_resource_growth_factor: 128,
+            properties: [
+                ("Ware".into(), "GETREIDE".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mut root = SourceMapCellState::new(0, 0, 0, &plantation, 0).unwrap();
+        root.source_map_owner_slot = 0;
+        root.set_footprint(3, 1);
+        let mut resource = SourceMapCellState::new_static(0, 4, 0, &raw_resource, 0).unwrap();
+        resource.source_map_owner_slot = 0;
+        sim.source_map_cell_states.push(root);
+        sim.source_static_map_roots.push(resource);
+
+        sim.tick_source_map_dispatch(1_000);
+        sim.tick_production();
+
+        assert_eq!(sim.figures.len(), 1);
+        assert_eq!(
+            sim.figures[0].source_worker_route,
+            SourceWorkerRoute::Searching
+        );
+        assert_eq!(sim.figures[0].carried_good, 0x2d);
+        assert_eq!(sim.figures[0].source_animation_state, 1);
+        assert_eq!(
+            (
+                sim.figures[0].source_worker_home_x,
+                sim.figures[0].source_worker_home_y,
+            ),
+            (1, 0)
+        );
+        assert!(!sim.source_static_map_roots[0].source_resource_reserved);
+        let event_slot = sim.figures[0]
+            .source_event_slot
+            .expect("plantation worker owns a source event");
+        assert!(!sim
+            .source_figure_events
+            .slot(event_slot)
+            .expect("worker event slot is present")
+            .is_free());
+        sim.source_map_cell_states[0].scheduler_cooldown = 11;
+        sim.source_map_cell_states[0].source_production_time = 48;
+
+        sim.tick_entities(99);
+        assert_eq!(
+            sim.figures[0].source_worker_route,
+            SourceWorkerRoute::Searching
+        );
+        assert!(!sim.source_static_map_roots[0].source_resource_reserved);
+
+        sim.tick_entities(1);
+        assert_eq!(
+            sim.figures[0].source_worker_route,
+            SourceWorkerRoute::ToResource
+        );
+        assert!(sim.source_static_map_roots[0].source_resource_reserved);
+        assert_eq!(sim.figures[0].source_animation_state, 2);
+
+        for _ in 0..100 {
+            if sim.figures[0].source_worker_route == SourceWorkerRoute::Harvesting {
+                break;
+            }
+            sim.tick_entities(100);
+        }
+
+        assert_eq!(sim.source_static_map_roots[0].kind_code, 9);
+        assert!(sim.source_static_map_roots[0].source_resource_reserved);
+        assert_eq!(sim.figures[0].action, ActionType::CarryingGoods);
+        assert_eq!(sim.figures[0].source_animation_state, 2);
+        assert_eq!(
+            sim.figures[0].source_worker_route,
+            SourceWorkerRoute::Harvesting
+        );
+        assert_eq!(
+            sim.source_figure_events
+                .slot(event_slot)
+                .expect("worker event slot is retained")
+                .lifecycle,
+            2
+        );
+
+        sim.tick_entities(100);
+        assert_eq!(sim.source_static_map_roots[0].source_definition_offset, 99);
+        assert_eq!(sim.source_static_map_roots[0].kind_code, 10);
+        assert!(!sim.source_static_map_roots[0].source_resource_reserved);
+        assert_eq!(sim.figures.len(), 1);
+        assert_eq!(sim.figures[0].source_animation_state, 0);
+        assert_eq!(
+            sim.figures[0].source_worker_route,
+            SourceWorkerRoute::ReturningSearch
+        );
+
+        sim.tick_entities(100);
+        assert_eq!(
+            sim.figures[0].source_worker_route,
+            SourceWorkerRoute::Returning
+        );
+        assert_eq!((sim.figures[0].target_x, sim.figures[0].target_y), (1, 0));
+
+        for _ in 0..100 {
+            if sim.figures.is_empty() {
+                break;
+            }
+            sim.tick_entities(100);
+        }
+
+        assert!(sim.figures.is_empty());
+        assert_eq!(sim.source_map_cell_states[0].scheduler_cooldown, 0);
+        assert_eq!(sim.source_map_cell_states[0].source_production_time, 37);
+        assert!(sim
+            .source_figure_events
+            .slot(event_slot)
+            .expect("released worker event slot is retained")
+            .is_free());
+    }
+
+    #[test]
+    fn plantation_worker_retries_after_ignoring_raw_resources_outside_its_authored_radius() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(0, 4, 1));
+        let plantation = CodBuilding {
+            kind: "GEBAEUDE".into(),
+            source_transfer_radius: 2,
+            properties: [
+                ("ProdKind".into(), "PLANTAGE".into()),
+                ("Rohstoff".into(), "GETREIDE".into()),
+                ("Figurnr".into(), "MAEHER".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let raw_resource = CodBuilding {
+            kind: "ROHSTOFF".into(),
+            properties: [
+                ("Ware".into(), "GETREIDE".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        sim.source_map_cell_states
+            .push(SourceMapCellState::new(0, 0, 0, &plantation, 0).unwrap());
+        sim.source_static_map_roots
+            .push(SourceMapCellState::new_static(0, 3, 0, &raw_resource, 0).unwrap());
+
+        sim.tick_source_map_dispatch(1_000);
+        sim.tick_production();
+
+        assert_eq!(sim.figures.len(), 1);
+        assert_eq!(
+            sim.figures[0].source_worker_route,
+            SourceWorkerRoute::Searching
+        );
+        assert!(!sim.source_static_map_roots[0].source_resource_reserved);
+        sim.tick_entities(100);
+        assert_eq!(
+            sim.figures[0].source_worker_route,
+            SourceWorkerRoute::Searching
+        );
+        assert!(!sim.source_static_map_roots[0].source_resource_reserved);
+
+        sim.source_static_map_roots
+            .push(SourceMapCellState::new_static(0, 1, 0, &raw_resource, 0).unwrap());
+        sim.tick_entities(100);
+
+        assert_eq!(
+            sim.figures[0].source_worker_route,
+            SourceWorkerRoute::ToResource
+        );
+        assert!(!sim.source_static_map_roots[0].source_resource_reserved);
+        assert!(sim.source_static_map_roots[1].source_resource_reserved);
     }
 
     #[test]

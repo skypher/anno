@@ -1880,7 +1880,10 @@ pub fn load_building_instances(
 /// Replay INSELHAUS overwrite order into the renderer-relevant subset of the
 /// source map-cell records. `FUN_00481450` removes records whose command
 /// roots are overwritten before `FUN_00481fc0` creates the new root record;
-/// this bridge retains the selector-bearing source kinds 1 through 8.
+/// this bridge retains the selector-bearing source kinds 1 through 8 plus
+/// nested production-kind-2 plantation roots. Their outer map kind only
+/// supplies the command footprint; `FUN_0047daf0` dispatches workers through
+/// the nested production kind.
 pub fn source_map_cell_states_from_scenario(
     szs: &SzsFile,
     cod: &CodFile,
@@ -2063,6 +2066,7 @@ fn source_map_roots_from_scenario(
             if !include_all_static_kinds
                 && !matches!(definition.source_kind_code(), Some(1..=8 | 30))
                 && !matches!(definition.source_production_kind_code(), Some(7 | 8 | 30))
+                && !static_state.is_some_and(SourceMapCellState::is_type12_plantation_root)
             {
                 continue;
             }
@@ -3021,6 +3025,70 @@ mod tests {
         assert!(static_cells
             .iter()
             .any(|state| { state.matches(6, 3, 4) && state.kind_code == 14 }));
+    }
+
+    #[test]
+    fn source_cell_seeder_retains_type_twelve_plantation_roots() {
+        use anno_formats::szs::{Island, IslandTile, ScenarioMeta};
+
+        let base = anno_formats::szs::INSELHAUS_SOURCE_ID_BASE;
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![CodBuilding {
+                source_id: base + 1,
+                kind: "GEBAEUDE".into(),
+                size: (2, 3),
+                properties: [
+                    ("ProdKind".into(), "PLANTAGE".into()),
+                    ("Rohstoff".into(), "GETREIDE".into()),
+                    ("Figurnr".into(), "MAEHER".into()),
+                ]
+                .into(),
+                ..Default::default()
+            }],
+        };
+        let szs = SzsFile {
+            chunks: Vec::new(),
+            islands: vec![Island {
+                number: 6,
+                width: 16,
+                height: 16,
+                x_pos: 0,
+                y_pos: 0,
+                fertilities: [7; 8],
+                tiles: vec![IslandTile {
+                    building_id: 1,
+                    x: 3,
+                    y: 4,
+                    orientation: 1,
+                    anim_count: 0,
+                    flags: 0,
+                }],
+                city: None,
+            }],
+            players: Vec::new(),
+            mission: None,
+            scenario: ScenarioMeta::default(),
+            ships: Vec::new(),
+            land_figures: Vec::new(),
+        };
+
+        let states = source_map_cell_states_from_scenario(&szs, &cod);
+        assert_eq!(states.len(), 1);
+        assert!(states[0].matches(6, 3, 4));
+        assert_eq!(
+            (
+                states[0].source_command_anchor_x,
+                states[0].source_command_anchor_y
+            ),
+            (3, 4)
+        );
+        assert_eq!(
+            (states[0].footprint_width, states[0].footprint_height),
+            (3, 2)
+        );
+        assert_eq!(states[0].source_orientation, 1);
+        assert!(states[0].is_type12_plantation_root());
     }
 
     #[test]

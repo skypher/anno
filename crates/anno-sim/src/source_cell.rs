@@ -202,6 +202,23 @@ pub struct SourceMapCellState {
     /// prevents `FUN_0047daf0` from deriving a nonzero production activity.
     #[serde(default)]
     pub source_output_ware_slot: u8,
+    /// Compiled `Rohstoff` selector at definition offset `+0x22`. Case 2 of
+    /// `FUN_0047daf0` gives this raw-resource ware to `FUN_0044b7e0`.
+    #[serde(default)]
+    pub source_raw_resource_ware_slot: u8,
+    /// Compiled worker definition passed to `FUN_00446ca0` by
+    /// `FUN_0044b7e0`: MAEHER through PFLUECKER2 occupy 0x60..=0x64.
+    #[serde(default)]
+    pub source_plantation_worker_definition: u8,
+    /// The transient `0x20000000` map bit set after `FUN_0046f920` selects a
+    /// raw-resource cell and cleared by `FUN_0047c830` on harvest.
+    #[serde(default)]
+    pub source_resource_reserved: bool,
+    /// Low seven bits copied by `FUN_0046f920` from compiled
+    /// `Wegspeed[0]`; the selector sets bit 7 while the cell is a candidate
+    /// target in the source weighted path grid.
+    #[serde(default)]
+    pub source_path_class: u8,
     /// Compiled `Randwachs` at definition offset `+0x40`, in the source's
     /// 128-scale. `FUN_004684a0` combines it with the island's live resource
     /// strength when `FUN_0047c830` replaces a harvested raw-resource cell.
@@ -216,9 +233,16 @@ pub struct SourceMapCellState {
     /// it beside the identified root preserves the same threshold lifetime.
     #[serde(default)]
     pub source_damage_accumulator: u16,
-    /// Source u16 `+0x10`, advanced by the map-cell scheduler and selected
-    /// transfers; kind 7 (`MARKT`) renders this accumulator.
+    /// Source u16 `+0x10`, the produced-stock accumulator advanced by the
+    /// map-cell scheduler. Kind 7 (`MARKT`) also receives completed transfer
+    /// amounts into this field.
     pub progress: u16,
+    /// Source u16 `+0x12`, the production-time accumulator. Each scheduler
+    /// run adds its selected interval, and `FUN_0047d940` subtracts the
+    /// current scheduler cooldown when an idle ordinary source receives a
+    /// completed delivery, including a zero-amount plantation worker return.
+    #[serde(default)]
+    pub source_production_time: u16,
     /// Compiled `AnimFrame` retained for `FUN_004638c0` transitions.
     pub animation_frame: i32,
     /// Compiled `AnimAnz` retained for `FUN_004638c0` transitions.
@@ -235,11 +259,16 @@ pub struct SourceMapCellState {
 }
 
 impl SourceMapCellState {
-    /// Construct the selector-bearing subset of a zeroed
-    /// `FUN_00481fc0` map-cell record.
+    /// Construct the source roots that own scheduler or transfer dispatch.
+    /// Besides the outer selector kinds retained by `FUN_00481fc0`, this
+    /// includes nested production-kind-2 plantations, whose worker event is
+    /// allocated through `FUN_0044b7e0` from the source command root.
     pub fn new(island: u8, x: u8, y: u8, definition: &BuildingDef, phase: u8) -> Option<Self> {
         let state = Self::new_static(island, x, y, definition, phase)?;
-        (matches!(state.kind_code, 1..=8 | 30) || state.is_type11_transfer_root()).then_some(state)
+        (matches!(state.kind_code, 1..=8 | 30)
+            || state.is_type11_transfer_root()
+            || state.is_type12_plantation_root())
+        .then_some(state)
     }
 
     /// Construct terminal metadata for any compiled static map root. Unlike
@@ -305,10 +334,22 @@ impl SourceMapCellState {
             source_scheduler_interval: definition.source_scheduler_interval,
             source_no_raw_material_count: 0,
             source_output_ware_slot: definition.source_ware_slot().unwrap_or_default(),
+            source_raw_resource_ware_slot: definition
+                .source_raw_resource_ware_slot()
+                .unwrap_or_default(),
+            source_plantation_worker_definition: definition
+                .source_plantation_worker_definition()
+                .unwrap_or_default(),
+            source_resource_reserved: false,
+            source_path_class: definition
+                .source_path_classes()
+                .map(|classes| classes[0])
+                .unwrap_or_default(),
             source_resource_growth_factor: definition.source_resource_growth_factor,
             source_damage_threshold: definition.source_damage_threshold,
             source_damage_accumulator: 0,
             progress: 0,
+            source_production_time: 0,
             animation_frame: definition.anim_frame,
             animation_count: definition.anim_anz,
             animation_continues: definition.animation_continues,
@@ -330,6 +371,47 @@ impl SourceMapCellState {
     #[inline]
     pub const fn is_type8_transfer_root(self) -> bool {
         self.source_production_kind_code == 1
+    }
+
+    /// Production kind 2 reaches `FUN_0044b7e0` only after the scheduler
+    /// leaves its activity byte at zero. The outer map kind determines the
+    /// command footprint, while the nested kind selects this worker branch.
+    /// The allocator needs both authored selectors; raw-resource definitions
+    /// themselves carry no worker ID.
+    #[inline]
+    pub const fn is_type12_plantation_root(self) -> bool {
+        self.source_production_kind_code == 2
+            && self.activity == 0
+            && self.source_raw_resource_ware_slot != 0
+            && self.source_plantation_worker_definition != 0
+    }
+
+    /// Model the state written by `FUN_0047c830` after a type-12 worker
+    /// harvests this kind-9 cell. Both adjacent authored records inherit the
+    /// preceding `ROHSTWACHS` definition's `WALD` map kind and `NOWARE`
+    /// selector; only their definition index distinguishes regrowth from dry.
+    pub fn replace_harvested_raw_resource(
+        &mut self,
+        transition: SourceResourceHarvestTransition,
+    ) -> bool {
+        if self.kind_code != 9 {
+            self.source_resource_reserved = false;
+            return false;
+        }
+        self.source_definition_offset = match transition {
+            SourceResourceHarvestTransition::Regrowth => {
+                self.source_definition_offset.saturating_sub(1)
+            }
+            SourceResourceHarvestTransition::Drought => {
+                self.source_definition_offset.saturating_add(1)
+            }
+        };
+        self.kind_code = 10;
+        self.source_output_ware_slot = 0;
+        self.source_raw_resource_ware_slot = 0;
+        self.source_plantation_worker_definition = 0;
+        self.source_resource_reserved = false;
+        true
     }
 
     /// The scheduler reaches its transfer switch only when its newly written
@@ -388,7 +470,9 @@ impl SourceMapCellState {
     /// Complete one executed `FUN_0047daf0` root branch. Idle and
     /// storage-blocked roots receive its fixed 11-phase retry; an active root
     /// reloads `ceil(Interval × activity / 128)` from definition offset
-    /// `+0x3a`.
+    /// `+0x3a`. The root records that interval in source u16 `+0x12`; once
+    /// the accumulator exceeds 239, both it and the produced-stock `+0x10`
+    /// are halved.
     pub fn complete_source_scheduler_run(&mut self) {
         if self.activity != 0 {
             self.source_no_raw_material_count = 0;
@@ -402,6 +486,13 @@ impl SourceMapCellState {
             ((u32::from(self.source_scheduler_interval) * u32::from(self.activity) + 127) >> 7)
                 as u16
         };
+        self.source_production_time = self
+            .source_production_time
+            .wrapping_add(self.scheduler_cooldown);
+        if self.source_production_time > 0xef {
+            self.source_production_time >>= 1;
+            self.progress >>= 1;
+        }
     }
 
     /// Apply the source byte `+0x0f` transition used by the map-state
@@ -648,6 +739,27 @@ impl SourceMapCellState {
         true
     }
 
+    /// Replay the ordinary-source zero-amount completion in `FUN_0047d940`.
+    /// The function first adds the delivered amount to an input buffer (a
+    /// no-op here), then clears an idle root's cooldown after subtracting it
+    /// from source u16 `+0x12`. The executable switches on compiled nested
+    /// production kind `+0x1c`, so kinds 7, 8, 14, and 15 take distinct
+    /// source-record branches and leave this record unchanged.
+    pub fn complete_zero_amount_source_delivery(&mut self) -> bool {
+        match self.source_production_kind_code {
+            7 | 8 | 14 | 15 => false,
+            _ => {
+                if self.activity == 0 {
+                    self.source_production_time = self
+                        .source_production_time
+                        .wrapping_sub(self.scheduler_cooldown);
+                    self.scheduler_cooldown = 0;
+                }
+                true
+            }
+        }
+    }
+
     /// Compute `FUN_0047daf0`'s source fixed-point activity ratio from the
     /// live `Rohmenge` and `Workmenge` buffers. The executable caps each
     /// operand at 128 and cancels work below 64/128.
@@ -799,10 +911,12 @@ mod tests {
         state.activity = 0;
         state.complete_source_scheduler_run();
         assert_eq!(state.scheduler_cooldown, 11);
+        assert_eq!(state.source_production_time, 11);
         state.source_scheduler_interval = 5;
         state.activity = 64;
         state.complete_source_scheduler_run();
         assert_eq!(state.scheduler_cooldown, 3);
+        assert_eq!(state.source_production_time, 14);
 
         state.activity = 128;
         state.block_source_scheduler();
@@ -811,6 +925,33 @@ mod tests {
         state.unblock_source_scheduler();
         assert!(!state.scheduler_blocked);
         assert_eq!(state.activity, 0);
+    }
+
+    #[test]
+    fn zero_amount_delivery_updates_only_the_ordinary_source_record_branch() {
+        let mut ordinary = SourceMapCellState::new(0, 0, 0, &definition(), 0).unwrap();
+        ordinary.scheduler_cooldown = 11;
+        ordinary.source_production_time = 48;
+        assert!(ordinary.complete_zero_amount_source_delivery());
+        assert_eq!(ordinary.scheduler_cooldown, 0);
+        assert_eq!(ordinary.source_production_time, 37);
+
+        let mut special = SourceMapCellState::new(
+            0,
+            0,
+            0,
+            &BuildingDef {
+                kind: "MARKT".into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        special.scheduler_cooldown = 11;
+        special.source_production_time = 48;
+        assert!(!special.complete_zero_amount_source_delivery());
+        assert_eq!(special.scheduler_cooldown, 11);
+        assert_eq!(special.source_production_time, 48);
     }
 
     #[test]
@@ -844,6 +985,13 @@ mod tests {
         state.complete_source_scheduler_run();
         assert_eq!(state.source_no_raw_material_count, 0);
         assert_eq!(state.source_max_no_raw_material_count, 9);
+
+        state.source_production_time = 239;
+        state.progress = 100;
+        state.activity = 0;
+        state.complete_source_scheduler_run();
+        assert_eq!(state.source_production_time, 125);
+        assert_eq!(state.progress, 50);
     }
 
     #[test]
@@ -1314,6 +1462,43 @@ mod tests {
 
         assert_eq!(state.kind_code, 9);
         assert_eq!(state.source_resource_growth_factor, 96);
+    }
+
+    #[test]
+    fn plantation_root_and_harvest_replacement_keep_the_source_selectors() {
+        let plantation = BuildingDef {
+            kind: "GEBAEUDE".into(),
+            properties: [
+                ("ProdKind".into(), "PLANTAGE".into()),
+                ("Rohstoff".into(), "GETREIDE".into()),
+                ("Figurnr".into(), "MAEHER".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let root = SourceMapCellState::new(1, 2, 3, &plantation, 0).unwrap();
+        assert!(root.is_type12_plantation_root());
+        assert_eq!(root.source_raw_resource_ware_slot, 0x2d);
+        assert_eq!(root.source_plantation_worker_definition, 0x60);
+
+        let raw = BuildingDef {
+            kind: "ROHSTOFF".into(),
+            gfx: 100,
+            properties: [
+                ("Ware".into(), "GETREIDE".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mut cell = SourceMapCellState::new_static(1, 7, 9, &raw, 0).unwrap();
+        assert_eq!(cell.source_path_class, 46);
+        cell.source_resource_reserved = true;
+        assert!(cell.replace_harvested_raw_resource(SourceResourceHarvestTransition::Regrowth));
+        assert_eq!(cell.source_definition_offset, 99);
+        assert_eq!(cell.kind_code, 10);
+        assert_eq!(cell.source_output_ware_slot, 0);
+        assert!(!cell.source_resource_reserved);
     }
 
     #[test]

@@ -73,6 +73,21 @@ pub enum CargoRoute {
     CityCart = 1,
 }
 
+/// The production-kind-2 type-12 plantation-worker state machine. This is
+/// separate from `CargoRoute`: workers reach a map cell, switch through the
+/// source lifecycle-2 harvest state, then return empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum SourceWorkerRoute {
+    #[default]
+    None = 0,
+    ToResource = 1,
+    Searching = 2,
+    Harvesting = 3,
+    Returning = 4,
+    ReturningSearch = 5,
+}
+
 /// A figure/entity in the world.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Figure {
@@ -158,6 +173,17 @@ pub struct Figure {
     /// Which source transfer handler owns this figure.
     #[serde(default)]
     pub cargo_route: CargoRoute,
+    /// Active only for the `FUN_0044b7e0` / `FUN_0045afd0` plantation worker
+    /// path. The selected raw cell is retained in `supplier_x/y`.
+    #[serde(default)]
+    pub source_worker_route: SourceWorkerRoute,
+    /// Centered root coordinate stored in the worker's source event at
+    /// `FUN_0044b7e0` construction time. It can differ from `origin_x/y`,
+    /// which retain the command anchor for root-state lookup.
+    #[serde(default)]
+    pub source_worker_home_x: i32,
+    #[serde(default)]
+    pub source_worker_home_y: i32,
 
     /// Type-11 city-cart origin. Type-8 figures retain their requesting
     /// building through `building_idx` and leave these fields at zero.
@@ -208,6 +234,13 @@ pub struct Figure {
     #[serde(default)]
     pub source_animation_elapsed_ms: u32,
 
+    /// Current generic-figure animation selector. `FUN_00446d90` resets the
+    /// animation counters when this changes to a distinct authored selector;
+    /// the plantation path changes from 0 to 2 for its outbound search and
+    /// back to 0 after harvesting.
+    #[serde(default)]
+    pub source_animation_state: u8,
+
     /// Movement timer accumulator.
     pub move_timer_ms: u32,
 
@@ -254,6 +287,9 @@ impl Figure {
             supplier_x: 0,
             supplier_y: 0,
             cargo_route: CargoRoute::InputCarrier,
+            source_worker_route: SourceWorkerRoute::None,
+            source_worker_home_x: 0,
+            source_worker_home_y: 0,
             origin_island: 0,
             origin_x: 0,
             origin_y: 0,
@@ -268,6 +304,7 @@ impl Figure {
             health: 0,
             anim_frame: 0,
             source_animation_elapsed_ms: 0,
+            source_animation_state: 0,
             move_timer_ms: 0,
             sprite_set: 0,
             base_sprite: 0,
@@ -294,6 +331,15 @@ impl Figure {
     pub fn reset_source_animation(&mut self) {
         self.anim_frame = 0;
         self.source_animation_elapsed_ms = 0;
+    }
+
+    /// Mirror the counter-reset portion of `FUN_00446d90` for source figure
+    /// states whose compiled animation descriptors differ.
+    pub fn select_source_animation_state(&mut self, state: u8) {
+        if self.source_animation_state != state {
+            self.source_animation_state = state;
+            self.reset_source_animation();
+        }
     }
 
     /// Advance an `ENDLESS` source animation using the selected frame's
@@ -342,6 +388,28 @@ mod tests {
 
         assert_eq!(figure.anim_frame, 0);
         assert_eq!(figure.source_animation_elapsed_ms, 0);
+    }
+
+    #[test]
+    fn source_animation_state_reset_occurs_only_on_selection_change() {
+        let mut figure = super::Figure::new();
+        figure.anim_frame = 3;
+        figure.source_animation_elapsed_ms = 71;
+
+        figure.select_source_animation_state(2);
+        assert_eq!(figure.source_animation_state, 2);
+        assert_eq!(
+            (figure.anim_frame, figure.source_animation_elapsed_ms),
+            (0, 0)
+        );
+
+        figure.anim_frame = 4;
+        figure.source_animation_elapsed_ms = 17;
+        figure.select_source_animation_state(2);
+        assert_eq!(
+            (figure.anim_frame, figure.source_animation_elapsed_ms),
+            (4, 17)
+        );
     }
 
     #[test]

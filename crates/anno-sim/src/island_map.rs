@@ -27,6 +27,8 @@ struct SourceCivilianPathCell {
     production_kind_code: u8,
     kind3_center_cell: bool,
     owner: u8,
+    source_ware_slot: u8,
+    plantation_path_class: u8,
     path_class: u8,
 }
 
@@ -181,16 +183,13 @@ impl IslandMap {
                         let source_cell_index = match tile.orientation & 3 {
                             0 => dy * def.size.0 + dx,
                             1 => (def.size.1 - 1 - dx) * def.size.0 + dy,
-                            2 => {
-                                (def.size.1 - 1 - dy) * def.size.0 + (def.size.0 - 1 - dx)
-                            }
+                            2 => (def.size.1 - 1 - dy) * def.size.0 + (def.size.0 - 1 - dx),
                             _ => dx * def.size.0 + (def.size.0 - 1 - dy),
                         };
                         source_map_kind_cells[idx] = Some(SourceMapKindCell {
                             kind_code: def.source_kind_code().unwrap_or(u8::MAX),
                             kind3_center_cell: def.source_kind_code() == Some(3)
-                                && source_cell_index
-                                    == def.size.0.saturating_mul(def.size.1) / 2,
+                                && source_cell_index == def.size.0.saturating_mul(def.size.1) / 2,
                         });
                         walkable[idx] = is_walkable;
                         road[idx] = is_road;
@@ -210,6 +209,8 @@ impl IslandMap {
                                     && source_cell_index
                                         == def.size.0.saturating_mul(def.size.1) / 2,
                                 owner: tile.source_owner(),
+                                source_ware_slot: def.source_ware_slot().unwrap_or_default(),
+                                plantation_path_class: path_classes[0],
                                 path_class: path_classes[3],
                             });
                         } else {
@@ -217,16 +218,12 @@ impl IslandMap {
                         }
                         source_terrain_heights[idx] = def.source_position_offset as f32 * 0.028;
                         source_land_target_sizes[idx] = source_land_target_size;
-                        let raw_origin = (
-                            source_world_origin.0 + x * 2,
-                            source_world_origin.1 + y * 2,
-                        );
+                        let raw_origin =
+                            (source_world_origin.0 + x * 2, source_world_origin.1 + y * 2);
                         for raw_y in raw_origin.1..=raw_origin.1 + 1 {
                             for raw_x in raw_origin.0..=raw_origin.0 + 1 {
-                                source_kind4_line_of_fire_template.set_direction_marker(
-                                    (raw_x, raw_y),
-                                    line_of_fire_direction,
-                                );
+                                source_kind4_line_of_fire_template
+                                    .set_direction_marker((raw_x, raw_y), line_of_fire_direction);
                             }
                         }
                         if kind == "KONTOR" {
@@ -415,6 +412,56 @@ impl IslandMap {
         self.carrier_path_template.clone()
     }
 
+    /// Rebuild the local type-12 plantation-worker grid made by
+    /// `FUN_0046f920` and `FUN_004710b0`. The source admits its fixed terrain
+    /// kinds, plus cells owned by the root whose compiled ware is the worker's
+    /// `Rohstoff`; the root footprint itself carries metadata `0x28`.
+    pub fn plantation_worker_path_grid(
+        &self,
+        center: (i32, i32),
+        root: (i32, i32),
+        footprint: (u8, u8),
+        radius: u8,
+        source_owner: u8,
+        raw_resource_ware_slot: u8,
+    ) -> SourcePathGrid {
+        let radius_usize = usize::from(radius);
+        let radius = i32::from(radius);
+        let width = usize::from(footprint.0.max(1)).saturating_add(radius.max(0) as usize * 2);
+        let height = usize::from(footprint.1.max(1)).saturating_add(radius.max(0) as usize * 2);
+        let origin = (center.0 - radius, center.1 - radius);
+        let mut grid = SourcePathGrid::new(origin, width, height);
+
+        for y in origin.1..origin.1 + height as i32 {
+            for x in origin.0..origin.0 + width as i32 {
+                grid.mark_direction_blocker((x, y));
+                let Some(cell) = self.civilian_path_cell((x, y)) else {
+                    continue;
+                };
+                let fixed_terrain = matches!(cell.kind_code, 1 | 11 | 12 | 13 | 18 | 29 | 30);
+                let matching_raw_resource =
+                    cell.owner == source_owner && cell.source_ware_slot == raw_resource_ware_slot;
+                if fixed_terrain || matching_raw_resource {
+                    grid.set_traversable_cell((x, y), cell.plantation_path_class);
+                }
+            }
+        }
+
+        if let Some(target) = SourcePathTargetRect::new(
+            root,
+            usize::from(footprint.0.max(1)),
+            usize::from(footprint.1.max(1)),
+        ) {
+            grid.set_target_region_metadata(target, 0x28);
+        }
+        let _ = grid.block_outside_source_radius_mask(
+            radius_usize,
+            usize::from(footprint.0.max(1)),
+            usize::from(footprint.1.max(1)),
+        );
+        grid
+    }
+
     /// Rebuild the `11 x 11` type-3 path window passed to
     /// `FUN_0046c7d0` by `FUN_0044b140`. The source first blocks every cell,
     /// then permits fixed terrain kinds 1, 13, 18, and 30 plus the selected
@@ -471,10 +518,7 @@ impl IslandMap {
     /// when the target map-owner selector matches the center cell. The
     /// `0x2000` mask supplied by both callers contains only that dynamic
     /// kind-13 permission.
-    pub fn source_kind13_transfer_path_grid(
-        &self,
-        center: (i32, i32),
-    ) -> Option<SourcePathGrid> {
+    pub fn source_kind13_transfer_path_grid(&self, center: (i32, i32)) -> Option<SourcePathGrid> {
         const RADIUS: i32 = 0x28;
         let center_cell = self.civilian_path_cell(center)?;
         let center_index = self.local_index(center)?;
@@ -555,9 +599,8 @@ impl IslandMap {
         };
         let (x, y) = origin;
         let edge_cell_allowed = |position| {
-            self.source_map_kind_cell(position).is_some_and(|cell| {
-                matches!(cell.kind_code, 1 | 18) || cell.kind3_center_cell
-            })
+            self.source_map_kind_cell(position)
+                .is_some_and(|cell| matches!(cell.kind_code, 1 | 18) || cell.kind3_center_cell)
         };
         let x_end = (x + width).min(i32::from(self.width));
         let y_end = (y + height).min(i32::from(self.height));
@@ -649,11 +692,7 @@ impl IslandMap {
     /// all have source tag 4; the source adds directional unit footprints
     /// only for tags 1 through 3. The remaining relevant overlay is the
     /// static map's `0x0d` cells retained above.
-    pub fn source_kind4_line_of_fire_clear(
-        &self,
-        start: (i32, i32),
-        end: (i32, i32),
-    ) -> bool {
+    pub fn source_kind4_line_of_fire_clear(&self, start: (i32, i32), end: (i32, i32)) -> bool {
         self.source_kind4_line_of_fire_template
             .direction_13_ray_clear(start, end, u32::MAX)
     }
@@ -662,13 +701,12 @@ impl IslandMap {
     /// executable resolves the raw coordinate back to its INSEL5 cell and
     /// accepts only the fixed terrain kinds used by `FUN_0046f460`.
     pub fn source_land_partial_marker_allowed(&self, position: (i32, i32)) -> bool {
-        self.source_world_to_local(position)
-            .is_some_and(|local| {
-                matches!(
-                    self.civilian_path_kind(local),
-                    Some(1 | 11 | 12 | 13 | 18 | 29 | 30)
-                )
-            })
+        self.source_world_to_local(position).is_some_and(|local| {
+            matches!(
+                self.civilian_path_kind(local),
+                Some(1 | 11 | 12 | 13 | 18 | 29 | 30)
+            )
+        })
     }
 
     /// Raw type-3 terrain speed for kind-12 civilian movement.
@@ -916,6 +954,8 @@ impl IslandMap {
                     production_kind_code: u8::MAX,
                     kind3_center_cell: false,
                     owner: 0,
+                    source_ware_slot: 0,
+                    plantation_path_class: 32,
                     path_class: 32,
                 });
                 size
@@ -1096,9 +1136,9 @@ mod tests {
         let map = IslandMap::from_island(&island, &[building]);
 
         assert_eq!(
-            map.source_land_target_rect(
-                SourceTargetDescriptor::from_source_kind34_island_cell(10, 1, 2)
-            ),
+            map.source_land_target_rect(SourceTargetDescriptor::from_source_kind34_island_cell(
+                10, 1, 2
+            )),
             SourcePathTargetRect::new((222, 264), 8, 4)
         );
         assert_eq!(
@@ -1358,10 +1398,7 @@ mod tests {
             properties: path_properties(),
             ..Default::default()
         };
-        let map = IslandMap::from_island(
-            &island,
-            &[residences, ground, blocked, same_owner_plaza],
-        );
+        let map = IslandMap::from_island(&island, &[residences, ground, blocked, same_owner_plaza]);
         let grid = map.source_kind13_transfer_path_grid((1, 0)).unwrap();
 
         assert_eq!(grid.metadata((-39, 0)), Some(0));
@@ -1461,6 +1498,36 @@ mod tests {
         assert_eq!(map.carrier_movement_speed((0, 0)), Some(100));
         assert_eq!(map.city_cart_movement_speed((0, 0)), Some(150));
         assert!((map.source_terrain_height((0, 0)).unwrap() - 0.28).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn plantation_worker_grid_marks_only_matching_raw_resource_cells() {
+        let mut map = IslandMap::new_open(3, 3, 1);
+        map.civilian_path_cells[1] = Some(SourceCivilianPathCell {
+            kind_code: 9,
+            production_kind_code: u8::MAX,
+            kind3_center_cell: false,
+            owner: 2,
+            source_ware_slot: 0x2d,
+            plantation_path_class: 41,
+            path_class: 41,
+        });
+        map.civilian_path_cells[2] = Some(SourceCivilianPathCell {
+            kind_code: 9,
+            production_kind_code: u8::MAX,
+            kind3_center_cell: false,
+            owner: 2,
+            source_ware_slot: 0x2e,
+            plantation_path_class: 42,
+            path_class: 42,
+        });
+
+        let grid = map.plantation_worker_path_grid((0, 0), (0, 0), (1, 1), 2, 2, 0x2d);
+
+        assert_eq!(grid.metadata((0, 0)), Some(0x28));
+        assert_eq!(grid.metadata((1, 0)), Some(41));
+        assert!(grid.route_to((0, 0), (1, 0)).is_ok());
+        assert!(grid.route_to((0, 0), (2, 0)).is_err());
     }
 
     #[test]

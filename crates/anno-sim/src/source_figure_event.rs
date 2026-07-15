@@ -323,6 +323,21 @@ impl SourceFigureEventRegistry {
         self.set_kind12_route_progress(slot, completed_steps)
     }
 
+    /// Update source byte `+0x01` for handlers whose figure lifecycle has a
+    /// distinct intermediate state. `FUN_0045afd0` advances a plantation
+    /// worker from lifecycle one to two after it reaches its selected raw
+    /// resource, then consumes the resource on the next handler pass.
+    pub fn set_lifecycle(&mut self, slot: u16, lifecycle: u8) -> bool {
+        let Some(entry) = self.slots.get_mut(usize::from(slot)) else {
+            return false;
+        };
+        if entry.is_free() {
+            return false;
+        }
+        entry.lifecycle = lifecycle;
+        true
+    }
+
     /// Release the coordinate pair exactly as the kind-12 branch in
     /// `FUN_00443520`, preserving the remaining event bytes except source
     /// lifecycle byte `+0x01`, which becomes `0xff`. Invalid indices are not
@@ -403,6 +418,8 @@ mod tests {
                 route_program: [0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             })
         );
+        assert!(registry.set_lifecycle(slot, 2));
+        assert_eq!(registry.slot(slot).unwrap().lifecycle, 2);
         assert!(registry.set_transfer_amount_fixed(slot, 65));
         assert_eq!(registry.slot(slot).unwrap().transfer_amount_fixed, 65);
     }

@@ -186,7 +186,11 @@ use std::path::Path;
 ///       activity.
 /// v101: source roots retain the compiled `Maxnorohst` threshold and their
 ///       saturated no-raw-material counter.
-pub const SAVE_VERSION: u32 = 101;
+/// v102: source roots retain plantation worker selectors, raw-resource
+///       reservation/path state, and the source `+0x12` production-time
+///       accumulator; figures retain type-12 worker route/home and animation
+///       selectors.
+pub const SAVE_VERSION: u32 = 102;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -200,7 +204,7 @@ pub const SAVE_VERSION: u32 = 101;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 101;
+pub const MIN_LOADABLE_VERSION: u32 = 102;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -598,9 +602,15 @@ mod tests {
                 source_scheduler_interval: 7,
                 source_no_raw_material_count: 6,
                 source_output_ware_slot: 0x16,
+                source_raw_resource_ware_slot: 0x2d,
+                source_plantation_worker_definition: 0x60,
+                source_resource_reserved: true,
+                source_path_class: 46,
+                source_resource_growth_factor: 96,
                 source_damage_threshold: 640,
                 source_damage_accumulator: 192,
                 progress: 512,
+                source_production_time: 384,
                 animation_frame: 2,
                 animation_count: 4,
                 animation_continues: true,
@@ -895,9 +905,15 @@ mod tests {
                 source_scheduler_interval: 7,
                 source_no_raw_material_count: 6,
                 source_output_ware_slot: 0x16,
+                source_raw_resource_ware_slot: 0x2d,
+                source_plantation_worker_definition: 0x60,
+                source_resource_reserved: true,
+                source_path_class: 46,
+                source_resource_growth_factor: 96,
                 source_damage_threshold: 640,
                 source_damage_accumulator: 192,
                 progress: 512,
+                source_production_time: 384,
                 animation_frame: 2,
                 animation_count: 4,
                 animation_continues: true,
