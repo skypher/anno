@@ -15,27 +15,183 @@ use crate::source_route::{
 };
 use crate::types::Good;
 
-/// Anchor data retained by the source `DAT_005a77e8` kind-13 location table.
+/// One live source `DAT_005a77e8` kind-13 map-object record.
 ///
 /// `FUN_00478b90` creates a ten-byte runtime entry whenever an INSELHAUS
 /// command installs a map object with source kind `0x0d` (`PLATZ` or
-/// `WOHNUNG`). `FUN_00480370` later samples this table before allocating its
-/// kind-`0x12` figures. The local representation retains the fields supplied
-/// directly by the placement command; the table's derived counter and class
-/// bytes remain owned by the source city-state model.
+/// `WOHNUNG`). `FUN_0047b9c0` updates its low-three-bit phase before city
+/// state consumes the group and fixed-point amount; `FUN_00480370` samples
+/// the same physical table before allocating kind-`0x12` figures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SourceKind13Location {
     pub island_id: u8,
     pub tile_x: u8,
     pub tile_y: u8,
     pub orientation: u8,
+    /// INSELHAUS packed variant passed as `param_4` to `FUN_00478b90` and
+    /// written to the high nibble of source byte `+0x04`. `FUN_0047b9c0`
+    /// selects the record's phase clock from this field.
+    #[serde(default)]
+    pub variant: u8,
     /// Source map-owner bits from the live root cell. `FUN_0044b140` passes
     /// these to `FUN_0046f000` when it builds a type-3 civilian path grid.
     pub source_owner: u8,
+    /// Low three bits of source byte `+0x03`, initially zeroed by
+    /// `FUN_00478b90` and advanced by `FUN_0047b9c0`.
+    #[serde(default)]
+    pub phase: u8,
+    /// Remaining source byte `+0x03` state bits. The effect queue preserves
+    /// these while it advances the phase field.
+    #[serde(default)]
+    pub state_bits: u8,
+    /// Definition `+0x2e` copied into source byte `+0x05`; for housing this
+    /// is the authored `BGruppe` tier.
+    #[serde(default)]
+    pub population_group: u8,
+    /// Source u16 at bytes `+0x06..+0x07`, initialized to `0x40` by
+    /// `FUN_00478b90` and maintained in the source's 1/64-unit scale.
+    #[serde(default = "source_kind13_initial_amount")]
+    pub amount: u16,
+    /// Source u16 at bytes `+0x08..+0x09`, initially zero and later read by
+    /// the stage-transition predicates in `FUN_0047bfa0`.
+    #[serde(default)]
+    pub lifecycle_flags: u16,
+}
+
+const fn source_kind13_initial_amount() -> u16 {
+    0x40
+}
+
+impl SourceKind13Location {
+    /// Source byte `+0x03`, combining the independently retained phase and
+    /// high lifecycle bits.
+    pub const fn state_byte(self) -> u8 {
+        (self.phase & 7) | (self.state_bits & !7)
+    }
+
+    /// Apply the low-three-bit phase write in `FUN_0047b9c0` while retaining
+    /// the object state flags installed by the effect queue.
+    pub fn set_phase(&mut self, phase: u8) {
+        self.phase = phase & 7;
+    }
+}
+
+/// City operands read by `FUN_0047b410` before it changes one kind-13
+/// record's fixed-point amount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceKind13TransferInputs {
+    /// Source city bytes `+0x248..+0x24c`, one satisfaction score per BGruppe.
+    pub satisfaction_by_group: [u8; 5],
+    /// Source city byte `+0x255`, the aggregate satisfaction score.
+    pub overall_satisfaction: u8,
+    /// Source city u16 `+0x1fe != 0`, which suppresses otherwise-positive
+    /// kind-13 amount changes.
+    pub growth_blocked: bool,
+}
+
+impl SourceKind13Location {
+    /// Replay the signed amount returned by `FUN_0047b410` for this record.
+    ///
+    /// The caller applies a negative result through `FUN_0047bbc0` and a
+    /// positive result through `FUN_0047c080`; those routines additionally
+    /// redistribute amounts among neighboring map-object records.
+    pub fn source_transfer_delta(self, inputs: SourceKind13TransferInputs) -> i32 {
+        let group = usize::from(self.population_group);
+        let Some(&group_satisfaction) = inputs.satisfaction_by_group.get(group) else {
+            return 0;
+        };
+        let state = self.state_byte();
+        let lifecycle_low = self.lifecycle_flags as u8;
+        let aggregate_satisfaction = inputs.overall_satisfaction;
+
+        let (current_satisfaction, source_satisfaction) = if state & 0x80 == 0 {
+            (
+                if group == 0 { group_satisfaction } else { 0 },
+                if lifecycle_low & 4 == 0 {
+                    0
+                } else {
+                    aggregate_satisfaction
+                },
+            )
+        } else {
+            (group_satisfaction, aggregate_satisfaction)
+        };
+
+        if aggregate_satisfaction > 0x57
+            && current_satisfaction > 0x6b
+            && state & 0x40 != 0
+            && lifecycle_low & 3 == 0
+        {
+            if aggregate_satisfaction > 0x7f
+                && current_satisfaction > 0x7f
+                && !inputs.growth_blocked
+            {
+                let growth = (128 - i32::from(source_kind13_growth_curve(aggregate_satisfaction)))
+                    * i32::from(source_kind13_variant_growth(self.variant));
+                return (growth + 127) >> 7;
+            }
+            return 0;
+        }
+
+        let decay_score = ((i32::from(source_kind13_group_curve(current_satisfaction))
+            + i32::from(source_kind13_satisfaction_curve(source_satisfaction)))
+            * i32::from(source_kind13_variant_decay(self.variant)))
+            >> 7;
+        let state_penalty = if state & 0x40 == 0 { 0x40 } else { 0 };
+        let lifecycle_penalty = match lifecycle_low & 3 {
+            1 => 0x100,
+            2 => 0xc0,
+            _ => 0,
+        };
+        -decay_score - state_penalty - lifecycle_penalty
+    }
+}
+
+fn source_kind13_linear_curve(index: u8, pieces: &[(u8, u8, i32, i32)]) -> u8 {
+    for &(start, end, initial, terminal) in pieces {
+        if index > end {
+            continue;
+        }
+        let span = i32::from(end) - i32::from(start);
+        let step = (terminal - initial) * 0x100 / span;
+        let fixed = initial * 0x100 + (i32::from(index) - i32::from(start)) * step;
+        return (fixed >> 8).clamp(0, 0xff) as u8;
+    }
+    0
+}
+
+fn source_kind13_growth_curve(satisfaction: u8) -> u8 {
+    source_kind13_linear_curve(satisfaction, &[(0, 0x80, 0x200, 0)])
+}
+
+fn source_kind13_satisfaction_curve(satisfaction: u8) -> u8 {
+    source_kind13_linear_curve(
+        satisfaction,
+        &[(0, 0x33, 0xc0, 0x40), (0x33, 0x58, 0x40, 0x13), (0x58, 0x80, 0x13, 0)],
+    )
+}
+
+fn source_kind13_group_curve(satisfaction: u8) -> u8 {
+    source_kind13_linear_curve(
+        satisfaction,
+        &[(0, 0x19, 0x6c, 0x46), (0x19, 0x33, 0x46, 0x20), (0x33, 0x58, 0x20, 0x0c), (0x58, 0x80, 0x0c, 0)],
+    )
+}
+
+fn source_kind13_variant_growth(variant: u8) -> u8 {
+    source_kind13_linear_curve(variant & 0x0f, &[(0, 6, 0xa0, 0x73)])
+}
+
+fn source_kind13_variant_decay(variant: u8) -> u8 {
+    source_kind13_linear_curve(variant & 0x0f, &[(0, 3, 0x66, 0x80), (3, 6, 0x80, 0xc0)])
 }
 
 /// Slot count of the source `DAT_005a77e8` kind-13 location table.
 pub const SOURCE_KIND13_LOCATION_TABLE_SLOTS: usize = 0x1040;
+pub const SOURCE_KIND13_PHASE_CLOCKS: usize = 16;
+pub const SOURCE_KIND13_PHASE_BASE_MS: u32 = 15_000;
+pub const SOURCE_KIND13_PHASE_STRIDE_MS: u32 = 64;
+pub const SOURCE_KIND13_DISPATCH_RECORDS_PER_UPDATE: usize = 0x46;
 
 /// Fixed count of city records at `DAT_005dbae0`.
 pub const SOURCE_CITY_RECORD_SLOTS: usize = 0x4b;
@@ -387,6 +543,61 @@ impl SourceKind13LocationTable {
     /// Live entries in physical source slot order, for assertions and audits.
     pub fn active_locations(&self) -> Vec<SourceKind13Location> {
         self.slots.iter().flatten().copied().collect()
+    }
+}
+
+/// Mutable phase clocks and physical cursor owned by `FUN_0047b9c0`.
+///
+/// The source advances sixteen staggered 15,000 ms clocks, then visits 70
+/// records from `DAT_005a77e8` in physical order on each engine-update slice.
+/// Its later city-state transfer branches retain their own source operands.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind13DispatchState {
+    phase_elapsed_ms: [u32; SOURCE_KIND13_PHASE_CLOCKS],
+    phases: [u8; SOURCE_KIND13_PHASE_CLOCKS],
+    cursor: usize,
+}
+
+impl Default for SourceKind13DispatchState {
+    fn default() -> Self {
+        Self {
+            phase_elapsed_ms: [0; SOURCE_KIND13_PHASE_CLOCKS],
+            phases: [0; SOURCE_KIND13_PHASE_CLOCKS],
+            cursor: 0,
+        }
+    }
+}
+
+impl SourceKind13DispatchState {
+    /// Advance phase clocks and replay `FUN_0047b9c0`'s 70-record phase batch.
+    /// Returns the count of records whose source byte `+0x03` changed.
+    pub fn advance(&mut self, table: &mut SourceKind13LocationTable, dt_ms: u32) -> usize {
+        for selector in 0..SOURCE_KIND13_PHASE_CLOCKS {
+            let threshold = SOURCE_KIND13_PHASE_BASE_MS
+                + u32::try_from(selector).unwrap_or(0) * SOURCE_KIND13_PHASE_STRIDE_MS;
+            let elapsed = self.phase_elapsed_ms[selector].saturating_add(dt_ms);
+            if elapsed >= threshold {
+                self.phase_elapsed_ms[selector] = 0;
+                self.phases[selector] = self.phases[selector].wrapping_add(1) & 7;
+            } else {
+                self.phase_elapsed_ms[selector] = elapsed;
+            }
+        }
+
+        let mut changed = 0;
+        for _ in 0..SOURCE_KIND13_DISPATCH_RECORDS_PER_UPDATE {
+            let slot = self.cursor;
+            self.cursor = (self.cursor + 1) % SOURCE_KIND13_LOCATION_TABLE_SLOTS;
+            let Some(location) = table.slots[slot].as_mut() else {
+                continue;
+            };
+            let phase = self.phases[usize::from(location.variant & 0x0f)];
+            if location.phase != phase {
+                location.set_phase(phase);
+                changed += 1;
+            }
+        }
+        changed
     }
 }
 
@@ -1260,7 +1471,13 @@ pub fn source_kind13_locations_from_scenario(
                 tile_x: tile.x,
                 tile_y: tile.y,
                 orientation: tile.orientation & 3,
+                variant: (tile.orientation >> 2) & 0x0f,
                 source_owner: tile.source_owner(),
+                phase: 0,
+                state_bits: 0,
+                population_group: definition.source_population_group().unwrap_or(0),
+                amount: source_kind13_initial_amount(),
+                lifecycle_flags: 0,
             });
         }
     }
@@ -2352,6 +2569,10 @@ mod tests {
                     source_id: base + 3,
                     kind: "PLATZ".into(),
                     size: (1, 1),
+                    properties: std::collections::HashMap::from([(
+                        "BGruppe".into(),
+                        "4".into(),
+                    )]),
                     ..Default::default()
                 },
             ],
@@ -2407,7 +2628,13 @@ mod tests {
                 tile_x: 8,
                 tile_y: 9,
                 orientation: 1,
+                variant: 1,
                 source_owner: 0,
+                phase: 0,
+                state_bits: 0,
+                population_group: 4,
+                amount: 0x40,
+                lifecycle_flags: 0,
             }]
         );
     }
@@ -2420,7 +2647,13 @@ mod tests {
             tile_x: 8,
             tile_y: 9,
             orientation: 0,
+            variant: 0,
             source_owner: 1,
+            phase: 0,
+            state_bits: 0,
+            population_group: 0,
+            amount: 0x40,
+            lifecycle_flags: 0,
         };
         let colliding = SourceKind13Location {
             tile_x: 9,
@@ -2438,6 +2671,104 @@ mod tests {
         assert_eq!(table.city_slice(2)[start - 2 * 0x400 + 1], Some(colliding));
         table.remove_roots_in_footprint(2, 8, 9, 1, 1);
         assert_eq!(table.active_locations(), vec![colliding]);
+    }
+
+    #[test]
+    fn kind13_state_byte_preserves_lifecycle_bits_while_advancing_phase() {
+        let mut location = SourceKind13Location {
+            island_id: 1,
+            tile_x: 2,
+            tile_y: 3,
+            orientation: 0,
+            variant: 0,
+            source_owner: 4,
+            phase: 0,
+            state_bits: 0xa0,
+            population_group: 2,
+            amount: 0x40,
+            lifecycle_flags: 0,
+        };
+
+        location.set_phase(11);
+        assert_eq!(location.phase, 3);
+        assert_eq!(location.state_byte(), 0xa3);
+    }
+
+    #[test]
+    fn kind13_transfer_delta_replays_source_growth_and_decay_branches() {
+        let mut location = SourceKind13Location {
+            island_id: 1,
+            tile_x: 2,
+            tile_y: 3,
+            orientation: 0,
+            variant: 0,
+            source_owner: 4,
+            phase: 0,
+            state_bits: 0,
+            population_group: 0,
+            amount: 0x40,
+            lifecycle_flags: 0,
+        };
+        let full_satisfaction = SourceKind13TransferInputs {
+            satisfaction_by_group: [128, 0, 0, 0, 0],
+            overall_satisfaction: 128,
+            growth_blocked: false,
+        };
+
+        location.state_bits = 0xc0;
+        assert_eq!(location.source_transfer_delta(full_satisfaction), 160);
+        assert_eq!(
+            location.source_transfer_delta(SourceKind13TransferInputs {
+                growth_blocked: true,
+                ..full_satisfaction
+            }),
+            0
+        );
+
+        location.state_bits = 0;
+        assert_eq!(
+            location.source_transfer_delta(SourceKind13TransferInputs {
+                satisfaction_by_group: [0; 5],
+                overall_satisfaction: 0,
+                growth_blocked: false,
+            }),
+            -303
+        );
+        location.state_bits = 0x40;
+        location.lifecycle_flags = 2;
+        assert_eq!(
+            location.source_transfer_delta(SourceKind13TransferInputs {
+                satisfaction_by_group: [0; 5],
+                overall_satisfaction: 0,
+                growth_blocked: false,
+            }),
+            -431
+        );
+    }
+
+    #[test]
+    fn kind13_dispatch_uses_staggered_clocks_and_physical_record_order() {
+        let mut table = SourceKind13LocationTable::default();
+        assert!(table.insert(SourceKind13Location {
+            island_id: 0,
+            tile_x: 0,
+            tile_y: 0,
+            orientation: 0,
+            variant: 1,
+            source_owner: 0,
+            phase: 0,
+            state_bits: 0xa0,
+            population_group: 0,
+            amount: 0x40,
+            lifecycle_flags: 0,
+        }));
+        let mut dispatch = SourceKind13DispatchState::default();
+
+        assert_eq!(dispatch.advance(&mut table, 15_063), 0);
+        assert_eq!(table.active_locations()[0].state_byte(), 0xa0);
+
+        assert_eq!(dispatch.advance(&mut table, 1), 1);
+        assert_eq!(table.active_locations()[0].state_byte(), 0xa1);
     }
 
     #[test]

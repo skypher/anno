@@ -17,7 +17,7 @@ pub const EVENT_TICK_MS: u32 = 10_000;
 pub const SHIP_TICK_MS: u32 = 1_000;
 pub const MARKET_TICK_MS: u32 = 1_000;
 pub const DIPLOMACY_TICK_MS: u32 = 5_000;
-pub const BUILDING_CONTROL_TICK_MS: u32 = 4_999;
+pub const PLAYER_CONTROL_TICK_MS: u32 = 4_999;
 
 pub const FREE_TRADER_TARGET_GATE_MASK: u64 = 3;
 pub const FREE_TRADER_TARGET_GATE_DENOMINATOR: u64 = 4;
@@ -53,7 +53,7 @@ pub struct SourceRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Subsystem {
     Production,
-    BuildingControl,
+    PlayerControl,
     Population,
     Diplomacy,
     MarketCoverage,
@@ -66,7 +66,7 @@ impl Subsystem {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Production => "production",
-            Self::BuildingControl => "building_control",
+            Self::PlayerControl => "player_control",
             Self::Population => "population",
             Self::Diplomacy => "diplomacy",
             Self::MarketCoverage => "market_coverage",
@@ -105,13 +105,13 @@ pub const TIMING_SPECS: [TimingSpec; 8] = [
         },
     },
     TimingSpec {
-        subsystem: Subsystem::BuildingControl,
-        cadence: TimingCadence::Interval(BUILDING_CONTROL_TICK_MS),
+        subsystem: Subsystem::PlayerControl,
+        cadence: TimingCadence::Interval(PLAYER_CONTROL_TICK_MS),
         status: FidelityStatus::BinaryVerified,
         source: SourceRef {
             source: "decompiled/1602_exe.c",
-            location: "84620-84666",
-            note: "per-building 4999 ms command dispatch; subcommand 0x5a does not allocate a figure",
+            location: "FUN_00476350:84620-84666",
+            note: "round-robin player control runs after a 4999 ms accumulator, not per-building construction",
         },
     },
     TimingSpec {
@@ -336,7 +336,7 @@ mod tests {
         }
 
         assert_eq!(count(&events, Subsystem::Production), 10);
-        assert_eq!(count(&events, Subsystem::BuildingControl), 2);
+        assert_eq!(count(&events, Subsystem::PlayerControl), 2);
         assert_eq!(count(&events, Subsystem::MarketCoverage), 10);
         assert_eq!(count(&events, Subsystem::Ships), 10);
         assert_eq!(count(&events, Subsystem::Diplomacy), 2);
@@ -357,7 +357,7 @@ mod tests {
                 },
                 TraceEvent {
                     at_ms: 10_000,
-                    subsystem: Subsystem::BuildingControl
+                    subsystem: Subsystem::PlayerControl
                 },
                 TraceEvent {
                     at_ms: 10_000,
@@ -421,7 +421,7 @@ mod tests {
         let snapshot = sim.subsystem_timing_snapshot();
         let expected: Vec<_> = TIMING_SPECS
             .iter()
-            .filter(|spec| spec.subsystem != Subsystem::BuildingControl)
+            .filter(|spec| spec.subsystem != Subsystem::PlayerControl)
             .map(|spec| (spec.subsystem, spec.cadence))
             .collect();
         assert_eq!(snapshot, expected);

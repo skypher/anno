@@ -251,6 +251,15 @@ impl BuildingDef {
             .and_then(|kind| Self::source_kind_code_for(kind))
     }
 
+    /// Runtime population-group byte at compiled definition offset `+0x2e`.
+    /// `FUN_00478b90` copies it into byte `+0x05` of each kind-13 map-object
+    /// record, where the city dispatcher uses it as the residence tier.
+    pub fn source_population_group(&self) -> Option<u8> {
+        self.properties
+            .get("BGruppe")
+            .and_then(|group| group.trim().parse().ok())
+    }
+
     fn source_kind_code_for(kind: &str) -> Option<u8> {
         match kind {
             "UNUSED" => Some(0),
@@ -956,6 +965,16 @@ mod tests {
             .expect("parse plaintext COD");
 
         assert_eq!(cod.buildings[0].source_damage_threshold, 1_600);
+    }
+
+    #[test]
+    fn parses_population_group_for_kind_thirteen_runtime_records() {
+        let cod = CodFile::parse(
+            b"@Nummer: 1\nObjekt: HAUS_PRODTYP\nKind: WOHNUNG\nBGruppe: 3\nEndObj;\n",
+        )
+        .expect("parse plaintext COD");
+
+        assert_eq!(cod.buildings[0].source_population_group(), Some(3));
     }
 
     #[test]

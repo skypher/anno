@@ -13,7 +13,8 @@ use crate::combat::{
 };
 use crate::coverage::CoverageMap;
 use crate::data_bridge::{
-    SourceCityRecord, SourceCityTable, SourceKind4Occupant, SourceKind13LocationTable,
+    SourceCityRecord, SourceCityTable, SourceKind4Occupant, SourceKind13DispatchState,
+    SourceKind13LocationTable,
 };
 use crate::economy;
 use crate::entity::{ActionType, CargoRoute, Figure};
@@ -144,8 +145,10 @@ pub struct Simulation {
     /// Loader-preserved static backing cells from source map array `+0xafc`.
     /// `FUN_004641d0` replays these when a terminal command has no ruin.
     pub source_static_map_backing_cells: Vec<SourceMapCellState>,
-    /// Placement anchors retained by the source kind-13 location table.
+    /// Live source kind-13 records retained by the fixed `DAT_005a77e8` table.
     pub source_kind13_locations: SourceKind13LocationTable,
+    /// Phase clocks and physical source-table cursor for `FUN_0047b9c0`.
+    pub source_kind13_dispatch: SourceKind13DispatchState,
     /// Fixed source city-record pool read by `FUN_0047f8a0`.
     pub source_cities: SourceCityTable,
     /// Live kind-4 occupancy reconstructed from authored `SOLDAT3` figures.
@@ -462,6 +465,7 @@ impl Simulation {
             source_static_map_roots: Vec::new(),
             source_static_map_backing_cells: Vec::new(),
             source_kind13_locations: SourceKind13LocationTable::default(),
+            source_kind13_dispatch: SourceKind13DispatchState::default(),
             source_cities: SourceCityTable::default(),
             source_kind4_occupants: Vec::new(),
             source_dynamic_combat_figures: Vec::new(),
@@ -918,6 +922,8 @@ impl Simulation {
         }
 
         self.tick_source_city_dispatch(dt_ms);
+        self.source_kind13_dispatch
+            .advance(&mut self.source_kind13_locations, dt_ms);
 
         // Entity movement (every step)
         self.tick_entities(dt_ms);

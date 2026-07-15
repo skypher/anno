@@ -7,7 +7,7 @@
 use crate::building::BuildingInstance;
 use crate::combat::{DiplomacyMatrix, MilitaryUnit, SourceDynamicCombatFigure};
 use crate::data_bridge::{
-    SourceCityTable, SourceKind4Occupant, SourceKind13Location, SourceKind13LocationTable,
+    SourceCityTable, SourceKind4Occupant, SourceKind13DispatchState, SourceKind13LocationTable,
 };
 use crate::entity::Figure;
 use crate::player::Player;
@@ -154,7 +154,9 @@ use std::path::Path;
 /// v84: static backing map cells persist for `Ruinenr = 0xff` terminal replay.
 /// v85: source map-cell records retain the backing command definition offset
 ///      needed to reconstruct visible NORUINE terminal replay.
-pub const SAVE_VERSION: u32 = 85;
+/// v86: kind-13 source records retain their initialized lifecycle state, and
+///      the 70-record phase dispatcher retains its clocks and physical cursor.
+pub const SAVE_VERSION: u32 = 86;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -168,7 +170,7 @@ pub const SAVE_VERSION: u32 = 85;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 85;
+pub const MIN_LOADABLE_VERSION: u32 = 86;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -187,6 +189,7 @@ pub struct SaveState {
     pub source_static_map_roots: Vec<SourceMapCellState>,
     pub source_static_map_backing_cells: Vec<SourceMapCellState>,
     pub source_kind13_locations: SourceKind13LocationTable,
+    pub source_kind13_dispatch: SourceKind13DispatchState,
     pub source_cities: SourceCityTable,
     pub source_kind4_occupants: Vec<SourceKind4Occupant>,
     pub source_dynamic_combat_figures: Vec<SourceDynamicCombatFigure>,
@@ -257,6 +260,7 @@ impl Simulation {
             source_static_map_roots: self.source_static_map_roots.clone(),
             source_static_map_backing_cells: self.source_static_map_backing_cells.clone(),
             source_kind13_locations: self.source_kind13_locations.clone(),
+            source_kind13_dispatch: self.source_kind13_dispatch.clone(),
             source_cities: self.source_cities.clone(),
             source_kind4_occupants: self.source_kind4_occupants.clone(),
             source_dynamic_combat_figures: self.source_dynamic_combat_figures.clone(),
@@ -297,6 +301,7 @@ impl Simulation {
         self.source_static_map_roots = s.source_static_map_roots;
         self.source_static_map_backing_cells = s.source_static_map_backing_cells;
         self.source_kind13_locations = s.source_kind13_locations;
+        self.source_kind13_dispatch = s.source_kind13_dispatch;
         self.source_cities = s.source_cities;
         self.source_kind4_occupants = s.source_kind4_occupants;
         self.source_dynamic_combat_figures = s.source_dynamic_combat_figures;
@@ -339,13 +344,29 @@ pub fn load_from_file(path: &Path) -> Result<SaveState, SaveError> {
     if bytes.len() < SAVE_MAGIC.len() || bytes[..SAVE_MAGIC.len()] != SAVE_MAGIC {
         return Err(SaveError::BadMagic);
     }
+    // `bincode::serialize` uses fixed-width little-endian integers, and
+    // `SaveState::version` is its first field. Reject incompatible layouts
+    // before deserializing fields that may have shifted since that version.
+    let version_offset = SAVE_MAGIC.len();
+    let version_end = version_offset + std::mem::size_of::<u32>();
+    if bytes.len() < version_end {
+        return Err(SaveError::Decode("save payload is missing its version".into()));
+    }
+    let found_version = u32::from_le_bytes([
+        bytes[version_offset],
+        bytes[version_offset + 1],
+        bytes[version_offset + 2],
+        bytes[version_offset + 3],
+    ]);
+    if found_version > SAVE_VERSION || found_version < MIN_LOADABLE_VERSION {
+        return Err(SaveError::VersionMismatch {
+            found: found_version,
+            expected: SAVE_VERSION,
+        });
+    }
     let state: SaveState = bincode::deserialize(&bytes[SAVE_MAGIC.len()..])
         .map_err(|e| SaveError::Decode(e.to_string()))?;
-    // Newer versions are unsupported (this build's struct schema
-    // doesn't know how to reach forward) and pre-v14 saves carry
-    // a different bincode enum layout that this build can't
-    // decode safely.
-    if state.version > SAVE_VERSION || state.version < MIN_LOADABLE_VERSION {
+    if state.version != found_version {
         return Err(SaveError::VersionMismatch {
             found: state.version,
             expected: SAVE_VERSION,
@@ -377,6 +398,7 @@ mod tests {
             source_static_map_roots: vec![],
             source_static_map_backing_cells: vec![],
             source_kind13_locations: SourceKind13LocationTable::default(),
+            source_kind13_dispatch: SourceKind13DispatchState::default(),
             source_cities: SourceCityTable::default(),
             source_kind4_occupants: vec![],
             source_dynamic_combat_figures: vec![],
@@ -418,6 +440,15 @@ mod tests {
         match load_from_file(&tmp) {
             Err(SaveError::VersionMismatch { .. }) => {}
             other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+
+        let mut legacy_layout = Vec::from(SAVE_MAGIC);
+        legacy_layout.extend_from_slice(&(MIN_LOADABLE_VERSION - 1).to_le_bytes());
+        legacy_layout.push(0);
+        std::fs::write(&tmp, legacy_layout).unwrap();
+        match load_from_file(&tmp) {
+            Err(SaveError::VersionMismatch { .. }) => {}
+            other => panic!("expected pre-decode VersionMismatch, got {other:?}"),
         }
         let _ = std::fs::remove_file(&tmp);
     }
@@ -541,7 +572,13 @@ mod tests {
                     tile_x: 9,
                     tile_y: 11,
                     orientation: 3,
+                    variant: 9,
                     source_owner: 4,
+                    phase: 5,
+                    state_bits: 0xa0,
+                    population_group: 2,
+                    amount: 192,
+                    lifecycle_flags: 0x14,
                 })
         );
         assert!(sim.source_cities.set_record(
@@ -554,6 +591,11 @@ mod tests {
                 tier_population: [10, 20, 30, 40, 50],
             }),
         ));
+        assert_eq!(
+            sim.source_kind13_dispatch
+                .advance(&mut sim.source_kind13_locations, 15_640),
+            0
+        );
         sim.source_city_dispatch_elapsed_ms = 9_800;
         sim.source_city_dispatch_phase = 6;
         sim.source_city_dispatch_cursor = 17;
@@ -830,9 +872,16 @@ mod tests {
                 tile_x: 9,
                 tile_y: 11,
                 orientation: 3,
+                variant: 9,
                 source_owner: 4,
+                phase: 5,
+                state_bits: 0xa0,
+                population_group: 2,
+                amount: 192,
+                lifecycle_flags: 0x14,
             }]
         );
+        assert_eq!(sim2.source_kind13_dispatch, sim.source_kind13_dispatch);
         assert_eq!(
             sim2.source_cities.record(3),
             Some(crate::data_bridge::SourceCityRecord {
