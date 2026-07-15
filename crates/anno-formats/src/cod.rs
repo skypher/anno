@@ -182,6 +182,11 @@ pub struct BuildingDef {
     /// Compiled `Interval` at definition offset `0x3a`. `FUN_0047daf0`
     /// reloads a root's scheduler cooldown from this authored tick count.
     pub source_scheduler_interval: u16,
+    /// Compiled `Randwachs` byte at definition offset `+0x40`. The source
+    /// parser converts its authored percentage into 128-scale with integer
+    /// division; `FUN_004684a0` multiplies an island resource strength by
+    /// this factor before selecting a raw-cell growth transition.
+    pub source_resource_growth_factor: u8,
     /// Compiled definition offset `+0x64`, populated from `Maxenergy:` by
     /// `FUN_0046248d..0x004624c4` as `round(Maxenergy * 32)`. The deferred
     /// category-6 hit handler accumulates raw strength against this value.
@@ -229,6 +234,7 @@ impl Default for BuildingDef {
             source_work_material_amount: 0,
             source_max_no_raw_material_count: 0,
             source_scheduler_interval: 0,
+            source_resource_growth_factor: 0,
             source_damage_threshold: 0,
             source_transfer_radius: 0,
             source_transfer_figure_limit: 0,
@@ -677,6 +683,18 @@ impl CodFile {
                 );
                 continue;
             }
+            // `FUN_0046124d..0x0046128c` stores Randwachs as an unsigned
+            // 128-scale byte at compiled definition offset `+0x40`.
+            if let Some(val_str) = line.strip_prefix("Randwachs:") {
+                let authored = Self::eval(&constants, val_str.trim()).max(0) as u32;
+                current.source_resource_growth_factor =
+                    ((authored.saturating_mul(128) / 100).min(u32::from(u8::MAX))) as u8;
+                current.properties.insert(
+                    "Randwachs".to_string(),
+                    current.source_resource_growth_factor.to_string(),
+                );
+                continue;
+            }
 
             // Parse NoShotFlg. The executable stores bit zero at runtime
             // definition offset 0x6a, bit 0x10; ship routing consults it in
@@ -1019,7 +1037,7 @@ mod tests {
     #[test]
     fn parses_source_cell_animation_flags() {
         let cod = CodFile::parse(
-            b"HIGHBODEN = 20\n@Nummer: 1\nId: 20001\nPosoffs: HIGHBODEN\nAnicontflg: 1\nLagAniFlg: 1\nMaxlager: 5\nProdmenge: 0.75\nRohmenge: 0.5\nWorkmenge: 2\nMaxnorohst: 9\nInterval: 7\n",
+            b"HIGHBODEN = 20\n@Nummer: 1\nId: 20001\nPosoffs: HIGHBODEN\nAnicontflg: 1\nLagAniFlg: 1\nMaxlager: 5\nProdmenge: 0.75\nRohmenge: 0.5\nWorkmenge: 2\nMaxnorohst: 9\nInterval: 7\nRandwachs: 75\n",
         )
         .expect("parse plaintext COD");
 
@@ -1032,6 +1050,7 @@ mod tests {
         assert_eq!(cod.buildings[0].source_work_material_amount, 64);
         assert_eq!(cod.buildings[0].source_max_no_raw_material_count, 9);
         assert_eq!(cod.buildings[0].source_scheduler_interval, 7);
+        assert_eq!(cod.buildings[0].source_resource_growth_factor, 96);
     }
 
     #[test]

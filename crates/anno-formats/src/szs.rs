@@ -105,6 +105,88 @@ pub struct Island {
     pub city: Option<City>,
 }
 
+/// The 8-byte `INSEL5` resource record consumed by `FUN_0046aff0`.
+///
+/// The source only reads byte 0 as the ware selector, byte 4 as the
+/// availability state, and bytes 6..8 as a remaining-amount threshold for
+/// `FUN_0046b0a0`; retaining the complete record keeps the scenario data
+/// available to source-backed callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IslandSourceResourceRecord {
+    pub raw: [u8; 8],
+}
+
+impl IslandSourceResourceRecord {
+    pub const fn ware(self) -> u8 {
+        self.raw[0]
+    }
+
+    pub const fn availability_state(self) -> u8 {
+        self.raw[4]
+    }
+
+    pub const fn remaining_amount(self) -> u16 {
+        u16::from_le_bytes([self.raw[6], self.raw[7]])
+    }
+}
+
+/// Runtime island-resource inputs serialized in an `INSEL5` record.
+/// `FUN_0046aff0` converts these fields into the 0/64/128 source-resource
+/// strength used by raw-cell replacement, while `FUN_004684a0` also consumes
+/// `attenuation` after applying a cell's compiled `Randwachs` factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IslandSourceResourceState {
+    /// `INSEL5[0x1A]`, capped by the eight serialized slots.
+    pub record_count: u8,
+    /// `INSEL5[0x1C..0x5C]`, eight records with stride eight.
+    pub records: [IslandSourceResourceRecord; 8],
+    /// `INSEL5[0x5C..0x60]`, the crop-resource bitmask.
+    pub crop_flags: u32,
+    /// `INSEL5[0x66]`, the mutable factor subtracted by `FUN_004684a0` for
+    /// non-grass, non-tree, and non-fish resources.
+    pub attenuation: u8,
+}
+
+impl IslandSourceResourceState {
+    /// Exact 0/64/128 result of `FUN_0046aff0` for one raw ware.
+    pub fn resource_strength(self, ware: u8) -> u8 {
+        if !(0x2d..=0x3a).contains(&ware) {
+            let mut partial_strength = 0;
+            for record in self
+                .records
+                .iter()
+                .take(usize::from(self.record_count).min(8))
+            {
+                if record.ware() != ware {
+                    continue;
+                }
+                match record.availability_state() {
+                    0 => return 0x80,
+                    1 => partial_strength = 0x40,
+                    _ => {}
+                }
+            }
+            return partial_strength;
+        }
+
+        if self.crop_flags & (1_u32 << u32::from(ware - 0x2d)) != 0 {
+            return 0x80;
+        }
+        if self.records[0].ware() == 0 {
+            return if matches!(ware, 0x2e | 0x30 | 0x32) {
+                0x40
+            } else {
+                0
+            };
+        }
+        if self.records[0].ware() == 1 && matches!(ware, 0x2f | 0x31 | 0x33) {
+            0x40
+        } else {
+            0
+        }
+    }
+}
+
 impl Island {
     /// Active (non-sentinel) fertilities decoded into the
     /// typed enum. Yields at most 8 entries; preserves the
@@ -1310,6 +1392,40 @@ fn write_chunk(out: &mut Vec<u8>, name: &str, body: &[u8]) {
 }
 
 impl SzsFile {
+    /// Decode the resource inputs paired with the `island_index`th parsed
+    /// `INSEL5` island. Short editor-generated records carry the zero state.
+    pub fn island_source_resource_state(&self, island_index: usize) -> IslandSourceResourceState {
+        let Some(data) = self
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.name == "INSEL5" && chunk.data.len() >= 8)
+            .nth(island_index)
+            .map(|chunk| chunk.data.as_slice())
+        else {
+            return IslandSourceResourceState::default();
+        };
+
+        let mut state = IslandSourceResourceState::default();
+        if data.len() >= 0x1b {
+            state.record_count = data[0x1a].min(8);
+        }
+        for (index, record) in state.records.iter_mut().enumerate() {
+            let offset = 0x1c + index * 8;
+            if data.len() >= offset + record.raw.len() {
+                record
+                    .raw
+                    .copy_from_slice(&data[offset..offset + record.raw.len()]);
+            }
+        }
+        if data.len() >= 0x60 {
+            state.crop_flags = u32::from_le_bytes(data[0x5c..0x60].try_into().expect("slice size"));
+        }
+        if data.len() > 0x66 {
+            state.attenuation = data[0x66];
+        }
+        state
+    }
+
     pub fn parse(data: &[u8]) -> Result<Self, SzsError> {
         if data.len() < CHUNK_HEADER_SIZE {
             return Err(SzsError::TooSmall);
@@ -3438,6 +3554,36 @@ mod tests {
         // 7 = sentinel, 8+ = invalid → None
         assert_eq!(Fertility::from_byte(7), None);
         assert_eq!(Fertility::from_byte(8), None);
+    }
+
+    #[test]
+    fn insel5_source_resource_state_matches_fun_0046aff0_inputs() {
+        let mut body = vec![0_u8; 0x74];
+        body[0] = 4;
+        body[1] = 12;
+        body[2] = 10;
+        body[0x1a] = 2;
+        body[0x1c..0x24].copy_from_slice(&[0x35, 0xaa, 0xbb, 0xcc, 1, 0xdd, 0x20, 0x00]);
+        body[0x24..0x2c].copy_from_slice(&[0x36, 0, 0, 0, 0, 0, 0x40, 0x00]);
+        body[0x5c..0x60].copy_from_slice(&(1_u32 << 2).to_le_bytes());
+        body[0x66] = 0x40;
+
+        let mut encoded = Vec::new();
+        write_chunk(&mut encoded, "INSEL5", &body);
+        let parsed = SzsFile::parse(&encoded).expect("parse resource state");
+        let state = parsed.island_source_resource_state(0);
+
+        assert_eq!(state.record_count, 2);
+        assert_eq!(state.records[0].ware(), 0x35);
+        assert_eq!(state.records[0].availability_state(), 1);
+        assert_eq!(state.records[0].remaining_amount(), 0x20);
+        assert_eq!(state.records[1].ware(), 0x36);
+        assert_eq!(state.attenuation, 0x40);
+        assert_eq!(state.resource_strength(0x35), 0x40);
+        assert_eq!(state.resource_strength(0x36), 0x80);
+        assert_eq!(state.resource_strength(0x37), 0);
+        assert_eq!(state.resource_strength(0x2f), 0x80);
+        assert_eq!(state.resource_strength(0x2e), 0);
     }
 
     #[test]

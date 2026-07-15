@@ -1220,7 +1220,9 @@ fn refresh_simulation_island_map(
     else {
         return;
     };
-    *map = IslandMap::from_island(island, &cod.buildings);
+    let source_resource_state = map.source_resource_state();
+    *map = IslandMap::from_island(island, &cod.buildings)
+        .with_source_resource_state(source_resource_state);
 }
 
 fn main() {
@@ -8162,7 +8164,11 @@ fn init_simulation(
     let island_maps: Vec<IslandMap> = szs
         .islands
         .iter()
-        .map(|island| IslandMap::from_island(island, &cod.buildings))
+        .enumerate()
+        .map(|(index, island)| {
+            IslandMap::from_island(island, &cod.buildings)
+                .with_source_resource_state(szs.island_source_resource_state(index))
+        })
         .collect();
 
     // Build coverage maps for each island

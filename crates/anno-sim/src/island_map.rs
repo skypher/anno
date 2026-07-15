@@ -11,7 +11,7 @@
 //! - Warehouse tiles are walkable (carriers need to reach them)
 
 use anno_formats::cod::BuildingDef as CodBuilding;
-use anno_formats::szs::Island;
+use anno_formats::szs::{Island, IslandSourceResourceState};
 use std::collections::HashSet;
 
 use crate::source_route::{
@@ -92,6 +92,9 @@ pub struct IslandMap {
     /// scenario file. Use `active_fertilities()` to iterate the
     /// non-sentinel typed values.
     pub fertilities: [u8; 8],
+    /// Source raw-resource availability and attenuation copied from the
+    /// matching `INSEL5` runtime record.
+    source_resource_state: IslandSourceResourceState,
 }
 
 /// Building kinds that represent walkable terrain or roads.
@@ -264,7 +267,27 @@ impl IslandMap {
             source_land_target_sizes,
             source_kind4_line_of_fire_template,
             fertilities: island.fertilities,
+            source_resource_state: IslandSourceResourceState::default(),
         }
+    }
+
+    /// Attach the matching `INSEL5` resource inputs after the static map has
+    /// been replayed from its island command stream.
+    pub fn with_source_resource_state(mut self, state: IslandSourceResourceState) -> Self {
+        self.source_resource_state = state;
+        self
+    }
+
+    pub const fn source_resource_state(&self) -> IslandSourceResourceState {
+        self.source_resource_state
+    }
+
+    pub fn source_resource_strength(&self, ware: u8) -> u8 {
+        self.source_resource_state.resource_strength(ware)
+    }
+
+    pub const fn source_resource_attenuation(&self) -> u8 {
+        self.source_resource_state.attenuation
     }
 
     /// Active (non-sentinel) fertilities decoded into the typed
@@ -916,6 +939,7 @@ impl IslandMap {
                 usize::from(height) * 2,
             ),
             fertilities: [7; 8],
+            source_resource_state: IslandSourceResourceState::default(),
         }
     }
 

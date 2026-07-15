@@ -122,7 +122,11 @@ fn main() {
     let island_maps: Vec<IslandMap> = szs
         .islands
         .iter()
-        .map(|island| IslandMap::from_island(island, &cod.buildings))
+        .enumerate()
+        .map(|(index, island)| {
+            IslandMap::from_island(island, &cod.buildings)
+                .with_source_resource_state(szs.island_source_resource_state(index))
+        })
         .collect();
     println!(
         "Built {} island walkability maps for A* pathfinding",

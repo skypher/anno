@@ -33,6 +33,42 @@ pub enum SourceType8TransferInput {
     WorkMaterial,
 }
 
+/// Definition selected by `FUN_0047c830` when a type-12 plantation worker
+/// harvests a raw-resource map cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceResourceHarvestTransition {
+    /// The preceding compiled definition record (`-0x88`), normally the
+    /// resource's `ROHSTWACHS` entry.
+    Regrowth,
+    /// The following compiled definition record (`+0x88`), normally the
+    /// authored dry-resource entry.
+    Drought,
+}
+
+const SOURCE_RESOURCE_GROWTH_MASKS: [[bool; 32]; 5] = [
+    [
+        false, false, true, false, false, false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, false, false, true, false, false, false,
+        false, false, false, false, false, false,
+    ],
+    [
+        false, false, true, false, false, false, true, true, false, false, true, false, false,
+        false, true, false, false, false, false, true, false, true, false, false, true, true,
+        false, false, false, true, false, false,
+    ],
+    [
+        false, true, true, false, true, false, false, true, true, true, false, true, false, false,
+        true, false, false, true, false, false, true, true, false, true, false, false, true, true,
+        false, true, false, true,
+    ],
+    [
+        true, false, true, true, true, false, true, true, false, true, true, false, true, false,
+        true, true, true, true, true, false, true, true, true, false, true, true, true, false,
+        true, false, true, true,
+    ],
+    [true; 32],
+];
+
 const fn source_scheduler_enabled_default() -> bool {
     true
 }
@@ -166,6 +202,11 @@ pub struct SourceMapCellState {
     /// prevents `FUN_0047daf0` from deriving a nonzero production activity.
     #[serde(default)]
     pub source_output_ware_slot: u8,
+    /// Compiled `Randwachs` at definition offset `+0x40`, in the source's
+    /// 128-scale. `FUN_004684a0` combines it with the island's live resource
+    /// strength when `FUN_0047c830` replaces a harvested raw-resource cell.
+    #[serde(default)]
+    pub source_resource_growth_factor: u8,
     /// Compiled `Maxenergy` at definition offset `+0x64`. The deferred
     /// category-6 source hit handler compares its map-cell accumulator with
     /// this fixed-point threshold before emitting the terminal type-7 event.
@@ -264,6 +305,7 @@ impl SourceMapCellState {
             source_scheduler_interval: definition.source_scheduler_interval,
             source_no_raw_material_count: 0,
             source_output_ware_slot: definition.source_ware_slot().unwrap_or_default(),
+            source_resource_growth_factor: definition.source_resource_growth_factor,
             source_damage_threshold: definition.source_damage_threshold,
             source_damage_accumulator: 0,
             progress: 0,
@@ -657,6 +699,48 @@ impl SourceMapCellState {
             self.progress = self.progress.wrapping_add(output);
         }
         self.set_activity(self.source_scheduler_activity());
+    }
+}
+
+/// Replay `FUN_004684a0` and the branch around it in `FUN_0047c830` for one
+/// harvested raw-resource map cell. The source's two 128-scale divisions are
+/// truncating for the nonnegative resource values supplied by `FUN_0046aff0`.
+pub const fn source_resource_harvest_transition(
+    resource_strength: u8,
+    growth_factor: u8,
+    island_attenuation: u8,
+    ware: u8,
+    island: u8,
+    x: u16,
+    y: u16,
+) -> SourceResourceHarvestTransition {
+    if island_attenuation == 0 {
+        return SourceResourceHarvestTransition::Regrowth;
+    }
+
+    let grown = ((resource_strength as u16) * (growth_factor as u16)) >> 7;
+    let strength = if matches!(ware, 0x34 | 0x35 | 0x39) {
+        grown
+    } else {
+        grown - (((island_attenuation as u16) * grown) >> 7)
+    };
+    let band = if strength < 0x13 {
+        0
+    } else if strength < 0x2a {
+        1
+    } else if strength < 0x4c {
+        2
+    } else if strength < 0x6c {
+        3
+    } else {
+        4
+    };
+    let mask_index =
+        (((x & 3) as u32 + (y as u32) * 4 + island as u32 + ware as u32) & 31) as usize;
+    if SOURCE_RESOURCE_GROWTH_MASKS[band][mask_index] {
+        SourceResourceHarvestTransition::Regrowth
+    } else {
+        SourceResourceHarvestTransition::Drought
     }
 }
 
@@ -1215,6 +1299,49 @@ mod tests {
         };
         assert_eq!(active.source_output_ware_slot, 0x16);
         assert_eq!(active.source_scheduler_activity(), 128);
+    }
+
+    #[test]
+    fn static_raw_resource_cell_retains_compiled_randwachs_factor() {
+        let definition = BuildingDef {
+            kind: "ROHSTOFF".into(),
+            source_resource_growth_factor: 96,
+            ..Default::default()
+        };
+
+        let state = SourceMapCellState::new_static(2, 7, 9, &definition, 0)
+            .expect("raw resource defines a static source cell");
+
+        assert_eq!(state.kind_code, 9);
+        assert_eq!(state.source_resource_growth_factor, 96);
+    }
+
+    #[test]
+    fn raw_resource_harvest_uses_the_fun_004684a0_masks_only_with_attenuation() {
+        assert_eq!(
+            source_resource_harvest_transition(0, 0, 0, 0x2d, 0, 0, 0),
+            SourceResourceHarvestTransition::Regrowth
+        );
+        assert_eq!(
+            source_resource_harvest_transition(128, 128, 128, 0x2d, 0, 0, 0),
+            SourceResourceHarvestTransition::Drought
+        );
+        assert_eq!(
+            source_resource_harvest_transition(128, 128, 64, 0x2d, 0, 1, 0),
+            SourceResourceHarvestTransition::Regrowth
+        );
+        assert_eq!(
+            source_resource_harvest_transition(128, 128, 64, 0x2d, 0, 0, 0),
+            SourceResourceHarvestTransition::Drought
+        );
+    }
+
+    #[test]
+    fn raw_resource_harvest_exempts_grass_tree_and_fish_from_attenuation() {
+        assert_eq!(
+            source_resource_harvest_transition(128, 128, 128, 0x34, 0, 2, 0),
+            SourceResourceHarvestTransition::Regrowth
+        );
     }
 
     #[test]
