@@ -138,6 +138,34 @@ struct SourceTransferEventCandidate {
     route_radius: u8,
 }
 
+/// One entry of an island's eight-slot terrain-event table at source offset
+/// `+0x6c`. A free entry has its island byte set to `0xff`; occupied entries
+/// retain local map coordinates and the absolute retry deadline at `+0x70`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceTerrainEventSchedule {
+    pub island_id: u8,
+    pub x: u8,
+    pub y: u8,
+    pub due_at_ticks: u32,
+}
+
+impl Default for SourceTerrainEventSchedule {
+    fn default() -> Self {
+        Self {
+            island_id: u8::MAX,
+            x: 0,
+            y: 0,
+            due_at_ticks: 0,
+        }
+    }
+}
+
+impl SourceTerrainEventSchedule {
+    pub const fn is_free(self) -> bool {
+        self.island_id == u8::MAX
+    }
+}
+
 /// The main game simulation state.
 pub struct Simulation {
     /// Game clock in centiseconds (600 = 1 displayed minute).
@@ -220,6 +248,15 @@ pub struct Simulation {
     /// Per-island source field `+0x64`, recording the last processed
     /// resource-environment phase.
     pub source_resource_environment_last_phase: Vec<u8>,
+    /// Eight physical `FUN_0046b920` terrain-event entries for each loaded
+    /// island-map index. The entries are source runtime state, not authored
+    /// `INSEL5` input, and survive snapshots alongside the associated
+    /// type-17 figures.
+    pub source_terrain_event_schedules: Vec<[SourceTerrainEventSchedule; 8]>,
+    /// Per-island source field `+0x68`. `FUN_0046b3e0` advances it once per
+    /// processed island phase and invokes `FUN_0046b920` after every fourth
+    /// advance.
+    pub source_terrain_event_schedule_counters: Vec<u8>,
     /// `DAT_005a6aec`: shared source map-root dispatch accumulator.
     pub source_map_dispatch_elapsed_ms: u32,
     /// `DAT_005a6c12`: low-three-bit phase consumed by `FUN_0047daf0`.
@@ -541,6 +578,8 @@ impl Simulation {
             source_resource_environment_phase: 0,
             source_resource_environment_cursor: 0,
             source_resource_environment_last_phase: Vec::new(),
+            source_terrain_event_schedules: Vec::new(),
+            source_terrain_event_schedule_counters: Vec::new(),
             source_map_dispatch_elapsed_ms: 0,
             source_map_dispatch_phase: 0,
             source_city_dispatch_elapsed_ms: 0,
@@ -1470,12 +1509,8 @@ impl Simulation {
                 map.source_resource_attenuation(),
             )
         };
-        if attenuation == 0 {
-            return;
-        }
-
         let mut changed = false;
-        if self.source_time_ticks < deadline {
+        if attenuation != 0 && self.source_time_ticks < deadline {
             let resource_state = self.island_maps[map_index].source_resource_state();
             for y in 0..height {
                 let mut x = i32::from(width) - i32::from(self.next_source_rand() & 3) - 1;
@@ -1500,7 +1535,7 @@ impl Simulation {
                     x -= 3;
                 }
             }
-        } else {
+        } else if attenuation != 0 {
             let attenuation = self.island_maps[map_index].decay_source_resource_attenuation();
             let resource_state = self.island_maps[map_index].source_resource_state();
             for y in 0..height {
@@ -1526,6 +1561,304 @@ impl Simulation {
         }
         if changed {
             self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+        }
+        self.spawn_due_source_terrain_events(map_index);
+        self.source_terrain_event_schedule_counters
+            .resize(self.island_maps.len(), 0);
+        let counter = self.source_terrain_event_schedule_counters[map_index].wrapping_add(1);
+        if counter > 3 {
+            self.source_terrain_event_schedule_counters[map_index] = 0;
+            self.schedule_source_terrain_events(map_index);
+        } else {
+            self.source_terrain_event_schedule_counters[map_index] = counter;
+        }
+    }
+
+    /// Return the final live source map cell at one local terrain position.
+    /// The source map array is a final-overwrite surface, so later command
+    /// cells shadow earlier records at the same island coordinate.
+    fn source_terrain_event_cell(
+        &self,
+        island_id: u8,
+        x: i32,
+        y: i32,
+    ) -> Option<SourceMapCellState> {
+        let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) else {
+            return None;
+        };
+        self.source_static_map_roots
+            .iter()
+            .rev()
+            .copied()
+            .find(|cell| cell.matches(island_id, x, y))
+    }
+
+    /// Test the five-cell plus shape read by `FUN_0046b920` and by the due
+    /// row branch in `FUN_0046b3e0`. Production-kind-10 cells compare their
+    /// adjacent `+0x88` definition's selector through
+    /// `plantation_path_resource_ware_slot`.
+    fn source_terrain_event_cross(
+        &self,
+        island_id: u8,
+        center: (i32, i32),
+    ) -> Option<(SourceMapCellState, u8)> {
+        let center_cell = self.source_terrain_event_cell(island_id, center.0, center.1)?;
+        let mut grass_cells = 0u8;
+        for (x, y) in [
+            center,
+            (center.0 - 1, center.1),
+            (center.0 + 1, center.1),
+            (center.0, center.1 - 1),
+            (center.0, center.1 + 1),
+        ] {
+            grass_cells = grass_cells.saturating_add(u8::from(
+                self.source_terrain_event_cell(island_id, x, y)
+                    .is_some_and(|cell| cell.plantation_path_resource_ware_slot() == 0x35),
+            ));
+        }
+        Some((center_cell, grass_cells))
+    }
+
+    /// `FUN_0046b3e0` examines every due row in the currently processed
+    /// island's eight-entry terrain-event table. A row remains due when event
+    /// allocation is refused, so the next island phase retries it.
+    fn spawn_due_source_terrain_events(&mut self, map_index: usize) {
+        let Some(map) = self.island_maps.get(map_index) else {
+            return;
+        };
+        let island_id = map.island_id;
+        self.source_terrain_event_schedules.resize(
+            self.island_maps.len(),
+            [SourceTerrainEventSchedule::default(); 8],
+        );
+        let due_rows: Vec<_> = self.source_terrain_event_schedules[map_index]
+            .iter()
+            .copied()
+            .filter(|row| {
+                !row.is_free()
+                    && row.island_id == island_id
+                    && row.due_at_ticks <= self.source_time_ticks
+            })
+            .collect();
+        for row in due_rows {
+            let Some((center, grass_cells)) = self
+                .source_terrain_event_cross(row.island_id, (i32::from(row.x), i32::from(row.y)))
+            else {
+                self.remove_source_terrain_event(row.island_id, row.x, row.y);
+                continue;
+            };
+            // `FUN_0046b3e0` counts only the four neighbours here, then
+            // separately requires the centre. `grass_cells` includes the
+            // centre, so a surviving due row has at least three grass cells.
+            if grass_cells <= 2
+                || center.plantation_path_resource_ware_slot() != 0x35
+                || center.source_production_kind_code == 10
+            {
+                self.remove_source_terrain_event(row.island_id, row.x, row.y);
+                continue;
+            }
+            if self.figures.iter().any(|figure| {
+                figure.is_active()
+                    && figure.source_terrain_event_active
+                    && figure.origin_island == row.island_id
+                    && figure.origin_x == u16::from(row.x)
+                    && figure.origin_y == u16::from(row.y)
+            }) {
+                continue;
+            }
+            if let Some(figure) = self.allocate_source_terrain_event(map_index, row) {
+                self.figures.push(figure);
+            }
+        }
+    }
+
+    /// `FUN_0046b920`: scan the source's interior two-cell lattice for plus
+    /// shapes containing at least four normalized grass selectors. At most
+    /// 500 candidates are retained; the source then samples
+    /// `floor((count + 5) / 8)` rows, capped at eight, using the physical
+    /// prefix of the island's scheduler table in reverse free-slot order.
+    fn schedule_source_terrain_events(&mut self, map_index: usize) {
+        let (island_id, width, height) = {
+            let Some(map) = self.island_maps.get(map_index) else {
+                return;
+            };
+            (map.island_id, i32::from(map.width), i32::from(map.height))
+        };
+        let mut candidates = Vec::new();
+        if width > 2 && height > 2 {
+            let mut y = 1;
+            while y < height - 1 && candidates.len() < 500 {
+                let mut x = width - 2;
+                while x > 0 {
+                    if self
+                        .source_terrain_event_cross(island_id, (x, y))
+                        .is_some_and(|(_, grass_cells)| grass_cells > 3)
+                    {
+                        candidates.push((x as u8, y as u8));
+                        if candidates.len() >= 500 {
+                            break;
+                        }
+                    }
+                    x -= 2;
+                }
+                y += 2;
+            }
+        }
+        let selection_count = ((candidates.len() + 5) / 8).min(8);
+        if selection_count == 0 {
+            return;
+        }
+        self.source_terrain_event_schedules.resize(
+            self.island_maps.len(),
+            [SourceTerrainEventSchedule::default(); 8],
+        );
+
+        for _ in 0..selection_count {
+            let candidate = candidates[usize::from(self.next_source_rand()) % candidates.len()];
+            let Some(schedule) = ({
+                let rows = &mut self.source_terrain_event_schedules[map_index];
+                if rows[..selection_count].iter().any(|row| {
+                    row.island_id == island_id && row.x == candidate.0 && row.y == candidate.1
+                }) {
+                    None
+                } else if let Some(slot) = (0..selection_count)
+                    .rev()
+                    .find(|&slot| rows[slot].is_free())
+                {
+                    rows[slot] = SourceTerrainEventSchedule {
+                        island_id,
+                        x: candidate.0,
+                        y: candidate.1,
+                        due_at_ticks: self.source_time_ticks.wrapping_add(600),
+                    };
+                    Some(rows[slot])
+                } else {
+                    None
+                }
+            }) else {
+                continue;
+            };
+            let allocate_now = self
+                .source_terrain_event_cell(
+                    island_id,
+                    i32::from(candidate.0),
+                    i32::from(candidate.1),
+                )
+                .is_some_and(|cell| cell.source_production_kind_code != 10);
+            if allocate_now {
+                if let Some(figure) = self.allocate_source_terrain_event(map_index, schedule) {
+                    self.figures.push(figure);
+                }
+            }
+        }
+    }
+
+    /// `FUN_0044bd00`: allocate a generic type-17 figure for one due terrain
+    /// row after the shared source-event table and generic figure pool both
+    /// admit it. The first INSEL5 resource selector chooses `FRAU` (`0x5b`)
+    /// only when it equals one; all other islands use `ADEL` (`0x59`).
+    fn allocate_source_terrain_event(
+        &mut self,
+        map_index: usize,
+        schedule: SourceTerrainEventSchedule,
+    ) -> Option<Figure> {
+        if !self.source_figure_pool_has_capacity() {
+            return None;
+        }
+        let map = self.island_maps.get(map_index)?;
+        if schedule.island_id != map.island_id
+            || u16::from(schedule.x) >= map.width
+            || u16::from(schedule.y) >= map.height
+        {
+            return None;
+        }
+        let local = (i32::from(schedule.x), i32::from(schedule.y));
+        let world = (
+            map.source_world_origin
+                .0
+                .div_euclid(2)
+                .checked_add(local.0)?,
+            map.source_world_origin
+                .1
+                .div_euclid(2)
+                .checked_add(local.1)?,
+        );
+        let (Ok(event_x), Ok(event_y)) = (i16::try_from(world.0), i16::try_from(world.1)) else {
+            return None;
+        };
+        let definition = if map.source_resource_state().records[0].ware() == 1 {
+            0x5b
+        } else {
+            0x59
+        };
+        let source_position_z = map.source_terrain_height(local).unwrap_or(0.0);
+        let slot = self
+            .source_figure_events
+            .prepare_terrain_event_if_absent(event_x, event_y)?;
+        if !self
+            .source_figure_events
+            .activate_terrain_event(slot, event_x, event_y)
+        {
+            return None;
+        }
+
+        let mut figure = Figure::new();
+        figure.action = ActionType::Walking;
+        figure.owner = 7;
+        figure.origin_island = schedule.island_id;
+        figure.origin_x = u16::from(schedule.x);
+        figure.origin_y = u16::from(schedule.y);
+        figure.tile_x = local.0;
+        figure.tile_y = local.1;
+        figure.target_x = local.0;
+        figure.target_y = local.1;
+        figure.speed = carrier::CARRIER_SPEED;
+        figure.source_move_speed = self
+            .civilian_config
+            .movement_speed_for_definition(definition);
+        figure.sprite_set = definition;
+        figure.base_sprite = self.civilian_config.sprite_base_for_definition(definition);
+        figure.source_position_z = source_position_z;
+        figure.initialize_source_position();
+        figure.source_event_slot = Some(slot);
+        figure.source_terrain_event_active = true;
+        Some(figure)
+    }
+
+    /// `FUN_0046b2a0`: reset a matching terrain row's retry deadline after a
+    /// type-17 terminal cleanup. The source can call this after a failed
+    /// route already compacted the row away, in which case it is a no-op.
+    fn defer_source_terrain_event(&mut self, island_id: u8, x: u8, y: u8) {
+        for rows in &mut self.source_terrain_event_schedules {
+            if let Some(row) = rows
+                .iter_mut()
+                .find(|row| row.island_id == island_id && row.x == x && row.y == y)
+            {
+                row.due_at_ticks = self.source_time_ticks.wrapping_add(600);
+                return;
+            }
+        }
+    }
+
+    /// `FUN_0046b310`: discard a scheduled terrain row by moving the last
+    /// occupied physical slot into the removed position, then restoring the
+    /// trailing free sentinel.
+    fn remove_source_terrain_event(&mut self, island_id: u8, x: u8, y: u8) {
+        for rows in &mut self.source_terrain_event_schedules {
+            let Some(removed) = rows
+                .iter()
+                .position(|row| row.island_id == island_id && row.x == x && row.y == y)
+            else {
+                continue;
+            };
+            let Some(last) = rows.iter().rposition(|row| !row.is_free()) else {
+                return;
+            };
+            if removed < last {
+                rows[removed] = rows[last];
+            }
+            rows[last] = SourceTerrainEventSchedule::default();
+            return;
         }
     }
 
@@ -3493,6 +3826,256 @@ impl Simulation {
         }
     }
 
+    /// Execute one native type-17 terrain-event dispatch interval. The event
+    /// table remains authoritative for its lifecycle and selected target;
+    /// the generic figure only supplies its continuous map position and
+    /// animation state to `FUN_0045bfc0`'s equivalent branches.
+    fn tick_source_terrain_event_figure(&mut self, figure_index: usize, dt_ms: u32) -> bool {
+        let Some(figure) = self.figures.get(figure_index).cloned() else {
+            return false;
+        };
+        if !figure.is_active()
+            || !figure.source_terrain_event_active
+            || figure.move_timer_ms.saturating_add(dt_ms) < 100
+        {
+            return false;
+        }
+        let Some(slot) = figure.source_event_slot else {
+            return true;
+        };
+        let Some(event) = self.source_figure_events.slot(slot) else {
+            return true;
+        };
+        if event.is_free() {
+            return true;
+        }
+        let Some(map_index) = self
+            .island_maps
+            .iter()
+            .position(|map| map.island_id == figure.origin_island)
+        else {
+            return true;
+        };
+        let (world_origin, width, height, resource_state, attenuation) = {
+            let map = &self.island_maps[map_index];
+            (
+                (
+                    map.source_world_origin.0.div_euclid(2),
+                    map.source_world_origin.1.div_euclid(2),
+                ),
+                i32::from(map.width),
+                i32::from(map.height),
+                map.source_resource_state(),
+                map.source_resource_attenuation(),
+            )
+        };
+        let target = (event.target_x, event.target_y);
+        let target_local = (target.0 != -1 && target.1 != -1)
+            .then(|| {
+                (
+                    i32::from(target.0) - world_origin.0,
+                    i32::from(target.1) - world_origin.1,
+                )
+            })
+            .filter(|target| {
+                target.0 >= 0 && target.1 >= 0 && target.0 < width && target.1 < height
+            });
+        let route_is_terminal = self
+            .source_figure_events
+            .kind12_is_terminal(slot)
+            .unwrap_or(true);
+
+        if route_is_terminal {
+            if target_local == Some((figure.tile_x, figure.tile_y)) {
+                match event.lifecycle {
+                    0 => {
+                        if let Some(figure) = self.figures.get_mut(figure_index) {
+                            figure.move_timer_ms = figure.move_timer_ms.saturating_add(dt_ms) - 100;
+                            figure.path.clear();
+                            figure.path_idx = 0;
+                            figure.source_step_remaining = 0.0;
+                            figure.select_source_animation_state(1);
+                        }
+                        self.source_figure_events.set_lifecycle(slot, 1);
+                    }
+                    1 => {
+                        let local = target_local.expect("terminal target is present");
+                        let mut changed = false;
+                        if let Some(cell) = self.source_static_map_roots.iter_mut().find(|cell| {
+                            cell.matches(
+                                figure.origin_island,
+                                u16::try_from(local.0).unwrap_or(u16::MAX),
+                                u16::try_from(local.1).unwrap_or(u16::MAX),
+                            )
+                        }) {
+                            let transition = source_resource_harvest_transition(
+                                resource_state.resource_strength(cell.source_output_ware_slot),
+                                cell.source_resource_growth_factor,
+                                attenuation,
+                                cell.source_output_ware_slot,
+                                figure.origin_island,
+                                u16::try_from(local.0).unwrap_or(u16::MAX),
+                                u16::try_from(local.1).unwrap_or(u16::MAX),
+                            );
+                            changed = cell.replace_harvested_raw_resource(transition);
+                        }
+                        if changed {
+                            self.source_map_cell_revision =
+                                self.source_map_cell_revision.wrapping_add(1);
+                        }
+                        self.source_figure_events.finish_terrain_harvest(slot);
+                        self.source_figure_events.clear_terrain_target(slot);
+                        if let Some(figure) = self.figures.get_mut(figure_index) {
+                            figure.move_timer_ms = figure.move_timer_ms.saturating_add(dt_ms) - 100;
+                            figure.path.clear();
+                            figure.path_idx = 0;
+                            figure.source_step_remaining = 0.0;
+                            figure.select_source_animation_state(0);
+                        }
+                    }
+                    2 => {
+                        let local = target_local.expect("terminal target is present");
+                        if let Some(cell) = self.source_static_map_roots.iter_mut().find(|cell| {
+                            cell.matches(
+                                figure.origin_island,
+                                u16::try_from(local.0).unwrap_or(u16::MAX),
+                                u16::try_from(local.1).unwrap_or(u16::MAX),
+                            )
+                        }) {
+                            let transition = source_resource_harvest_transition(
+                                resource_state.resource_strength(cell.source_output_ware_slot),
+                                cell.source_resource_growth_factor,
+                                attenuation,
+                                cell.source_output_ware_slot,
+                                figure.origin_island,
+                                u16::try_from(local.0).unwrap_or(u16::MAX),
+                                u16::try_from(local.1).unwrap_or(u16::MAX),
+                            );
+                            if cell.replace_harvested_raw_resource(transition) {
+                                self.source_map_cell_revision =
+                                    self.source_map_cell_revision.wrapping_add(1);
+                            }
+                        }
+                        self.defer_source_terrain_event(
+                            figure.origin_island,
+                            figure.origin_x as u8,
+                            figure.origin_y as u8,
+                        );
+                        return true;
+                    }
+                    _ => return true,
+                }
+                return false;
+            }
+
+            let start = (figure.tile_x, figure.tile_y);
+            let Some((route, path, target_world)) = (|| {
+                let map = self.island_maps.get(map_index)?;
+                let mut grid = map.source_type17_terrain_path_grid(
+                    start,
+                    event.resource_ware_slot,
+                    &self.source_static_map_roots,
+                );
+                let route = grid.search_source_high_metadata_target(start, 0xc0).ok()?;
+                let path = source_route_positions(start, &route.steps)?;
+                (path.last().copied() == Some(route.position)).then_some((
+                    route,
+                    path,
+                    (
+                        world_origin.0.checked_add(route.position.0)?,
+                        world_origin.1.checked_add(route.position.1)?,
+                    ),
+                ))
+            })() else {
+                let current_world = (
+                    world_origin.0.saturating_add(start.0),
+                    world_origin.1.saturating_add(start.1),
+                );
+                let (Ok(x), Ok(y)) = (
+                    i16::try_from(current_world.0),
+                    i16::try_from(current_world.1),
+                ) else {
+                    return true;
+                };
+                self.source_figure_events.set_lifecycle(slot, 2);
+                self.source_figure_events
+                    .set_terrain_target(slot, (x, y), 0);
+                self.remove_source_terrain_event(
+                    figure.origin_island,
+                    figure.origin_x as u8,
+                    figure.origin_y as u8,
+                );
+                if let Some(figure) = self.figures.get_mut(figure_index) {
+                    figure.move_timer_ms = figure.move_timer_ms.saturating_add(dt_ms) - 100;
+                    figure.select_source_animation_state(2);
+                }
+                return false;
+            };
+            let (Ok(target_x), Ok(target_y)) =
+                (i16::try_from(target_world.0), i16::try_from(target_world.1))
+            else {
+                return true;
+            };
+            if let Some(cell) = self.source_static_map_roots.iter_mut().find(|cell| {
+                cell.matches(
+                    figure.origin_island,
+                    u16::try_from(route.position.0).unwrap_or(u16::MAX),
+                    u16::try_from(route.position.1).unwrap_or(u16::MAX),
+                )
+            }) {
+                cell.source_resource_reserved = true;
+                self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+            }
+            if !self.source_figure_events.set_terrain_target(
+                slot,
+                (target_x, target_y),
+                // `FUN_00471c50` returns its fixed success code `0x20`;
+                // the wave distance only controls which high-metadata cell
+                // it selects. `FUN_0045c270` accumulates that return value.
+                0x20,
+            ) || !self
+                .source_figure_events
+                .write_terrain_route(slot, &route.steps)
+            {
+                return true;
+            }
+            if let Some(figure) = self.figures.get_mut(figure_index) {
+                figure.move_timer_ms = figure.move_timer_ms.saturating_add(dt_ms) - 100;
+                figure.target_x = route.position.0;
+                figure.target_y = route.position.1;
+                figure.path = path;
+                figure.path_idx = 0;
+                figure.source_step_remaining = 0.0;
+                figure.source_event_route_steps = route.steps;
+                figure.select_source_animation_state(0);
+            }
+            return false;
+        }
+
+        let terrain_wegspeed = self.island_maps[map_index]
+            .civilian_movement_speed((figure.tile_x, figure.tile_y))
+            .unwrap_or(100);
+        let next = figure
+            .path
+            .get(figure.path_idx)
+            .copied()
+            .unwrap_or((figure.target_x, figure.target_y));
+        let moving = next != (figure.tile_x, figure.tile_y);
+        let civilian_config = self.civilian_config;
+        let figure = &mut self.figures[figure_index];
+        figure.move_timer_ms = figure.move_timer_ms.saturating_add(dt_ms) - 100;
+        let frame_duration_ms = carrier::source_animation_frame_duration_ms(
+            civilian_config.frame_speed_for(figure) as u16,
+            terrain_wegspeed,
+            moving,
+        );
+        figure.advance_source_animation(100, frame_duration_ms, civilian_config.frames_per_dir);
+        carrier::advance_source_carrier(figure, 100, terrain_wegspeed);
+        self.source_figure_events
+            .set_kind12_route_progress(slot, figure.path_idx);
+        false
+    }
+
     fn tick_entities(&mut self, dt_ms: u32) {
         // Refresh escort targets so warships stay glued to their assigned
         // trade ship before move orders are stepped.
@@ -3551,6 +4134,20 @@ impl Simulation {
         let city_cart_config = self.city_cart_config;
         let civilian_config = self.civilian_config;
 
+        let terrain_event_indices: Vec<_> = self
+            .figures
+            .iter()
+            .enumerate()
+            .filter_map(|(index, figure)| {
+                (figure.is_active() && figure.source_terrain_event_active).then_some(index)
+            })
+            .collect();
+        for index in terrain_event_indices {
+            if self.tick_source_terrain_event_figure(index, dt_ms) {
+                despawn_indices.push(index);
+            }
+        }
+
         let searching_worker_indices: Vec<_> = self
             .figures
             .iter()
@@ -3584,6 +4181,9 @@ impl Simulation {
 
         for (idx, figure) in self.figures.iter_mut().enumerate() {
             if !figure.is_active() {
+                continue;
+            }
+            if figure.source_terrain_event_active {
                 continue;
             }
 
@@ -6737,6 +7337,187 @@ mod tests {
     }
 
     #[test]
+    fn type17_terrain_event_replays_target_harvest_and_failed_route_cleanup() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(0, 3, 3));
+        let grass = |x, y| SourceMapCellState {
+            kind_code: 9,
+            source_production_kind_code: 9,
+            source_output_ware_slot: 0x35,
+            ..SourceMapCellState::new_static(
+                0,
+                x,
+                y,
+                &CodBuilding {
+                    kind: "ROHSTOFF".into(),
+                    properties: [("Ware".into(), "ERDE".into())].into(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        };
+        let terrain_target = SourceMapCellState {
+            kind_code: 1,
+            source_production_kind_code: 9,
+            source_output_ware_slot: 0x34,
+            ..SourceMapCellState::new_static(
+                0,
+                2,
+                1,
+                &CodBuilding {
+                    kind: "ROHSTOFF".into(),
+                    properties: [("Ware".into(), "GRAS".into())].into(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        };
+        sim.source_static_map_roots = vec![
+            grass(1, 1),
+            grass(0, 1),
+            grass(1, 0),
+            grass(1, 2),
+            terrain_target,
+        ];
+        let mut rows = [SourceTerrainEventSchedule::default(); 8];
+        rows[0] = SourceTerrainEventSchedule {
+            island_id: 0,
+            x: 1,
+            y: 1,
+            due_at_ticks: 0,
+        };
+        sim.source_terrain_event_schedules.push(rows);
+        sim.source_resource_environment_phase = 1;
+        sim.source_resource_environment_last_phase = vec![0];
+
+        sim.tick_source_resource_environment(0);
+        assert_eq!(sim.figures.len(), 1);
+        assert!(sim.figures[0].source_terrain_event_active);
+        assert_eq!(sim.figures[0].sprite_set, 0x59);
+        let slot = sim.figures[0]
+            .source_event_slot
+            .expect("terrain event owns a shared source slot");
+        assert_eq!(sim.source_figure_events.slot(slot).unwrap().owner, 7);
+
+        sim.tick_entities(100);
+        assert_eq!(
+            (
+                sim.source_figure_events.slot(slot).unwrap().target_x,
+                sim.source_figure_events.slot(slot).unwrap().target_y,
+            ),
+            (2, 1)
+        );
+        assert!(sim.source_static_map_roots[4].source_resource_reserved);
+
+        let route_steps = sim.figures[0].source_event_route_steps.len();
+        assert!(sim
+            .source_figure_events
+            .set_kind12_route_progress(slot, route_steps));
+        sim.figures[0].tile_x = 2;
+        sim.figures[0].tile_y = 1;
+        sim.tick_entities(100);
+        assert_eq!(sim.source_figure_events.slot(slot).unwrap().lifecycle, 1);
+        sim.tick_entities(100);
+        let harvested = sim.source_figure_events.slot(slot).unwrap();
+        assert_eq!((harvested.target_x, harvested.target_y), (-1, -1));
+        assert_eq!(harvested.lifecycle, 0);
+        assert_eq!(harvested.resource_ware_slot, 0x34);
+        assert!(!sim.source_static_map_roots[4].source_resource_reserved);
+
+        sim.source_static_map_roots[4].kind_code = 9;
+        sim.tick_entities(100);
+        assert_eq!(sim.source_figure_events.slot(slot).unwrap().lifecycle, 2);
+        assert!(sim.source_terrain_event_schedules[0][0].is_free());
+        sim.tick_entities(100);
+        assert!(sim.figures.is_empty());
+        assert!(sim.source_figure_events.slot(slot).unwrap().is_free());
+    }
+
+    #[test]
+    fn terrain_event_due_row_requires_two_grass_neighbours() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(0, 3, 3));
+        let grass = CodBuilding {
+            kind: "ROHSTOFF".into(),
+            properties: [("Ware".into(), "ERDE".into())].into(),
+            ..Default::default()
+        };
+        for (x, y) in [(1, 1), (0, 1)] {
+            sim.source_static_map_roots.push(SourceMapCellState {
+                kind_code: 9,
+                source_production_kind_code: 9,
+                source_output_ware_slot: 0x35,
+                ..SourceMapCellState::new_static(0, x, y, &grass, 0).unwrap()
+            });
+        }
+        let mut rows = [SourceTerrainEventSchedule::default(); 8];
+        rows[0] = SourceTerrainEventSchedule {
+            island_id: 0,
+            x: 1,
+            y: 1,
+            due_at_ticks: 0,
+        };
+        sim.source_terrain_event_schedules.push(rows);
+        sim.source_resource_environment_phase = 1;
+        sim.source_resource_environment_last_phase = vec![0];
+
+        sim.tick_source_resource_environment(0);
+
+        assert!(sim.source_terrain_event_schedules[0][0].is_free());
+        assert!(sim.figures.is_empty());
+    }
+
+    #[test]
+    fn terrain_event_candidate_scan_emits_one_due_row_after_four_island_phases() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(0, 7, 3));
+        let source_grass = CodBuilding {
+            kind: "ROHSTOFF".into(),
+            properties: [("Ware".into(), "ERDE".into())].into(),
+            ..Default::default()
+        };
+        for y in 0..3 {
+            for x in 0..7 {
+                sim.source_static_map_roots.push(SourceMapCellState {
+                    kind_code: 9,
+                    source_production_kind_code: 9,
+                    source_output_ware_slot: 0x35,
+                    ..SourceMapCellState::new_static(0, x, y, &source_grass, 0).unwrap()
+                });
+            }
+        }
+        sim.seed_source_rand(1);
+        sim.source_time_ticks = 100;
+        sim.source_resource_environment_phase = 1;
+        sim.source_resource_environment_last_phase = vec![0];
+        sim.source_terrain_event_schedule_counters = vec![3];
+
+        sim.tick_source_resource_environment(0);
+
+        assert_eq!(sim.source_terrain_event_schedule_counters, vec![0]);
+        assert_eq!(sim.source_terrain_event_schedules.len(), 1);
+        let rows = sim.source_terrain_event_schedules[0];
+        assert_eq!(rows.iter().filter(|row| !row.is_free()).count(), 1);
+        let row = rows.into_iter().find(|row| !row.is_free()).unwrap();
+        assert_eq!(row.island_id, 0);
+        assert_eq!(row.due_at_ticks, 700);
+        assert!(matches!((row.x, row.y), (1 | 3 | 5, 1)));
+        assert_eq!(sim.figures.len(), 1);
+        assert_eq!(
+            (sim.figures[0].origin_x, sim.figures[0].origin_y),
+            (u16::from(row.x), u16::from(row.y))
+        );
+    }
+
+    #[test]
     fn ai_request_build_places_building() {
         use crate::ai::AiAction;
         use crate::building::BuildingDef;
@@ -9237,11 +10018,14 @@ mod tests {
                 route_radius: 0,
                 x: 115,
                 y: 137,
+                target_x: -1,
+                target_y: -1,
                 lifecycle: 0,
                 owner: 0,
                 route_cursor: 0,
                 state: 0xc0,
                 transfer_amount_fixed: 0,
+                resource_ware_slot: 0,
                 route_program: [0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             })
         );
@@ -9286,11 +10070,14 @@ mod tests {
                 route_radius: 16,
                 x: 116,
                 y: 137,
+                target_x: -1,
+                target_y: -1,
                 lifecycle: 1,
                 owner: 4,
                 route_cursor: 0,
                 state: 0xc0,
                 transfer_amount_fixed: 0,
+                resource_ware_slot: 0,
                 route_program: [0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             })
         );

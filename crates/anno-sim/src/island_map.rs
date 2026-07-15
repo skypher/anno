@@ -488,6 +488,75 @@ impl IslandMap {
         grid
     }
 
+    /// Rebuild the clipped `35 x 35` terrain-event grid made by
+    /// `FUN_004702b0` for a generic type-17 figure. The native overlay uses
+    /// fixed terrain kinds, the centre cell of kind 3, and its special
+    /// `Ware = 0x35` branch. Every admitted cell gets the fixed `0x20` path
+    /// class; matching, unreserved resource cells instead become the `0xa0`
+    /// terminal callback cells scanned by `FUN_00471c50`.
+    pub fn source_type17_terrain_path_grid(
+        &self,
+        center: (i32, i32),
+        resource_ware_slot: u8,
+        static_cells: &[SourceMapCellState],
+    ) -> SourcePathGrid {
+        const RADIUS: i32 = 17;
+        const GRID_SIDE: usize = 35;
+        const SPECIAL_TERRAIN_WARE_SLOT: u8 = 0x35;
+        const PATH_CLASS: u8 = 0x20;
+        const TARGET_METADATA: u8 = 0xa0;
+
+        let origin = (center.0 - RADIUS, center.1 - RADIUS);
+        let mut grid = SourcePathGrid::new(origin, GRID_SIDE, GRID_SIDE);
+
+        for y in origin.1..=origin.1 + RADIUS * 2 {
+            for x in origin.0..=origin.0 + RADIUS * 2 {
+                let position = (x, y);
+                grid.mark_direction_blocker(position);
+
+                let civilian_cell = self.civilian_path_cell(position);
+                let kind3_center_cell = civilian_cell.is_some_and(|cell| cell.kind3_center_cell);
+                if let Some(static_cell) = static_cells.iter().rev().find(|state| {
+                    state.island == self.island_id
+                        && i32::from(state.x) == x
+                        && i32::from(state.y) == y
+                }) {
+                    let normalized_ware_slot = static_cell.plantation_path_resource_ware_slot();
+                    let traversable =
+                        source_plantation_path_kind_always_walkable(static_cell.kind_code)
+                            || (static_cell.kind_code == 3 && kind3_center_cell)
+                            || (static_cell.source_production_kind_code != 10
+                                && normalized_ware_slot == SPECIAL_TERRAIN_WARE_SLOT);
+                    if traversable {
+                        grid.set_traversable_cell(position, PATH_CLASS);
+                        if normalized_ware_slot == resource_ware_slot
+                            && !static_cell.source_resource_reserved
+                        {
+                            grid.set_metadata(position, TARGET_METADATA);
+                        }
+                    }
+                    continue;
+                }
+
+                let Some(cell) = civilian_cell else {
+                    continue;
+                };
+                let traversable = source_plantation_path_kind_always_walkable(cell.kind_code)
+                    || cell.kind3_center_cell
+                    || (cell.production_kind_code != 10
+                        && cell.source_ware_slot == SPECIAL_TERRAIN_WARE_SLOT);
+                if traversable {
+                    grid.set_traversable_cell(position, PATH_CLASS);
+                    if cell.source_ware_slot == resource_ware_slot {
+                        grid.set_metadata(position, TARGET_METADATA);
+                    }
+                }
+            }
+        }
+
+        grid
+    }
+
     /// Rebuild the `11 x 11` type-3 path window passed to
     /// `FUN_0046c7d0` by `FUN_0044b140`. The source first blocks every cell,
     /// then permits fixed terrain kinds 1, 13, 18, and 30 plus the selected
@@ -1584,6 +1653,58 @@ mod tests {
 
         assert_eq!(grid.metadata((1, 0)), Some(46));
         assert!(grid.route_to((0, 0), (1, 0)).is_ok());
+    }
+
+    #[test]
+    fn type17_terrain_grid_uses_fixed_costs_and_unreserved_resource_targets() {
+        let map = IslandMap::new_open(3, 3, 1);
+        let raw_resource = |x, reserved| SourceMapCellState {
+            source_output_ware_slot: 0x34,
+            source_resource_reserved: reserved,
+            kind_code: 1,
+            ..SourceMapCellState::new_static(
+                3,
+                x,
+                0,
+                &CodBuilding {
+                    kind: "BODEN".into(),
+                    properties: [("Ware".into(), "GRAS".into())].into(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        };
+        let special_terrain = SourceMapCellState {
+            source_output_ware_slot: 0x35,
+            kind_code: 9,
+            ..SourceMapCellState::new_static(
+                3,
+                0,
+                0,
+                &CodBuilding {
+                    kind: "ROHSTOFF".into(),
+                    properties: [("Ware".into(), "ERDE".into())].into(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        };
+
+        let grid = map.source_type17_terrain_path_grid(
+            (1, 0),
+            0x34,
+            &[
+                special_terrain,
+                raw_resource(1, false),
+                raw_resource(2, true),
+            ],
+        );
+
+        assert_eq!(grid.metadata((0, 0)), Some(0x20));
+        assert_eq!(grid.metadata((1, 0)), Some(0xa0));
+        assert_eq!(grid.metadata((2, 0)), Some(0x20));
     }
 
     #[test]

@@ -194,7 +194,11 @@ use std::path::Path;
 ///       selector used by plantation-worker traversal after regrowth.
 /// v104: source resource-environment phase/cursor state and dry-cell markers
 ///       retain the `FUN_0046b3e0` / `FUN_0047c920` transition schedule.
-pub const SAVE_VERSION: u32 = 104;
+/// v105: source terrain-event scheduler rows and type-17 event-slot fields
+///       retain the `FUN_0044bd00` / `FUN_0045bfc0` lifecycle state.
+/// v106: source terrain-event four-phase scheduling counters retain the
+///       `FUN_0046b920` candidate-emission cadence.
+pub const SAVE_VERSION: u32 = 106;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -208,7 +212,7 @@ pub const SAVE_VERSION: u32 = 104;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 104;
+pub const MIN_LOADABLE_VERSION: u32 = 106;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -245,6 +249,8 @@ pub struct SaveState {
     pub source_resource_environment_phase: u8,
     pub source_resource_environment_cursor: usize,
     pub source_resource_environment_last_phase: Vec<u8>,
+    pub source_terrain_event_schedules: Vec<[crate::simulation::SourceTerrainEventSchedule; 8]>,
+    pub source_terrain_event_schedule_counters: Vec<u8>,
     pub source_map_dispatch_elapsed_ms: u32,
     pub source_map_dispatch_phase: u8,
     pub source_city_dispatch_elapsed_ms: u32,
@@ -326,6 +332,10 @@ impl Simulation {
             source_resource_environment_last_phase: self
                 .source_resource_environment_last_phase
                 .clone(),
+            source_terrain_event_schedules: self.source_terrain_event_schedules.clone(),
+            source_terrain_event_schedule_counters: self
+                .source_terrain_event_schedule_counters
+                .clone(),
             source_map_dispatch_elapsed_ms: self.source_map_dispatch_elapsed_ms,
             source_map_dispatch_phase: self.source_map_dispatch_phase,
             source_city_dispatch_elapsed_ms: self.source_city_dispatch_elapsed_ms,
@@ -375,6 +385,8 @@ impl Simulation {
         self.source_resource_environment_phase = s.source_resource_environment_phase;
         self.source_resource_environment_cursor = s.source_resource_environment_cursor;
         self.source_resource_environment_last_phase = s.source_resource_environment_last_phase;
+        self.source_terrain_event_schedules = s.source_terrain_event_schedules;
+        self.source_terrain_event_schedule_counters = s.source_terrain_event_schedule_counters;
         self.source_map_dispatch_elapsed_ms = s.source_map_dispatch_elapsed_ms;
         self.source_map_dispatch_phase = s.source_map_dispatch_phase;
         self.source_city_dispatch_elapsed_ms = s.source_city_dispatch_elapsed_ms;
@@ -482,6 +494,8 @@ mod tests {
             source_resource_environment_phase: 0,
             source_resource_environment_cursor: 0,
             source_resource_environment_last_phase: vec![],
+            source_terrain_event_schedules: vec![],
+            source_terrain_event_schedule_counters: vec![],
             source_map_dispatch_elapsed_ms: 0,
             source_map_dispatch_phase: 0,
             source_city_dispatch_elapsed_ms: 0,
@@ -698,6 +712,22 @@ mod tests {
         sim.source_resource_environment_phase = 3;
         sim.source_resource_environment_cursor = 1;
         sim.source_resource_environment_last_phase = vec![2, 3];
+        sim.source_terrain_event_schedules = vec![[
+            crate::simulation::SourceTerrainEventSchedule {
+                island_id: 3,
+                x: 7,
+                y: 9,
+                due_at_ticks: 619,
+            },
+            crate::simulation::SourceTerrainEventSchedule::default(),
+            crate::simulation::SourceTerrainEventSchedule::default(),
+            crate::simulation::SourceTerrainEventSchedule::default(),
+            crate::simulation::SourceTerrainEventSchedule::default(),
+            crate::simulation::SourceTerrainEventSchedule::default(),
+            crate::simulation::SourceTerrainEventSchedule::default(),
+            crate::simulation::SourceTerrainEventSchedule::default(),
+        ]];
+        sim.source_terrain_event_schedule_counters = vec![3, 1];
         sim.source_map_dispatch_elapsed_ms = 800;
         sim.source_map_dispatch_phase = 5;
         sim.source_kind4_dispatch = crate::combat::SourceKind4DispatchState {
@@ -1029,6 +1059,16 @@ mod tests {
         assert_eq!(sim2.source_resource_environment_phase, 3);
         assert_eq!(sim2.source_resource_environment_cursor, 1);
         assert_eq!(sim2.source_resource_environment_last_phase, vec![2, 3]);
+        assert_eq!(
+            sim2.source_terrain_event_schedules[0][0],
+            crate::simulation::SourceTerrainEventSchedule {
+                island_id: 3,
+                x: 7,
+                y: 9,
+                due_at_ticks: 619,
+            }
+        );
+        assert_eq!(sim2.source_terrain_event_schedule_counters, vec![3, 1]);
         assert_eq!(sim2.source_map_dispatch_elapsed_ms, 800);
         assert_eq!(sim2.source_map_dispatch_phase, 5);
         assert_eq!(

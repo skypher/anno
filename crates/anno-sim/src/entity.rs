@@ -150,6 +150,11 @@ pub struct Figure {
     #[serde(default)]
     pub source_event_slot: Option<u16>,
 
+    /// Marks a generic type-17 terrain figure allocated by `FUN_0044bd00`.
+    /// Its route and lifecycle state live in the shared source event slot.
+    #[serde(default)]
+    pub source_terrain_event_active: bool,
+
     /// Movement direction (0-7, compass directions).
     pub direction: u8,
 
@@ -280,6 +285,7 @@ impl Figure {
             source_position_z: 0.0,
             source_position_initialized: false,
             source_event_slot: None,
+            source_terrain_event_active: false,
             direction: 0,
             target_x: 0,
             target_y: 0,

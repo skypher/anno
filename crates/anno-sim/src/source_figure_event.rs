@@ -20,6 +20,13 @@ pub struct SourceFigureEventSlot {
     pub route_radius: u8,
     pub x: i16,
     pub y: i16,
+    /// Source words `+0x08/+0x0a`, the current type-17 terrain-event target.
+    /// `FUN_0044bd00` initializes both to `-1`; `FUN_0045c270` writes a
+    /// selected terrain cell and `FUN_0045c3f0` restores the sentinels.
+    #[serde(default = "source_event_target_sentinel")]
+    pub target_x: i16,
+    #[serde(default = "source_event_target_sentinel")]
+    pub target_y: i16,
     /// Source byte `+0x01`, written as `0xff` by the shared release branch
     /// in `FUN_00443520` and otherwise retained by the kind-12 allocator.
     pub lifecycle: u8,
@@ -33,10 +40,19 @@ pub struct SourceFigureEventSlot {
     /// Source word `+0x28`, the 1/32-good quantity accumulated by a
     /// type-11 `FUN_00459400` cart and passed to `FUN_0047d940` on arrival.
     pub transfer_amount_fixed: u16,
+    /// Source byte `+0x2a`. Type-17 terrain figures begin with `0x34` and
+    /// switch to `0x35` after their accumulated source path cost reaches
+    /// `0x40`.
+    #[serde(default)]
+    pub resource_ware_slot: u8,
     /// Source bytes `+0x14..=+0x1f`, written by `FUN_0046cf70` after a
     /// successful kind-12 grid search. The first byte is also `state` while
     /// `route_cursor` is zero.
     pub route_program: [u8; SourceFigureEventRegistry::KIND12_ROUTE_CAPACITY],
+}
+
+const fn source_event_target_sentinel() -> i16 {
+    -1
 }
 
 impl Default for SourceFigureEventSlot {
@@ -45,11 +61,14 @@ impl Default for SourceFigureEventSlot {
             route_radius: 0,
             x: -1,
             y: -1,
+            target_x: -1,
+            target_y: -1,
             lifecycle: 0,
             owner: 0,
             route_cursor: 0,
             state: 0,
             transfer_amount_fixed: 0,
+            resource_ware_slot: 0,
             route_program: [0; SourceFigureEventRegistry::KIND12_ROUTE_CAPACITY],
         }
     }
@@ -202,6 +221,30 @@ impl SourceFigureEventRegistry {
         true
     }
 
+    /// Claim and publish the `FUN_0044bd00` entry for a generic type-17
+    /// terrain figure. Its lookup owner is the fixed source selector seven,
+    /// distinct from the category-six byte written at source offset `+0x00`.
+    pub fn prepare_terrain_event_if_absent(&mut self, x: i16, y: i16) -> Option<u16> {
+        self.prepare_kind12_if_absent(x, y, 7)
+    }
+
+    /// Complete type-17 terrain-event construction after generic-figure pool
+    /// allocation succeeds. This mirrors the writes in `FUN_0044bd00`.
+    pub fn activate_terrain_event(&mut self, slot: u16, x: i16, y: i16) -> bool {
+        if !self.activate_kind12(slot, x, y) {
+            return false;
+        }
+        let entry = &mut self.slots[usize::from(slot)];
+        entry.route_radius = 6;
+        entry.lifecycle = 0;
+        entry.owner = 7;
+        entry.target_x = -1;
+        entry.target_y = -1;
+        entry.transfer_amount_fixed = 0;
+        entry.resource_ware_slot = 0x34;
+        true
+    }
+
     /// Claim a kind-12 source event slot and activate its coordinates. This
     /// convenience operation is appropriate when generic figure-pool
     /// allocation is already known to succeed.
@@ -253,6 +296,64 @@ impl SourceFigureEventRegistry {
         entry.route_cursor = 0;
         entry.route_program[..program.len()].copy_from_slice(&program);
         entry.state = entry.route_program[0];
+        true
+    }
+
+    /// `FUN_0045c270` encodes a type-17 terrain route with the same
+    /// `FUN_00472b60` direction-only program as a plantation worker.
+    pub fn write_terrain_route(&mut self, slot: u16, steps: &[SourceRouteStep]) -> bool {
+        self.write_plantation_route(slot, steps)
+    }
+
+    /// Set the terrain target selected by `FUN_00471c50` and retain its
+    /// source path cost when the active resource selector is `0x34`.
+    pub fn set_terrain_target(&mut self, slot: u16, target: (i16, i16), path_cost: u16) -> bool {
+        let Some(entry) = self.slots.get_mut(usize::from(slot)) else {
+            return false;
+        };
+        if entry.is_free() {
+            return false;
+        }
+        entry.target_x = target.0;
+        entry.target_y = target.1;
+        if entry.resource_ware_slot == 0x34 {
+            entry.transfer_amount_fixed = entry.transfer_amount_fixed.saturating_add(path_cost);
+        }
+        true
+    }
+
+    /// `FUN_0045c3f0` drops the active terrain target and restores the route
+    /// terminator while retaining the event's resource selector and cost.
+    pub fn clear_terrain_target(&mut self, slot: u16) -> bool {
+        let Some(entry) = self.slots.get_mut(usize::from(slot)) else {
+            return false;
+        };
+        if entry.is_free() {
+            return false;
+        }
+        entry.target_x = -1;
+        entry.target_y = -1;
+        entry.route_cursor = 0;
+        entry.state = 0xc0;
+        entry.route_program[0] = 0xc0;
+        true
+    }
+
+    /// Apply the type-17 harvest postcondition from `FUN_0045bfc0`.
+    pub fn finish_terrain_harvest(&mut self, slot: u16) -> bool {
+        let Some(entry) = self.slots.get_mut(usize::from(slot)) else {
+            return false;
+        };
+        if entry.is_free() {
+            return false;
+        }
+        entry.lifecycle = 0;
+        if entry.transfer_amount_fixed < 0x40 {
+            entry.resource_ware_slot = 0x34;
+        } else {
+            entry.transfer_amount_fixed = 0;
+            entry.resource_ware_slot = 0x35;
+        }
         true
     }
 
@@ -434,11 +535,14 @@ mod tests {
                 route_radius: 16,
                 x: 7,
                 y: 9,
+                target_x: -1,
+                target_y: -1,
                 lifecycle: 1,
                 owner: 3,
                 route_cursor: 0,
                 state: 0xc0,
                 transfer_amount_fixed: 0,
+                resource_ware_slot: 0,
                 route_program: [0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             })
         );
@@ -446,6 +550,49 @@ mod tests {
         assert_eq!(registry.slot(slot).unwrap().lifecycle, 2);
         assert!(registry.set_transfer_amount_fixed(slot, 65));
         assert_eq!(registry.slot(slot).unwrap().transfer_amount_fixed, 65);
+    }
+
+    #[test]
+    fn terrain_event_tracks_native_target_and_resource_lifecycle() {
+        let mut registry = SourceFigureEventRegistry::default();
+        let slot = registry.prepare_terrain_event_if_absent(7, 9).unwrap();
+        assert!(registry.activate_terrain_event(slot, 7, 9));
+        assert_eq!(registry.lookup(7, 9, 7), Some(slot));
+        assert_eq!(
+            registry.slot(slot),
+            Some(SourceFigureEventSlot {
+                route_radius: 6,
+                x: 7,
+                y: 9,
+                target_x: -1,
+                target_y: -1,
+                lifecycle: 0,
+                owner: 7,
+                route_cursor: 0,
+                state: 0xc0,
+                transfer_amount_fixed: 0,
+                resource_ware_slot: 0x34,
+                route_program: [0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            })
+        );
+        assert!(registry.set_terrain_target(slot, (11, 13), 0x40));
+        assert!(registry.write_terrain_route(
+            slot,
+            &[SourceRouteStep {
+                direction: 3,
+                metadata: 0x20,
+            }]
+        ));
+        assert!(registry.set_lifecycle(slot, 1));
+        assert!(registry.finish_terrain_harvest(slot));
+        assert_eq!(registry.slot(slot).unwrap().resource_ware_slot, 0x35);
+        assert_eq!(registry.slot(slot).unwrap().transfer_amount_fixed, 0);
+        assert!(registry.clear_terrain_target(slot));
+        let entry = registry.slot(slot).unwrap();
+        assert_eq!(
+            (entry.target_x, entry.target_y, entry.state),
+            (-1, -1, 0xc0)
+        );
     }
 
     #[test]
@@ -469,11 +616,14 @@ mod tests {
                 route_radius: 16,
                 x: -1,
                 y: -1,
+                target_x: -1,
+                target_y: -1,
                 lifecycle: 0xff,
                 owner: 3,
                 route_cursor: 0,
                 state: 0x31,
                 transfer_amount_fixed: 129,
+                resource_ware_slot: 0,
                 route_program: [0x31, SOURCE_ROUTE_TERMINATOR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,],
             })
         );
