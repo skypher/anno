@@ -282,6 +282,9 @@ pub fn land_units_from_scenario(szs: &SzsFile) -> Vec<crate::combat::MilitaryUni
             unit.source_position_initialized = true;
             unit.source_island_id = Some(figure.island_id);
             unit.source_runtime_slot = Some(figure.runtime_slot);
+            unit.source_live_runtime_slot = Some(figure.runtime_slot);
+            unit.source_candidate_list_key = Some(figure.island_id);
+            unit.source_figure_kind = Some(figure.figure_kind);
             unit.source_figure_definition_id = Some(definition.id);
             unit.source_energy = figure.source_energy;
             unit.source_route_radius = figure.route_radius;
@@ -1305,13 +1308,21 @@ pub fn warships_from_ships(ships: &[anno_formats::szs::Ship]) -> Vec<crate::comb
                 ShipClass::PirateShip => UnitType::PirateShip,
                 _ => return None,
             };
-            Some(MilitaryUnit::with_name(
+            let mut unit = MilitaryUnit::with_name(
                 unit_type,
                 s.owner,
                 s.x as i32,
                 s.y as i32,
                 s.name.clone(),
-            ))
+            );
+            unit.source_live_runtime_slot = Some(s.runtime_slot);
+            unit.source_candidate_list_key = Some(s.candidate_list_key);
+            unit.source_figure_kind = Some(s.figure_kind);
+            unit.source_figure_definition_id = Some(s.figure_definition_id);
+            unit.source_energy = s.stored_energy;
+            unit.source_score_state = s.heading_byte;
+            unit.direction = s.source_direction;
+            Some(unit)
         })
         .collect()
 }
@@ -1355,6 +1366,13 @@ pub fn traders_from_ships(
             // Carry the authored heading so the renderer
             // shows the ship facing the right direction.
             t.heading = s.heading();
+            t.source_figure_kind = Some(s.figure_kind);
+            t.source_runtime_slot = Some(s.runtime_slot);
+            t.source_candidate_list_key = Some(s.candidate_list_key);
+            t.source_direction = s.source_direction;
+            t.source_figure_definition_id = Some(s.figure_definition_id);
+            t.source_energy = s.stored_energy;
+            t.source_score_state = s.heading_byte;
             t.source_target_approach_radius = cargo_config.target_approach_radius_for(class);
             t
         })
@@ -1400,11 +1418,13 @@ mod tests {
             owner,
             figure_definition_id: class.into(),
             ship_class: class,
-            stored_energy: 0,
-            runtime_slot: 0,
-            figure_kind: 0,
+            stored_energy: u16::from(class) + 100,
+            runtime_slot: class.into(),
+            figure_kind: if owner == 5 { 3 } else { 1 },
+            candidate_list_key: 9,
+            source_direction: 6,
             animation_state: 0,
-            heading_byte: 0,
+            heading_byte: 4,
             cargo_slots: [0; 7],
         };
         let ships = vec![
@@ -1412,16 +1432,25 @@ mod tests {
             mk(1, 0x19, 20, 20), // SmallWarship → keep
             mk(2, 0x1B, 30, 30), // LargeWarship → keep
             mk(0, 0x17, 40, 40), // LargeTrader  → skip
-            mk(6, 0x1F, 50, 50), // PirateShip   → keep
+            mk(5, 0x1F, 50, 50), // PirateShip   → keep
             mk(0, 0xFE, 0, 0),   // unknown     → skip
         ];
         let units = warships_from_ships(&ships);
         assert_eq!(units.len(), 3);
         assert_eq!(units[0].unit_type, UnitType::SmallWarship);
         assert_eq!(units[0].owner, 1);
+        assert_eq!(units[0].source_figure_kind, Some(1));
+        assert_eq!(units[0].source_runtime_slot, None);
+        assert_eq!(units[0].source_live_runtime_slot, Some(0x19));
+        assert_eq!(units[0].source_candidate_list_key, Some(9));
+        assert_eq!(units[0].source_figure_definition_id, Some(0x19));
+        assert_eq!(units[0].source_energy, 125);
+        assert_eq!(units[0].source_score_state, 4);
+        assert_eq!(units[0].direction, 6);
         assert_eq!(units[1].unit_type, UnitType::LargeWarship);
         assert_eq!(units[2].unit_type, UnitType::PirateShip);
-        assert_eq!(units[2].owner, 6);
+        assert_eq!(units[2].owner, 5);
+        assert_eq!(units[2].source_figure_kind, Some(3));
         // Position should round-trip from u16 → i32.
         assert_eq!(units[0].tile_x, 20);
         assert_eq!(units[0].tile_y, 20);
@@ -1438,11 +1467,13 @@ mod tests {
             owner,
             figure_definition_id: class.into(),
             ship_class: class,
-            stored_energy: 0,
-            runtime_slot: 0,
-            figure_kind: 0,
+            stored_energy: u16::from(class) + 100,
+            runtime_slot: class.into(),
+            figure_kind: if owner == 5 { 3 } else { 1 },
+            candidate_list_key: 9,
+            source_direction: 6,
             animation_state: 0,
-            heading_byte: 0,
+            heading_byte: 4,
             cargo_slots: [0; 7],
         };
         let ships = vec![
@@ -1468,6 +1499,14 @@ mod tests {
         assert_eq!(traders[0].owner, 0);
         assert_eq!(traders[0].name, "test");
         assert_eq!(traders[0].world_x, 10);
+        assert_eq!(traders[0].source_figure_kind, Some(1));
+        assert_eq!(traders[0].source_runtime_slot, Some(0x15));
+        assert_eq!(traders[0].source_candidate_list_key, Some(9));
+        assert_eq!(traders[0].source_direction, 6);
+        assert_eq!(traders[0].source_figure_definition_id, Some(0x15));
+        assert_eq!(traders[0].source_energy, 121);
+        assert_eq!(traders[0].source_score_state, 4);
+        assert_eq!(traders[0].heading, 2);
         assert_eq!(traders[0].class, crate::trade::TradeShipClass::SmallTrader);
         assert_eq!(traders[0].cargo_capacity(), 40);
         assert_eq!(traders[0].source_target_approach_radius, 4);
@@ -1566,6 +1605,9 @@ mod tests {
         assert_eq!(units[0].direction, 7);
         assert_eq!(units[0].source_island_id, Some(7));
         assert_eq!(units[0].source_runtime_slot, Some(14));
+        assert_eq!(units[0].source_live_runtime_slot, Some(14));
+        assert_eq!(units[0].source_candidate_list_key, Some(7));
+        assert_eq!(units[0].source_figure_kind, Some(4));
         assert_eq!(units[0].source_figure_definition_id, Some(5));
         assert_eq!(units[0].source_energy, 18);
         assert_eq!(units[0].source_route_radius, 7);

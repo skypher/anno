@@ -15,7 +15,7 @@
 
 use crate::source_rand::SourceRand;
 use crate::source_route::SourceTargetDescriptor;
-use anno_formats::szs::LandFigureDefinition;
+use anno_formats::szs::{LandFigureDefinition, SourceCombatDefinition};
 
 /// `FUN_00446ca0` initializes byte zero of each newly allocated type-4
 /// runtime slot to `0x2d`; `FUN_004581f0` uses that byte as its raw-grid
@@ -35,6 +35,194 @@ pub const SOURCE_KIND4_TERMINAL_IDLE_REMAINING: f32 = 2.0;
 /// `FUN_00456d00` pairs the terminal remaining amount with this source
 /// motion rate, producing a two-second dispatch pause.
 pub const SOURCE_KIND4_TERMINAL_IDLE_RATE: f32 = 0.02;
+
+/// Locally reconstructed entity participating in the source candidate list
+/// assembled by `FUN_00453da0` and consumed by
+/// `FUN_0045cd20`. The source category-local slot is meaningful only with
+/// its [`SourceCombatCandidate::figure_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCombatCandidateEntity {
+    MilitaryUnit(usize),
+    TradeShip(usize),
+    DynamicFigure(usize),
+}
+
+/// Source-live identity and placement required by the common candidate
+/// producer. This view covers every currently reconstructed entity carrying
+/// a live category tag; runtime-created categories can enter by preserving
+/// the same identity fields on their local representation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceCombatCandidate {
+    pub entity: SourceCombatCandidateEntity,
+    pub figure_kind: u8,
+    pub runtime_slot: u16,
+    /// Compiled `figuren.cod` definition ID loaded at runtime offset `+0x44`.
+    pub figure_definition_id: Option<u16>,
+    /// Live energy consumed by `FUN_00454250`'s candidate score curves.
+    pub source_energy: u16,
+    /// Shared category-1/2/3 slot byte `+0x1a2`. The SHIP4 loader copies
+    /// raw record byte `0x42` here; `FUN_00454250` maps it to a target
+    /// strength multiplier independently from the source movement direction.
+    pub source_score_state: u8,
+    /// Live byte `+1`, used by `FUN_00453da0` to choose one of its candidate
+    /// lists. This is independent from the faction byte at `+2`.
+    pub candidate_list_key: Option<u8>,
+    pub owner: u8,
+    pub position: (f32, f32),
+    pub direction: u8,
+}
+
+impl SourceCombatCandidate {
+    /// Resolve the source-compiled score fields for this candidate's figure
+    /// definition. Unknown definition IDs remain unavailable rather than
+    /// inheriting local compatibility-unit statistics.
+    pub fn combat_definition(&self) -> Option<SourceCombatDefinition> {
+        self.figure_definition_id
+            .and_then(SourceCombatDefinition::from_id)
+    }
+}
+
+/// One live dynamic figure supplied by an `0x84a` spawn record and installed
+/// through `FUN_0045deb0`/`FUN_0045d380`. This retains the fields that the
+/// source loader copies into its category-local tables without mapping an
+/// unclassified source figure onto a local [`UnitType`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceDynamicCombatFigure {
+    pub active: bool,
+    /// Source category at spawn-record offset `+0x00`.
+    pub figure_kind: u8,
+    /// Live candidate-list key at spawn-record offset `+0x01`.
+    pub candidate_list_key: u8,
+    /// Compiled figure-definition ID at spawn-record offset `+0x02`.
+    pub figure_definition_id: u8,
+    /// Live source compass direction at spawn-record offset `+0x03`.
+    pub direction: u8,
+    /// Loader payload at spawn-record offset `+0x04`.
+    pub source_payload: u32,
+    /// World position resolved by `FUN_004444c0` from the spawn descriptor.
+    pub position: (f32, f32),
+    /// Source energy at spawn-record offset `+0x0a`.
+    pub source_energy: u16,
+    /// Target descriptor at spawn-record offset `+0x0c`.
+    pub target_descriptor: SourceTargetDescriptor,
+    /// Follow-up descriptor at spawn-record offset `+0x10`.
+    pub state_descriptor: SourceTargetDescriptor,
+    /// Faction at spawn-record offset `+0x14`.
+    pub owner: u8,
+    /// Loader state byte at spawn-record offset `+0x15`.
+    pub state: u8,
+    /// Loader flags at spawn-record offset `+0x16`.
+    pub flags: u8,
+    /// Notification byte at spawn-record offset `+0x17`.
+    pub notification: u8,
+    /// Category-local table slot at spawn-record offset `+0x18`.
+    pub runtime_slot: u16,
+    /// Auxiliary category byte at spawn-record offset `+0x1a`.
+    pub auxiliary_kind: u8,
+    /// Source string-table index at spawn-record offset `+0x1b`.
+    pub name_index: u8,
+}
+
+/// `FUN_0045e170` scans this shared table for categories 1, 2, 3, and 5.
+pub(crate) const SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY: u16 = 150;
+/// `FUN_00449ca0` scans this category-4 table.
+pub(crate) const SOURCE_DYNAMIC_KIND4_SLOT_CAPACITY: u16 = 400;
+/// `FUN_0045e110` scans this category-6 table.
+pub(crate) const SOURCE_DYNAMIC_KIND6_SLOT_CAPACITY: u16 = 350;
+
+/// Return the source dynamic-figure table identity and its capacity for a
+/// source category. `FUN_0045d380` selects these three tables: categories
+/// 1/2/3/5 share `0x218`-byte records, category 4 uses `0x1b0`-byte records,
+/// and category 6 uses `0x118`-byte records.
+pub(crate) fn source_dynamic_slot_table(figure_kind: u8) -> Option<(u8, u16)> {
+    match figure_kind {
+        1 | 2 | 3 | 5 => Some((0, SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY)),
+        4 => Some((1, SOURCE_DYNAMIC_KIND4_SLOT_CAPACITY)),
+        6 => Some((2, SOURCE_DYNAMIC_KIND6_SLOT_CAPACITY)),
+        _ => None,
+    }
+}
+
+/// Construct the locally available portion of `FUN_0045cd20`'s candidate
+/// population. Static SHIP4 records supply categories 1 and 3, while
+/// SOLDAT3 supplies category 4. The source only accepts tags 1 through 6;
+/// malformed or non-source entities are excluded here before pair scoring.
+/// Runtime-created categories retain a missing `candidate_list_key` until their
+/// constructors are reconstructed.
+pub fn source_combat_candidate_buffer(
+    units: &[MilitaryUnit],
+    trade_ships: &[crate::trade::TradeShip],
+    dynamic_figures: &[SourceDynamicCombatFigure],
+) -> Vec<SourceCombatCandidate> {
+    let mut candidates = Vec::new();
+    for (index, unit) in units.iter().enumerate() {
+        let (Some(figure_kind), Some(runtime_slot)) =
+            (unit.source_figure_kind, unit.source_live_runtime_slot)
+        else {
+            continue;
+        };
+        if !unit.active || !(1..=6).contains(&figure_kind) {
+            continue;
+        }
+        let position = if unit.source_position_initialized {
+            (unit.source_position_x, unit.source_position_y)
+        } else {
+            (unit.tile_x as f32, unit.tile_y as f32)
+        };
+        candidates.push(SourceCombatCandidate {
+            entity: SourceCombatCandidateEntity::MilitaryUnit(index),
+            figure_kind,
+            runtime_slot,
+            figure_definition_id: unit.source_figure_definition_id,
+            source_energy: unit.source_energy,
+            source_score_state: unit.source_score_state,
+            candidate_list_key: unit.source_candidate_list_key,
+            owner: unit.owner,
+            position,
+            direction: unit.direction,
+        });
+    }
+    for (index, ship) in trade_ships.iter().enumerate() {
+        let (Some(figure_kind), Some(runtime_slot)) =
+            (ship.source_figure_kind, ship.source_runtime_slot)
+        else {
+            continue;
+        };
+        if !ship.active || !(1..=6).contains(&figure_kind) {
+            continue;
+        }
+        candidates.push(SourceCombatCandidate {
+            entity: SourceCombatCandidateEntity::TradeShip(index),
+            figure_kind,
+            runtime_slot,
+            figure_definition_id: ship.source_figure_definition_id,
+            source_energy: ship.source_energy,
+            source_score_state: ship.source_score_state,
+            candidate_list_key: ship.source_candidate_list_key,
+            owner: ship.owner,
+            position: (ship.world_x as f32, ship.world_y as f32),
+            direction: ship.source_direction,
+        });
+    }
+    for (index, figure) in dynamic_figures.iter().enumerate() {
+        if !figure.active || !(1..=6).contains(&figure.figure_kind) {
+            continue;
+        }
+        candidates.push(SourceCombatCandidate {
+            entity: SourceCombatCandidateEntity::DynamicFigure(index),
+            figure_kind: figure.figure_kind,
+            runtime_slot: figure.runtime_slot,
+            figure_definition_id: Some(u16::from(figure.figure_definition_id)),
+            source_energy: figure.source_energy,
+            source_score_state: 0,
+            candidate_list_key: Some(figure.candidate_list_key),
+            owner: figure.owner,
+            position: figure.position,
+            direction: figure.direction,
+        });
+    }
+    candidates
+}
 
 /// Source player globals read by `FUN_00456d00` before it decides whether a
 /// terminal type-4 program may construct another route. `active_player_slot`
@@ -283,6 +471,22 @@ pub struct MilitaryUnit {
     /// same executable figure lifecycle.
     #[serde(default)]
     pub source_runtime_slot: Option<u16>,
+    /// Category-local slot restored into the live figure's `+0x44` field.
+    /// Unlike `source_runtime_slot`, this also represents the separate
+    /// category-1/2/3 and category-6 source tables and must not drive the
+    /// type-4 SOLDAT3 occupancy lifecycle.
+    #[serde(default)]
+    pub source_live_runtime_slot: Option<u16>,
+    /// Live byte `+0x01` used by `FUN_00453da0` to select the source
+    /// candidate list. Type-4 land figures load this from SOLDAT3's island
+    /// byte; SHIP4 preserves it at record offset `0x4D`.
+    #[serde(default)]
+    pub source_candidate_list_key: Option<u8>,
+    /// Live category written to byte zero by `FUN_00446ca0`. Static
+    /// `SOLDAT3` land figures use category 4; `SHIP4` player/AI and native
+    /// hulls retain categories 1 and 3 respectively.
+    #[serde(default)]
+    pub source_figure_kind: Option<u8>,
     /// Compiled `figuren.cod` definition retained from the source figure.
     #[serde(default)]
     pub source_figure_definition_id: Option<u16>,
@@ -291,6 +495,11 @@ pub struct MilitaryUnit {
     /// the compatibility health scalar when it ranks candidates.
     #[serde(default)]
     pub source_energy: u16,
+    /// Shared source candidate-table byte `+0x1a2`. SHIP4 loading copies
+    /// record byte `0x42` here, and `FUN_00454250` uses its tier rather than
+    /// the local renderer direction while scoring categories 1 through 3.
+    #[serde(default)]
+    pub source_score_state: u8,
     /// Type-4 origin descriptor restored from `SOLDAT3`.
     #[serde(default)]
     pub source_origin_descriptor: Option<SourceTargetDescriptor>,
@@ -457,8 +666,12 @@ impl MilitaryUnit {
             owner,
             source_island_id: None,
             source_runtime_slot: None,
+            source_live_runtime_slot: None,
+            source_candidate_list_key: None,
+            source_figure_kind: None,
             source_figure_definition_id: None,
             source_energy: 0,
+            source_score_state: 0,
             source_origin_descriptor: None,
             source_target_descriptor: None,
             source_route_radius: SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
@@ -678,9 +891,22 @@ fn is_source_kind4_land_figure(unit: &MilitaryUnit) -> bool {
 /// only ranks candidates after the current route program reaches its terminal
 /// opcode; it retains candidates inside the attacker's `Shotradius + 0x40`
 /// envelope and ranks them with `FUN_00454250`'s generated score curves.
+/// This score-only entry point is retained for map-free callers; simulation
+/// dispatch uses [`acquire_source_kind4_candidates_with_terrain`].
 pub fn acquire_source_kind4_candidates(
     units: &mut [MilitaryUnit],
     diplomacy: &DiplomacyMatrix,
+) {
+    acquire_source_kind4_candidates_with_terrain(units, diplomacy, &[]);
+}
+
+/// Select source type-4 candidates with `FUN_00453e50`'s terminal static-map
+/// direct-ray fallback. Candidate scores are ordered first; each rejected
+/// `0x0d` ray advances to the next score-ranked candidate.
+pub fn acquire_source_kind4_candidates_with_terrain(
+    units: &mut [MilitaryUnit],
+    diplomacy: &DiplomacyMatrix,
+    island_maps: &[crate::island_map::IslandMap],
 ) {
     for unit_index in 0..units.len() {
         if !units[unit_index].is_alive()
@@ -697,7 +923,7 @@ pub fn acquire_source_kind4_candidates(
         let selected = if source_kind4_program_is_terminal(&units[unit_index]) {
             {
                 let attacker = &units[unit_index];
-                units
+                let mut candidates = units
                     .iter()
                     .enumerate()
                     .filter(|(target_index, _)| {
@@ -718,15 +944,23 @@ pub fn acquire_source_kind4_candidates(
                         );
                         source_kind4_candidate_score(attacker, target, metric).map(|score| {
                             (
-                                score,
-                                std::cmp::Reverse(target.source_runtime_slot.unwrap_or(u16::MAX)),
-                                std::cmp::Reverse(target_index),
+                                std::cmp::Reverse(score),
+                                target.source_runtime_slot.unwrap_or(u16::MAX),
+                                target_index,
                                 target_index,
                             )
                         })
                     })
-                    .max_by_key(|(score, slot, index, _)| (*score, *slot, *index))
-                    .map(|(_, _, _, target_index)| target_index)
+                    .collect::<Vec<_>>();
+                candidates.sort_unstable();
+                candidates.into_iter().find_map(|(_, _, _, target_index)| {
+                    source_kind4_candidate_terrain_allowed(
+                        &units[unit_index],
+                        &units[target_index],
+                        island_maps,
+                    )
+                    .then_some(target_index)
+                })
             }
         } else {
             existing_target.filter(|&target_index| {
@@ -758,6 +992,26 @@ pub fn acquire_source_kind4_candidates(
             unit.clear_source_route_program();
         }
     }
+}
+
+fn source_kind4_candidate_terrain_allowed(
+    attacker: &MilitaryUnit,
+    target: &MilitaryUnit,
+    island_maps: &[crate::island_map::IslandMap],
+) -> bool {
+    let Some(island_id) = attacker.source_island_id else {
+        return true;
+    };
+    island_maps
+        .iter()
+        .find(|map| map.island_id == island_id)
+        .map(|map| {
+            map.source_kind4_line_of_fire_clear(
+                (attacker.tile_x, attacker.tile_y),
+                (target.tile_x, target.tile_y),
+            )
+        })
+        .unwrap_or(true)
 }
 
 fn source_kind4_candidate_allowed(
@@ -832,11 +1086,14 @@ fn source_kind4_definition(unit: &MilitaryUnit) -> Option<LandFigureDefinition> 
 }
 
 /// `FUN_00456d00` and the type-4 target branch of `FUN_00454250` compute
-/// effective strength from live energy, authored energy cap, and hitpoint.
+/// effective strength from live energy, compiled energy cap, hitpoint, and
+/// work-time divisor.
 fn source_kind4_strength(unit: &MilitaryUnit, definition: LandFigureDefinition) -> u32 {
     let energy_cap = u32::from(definition.source_runtime_energy_cap());
     let energy_term = u32::from(unit.source_energy) * 0x55 / energy_cap;
-    (energy_term + 0x2b) * u32::from(definition.source_runtime_hit_points()) / 128
+    let hit_point_term =
+        (energy_term + 0x2b) * u32::from(definition.source_runtime_hit_points()) / 128;
+    (hit_point_term as f32 / definition.source_runtime_work_time()) as u32
 }
 
 fn source_kind4_curve_depleted(index: usize) -> u8 {
@@ -1768,13 +2025,136 @@ pub fn simulate_battle_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anno_formats::cod::BuildingDef as CodBuilding;
+    use anno_formats::szs::{Island, IslandTile};
 
     fn source_kind4_unit(owner: u8, runtime_slot: u16, x: i32, y: i32) -> MilitaryUnit {
         let mut unit = MilitaryUnit::new(UnitType::Infantry, owner, x, y);
         unit.source_island_id = Some(10);
         unit.source_runtime_slot = Some(runtime_slot);
+        unit.source_candidate_list_key = Some(10);
         unit.source_figure_definition_id = Some(14);
         unit
+    }
+
+    #[test]
+    fn source_candidate_buffer_keeps_category_local_identity() {
+        let mut land = source_kind4_unit(2, 14, 40, 60);
+        land.source_live_runtime_slot = Some(14);
+        land.source_figure_kind = Some(4);
+        land.source_position_x = 20.25;
+        land.source_position_y = 30.25;
+        land.source_position_initialized = true;
+        land.direction = 7;
+
+        let mut warship = MilitaryUnit::new(UnitType::SmallWarship, 1, 80, 90);
+        warship.source_live_runtime_slot = Some(3);
+        warship.source_candidate_list_key = Some(3);
+        warship.source_figure_kind = Some(1);
+        warship.source_figure_definition_id = Some(0x19);
+        warship.source_energy = 195;
+        warship.source_score_state = 10;
+        warship.direction = 2;
+
+        let mut trader = crate::trade::TradeShip::new(0, 0, 100, 110);
+        trader.source_runtime_slot = Some(5);
+        trader.source_candidate_list_key = Some(5);
+        trader.source_figure_kind = Some(1);
+        trader.source_figure_definition_id = Some(0x15);
+        trader.source_energy = 150;
+        trader.source_score_state = 4;
+        trader.source_direction = 6;
+
+        let dynamic = SourceDynamicCombatFigure {
+            active: true,
+            figure_kind: 6,
+            candidate_list_key: 4,
+            figure_definition_id: 31,
+            direction: 1,
+            source_payload: 0,
+            position: (120.0, 130.0),
+            source_energy: 320,
+            target_descriptor: SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            owner: 3,
+            state: 7,
+            flags: 0,
+            notification: 0,
+            runtime_slot: 8,
+            auxiliary_kind: 0,
+            name_index: 0,
+        };
+
+        let candidates = source_combat_candidate_buffer(&[land, warship], &[trader], &[dynamic]);
+        assert_eq!(
+            candidates,
+            vec![
+                SourceCombatCandidate {
+                    entity: SourceCombatCandidateEntity::MilitaryUnit(0),
+                    figure_kind: 4,
+                    runtime_slot: 14,
+                    figure_definition_id: Some(14),
+                    source_energy: 0,
+                    source_score_state: 0,
+                    candidate_list_key: Some(10),
+                    owner: 2,
+                    position: (20.25, 30.25),
+                    direction: 7,
+                },
+                SourceCombatCandidate {
+                    entity: SourceCombatCandidateEntity::MilitaryUnit(1),
+                    figure_kind: 1,
+                    runtime_slot: 3,
+                    figure_definition_id: Some(0x19),
+                    source_energy: 195,
+                    source_score_state: 10,
+                    candidate_list_key: Some(3),
+                    owner: 1,
+                    position: (80.0, 90.0),
+                    direction: 2,
+                },
+                SourceCombatCandidate {
+                    entity: SourceCombatCandidateEntity::TradeShip(0),
+                    figure_kind: 1,
+                    runtime_slot: 5,
+                    figure_definition_id: Some(0x15),
+                    source_energy: 150,
+                    source_score_state: 4,
+                    candidate_list_key: Some(5),
+                    owner: 0,
+                    position: (100.0, 110.0),
+                    direction: 6,
+                },
+                SourceCombatCandidate {
+                    entity: SourceCombatCandidateEntity::DynamicFigure(0),
+                    figure_kind: 6,
+                    runtime_slot: 8,
+                    figure_definition_id: Some(31),
+                    source_energy: 320,
+                    source_score_state: 0,
+                    candidate_list_key: Some(4),
+                    owner: 3,
+                    position: (120.0, 130.0),
+                    direction: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            candidates[0].combat_definition(),
+            SourceCombatDefinition::from_id(14)
+        );
+        assert_eq!(
+            candidates[1].combat_definition(),
+            SourceCombatDefinition::from_id(0x19)
+        );
+        assert_eq!(
+            candidates[2].combat_definition(),
+            SourceCombatDefinition::from_id(0x15)
+        );
+        assert_eq!(
+            candidates[3].combat_definition(),
+            SourceCombatDefinition::from_id(31)
+        );
     }
 
     #[test]
@@ -1822,30 +2202,94 @@ mod tests {
         attacker.source_island_id = Some(10);
         attacker.source_runtime_slot = Some(0);
         attacker.source_figure_definition_id = Some(9);
-        attacker.source_energy = 480;
+        attacker.source_energy = 45;
 
         let mut nearby_infantry = MilitaryUnit::new(UnitType::Infantry, 1, 206, 200);
         nearby_infantry.source_island_id = Some(10);
         nearby_infantry.source_runtime_slot = Some(1);
         nearby_infantry.source_figure_definition_id = Some(1);
-        nearby_infantry.source_energy = 640;
+        nearby_infantry.source_energy = 60;
 
         let mut farther_cannon = MilitaryUnit::new(UnitType::Cannon, 2, 220, 200);
         farther_cannon.source_island_id = Some(10);
         farther_cannon.source_runtime_slot = Some(2);
         farther_cannon.source_figure_definition_id = Some(13);
-        farther_cannon.source_energy = 384;
+        farther_cannon.source_energy = 36;
 
         let infantry_score = source_kind4_candidate_score(&attacker, &nearby_infantry, 6)
             .expect("infantry is in the source score envelope");
         let cannon_score = source_kind4_candidate_score(&attacker, &farther_cannon, 20)
             .expect("cannon is in the source score envelope");
-        assert!(cannon_score > infantry_score);
+        assert!(infantry_score > cannon_score);
 
         let mut units = vec![attacker, nearby_infantry, farther_cannon];
         acquire_source_kind4_candidates(&mut units, &DiplomacyMatrix::new());
+        assert_eq!(units[0].combat_target, 1);
+        assert_eq!((units[0].target_x, units[0].target_y), (206, 200));
+    }
+
+    #[test]
+    fn source_kind4_candidates_skip_a_higher_score_behind_noshot_terrain() {
+        let island = Island {
+            number: 10,
+            width: 12,
+            height: 52,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles: vec![IslandTile {
+                building_id: 1,
+                x: 1,
+                y: 0,
+                orientation: 0,
+                anim_count: 0,
+                flags: 0,
+            }],
+            city: None,
+        };
+        let map = crate::island_map::IslandMap::from_island(
+            &island,
+            &[CodBuilding {
+                source_id: 0x4e21,
+                kind: "WALD".to_string(),
+                no_shot: true,
+                ..Default::default()
+            }],
+        );
+
+        let mut attacker = MilitaryUnit::new(UnitType::Musketeer, 0, 0, 0);
+        attacker.source_island_id = Some(10);
+        attacker.source_runtime_slot = Some(0);
+        attacker.source_figure_definition_id = Some(9);
+        attacker.source_energy = 45;
+
+        let mut blocked_cannon = MilitaryUnit::new(UnitType::Cannon, 1, 10, 0);
+        blocked_cannon.source_island_id = Some(10);
+        blocked_cannon.source_runtime_slot = Some(1);
+        blocked_cannon.source_figure_definition_id = Some(13);
+        blocked_cannon.source_energy = 36;
+
+        let mut clear_infantry = MilitaryUnit::new(UnitType::Infantry, 2, 0, 50);
+        clear_infantry.source_island_id = Some(10);
+        clear_infantry.source_runtime_slot = Some(2);
+        clear_infantry.source_figure_definition_id = Some(1);
+        clear_infantry.source_energy = 60;
+
+        let cannon_score = source_kind4_candidate_score(&attacker, &blocked_cannon, 10)
+            .expect("cannon is in the source score envelope");
+        let infantry_score = source_kind4_candidate_score(&attacker, &clear_infantry, 50)
+            .expect("infantry is in the source score envelope");
+        assert!(cannon_score > infantry_score);
+
+        let mut units = vec![attacker, blocked_cannon, clear_infantry];
+        acquire_source_kind4_candidates_with_terrain(
+            &mut units,
+            &DiplomacyMatrix::new(),
+            &[map],
+        );
+
         assert_eq!(units[0].combat_target, 2);
-        assert_eq!((units[0].target_x, units[0].target_y), (220, 200));
+        assert_eq!((units[0].target_x, units[0].target_y), (0, 50));
     }
 
     #[test]
@@ -1876,7 +2320,7 @@ mod tests {
         attacker.source_island_id = Some(10);
         attacker.source_runtime_slot = Some(0);
         attacker.source_figure_definition_id = Some(9);
-        attacker.source_energy = 480;
+        attacker.source_energy = 45;
         attacker.source_route_program[0] = 0x21;
         attacker.combat_target = 1;
 
@@ -1884,13 +2328,13 @@ mod tests {
         infantry.source_island_id = Some(10);
         infantry.source_runtime_slot = Some(1);
         infantry.source_figure_definition_id = Some(1);
-        infantry.source_energy = 640;
+        infantry.source_energy = 60;
 
         let mut cannon = MilitaryUnit::new(UnitType::Cannon, 2, 220, 200);
         cannon.source_island_id = Some(10);
         cannon.source_runtime_slot = Some(2);
         cannon.source_figure_definition_id = Some(13);
-        cannon.source_energy = 384;
+        cannon.source_energy = 36;
 
         let mut units = vec![attacker, infantry, cannon];
         acquire_source_kind4_candidates(&mut units, &DiplomacyMatrix::new());

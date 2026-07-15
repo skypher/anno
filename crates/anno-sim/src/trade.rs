@@ -194,6 +194,31 @@ impl TradeRoute {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeShip {
     pub owner: u8,
+    /// Live category written to byte zero by `FUN_00446ca0` when this ship
+    /// came from SHIP4. Static player and AI trader hulls use category 1.
+    #[serde(default)]
+    pub source_figure_kind: Option<u8>,
+    /// SHIP4 runtime slot restored by `FUN_0045f550` into the source's
+    /// category-1 record table.
+    #[serde(default)]
+    pub source_runtime_slot: Option<u16>,
+    /// Live candidate-list key restored from SHIP4 record offset `0x4D`.
+    #[serde(default)]
+    pub source_candidate_list_key: Option<u8>,
+    /// Source movement direction restored from SHIP4 record offset `0x50`.
+    #[serde(default)]
+    pub source_direction: u8,
+    /// Compiled source figure-definition ID supplied by SHIP4.
+    #[serde(default)]
+    pub source_figure_definition_id: Option<u16>,
+    /// Serialized SHIP4 energy restored and capped by the source loader.
+    #[serde(default)]
+    pub source_energy: u16,
+    /// Shared source candidate-table byte `+0x1a2`. The SHIP4 loader copies
+    /// record byte `0x42` here; `FUN_00454250` uses it to scale categories 1
+    /// through 3 independently from movement direction and animation state.
+    #[serde(default)]
+    pub source_score_state: u8,
     /// Authored ship name from SHIP4 when available.
     #[serde(default)]
     pub name: String,
@@ -300,6 +325,13 @@ impl TradeShip {
     ) -> Self {
         Self {
             owner,
+            source_figure_kind: None,
+            source_runtime_slot: None,
+            source_candidate_list_key: None,
+            source_direction: 0,
+            source_figure_definition_id: None,
+            source_energy: 0,
+            source_score_state: 0,
             name: String::new(),
             route_id,
             world_x,

@@ -8,7 +8,7 @@ use crate::ai::{AiAction, AiController};
 use crate::building::{BuildingDef, BuildingInstance};
 use crate::carrier;
 use crate::civilian;
-use crate::combat::{self, DiplomacyMatrix, MilitaryUnit};
+use crate::combat::{self, DiplomacyMatrix, MilitaryUnit, SourceDynamicCombatFigure};
 use crate::coverage::CoverageMap;
 use crate::data_bridge::{
     SourceCityRecord, SourceCityTable, SourceKind4Occupant, SourceKind13LocationTable,
@@ -111,6 +111,10 @@ pub struct Simulation {
     pub source_cities: SourceCityTable,
     /// Live kind-4 occupancy reconstructed from authored `SOLDAT3` figures.
     pub source_kind4_occupants: Vec<SourceKind4Occupant>,
+    /// Live `0x84a`/`0x84b` source figure records that do not have an
+    /// equivalent local entity type. Categories 1 through 6 remain available
+    /// to the common source candidate producer through these records.
+    pub source_dynamic_combat_figures: Vec<SourceDynamicCombatFigure>,
     /// Source player globals that select type-4 terminal-route dispatch.
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
     /// `DAT_005b6040`: source simulation clock in 100-ms ticks.
@@ -408,6 +412,7 @@ impl Simulation {
             source_kind13_locations: SourceKind13LocationTable::default(),
             source_cities: SourceCityTable::default(),
             source_kind4_occupants: Vec::new(),
+            source_dynamic_combat_figures: Vec::new(),
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
@@ -449,6 +454,50 @@ impl Simulation {
             outcome: GameOutcome::Pending,
             native_villages: Vec::new(),
         }
+    }
+
+    /// Collect source-live combat candidates across authored and dynamically
+    /// spawned figures. This mirrors the population consumed by
+    /// `FUN_0045cd20` before category-specific handlers select an action.
+    pub fn source_combat_candidates(&self) -> Vec<combat::SourceCombatCandidate> {
+        combat::source_combat_candidate_buffer(
+            &self.military_units,
+            &self.trade_ships,
+            &self.source_dynamic_combat_figures,
+        )
+    }
+
+    /// Install a live `0x84a`/`0x84b` figure in the category table selected
+    /// by `FUN_0045d380`. Categories 1, 2, 3, and 5 share table slots, while
+    /// categories 4 and 6 own their respective source tables. A later load of
+    /// the same source table slot replaces the represented live record.
+    pub fn install_source_dynamic_combat_figure(
+        &mut self,
+        figure: SourceDynamicCombatFigure,
+    ) -> bool {
+        let Some((table, capacity)) = combat::source_dynamic_slot_table(figure.figure_kind)
+        else {
+            return false;
+        };
+        if figure.runtime_slot >= capacity {
+            return false;
+        }
+
+        if let Some(index) = self
+            .source_dynamic_combat_figures
+            .iter()
+            .position(|existing| {
+                combat::source_dynamic_slot_table(existing.figure_kind)
+                    .is_some_and(|(existing_table, _)| {
+                        existing_table == table && existing.runtime_slot == figure.runtime_slot
+                    })
+            })
+        {
+            self.source_dynamic_combat_figures[index] = figure;
+        } else {
+            self.source_dynamic_combat_figures.push(figure);
+        }
+        true
     }
 
     /// Reconstruct one source island's dynamic map-object table from scenario
@@ -1654,7 +1703,11 @@ impl Simulation {
     /// until the full type-4 state machine is reconstructed.
     fn tick_source_land_figures(&mut self, dt_ms: u32) {
         self.assign_native_idle_targets();
-        combat::acquire_source_kind4_candidates(&mut self.military_units, &self.diplomacy);
+        combat::acquire_source_kind4_candidates_with_terrain(
+            &mut self.military_units,
+            &self.diplomacy,
+            &self.island_maps,
+        );
         let mut source_rand = std::mem::take(&mut self.rng_state);
         combat::tick_unit_orders_with_maps_and_source_rand_and_dispatch_state(
             &mut self.military_units,
@@ -3071,6 +3124,51 @@ impl Simulation {
 mod tests {
     use super::*;
     use crate::ai::{AiController, AiPersonality, Difficulty};
+
+    #[test]
+    fn source_dynamic_figure_loader_enforces_source_category_tables() {
+        let mut sim = Simulation::new();
+        let figure = |figure_kind, runtime_slot, owner| SourceDynamicCombatFigure {
+            active: true,
+            figure_kind,
+            candidate_list_key: 4,
+            figure_definition_id: 31,
+            direction: 1,
+            source_payload: 0,
+            position: (120.0, 130.0),
+            source_energy: 320,
+            target_descriptor: SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            owner,
+            state: 7,
+            flags: 0,
+            notification: 0,
+            runtime_slot,
+            auxiliary_kind: 0,
+            name_index: 0,
+        };
+
+        assert!(sim.install_source_dynamic_combat_figure(figure(1, 149, 1)));
+        assert!(sim.install_source_dynamic_combat_figure(figure(3, 149, 2)));
+        assert_eq!(sim.source_dynamic_combat_figures.len(), 1);
+        assert_eq!(sim.source_dynamic_combat_figures[0].figure_kind, 3);
+        assert_eq!(sim.source_dynamic_combat_figures[0].owner, 2);
+        assert!(!sim.install_source_dynamic_combat_figure(figure(1, 150, 0)));
+
+        assert!(sim.install_source_dynamic_combat_figure(figure(4, 399, 3)));
+        assert!(!sim.install_source_dynamic_combat_figure(figure(4, 400, 0)));
+        assert!(sim.install_source_dynamic_combat_figure(figure(6, 349, 4)));
+        assert!(!sim.install_source_dynamic_combat_figure(figure(6, 350, 0)));
+        assert!(!sim.install_source_dynamic_combat_figure(figure(7, 0, 0)));
+
+        assert_eq!(
+            sim.source_combat_candidates()
+                .iter()
+                .map(|candidate| (candidate.figure_kind, candidate.runtime_slot))
+                .collect::<Vec<_>>(),
+            vec![(3, 149), (4, 399), (6, 349)]
+        );
+    }
 
     #[test]
     fn source_city_activity_gate_counts_only_foreign_kind_four_land_units() {

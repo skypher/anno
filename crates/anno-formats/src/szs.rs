@@ -265,6 +265,15 @@ pub struct Ship {
     /// loader passes it as the first argument when creating the
     /// runtime figure (`0x0045f79a..0x0045f7a4`).
     pub figure_kind: u8,
+    /// Candidate-list key at record offset 0x4D. The SHIP4 loader writes
+    /// this byte to live figure offset `+0x01` before `FUN_00453da0` uses it
+    /// to select the source candidate list (`0x0045f7c0..0x0045f7c5`). It
+    /// is independent from the faction at record offset 0x4B.
+    pub candidate_list_key: u8,
+    /// Source movement direction at record offset 0x50. The SHIP4 loader
+    /// writes this to the live figure direction byte (`0x0045f7c6..0x0045f7cb`),
+    /// separately from the renderer heading at 0x42.
+    pub source_direction: u8,
     /// Initial figure-animation state at record offset 0x4E.
     /// After allocating the stationary source figure, the
     /// SHIP4 loader passes this value to `0x00446d90`, which
@@ -275,7 +284,9 @@ pub struct Ship {
     /// Compass-heading byte at record offset 0x42. Raw value
     /// ranges 0..14 across the corpus; 95% are even. Likely a
     /// `(heading × 2) + frame_phase` packing — use
-    /// `Ship::heading()` for the typed 0..7 cardinal direction.
+    /// `Ship::heading()` for the typed 0..7 cardinal direction. The SHIP4
+    /// loader also copies the raw byte to its shared category-1/2/3 slot at
+    /// `+0x1a2`, where `FUN_00454250` reads it as a score-state tier.
     pub heading_byte: u8,
     /// Up to 7 cargo manifest slots at record offsets 0x174,
     /// 0x17C, 0x184, 0x18C, 0x194, 0x19C, 0x1A4 (stride 8 with
@@ -483,11 +494,12 @@ impl LandFigureDefinition {
         }
     }
 
-    /// `Maxenergy:` in the source runtime's fixed-point energy units. The
-    /// `SOLDAT3 +0x04` corpus stores full energy as this cap, and
-    /// `FUN_00454250` divides one raw energy value by another.
+    /// `Maxenergy:` in the source runtime's compiled units. `FUN_00441210`
+    /// multiplies the parsed value by the executable constant `3.0` at
+    /// `0x00441a4c` before storing it at definition offset `+0x3c`; the
+    /// `SOLDAT3 +0x04` corpus and `FUN_00454250` use this same scale.
     pub const fn source_runtime_energy_cap(self) -> u16 {
-        self.source_max_energy() * 32
+        self.source_max_energy() * 3
     }
 
     /// Authored `Shotradius:` compiled by `FUN_00441210` at definition
@@ -504,27 +516,41 @@ impl LandFigureDefinition {
     }
 
     /// `Shotradius:` in the source runtime units. `FUN_00441210` multiplies
-    /// the parsed value by 8 before storing the unsigned definition field at
-    /// `+0x4a`; `FUN_00454250` consumes that field directly.
+    /// the parsed value by the executable constant `2.0` at `0x0044170c`
+    /// and converts toward zero before storing the unsigned definition field
+    /// at `+0x4a`; `FUN_00454250` consumes that field directly.
     pub const fn source_runtime_shot_radius(self) -> u16 {
         match self.family {
-            LandFigureFamily::Infantry | LandFigureFamily::Cavalry => 6,
-            LandFigureFamily::Musketeer => 32,
-            LandFigureFamily::Cannoneer => 56,
-            LandFigureFamily::NativeSpearman => 8,
+            LandFigureFamily::Infantry | LandFigureFamily::Cavalry => 1,
+            LandFigureFamily::Musketeer => 8,
+            LandFigureFamily::Cannoneer => 14,
+            LandFigureFamily::NativeSpearman => 2,
         }
     }
 
-    /// `Hitpoint:` in the runtime fixed-point units consumed by
-    /// `FUN_00454250`. The parser multiplies the authored value by 32 and
-    /// converts toward zero before storing the unsigned definition field.
+    /// `Hitpoint:` in the runtime units consumed by `FUN_00454250`.
+    /// `FUN_00441210` applies the same `3.0` multiplier at `0x00441abb` as
+    /// its `Maxenergy:` loader branch, then converts toward zero before
+    /// storing the unsigned definition field.
     pub const fn source_runtime_hit_points(self) -> u16 {
         match self.family {
-            LandFigureFamily::Infantry => 32,
-            LandFigureFamily::Cavalry => 51,
-            LandFigureFamily::Musketeer => 76,
-            LandFigureFamily::Cannoneer => 224,
-            LandFigureFamily::NativeSpearman => 38,
+            LandFigureFamily::Infantry => 3,
+            LandFigureFamily::Cavalry => 4,
+            LandFigureFamily::Musketeer => 7,
+            LandFigureFamily::Cannoneer => 21,
+            LandFigureFamily::NativeSpearman => 3,
+        }
+    }
+
+    /// `Worktime:` stored as a source `float` at compiled definition offset
+    /// `+0x14` by `FUN_00441210`. `FUN_00454250` divides the energy-adjusted
+    /// hit-point term by this value before converting it toward zero.
+    pub const fn source_runtime_work_time(self) -> f32 {
+        match self.family {
+            LandFigureFamily::Infantry | LandFigureFamily::NativeSpearman => 0.8,
+            LandFigureFamily::Cavalry => 1.0,
+            LandFigureFamily::Musketeer => 2.0,
+            LandFigureFamily::Cannoneer => 4.5,
         }
     }
 
@@ -535,6 +561,65 @@ impl LandFigureDefinition {
     pub const fn source_turn_time(self) -> f32 {
         let _ = self;
         0.0
+    }
+}
+
+/// The four compiled definition fields consumed by `FUN_00454250` when it
+/// scores a combat candidate. `FUN_00441210` assigns definition IDs from the
+/// executable name table at `0x00498b98`; the loader multiplies authored
+/// `Maxenergy:` and `Hitpoint:` by `3.0`, and `Shotradius:` by `2.0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceCombatDefinition {
+    pub id: u16,
+    pub source_figure_name: &'static str,
+    pub runtime_energy_cap: u16,
+    pub runtime_hit_points: u16,
+    pub runtime_shot_radius: u16,
+    pub runtime_work_time: f32,
+}
+
+impl SourceCombatDefinition {
+    /// Resolve every combat-capable compiled figure ID currently identified
+    /// in the source definition table. IDs without a score-bearing figure
+    /// definition deliberately return `None`.
+    pub const fn from_id(id: u16) -> Option<Self> {
+        if let Some(definition) = LandFigureDefinition::from_id(id) {
+            return Some(Self {
+                id,
+                source_figure_name: definition.source_figure_name(),
+                runtime_energy_cap: definition.source_runtime_energy_cap(),
+                runtime_hit_points: definition.source_runtime_hit_points(),
+                runtime_shot_radius: definition.source_runtime_shot_radius(),
+                runtime_work_time: definition.source_runtime_work_time(),
+            });
+        }
+
+        let definition = match id {
+            0x15 => ("HANDEL1", 150, 6, 14, 5.0),
+            0x16 => ("HANDELD1", 150, 6, 14, 5.0),
+            0x17 => ("HANDEL2", 240, 6, 14, 5.0),
+            0x18 => ("HANDELD2", 240, 6, 14, 5.0),
+            0x19 => ("KRIEG1", 195, 6, 14, 5.0),
+            0x1a => ("KRIEGD1", 195, 6, 14, 5.0),
+            0x1b => ("KRIEG2", 360, 6, 14, 5.0),
+            0x1c => ("KRIEGD2", 360, 6, 14, 5.0),
+            0x1d => ("HANDLER", 285, 6, 14, 5.0),
+            0x1e => ("HANDLERD", 285, 6, 14, 5.0),
+            0x1f => ("PIRAT", 285, 6, 14, 5.0),
+            0x20 => ("PIRATD", 285, 6, 14, 5.0),
+            0x25 => ("TRADER1", 42, 2, 8, 2.0),
+            0x26 => ("KANONTURM", 72, 12, 15, 3.0),
+            0x28 => ("PIRATTURM", 72, 12, 15, 3.0),
+            _ => return None,
+        };
+        Some(Self {
+            id,
+            source_figure_name: definition.0,
+            runtime_energy_cap: definition.1,
+            runtime_hit_points: definition.2,
+            runtime_shot_radius: definition.3,
+            runtime_work_time: definition.4,
+        })
     }
 }
 
@@ -1330,6 +1415,16 @@ impl SzsFile {
             } else {
                 0
             };
+            let candidate_list_key = if off + 0x4e <= data.len() {
+                data[off + 0x4d]
+            } else {
+                0
+            };
+            let source_direction = if off + 0x51 <= data.len() {
+                data[off + 0x50]
+            } else {
+                0
+            };
             let heading_byte = if off + 0x43 <= data.len() {
                 data[off + 0x42]
             } else {
@@ -1353,6 +1448,8 @@ impl SzsFile {
                 stored_energy,
                 runtime_slot,
                 figure_kind,
+                candidate_list_key,
+                source_direction,
                 animation_state,
                 heading_byte,
                 cargo_slots,
@@ -1665,11 +1762,11 @@ mod tests {
     #[test]
     fn land_figure_motion_properties_match_authored_bases() {
         let cases = [
-            (1, 260, 0, 1, 20, 640, 0.75, 6, 0.0),
-            (5, 400, 1, 1, 18, 576, 0.75, 6, 0.0),
-            (9, 210, 0, 2, 15, 480, 4.0, 32, 0.0),
-            (13, 230, 2, 3, 12, 384, 7.0, 56, 0.0),
-            (33, 280, 0, 1, 18, 576, 1.0, 8, 0.0),
+            (1, 260, 0, 1, 20, 60, 3, 0.8, 0.75, 1, 0.0),
+            (5, 400, 1, 1, 18, 54, 4, 1.0, 0.75, 1, 0.0),
+            (9, 210, 0, 2, 15, 45, 7, 2.0, 4.0, 8, 0.0),
+            (13, 230, 2, 3, 12, 36, 21, 4.5, 7.0, 14, 0.0),
+            (33, 280, 0, 1, 18, 54, 3, 0.8, 1.0, 2, 0.0),
         ];
         for (
             id,
@@ -1678,6 +1775,8 @@ mod tests {
             max_step_count,
             max_energy,
             runtime_energy,
+            runtime_hit_points,
+            runtime_work_time,
             shot_radius,
             runtime_shot_radius,
             turn_time,
@@ -1689,10 +1788,48 @@ mod tests {
             assert_eq!(definition.source_max_step_count(), max_step_count);
             assert_eq!(definition.source_max_energy(), max_energy);
             assert_eq!(definition.source_runtime_energy_cap(), runtime_energy);
+            assert_eq!(definition.source_runtime_hit_points(), runtime_hit_points);
+            assert_eq!(definition.source_runtime_work_time(), runtime_work_time);
             assert_eq!(definition.source_shot_radius(), shot_radius);
             assert_eq!(definition.source_runtime_shot_radius(), runtime_shot_radius);
             assert_eq!(definition.source_turn_time(), turn_time);
         }
+    }
+
+    #[test]
+    fn source_combat_definitions_match_the_compiled_figure_table() {
+        let cases = [
+            (1, "SOLDAT1", 60, 3, 1, 0.8),
+            (9, "MUSKETIER1", 45, 7, 8, 2.0),
+            (13, "KANONIER1", 36, 21, 14, 4.5),
+            (0x15, "HANDEL1", 150, 6, 14, 5.0),
+            (0x16, "HANDELD1", 150, 6, 14, 5.0),
+            (0x19, "KRIEG1", 195, 6, 14, 5.0),
+            (0x1c, "KRIEGD2", 360, 6, 14, 5.0),
+            (0x1d, "HANDLER", 285, 6, 14, 5.0),
+            (0x1f, "PIRAT", 285, 6, 14, 5.0),
+            (0x21, "SPEER1", 54, 3, 2, 0.8),
+            (0x25, "TRADER1", 42, 2, 8, 2.0),
+            (0x26, "KANONTURM", 72, 12, 15, 3.0),
+            (0x28, "PIRATTURM", 72, 12, 15, 3.0),
+        ];
+
+        for (id, name, energy, hit_points, shot_radius, work_time) in cases {
+            assert_eq!(
+                SourceCombatDefinition::from_id(id),
+                Some(SourceCombatDefinition {
+                    id,
+                    source_figure_name: name,
+                    runtime_energy_cap: energy,
+                    runtime_hit_points: hit_points,
+                    runtime_shot_radius: shot_radius,
+                    runtime_work_time: work_time,
+                })
+            );
+        }
+        assert_eq!(SourceCombatDefinition::from_id(0), None);
+        assert_eq!(SourceCombatDefinition::from_id(0x27), None);
+        assert_eq!(SourceCombatDefinition::from_id(0x77), None);
     }
 
     #[test]
@@ -3422,6 +3559,8 @@ mod tests {
         );
         assert_eq!(ship.figure_definition_id as u8, ship.ship_class);
         assert_eq!(ship.raw_record[0x4a], ship.figure_kind);
+        assert_eq!(ship.raw_record[0x4d], ship.candidate_list_key);
+        assert_eq!(ship.raw_record[0x50], ship.source_direction);
         assert_eq!(ship.raw_record[0x4e], ship.animation_state);
         assert_eq!(ship.raw_record[0x4b], ship.owner);
         assert_eq!(

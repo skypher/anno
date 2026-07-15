@@ -105,6 +105,62 @@ pub fn source_direction_delta(direction: u8) -> Option<(i32, i32)> {
     }
 }
 
+/// Return the zero-based source compass code emitted by `FUN_00454050` for a
+/// raw target delta. This is distinct from the one-based route-step encoding
+/// accepted by [`source_direction_delta`]: `0..=7` means
+/// north, north-east, east, south-east, south, south-west, west, north-west.
+///
+/// Category-6 dispatch calls this after clamping its doubled-coordinate target
+/// footprint in `FUN_00458d80`; its exact tie rules are therefore preserved
+/// here rather than inferred from the route-step encoder.
+pub fn source_target_direction(dx: i32, dy: i32) -> u8 {
+    let dx = i64::from(dx);
+    let dy = i64::from(dy);
+    if dy < 0 {
+        let north = -dy;
+        if dx < 0 {
+            let west = -dx;
+            if north < west {
+                if -2 * dy < west {
+                    return 6;
+                }
+            } else if -2 * dx < north {
+                return 0;
+            }
+            return 7;
+        }
+        if north < dx {
+            if -2 * dy < dx {
+                return 2;
+            }
+        } else if 2 * dx < north {
+            return 0;
+        }
+        return 1;
+    }
+
+    if dx >= 0 {
+        if dy < dx {
+            if 2 * dy < dx {
+                return 2;
+            }
+        } else if 2 * dx < dy {
+            return 4;
+        }
+        return 3;
+    }
+
+    let west = -dx;
+    if dy < west {
+        if 2 * dy < west {
+            return 6;
+        }
+    } else if -2 * dx < dy {
+        return 4;
+    }
+    5
+}
+
 /// Expand predecessor-route steps into the successive source-grid positions.
 /// Returns `None` when a step contains an invalid source direction or would
 /// overflow the coordinate representation.
@@ -719,6 +775,21 @@ pub fn source_target_metric(position: (i32, i32), selected: (i32, i32)) -> u32 {
     dx.max(dy) + dx.min(dy) / 4
 }
 
+/// Reproduce category-6's target-footprint gate in `FUN_00458d80` after the
+/// descriptor has been resolved through `FUN_00444fe0`. Both inputs are raw
+/// doubled coordinates. The source clamps `position` to the target rectangle,
+/// accepts only metric at most `floor(shot_radius / 4)`, and returns its
+/// zero-based direction code from `FUN_00454050`.
+pub fn source_kind6_target_direction(
+    position: (i32, i32),
+    target: SourcePathTargetRect,
+    shot_radius: u16,
+) -> Option<u8> {
+    let selected = target.nearest_point(position);
+    (source_target_metric(position, selected) <= u32::from(shot_radius) / 4)
+        .then(|| source_target_direction(selected.0 - position.0, selected.1 - position.1))
+}
+
 impl SourcePathTargetRect {
     /// Construct a source target rectangle. Empty source footprints do not
     /// reach either `FUN_00443380` or `FUN_0046d680`.
@@ -907,6 +978,17 @@ impl SourcePathGrid {
         true
     }
 
+    /// Set one source direction byte without changing the cell's path
+    /// metadata. `FUN_0046f460` uses this when it overlays a static map cell
+    /// into its temporary type-4 target-selection grid.
+    pub fn set_direction_marker(&mut self, position: (i32, i32), direction: u8) -> bool {
+        let Some(index) = self.index(position) else {
+            return false;
+        };
+        self.cells[index].direction = direction;
+        true
+    }
+
     /// Set a path-grid cell selected by the static-map overlay. This clears
     /// its `0x0c` direction blocker exactly as `FUN_0046f000` does after it
     /// accepts a fixed or permission-matched source map object.
@@ -929,11 +1011,203 @@ impl SourcePathGrid {
     /// Mark a cell with source direction marker `0xc`, as
     /// `FUN_0046f6d0`/`FUN_0046d900` do for path blockers.
     pub fn mark_direction_blocker(&mut self, position: (i32, i32)) -> bool {
-        let Some(index) = self.index(position) else {
+        self.set_direction_marker(position, 0x0c)
+    }
+
+    /// Rasterize a source direction-13 segment as `FUN_0046dd30` does. The
+    /// caller supplies already-clipped endpoints; this adapter rejects a
+    /// segment unless both endpoints are inside this grid.
+    pub fn mark_direction_13_segment(&mut self, start: (i32, i32), end: (i32, i32)) -> bool {
+        if self.index(start).is_none() || self.index(end).is_none() {
             return false;
-        };
-        self.cells[index].direction = 0x0c;
+        }
+        Self::source_raster_segment(start, end, |position| {
+            let index = self
+                .index(position)
+                .expect("a raster between in-bounds source-grid endpoints stays in bounds");
+            self.cells[index].direction = 0x0d;
+        });
         true
+    }
+
+    /// Overlay one candidate figure accepted by `FUN_00453e50`'s dynamic
+    /// mask. Only live categories 1 through 3 receive this direction-13
+    /// footprint; category 4 land figures and later categories leave the
+    /// temporary grid unchanged. `FUN_0046d9d0` uses the wide, five-cell
+    /// branches selected by `FUN_0046c630(..., 1)` in that caller.
+    pub fn overlay_source_candidate_footprint(
+        &mut self,
+        figure_kind: u8,
+        position: (i32, i32),
+        direction: u8,
+    ) -> bool {
+        if !(1..=3).contains(&figure_kind) {
+            return false;
+        }
+
+        let center = (
+            position.0.saturating_sub(self.origin.0),
+            position.1.saturating_sub(self.origin.1),
+        );
+        let mut changed = false;
+        let mut mark = |start, end| {
+            changed |= self.mark_direction_13_segment_clipped(start, end);
+        };
+        match direction {
+            0 | 4 => mark((center.0, center.1 - 2), (center.0, center.1 + 2)),
+            1 | 5 => {
+                mark((center.0 + 2, center.1 - 2), (center.0 - 2, center.1 + 2));
+                mark((center.0 + 1, center.1 - 2), (center.0 - 2, center.1 + 1));
+            }
+            2 | 6 => mark((center.0 - 2, center.1), (center.0 + 2, center.1)),
+            3 | 7 => {
+                mark((center.0 - 2, center.1 - 2), (center.0 + 2, center.1 + 2));
+                mark((center.0 - 2, center.1 - 1), (center.0 + 2, center.1 + 1));
+            }
+            _ => return false,
+        }
+        changed
+    }
+
+    /// `FUN_0046db80` clips a direction-13 segment to the local temporary
+    /// grid before forwarding it to `FUN_0046dd30`. This keeps a candidate
+    /// at the boundary from losing the in-bounds portion of its footprint.
+    fn mark_direction_13_segment_clipped(
+        &mut self,
+        mut start: (i32, i32),
+        mut end: (i32, i32),
+    ) -> bool {
+        let max_x = self.width as i32 - 1;
+        let max_y = self.height as i32 - 1;
+        let edge_bits = |point: (i32, i32)| {
+            (u8::from(point.0 < 0))
+                | (u8::from(point.0 > max_x) << 1)
+                | (u8::from(point.1 < 0) << 2)
+                | (u8::from(point.1 > max_y) << 3)
+        };
+        let start_bits = edge_bits(start);
+        let end_bits = edge_bits(end);
+        if start_bits | end_bits == 0 {
+            return self.mark_direction_13_segment(start, end);
+        }
+        if start_bits & end_bits != 0 {
+            return false;
+        }
+
+        let delta_x = end.0 - start.0;
+        let delta_y = end.1 - start.1;
+        if start_bits & 1 != 0 {
+            start.1 -= delta_y * start.0 / delta_x;
+            start.0 = 0;
+        } else if start_bits & 2 != 0 {
+            start.0 -= max_x;
+            start.1 -= delta_y * start.0 / delta_x;
+            start.0 = max_x;
+        }
+        if start.1 < 0 {
+            start.0 -= delta_x * start.1 / delta_y;
+            start.1 = 0;
+        } else if start.1 > max_y {
+            start.1 -= max_y;
+            start.0 -= delta_x * start.1 / delta_y;
+            start.1 = max_y;
+        }
+
+        if end_bits & 1 != 0 {
+            end.1 -= delta_y * end.0 / delta_x;
+            end.0 = 0;
+        } else if end_bits & 2 != 0 {
+            end.0 -= max_x;
+            end.1 -= delta_y * end.0 / delta_x;
+            end.0 = max_x;
+        }
+        if end.1 < 0 {
+            end.0 -= delta_x * end.1 / delta_y;
+            end.1 = 0;
+        } else if end.1 > max_y {
+            end.1 -= max_y;
+            end.0 -= delta_x * end.1 / delta_y;
+            end.1 = max_y;
+        }
+
+        if start == end {
+            false
+        } else {
+            self.mark_direction_13_segment(start, end)
+        }
+    }
+
+    /// `FUN_0046e8b0`'s direct direction-13 test. It rejects endpoints outside
+    /// the local grid, requires the source's ceiling-quarter distance bound,
+    /// and scans every raster cell after `start`. A direction-13 marker at
+    /// `end` is permitted; every earlier direction-13 marker rejects the ray.
+    pub fn direction_13_ray_clear(
+        &self,
+        start: (i32, i32),
+        end: (i32, i32),
+        radius: u32,
+    ) -> bool {
+        if self.index(start).is_none() || self.index(end).is_none() {
+            return false;
+        }
+        let dx = start.0.abs_diff(end.0);
+        let dy = start.1.abs_diff(end.1);
+        let source_distance = dx.max(dy) + (dx.min(dy) + 3) / 4;
+        if source_distance > radius {
+            return false;
+        }
+
+        let mut clear = true;
+        Self::source_raster_segment(start, end, |position| {
+            if position != start
+                && position != end
+                && self
+                    .index(position)
+                    .is_some_and(|index| self.cells[index].direction == 0x0d)
+            {
+                clear = false;
+            }
+        });
+        clear
+    }
+
+    /// The inclusive Bresenham traversal shared by `FUN_0046dd30` and
+    /// `FUN_0046e8b0`. Its initial error is `floor(major / 2)`, matching the
+    /// source's signed divide-by-two sequence.
+    fn source_raster_segment<F>(start: (i32, i32), end: (i32, i32), mut visit: F)
+    where
+        F: FnMut((i32, i32)),
+    {
+        let dx = start.0.abs_diff(end.0);
+        let dy = start.1.abs_diff(end.1);
+        let step_x = if end.0 >= start.0 { 1 } else { -1 };
+        let step_y = if end.1 >= start.1 { 1 } else { -1 };
+        let mut position = start;
+        visit(position);
+
+        if dx > dy {
+            let mut error = i64::from(dx) / 2;
+            for _ in 0..dx {
+                position.0 += step_x;
+                error -= i64::from(dy);
+                if error < 0 {
+                    error += i64::from(dx);
+                    position.1 += step_y;
+                }
+                visit(position);
+            }
+        } else {
+            let mut error = i64::from(dy) / 2;
+            for _ in 0..dy {
+                position.1 += step_y;
+                error -= i64::from(dx);
+                if error < 0 {
+                    error += i64::from(dy);
+                    position.0 += step_x;
+                }
+                visit(position);
+            }
+        }
     }
 
     /// Mark a target rectangle as high-metadata callback cells. This is the
@@ -1229,7 +1503,7 @@ impl SourcePathGrid {
             let Some(definition) = definitions_by_source_id.get(&tile.source_id()) else {
                 continue;
             };
-            let Some(direction) = source_ship_route_direction(definition, tile) else {
+            let Some(direction) = source_static_map_direction(definition, tile) else {
                 continue;
             };
             let position = (
@@ -1621,9 +1895,10 @@ fn source_fixed_path_kind(definition: &CodBuilding) -> bool {
     )
 }
 
-/// Return the source direction marker that `FUN_0046f6d0` writes for one
-/// static map cell. `None` is the explicit `MEER`/`KIRCHE` pass-through.
-fn source_ship_route_direction(definition: &CodBuilding, tile: IslandTile) -> Option<u8> {
+/// Return the source direction marker that `FUN_0046f460` and `FUN_0046f6d0`
+/// write for one static map cell. `None` is the explicit `MEER`/`KIRCHE`
+/// pass-through.
+pub(crate) fn source_static_map_direction(definition: &CodBuilding, tile: IslandTile) -> Option<u8> {
     let kind = definition.source_kind_code()?;
     if kind == 19 {
         return None;
@@ -2089,6 +2364,44 @@ mod tests {
     }
 
     #[test]
+    fn direction_13_ray_matches_fun_0046dd30_and_fun_0046e8b0() {
+        let mut grid = SourcePathGrid::new((0, 0), 7, 3);
+        assert!(grid.mark_direction_13_segment((3, 2), (3, 2)));
+        assert!(grid.mark_direction_13_segment((6, 2), (6, 2)));
+
+        // The source direct-ray metric uses ceil(minor / 4), unlike the
+        // candidate producer's floor-based metric.
+        assert!(!grid.direction_13_ray_clear((0, 1), (4, 2), 4));
+        assert!(!grid.direction_13_ray_clear((0, 1), (4, 2), 5));
+
+        // An intermediate direction-13 cell rejects the segment, whereas a
+        // marker exactly at the selected endpoint is allowed.
+        assert!(grid.direction_13_ray_clear((4, 2), (6, 2), 2));
+        assert!(grid.direction_13_ray_clear((0, 0), (6, 2), 7));
+        assert!(!grid.direction_13_ray_clear((-1, 0), (1, 0), 2));
+    }
+
+    #[test]
+    fn source_candidate_footprint_matches_fun_0046d9d0_wide_branches() {
+        let mut grid = SourcePathGrid::new((0, 0), 7, 7);
+        assert!(grid.overlay_source_candidate_footprint(1, (3, 3), 2));
+        for x in 1..=5 {
+            assert_eq!(grid.cells[grid.index((x, 3)).unwrap()].direction, 0x0d);
+        }
+
+        let mut edge = SourcePathGrid::new((0, 0), 5, 5);
+        assert!(edge.overlay_source_candidate_footprint(3, (0, 1), 1));
+        assert_eq!(edge.cells[edge.index((1, 0)).unwrap()].direction, 0x0d);
+        assert_eq!(edge.cells[edge.index((0, 1)).unwrap()].direction, 0x0d);
+
+        let mut corner = SourcePathGrid::new((0, 0), 5, 5);
+        assert!(!corner.overlay_source_candidate_footprint(3, (0, 0), 1));
+
+        assert!(!edge.overlay_source_candidate_footprint(4, (2, 2), 2));
+        assert!(!edge.overlay_source_candidate_footprint(1, (2, 2), 8));
+    }
+
+    #[test]
     fn source_directions_match_fun_00456270() {
         assert_eq!(source_direction_delta(1), Some((0, -1)));
         assert_eq!(source_direction_delta(2), Some((1, -1)));
@@ -2099,6 +2412,40 @@ mod tests {
         assert_eq!(source_direction_delta(7), Some((-1, 0)));
         assert_eq!(source_direction_delta(8), Some((-1, -1)));
         assert_eq!(source_direction_delta(0), None);
+    }
+
+    #[test]
+    fn source_target_direction_matches_fun_00454050_axes_diagonals_and_ties() {
+        assert_eq!(source_target_direction(0, -1), 0);
+        assert_eq!(source_target_direction(1, -1), 1);
+        assert_eq!(source_target_direction(1, 0), 2);
+        assert_eq!(source_target_direction(1, 1), 3);
+        assert_eq!(source_target_direction(0, 1), 4);
+        assert_eq!(source_target_direction(-1, 1), 5);
+        assert_eq!(source_target_direction(-1, 0), 6);
+        assert_eq!(source_target_direction(-1, -1), 7);
+
+        // Source comparisons are strict: 2:1 is axial, while the matching
+        // diagonal boundary remains diagonal. Even zero follows the final
+        // south-east return in the original branch structure.
+        assert_eq!(source_target_direction(2, -1), 2);
+        assert_eq!(source_target_direction(1, -2), 1);
+        assert_eq!(source_target_direction(1, -3), 0);
+        assert_eq!(source_target_direction(0, 0), 3);
+    }
+
+    #[test]
+    fn source_kind6_target_direction_clamps_raw_footprint_and_applies_quarter_radius() {
+        let target = SourcePathTargetRect::new((10, 10), 4, 2).unwrap();
+
+        // The nearest raw point is (10, 11), four cells east. Runtime shot
+        // radius 16 permits metric four; radius 12 permits only three.
+        assert_eq!(source_kind6_target_direction((6, 11), target, 16), Some(2));
+        assert_eq!(source_kind6_target_direction((6, 11), target, 12), None);
+
+        // A position inside the footprint clamps to itself; `FUN_00454050`
+        // returns its source zero-delta direction value.
+        assert_eq!(source_kind6_target_direction((11, 11), target, 0), Some(3));
     }
 
     #[test]
@@ -2568,7 +2915,7 @@ mod tests {
             flags: 0,
         };
         assert_eq!(
-            source_ship_route_direction(&central_gate, center_tile),
+            source_static_map_direction(&central_gate, center_tile),
             Some(0x0c)
         );
     }

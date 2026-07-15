@@ -5,7 +5,7 @@
 //! captured. CoverageMap and AI controllers are recomputed from scratch.
 
 use crate::building::BuildingInstance;
-use crate::combat::{DiplomacyMatrix, MilitaryUnit};
+use crate::combat::{DiplomacyMatrix, MilitaryUnit, SourceDynamicCombatFigure};
 use crate::data_bridge::{
     SourceCityTable, SourceKind4Occupant, SourceKind13Location, SourceKind13LocationTable,
 };
@@ -120,7 +120,11 @@ use std::path::Path;
 /// program and its `+0x02` cursor between dispatcher updates.
 /// v63: type-4 figures retain the `FUN_00456d00` terminal route residual.
 /// v64: source type-4 dispatch retains source player/session state.
-pub const SAVE_VERSION: u32 = 64;
+/// v65: dynamic `0x84a`/`0x84b` source combat figures retain their
+/// category-local live records independently of local unit types.
+/// v66: source figures retain SHIP4 byte `0x42` as the category-1/2/3
+/// `FUN_00454250` score-state tier.
+pub const SAVE_VERSION: u32 = 66;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -134,7 +138,7 @@ pub const SAVE_VERSION: u32 = 64;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 64;
+pub const MIN_LOADABLE_VERSION: u32 = 66;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -153,6 +157,7 @@ pub struct SaveState {
     pub source_kind13_locations: SourceKind13LocationTable,
     pub source_cities: SourceCityTable,
     pub source_kind4_occupants: Vec<SourceKind4Occupant>,
+    pub source_dynamic_combat_figures: Vec<SourceDynamicCombatFigure>,
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
     pub source_time_ticks: u32,
     pub source_time_remainder_ms: u32,
@@ -215,6 +220,7 @@ impl Simulation {
             source_kind13_locations: self.source_kind13_locations.clone(),
             source_cities: self.source_cities.clone(),
             source_kind4_occupants: self.source_kind4_occupants.clone(),
+            source_dynamic_combat_figures: self.source_dynamic_combat_figures.clone(),
             source_kind4_dispatch: self.source_kind4_dispatch,
             source_time_ticks: self.source_time_ticks,
             source_time_remainder_ms: self.source_time_remainder_ms,
@@ -247,6 +253,7 @@ impl Simulation {
         self.source_kind13_locations = s.source_kind13_locations;
         self.source_cities = s.source_cities;
         self.source_kind4_occupants = s.source_kind4_occupants;
+        self.source_dynamic_combat_figures = s.source_dynamic_combat_figures;
         self.source_kind4_dispatch = s.source_kind4_dispatch;
         self.source_time_ticks = s.source_time_ticks;
         self.source_time_remainder_ms = s.source_time_remainder_ms;
@@ -319,6 +326,7 @@ mod tests {
             source_kind13_locations: SourceKind13LocationTable::default(),
             source_cities: SourceCityTable::default(),
             source_kind4_occupants: vec![],
+            source_dynamic_combat_figures: vec![],
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
@@ -493,6 +501,30 @@ mod tests {
                 state_payload: [0; 8],
                 active: true,
             });
+        sim.source_dynamic_combat_figures
+            .push(crate::combat::SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 6,
+                candidate_list_key: 1,
+                figure_definition_id: 31,
+                direction: 7,
+                source_payload: 0x1234_5678,
+                position: (18.5, 21.25),
+                source_energy: 320,
+                target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    0x37, 0, 9, 10,
+                ]),
+                state_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    0x38, 0, 18, 21,
+                ]),
+                owner: 4,
+                state: 7,
+                flags: 1,
+                notification: 0,
+                runtime_slot: 12,
+                auxiliary_kind: 2,
+                name_index: 6,
+            });
         let mut source_spearman =
             crate::combat::MilitaryUnit::new(crate::combat::UnitType::NativeSpearman, 6, 12, 14);
         source_spearman.source_island_id = Some(1);
@@ -623,6 +655,47 @@ mod tests {
         assert_eq!(sim2.source_city_dispatch_cursor, 17);
         assert_eq!(sim2.source_time_ticks, 19);
         assert_eq!(sim2.source_time_remainder_ms, 99);
+        assert_eq!(
+            sim2.source_dynamic_combat_figures,
+            vec![crate::combat::SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 6,
+                candidate_list_key: 1,
+                figure_definition_id: 31,
+                direction: 7,
+                source_payload: 0x1234_5678,
+                position: (18.5, 21.25),
+                source_energy: 320,
+                target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    0x37, 0, 9, 10,
+                ]),
+                state_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    0x38, 0, 18, 21,
+                ]),
+                owner: 4,
+                state: 7,
+                flags: 1,
+                notification: 0,
+                runtime_slot: 12,
+                auxiliary_kind: 2,
+                name_index: 6,
+            }]
+        );
+        assert_eq!(
+            sim2.source_combat_candidates(),
+            vec![crate::combat::SourceCombatCandidate {
+                entity: crate::combat::SourceCombatCandidateEntity::DynamicFigure(0),
+                figure_kind: 6,
+                runtime_slot: 12,
+                figure_definition_id: Some(31),
+                source_energy: 320,
+                source_score_state: 0,
+                candidate_list_key: Some(1),
+                owner: 4,
+                position: (18.5, 21.25),
+                direction: 7,
+            }]
+        );
         assert_eq!(
             sim2.source_kind4_dispatch,
             crate::combat::SourceKind4DispatchState {
