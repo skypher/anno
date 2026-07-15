@@ -1281,9 +1281,17 @@ impl Simulation {
             if city.phase == self.source_city_dispatch_phase {
                 continue;
             }
-            if let Some(city) = self.source_cities.record_mut(slot) {
-                city.phase = self.source_city_dispatch_phase;
+            let city_satisfaction_allowed = self.source_city_satisfaction_allows(city.owner_slot);
+            let Some(city) = self.source_cities.record_mut(slot) else {
+                continue;
+            };
+            city.phase = self.source_city_dispatch_phase;
+            if city_satisfaction_allowed {
+                city.satisfaction_pressure =
+                    (u32::from(city.satisfaction_pressure) * 0xff >> 8) as u16;
+                city.refresh_group_satisfaction();
             }
+            let city = *city;
             if city.tier_population.iter().copied().sum::<u32>() > 29
                 && self.source_city_activity_allows(city)
             {
@@ -1324,6 +1332,20 @@ impl Simulation {
                         )
                 })
             })
+    }
+
+    /// The fully represented local-owner branch of `FUN_0047f8a0`: after
+    /// the city phase write, it updates demand satisfaction only for player
+    /// state zero or twelve. Remote-owner dispatch additionally depends on
+    /// a separate session global and remains outside this local gate.
+    fn source_city_satisfaction_allows(&self, owner_slot: u8) -> bool {
+        owner_slot == self.source_kind4_dispatch.active_player_slot
+            && self
+                .players
+                .get(usize::from(owner_slot))
+                .is_some_and(|player| {
+                    matches!(player.state, PlayerState::HumanActive | PlayerState::AiActive)
+                })
     }
 
     /// Delete one live source kind-4 figure by its `SOLDAT3` runtime slot.
@@ -4186,6 +4208,7 @@ mod tests {
             owner_slot: 0,
             phase: 0,
             tier_population: [30, 0, 0, 0, 0],
+            ..Default::default()
         };
         let mut foreign_land = MilitaryUnit::new(crate::combat::UnitType::Infantry, 1, 4, 4);
         foreign_land.source_island_id = Some(3);

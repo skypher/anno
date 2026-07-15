@@ -24,6 +24,7 @@ use crate::source_route::{
 #[derive(Debug, Clone, Copy)]
 struct SourceCivilianPathCell {
     kind_code: u8,
+    production_kind_code: u8,
     owner: u8,
     path_class: u8,
 }
@@ -173,6 +174,9 @@ impl IslandMap {
                         if let Some(path_classes) = def.source_path_classes() {
                             civilian_path_cells[idx] = Some(SourceCivilianPathCell {
                                 kind_code: def.source_kind_code().unwrap_or(u8::MAX),
+                                production_kind_code: def
+                                    .source_production_kind_code()
+                                    .unwrap_or(u8::MAX),
                                 owner: tile.source_owner(),
                                 path_class: path_classes[3],
                             });
@@ -399,10 +403,10 @@ impl IslandMap {
     ///
     /// `FUN_004722f0` centers this window on the selected map definition's
     /// oriented footprint and extends each axis by `0x28`; `FUN_004724d0`
-    /// then admits its fixed terrain kinds plus source kind 13 when the
-    /// target map-owner selector matches the center cell. The `0x2000`
-    /// mask supplied by both callers contains only that dynamic kind-13
-    /// permission.
+    /// then admits its fixed terrain kinds plus compiled production kind 13
+    /// when the target map-owner selector matches the center cell. The
+    /// `0x2000` mask supplied by both callers contains only that dynamic
+    /// kind-13 permission.
     pub fn source_kind13_transfer_path_grid(
         &self,
         center: (i32, i32),
@@ -428,7 +432,7 @@ impl IslandMap {
                 let Some(cell) = self.civilian_path_cell(position) else {
                     continue;
                 };
-                let owner_matched_kind13 = cell.kind_code == 13
+                let owner_matched_kind13 = cell.production_kind_code == 13
                     && (center_cell.owner == 7 || cell.owner == center_cell.owner);
                 let fixed_kind = matches!(cell.kind_code, 1 | 11 | 12 | 13 | 18 | 29 | 30);
                 if fixed_kind || owner_matched_kind13 {
@@ -794,6 +798,7 @@ impl IslandMap {
             civilian_path_cells: vec![
                 Some(SourceCivilianPathCell {
                     kind_code: 11,
+                    production_kind_code: u8::MAX,
                     owner: 0,
                     path_class: 32,
                 });
@@ -1133,6 +1138,14 @@ mod tests {
             fertilities: [7; 8],
             tiles: vec![
                 IslandTile {
+                    building_id: 4,
+                    x: 0,
+                    y: 0,
+                    orientation: 0,
+                    anim_count: 0x80,
+                    flags: 0,
+                },
+                IslandTile {
                     building_id: 1,
                     x: 1,
                     y: 0,
@@ -1178,11 +1191,17 @@ mod tests {
         let path_properties = || {
             std::collections::HashMap::from([("Wegspeed".to_owned(), "100,100,100,100".to_owned())])
         };
+        let residence_properties = || {
+            std::collections::HashMap::from([
+                ("Wegspeed".to_owned(), "100,100,100,100".to_owned()),
+                ("ProdKind".to_owned(), "WOHNUNG".to_owned()),
+            ])
+        };
         let residences = CodBuilding {
             source_id: 20_001,
             kind: "PLATZ".to_owned(),
             size: (1, 1),
-            properties: path_properties(),
+            properties: residence_properties(),
             ..Default::default()
         };
         let ground = CodBuilding {
@@ -1199,13 +1218,24 @@ mod tests {
             properties: path_properties(),
             ..Default::default()
         };
-        let map = IslandMap::from_island(&island, &[residences, ground, blocked]);
+        let same_owner_plaza = CodBuilding {
+            source_id: 20_004,
+            kind: "PLATZ".to_owned(),
+            size: (1, 1),
+            properties: path_properties(),
+            ..Default::default()
+        };
+        let map = IslandMap::from_island(
+            &island,
+            &[residences, ground, blocked, same_owner_plaza],
+        );
         let grid = map.source_kind13_transfer_path_grid((1, 0)).unwrap();
 
         assert_eq!(grid.metadata((-39, 0)), Some(0));
         assert_eq!(grid.metadata((41, 0)), Some(0));
         assert_eq!(grid.metadata((-40, 0)), None);
         assert_eq!(grid.metadata((42, 0)), None);
+        assert_eq!(grid.metadata((0, 0)), Some(0x20));
         assert_eq!(grid.metadata((2, 0)), Some(0xa0));
         assert_eq!(grid.metadata((3, 0)), Some(0x20));
         assert_eq!(grid.metadata((4, 0)), Some(0x20));

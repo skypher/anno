@@ -844,6 +844,36 @@ impl CodFile {
         self.buildings.iter().position(|b| b.source_id == source_id)
     }
 
+    /// Resolve the first compiled `HAUS_PRODTYP Kind: WOHNUNG` definition
+    /// for one BGruppe. The haeuser loader stores this first matching record
+    /// at `DAT_0061fa84 + BGruppe * 0x48`; `FUN_0047bbc0` and
+    /// `FUN_0047c080` use the same table for residential tier transitions.
+    pub fn source_population_group_building(&self, group: u8) -> Option<&BuildingDef> {
+        self.buildings.iter().find(|building| {
+            building.source_production_kind_code() == Some(13)
+                && building.source_population_group() == Some(group)
+        })
+    }
+
+    /// Resolve the concrete BGruppe housing variant selected from a source
+    /// `rand()` draw. The transition paths use the base definition's
+    /// `RandAnz` and `RandAdd` with the same contiguous compiled-record
+    /// layout as the terminal ruin selector.
+    pub fn source_population_group_variant(
+        &self,
+        group: u8,
+        rand_value: u16,
+    ) -> Option<&BuildingDef> {
+        let base_index = self.buildings.iter().position(|building| {
+            building.source_production_kind_code() == Some(13)
+                && building.source_population_group() == Some(group)
+        })?;
+        let base = self.buildings.get(base_index)?;
+        let variant_count = usize::from(base.rand_anz.max(1));
+        let variant = (usize::from(rand_value) % variant_count) * usize::from(base.rand_add);
+        self.buildings.get(base_index + variant).or(Some(base))
+    }
+
     /// Resolve an original `Ruinenr` byte to the base ruin building.
     ///
     /// The binary builds this table after parsing haeuser.cod
@@ -975,6 +1005,29 @@ mod tests {
         .expect("parse plaintext COD");
 
         assert_eq!(cod.buildings[0].source_population_group(), Some(3));
+    }
+
+    #[test]
+    fn population_group_housing_resolver_uses_first_nested_wohnung_and_variant_stride() {
+        let cod = CodFile::parse(
+            b"@Nummer: 1\nId: 21001\nRandAnz: 3\nRandAdd: 1\nObjekt: HAUS_PRODTYP\nKind: WOHNUNG\nBGruppe: 1\nEndObj;\n@Nummer: 2\nId: 21002\nObjekt: HAUS_PRODTYP\nKind: WOHNUNG\nBGruppe: 1\nEndObj;\n@Nummer: 3\nId: 21003\nObjekt: HAUS_PRODTYP\nKind: WOHNUNG\nBGruppe: 1\nEndObj;\n@Nummer: 4\nId: 21004\nObjekt: HAUS_PRODTYP\nKind: WOHNUNG\nBGruppe: 2\nEndObj;\n",
+        )
+        .expect("parse plaintext COD");
+
+        assert_eq!(
+            cod.source_population_group_building(1).map(|building| building.source_id),
+            Some(21001)
+        );
+        assert_eq!(
+            cod.source_population_group_variant(1, 4)
+                .map(|building| building.source_id),
+            Some(21002)
+        );
+        assert_eq!(
+            cod.source_population_group_variant(2, 0)
+                .map(|building| building.source_id),
+            Some(21004)
+        );
     }
 
     #[test]

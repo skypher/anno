@@ -210,6 +210,21 @@ pub const SOURCE_KIND13_MAX_RESIDENTS: [u16; 5] = [2, 6, 15, 25, 40];
 /// Source `DAT_0061fa4c` values produced by `Maxwohn << 6` during the
 /// BGRUPPE loader. Kind-13 record amounts use this 1/64-resident scale.
 pub const SOURCE_KIND13_AMOUNT_CAPACITIES: [u16; 5] = [0x80, 0x180, 0x3c0, 0x640, 0xa00];
+/// The seven contiguous `Ware` slots at `DAT_0061fa5c..=DAT_0061fa74`
+/// sampled by `FUN_0047f0c0`: tobacco products through jewelry.
+pub const SOURCE_CITY_LUXURY_WARE_SLOTS: [u8; 7] = [0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15];
+/// `BGRUPPE.Prozent`, compiled by the haeuser loader as `Prozent * 128 / 100`
+/// at `DAT_0061fa40 + BGruppe * 0x48`.
+pub const SOURCE_CITY_GROUP_FULFILLMENT_TARGETS: [u8; 5] = [0, 60, 90, 99, 107];
+/// Nonzero `BGRUPPE_WARE` selectors in the shipped haeuser configuration.
+/// Columns follow [`SOURCE_CITY_LUXURY_WARE_SLOTS`].
+pub const SOURCE_CITY_GROUP_LUXURY_REQUIREMENTS: [[bool; 7]; 5] = [
+    [false, false, false, false, false, false, false],
+    [false, false, false, true, true, false, false],
+    [true, true, false, true, true, false, false],
+    [true, true, true, true, true, false, false],
+    [true, true, true, true, false, true, true],
+];
 
 /// Fixed count of city records at `DAT_005dbae0`.
 pub const SOURCE_CITY_RECORD_SLOTS: usize = 0x4b;
@@ -230,6 +245,136 @@ pub struct SourceCityRecord {
     pub phase: u8,
     /// The five BGRUPPE populations summed by `FUN_0047f1f0(city, 1)`.
     pub tier_population: [u32; 5],
+    /// Source city bytes `+0x164 + 0x0c * i` sampled by `FUN_0047f0c0` for
+    /// luxury ware slots `0x0f + i`.
+    #[serde(default)]
+    pub luxury_satisfaction: [u8; 7],
+    /// Source city bytes `+0x24d..+0x251`. `FUN_00468ce0` initializes all
+    /// five to `0x80`, and `FUN_0047f400` applies each to its group target.
+    #[serde(default = "source_city_initial_satisfaction_weights")]
+    pub satisfaction_weights: [u8; 5],
+    /// Source city u16 `+0x200`; `FUN_0047f8a0` decays it by `255 / 256`
+    /// before `FUN_0047f400` converts it into a satisfaction denominator.
+    #[serde(default)]
+    pub satisfaction_pressure: u16,
+    /// Source city bytes `+0x248..+0x24c`, written by `FUN_0047f850`.
+    #[serde(default)]
+    pub satisfaction_by_group: [u8; 5],
+    /// Source city byte `+0x255`, supplied by the city-demand dispatcher to
+    /// `FUN_0047b410` as its cross-group satisfaction operand.
+    #[serde(default)]
+    pub overall_satisfaction: u8,
+    /// Source city u16 `+0x1fe`; a nonzero value suppresses positive
+    /// kind-13 amount changes in `FUN_0047b410`.
+    #[serde(default)]
+    pub growth_blocked: bool,
+    /// Source city u16s `+0x234..+0x23c`, one pending kind-13 promotion
+    /// amount per target BGruppe in whole residents.
+    #[serde(default)]
+    pub promotion_reservations: [u16; 5],
+    /// Source city bytes `+0x23e..+0x242` and `+0x243..+0x247`, the origin
+    /// coordinates paired with a pending promotion reservation.
+    #[serde(default)]
+    pub promotion_reservation_positions: [(u8, u8); 5],
+}
+
+const fn source_city_initial_satisfaction_weights() -> [u8; 5] {
+    [0x80; 5]
+}
+
+impl Default for SourceCityRecord {
+    fn default() -> Self {
+        Self {
+            island_id: u8::MAX,
+            source_owner: 0,
+            owner_slot: 0,
+            phase: 0,
+            tier_population: [0; 5],
+            luxury_satisfaction: [0; 7],
+            satisfaction_weights: source_city_initial_satisfaction_weights(),
+            satisfaction_pressure: 0,
+            satisfaction_by_group: [0; 5],
+            overall_satisfaction: 0,
+            growth_blocked: false,
+            promotion_reservations: [0; 5],
+            promotion_reservation_positions: [(0, 0); 5],
+        }
+    }
+}
+
+impl SourceCityRecord {
+    /// Replay `FUN_0047f0c0`, `FUN_0047f400`, and `FUN_0047f850` for the
+    /// five population groups. The caller supplies the live city demand
+    /// bytes; the BGRUPPE selectors and targets are fixed source data.
+    pub fn refresh_group_satisfaction(&mut self) {
+        self.satisfaction_by_group = std::array::from_fn(|group| {
+            let fulfilled: u32 = SOURCE_CITY_GROUP_LUXURY_REQUIREMENTS[group]
+                .iter()
+                .zip(self.luxury_satisfaction)
+                .filter_map(|(&required, satisfaction)| required.then_some(u32::from(satisfaction)))
+                .sum();
+            let denominator = source_city_group_satisfaction_denominator(
+                self.satisfaction_pressure,
+                self.satisfaction_weights[group],
+                SOURCE_CITY_GROUP_FULFILLMENT_TARGETS[group],
+            );
+            if denominator == 0 {
+                0x80
+            } else {
+                ((fulfilled << 7) / denominator).min(0x80) as u8
+            }
+        });
+    }
+
+    /// Assemble the source city operands consumed by `FUN_0047b410`.
+    pub const fn source_kind13_transfer_inputs(self) -> SourceKind13TransferInputs {
+        SourceKind13TransferInputs {
+            satisfaction_by_group: self.satisfaction_by_group,
+            overall_satisfaction: self.overall_satisfaction,
+            growth_blocked: self.growth_blocked,
+        }
+    }
+}
+
+/// `FUN_0047f400`: required fulfillment for one population group.
+fn source_city_group_satisfaction_denominator(
+    pressure: u16,
+    weight: u8,
+    fulfillment_target: u8,
+) -> u32 {
+    let pressure_steps = u32::from(pressure >> 5);
+    let curve_input = 0x80_u32.saturating_sub(pressure_steps) * u32::from(weight);
+    let curve = source_city_satisfaction_curve((curve_input >> 7) as u8);
+    (curve * u32::from(fulfillment_target)) >> 7
+}
+
+/// Runtime `DAT_0055e780` initialized by the nine `FUN_004033d0` calls in
+/// `FUN_0047f8a0`. The source stores each value after truncating its 8.8
+/// linear interpolation, including the terminal point of every segment.
+fn source_city_satisfaction_curve(index: u8) -> u32 {
+    const SEGMENTS: &[(u8, u8, u32, u32)] = &[
+        (0x00, 0x4c, 0x4c, 0x59),
+        (0x4c, 0x66, 0x59, 0x66),
+        (0x66, 0x73, 0x66, 0x6c),
+        (0x73, 0x80, 0x6c, 0x80),
+        (0x80, 0x8c, 0x80, 0x93),
+        (0x8c, 0xa6, 0x93, 0xd5),
+        (0xa6, 0xb3, 0xd5, 0x100),
+        (0xb3, 0xc0, 0x100, 0x160),
+        (0xc0, 0xfe, 0x160, 0x280),
+    ];
+
+    let index = u32::from(index);
+    for &(start, end, initial, terminal) in SEGMENTS {
+        let start = u32::from(start);
+        let end = u32::from(end);
+        if index <= end {
+            let step = ((terminal * 0x100) as i32 - (initial * 0x100) as i32)
+                / (end - start) as i32;
+            return ((initial * 0x100) as i32 + (index - start) as i32 * step) as u32 >> 8;
+        }
+    }
+    0
 }
 
 /// One live source kind-4 land-figure contribution to an island's owner
@@ -365,6 +510,7 @@ pub fn source_cities_from_scenario(szs: &SzsFile) -> SourceCityTable {
             owner_slot: city.owner_slot,
             phase: 0,
             tier_population: city.tier_population,
+            ..SourceCityRecord::default()
         }) {
             break;
         }
@@ -491,6 +637,25 @@ pub struct SourceKind13LocationTable {
     slots: Vec<Option<SourceKind13Location>>,
 }
 
+/// Result of the source `FUN_0047bbc0` decrease path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind13DecreaseResult {
+    /// The source record and city tier total were updated in place. Neighbor
+    /// transfer is already reflected in the table.
+    Applied {
+        remaining_amount: u16,
+        redistributed_amount: u16,
+    },
+    /// The source selected a lower BGruppe and must emit an INSELHAUS
+    /// replacement command. Definition selection and command emission are
+    /// owned by the map-transition layer, so this table operation leaves all
+    /// records unchanged for that branch.
+    DowngradeRequired {
+        target_group: u8,
+        remaining_amount: u16,
+    },
+}
+
 impl Default for SourceKind13LocationTable {
     fn default() -> Self {
         Self {
@@ -571,6 +736,74 @@ impl SourceKind13LocationTable {
         self.slots[slot].as_mut()
     }
 
+    /// Replay the in-memory portion of `FUN_0047bbc0` for one location.
+    ///
+    /// `neighbors` must be the ordered coordinate buffer from
+    /// `LAB_00472ad0`; only records matching the origin BGruppe participate.
+    /// When the source would emit a lower-tier map replacement, this returns
+    /// [`SourceKind13DecreaseResult::DowngradeRequired`] without mutating
+    /// either table or city state.
+    pub fn apply_source_kind13_decrease(
+        &mut self,
+        city: &mut SourceCityRecord,
+        island_id: u8,
+        tile_x: u8,
+        tile_y: u8,
+        decrease: u16,
+        neighbors: &[(u8, u8)],
+    ) -> Option<SourceKind13DecreaseResult> {
+        let origin = self.location_at(island_id, tile_x, tile_y)?;
+        let group = usize::from(origin.population_group);
+        let capacity = *SOURCE_KIND13_AMOUNT_CAPACITIES.get(group)?;
+        let remaining = origin.amount.checked_sub(decrease)?;
+
+        let low_satisfaction = origin.state_byte() & 0x40 == 0
+            || city.satisfaction_by_group[group] < 0x58;
+        if low_satisfaction && group != 0 && remaining <= SOURCE_KIND13_AMOUNT_CAPACITIES[group - 1]
+        {
+            return Some(SourceKind13DecreaseResult::DowngradeRequired {
+                target_group: origin.population_group - 1,
+                remaining_amount: remaining,
+            });
+        }
+
+        city.tier_population[group] = city.tier_population[group].wrapping_sub(u32::from(origin.amount >> 6));
+        let mut remaining = i32::from(remaining);
+        let mut redistributed = 0_i32;
+        if !low_satisfaction && group != 0 && remaining < i32::from(capacity / 2) {
+            for &(neighbor_x, neighbor_y) in neighbors {
+                if remaining == 0 || (neighbor_x, neighbor_y) == (tile_x, tile_y) {
+                    continue;
+                }
+                let Some(neighbor) = self.location_at(island_id, neighbor_x, neighbor_y) else {
+                    continue;
+                };
+                if neighbor.population_group != origin.population_group {
+                    continue;
+                }
+
+                city.tier_population[group] = city.tier_population[group]
+                    .wrapping_sub(u32::from(neighbor.amount >> 6));
+                let room = i32::from(capacity) - i32::from(neighbor.amount);
+                let transfer = remaining.min(room);
+                let neighbor = self.location_at_mut(island_id, neighbor_x, neighbor_y)?;
+                neighbor.amount = (i32::from(neighbor.amount) + transfer) as u16;
+                remaining -= transfer;
+                redistributed += transfer;
+                city.tier_population[group] = city.tier_population[group]
+                    .wrapping_add(u32::from(neighbor.amount >> 6));
+            }
+        }
+
+        city.tier_population[group] = city.tier_population[group]
+            .wrapping_add_signed(source_kind13_population_units(remaining));
+        self.location_at_mut(island_id, tile_x, tile_y)?.amount = remaining as u16;
+        Some(SourceKind13DecreaseResult::Applied {
+            remaining_amount: remaining as u16,
+            redistributed_amount: redistributed as u16,
+        })
+    }
+
     /// Remove source roots overwritten by a later oriented INSELHAUS command.
     pub fn remove_roots_in_footprint(
         &mut self,
@@ -606,6 +839,12 @@ impl SourceKind13LocationTable {
     pub fn active_locations(&self) -> Vec<SourceKind13Location> {
         self.slots.iter().flatten().copied().collect()
     }
+}
+
+/// Source signed `(amount + sign_bit * 63) >> 6` conversion used when a
+/// kind-13 fixed-point amount changes a city population total.
+const fn source_kind13_population_units(amount: i32) -> i32 {
+    (amount + ((amount >> 31) & 0x3f)) >> 6
 }
 
 /// Mutable phase clocks and physical cursor owned by `FUN_0047b9c0`.
@@ -2745,6 +2984,108 @@ mod tests {
     }
 
     #[test]
+    fn kind13_decrease_replays_ordered_neighbor_redistribution_and_downgrade_handoff() {
+        let origin = SourceKind13Location {
+            island_id: 2,
+            tile_x: 8,
+            tile_y: 9,
+            source_owner: 1,
+            state_bits: 0x40,
+            population_group: 1,
+            amount: 200,
+            ..SourceKind13Location {
+                island_id: 0,
+                tile_x: 0,
+                tile_y: 0,
+                orientation: 0,
+                variant: 0,
+                source_owner: 0,
+                phase: 0,
+                state_bits: 0,
+                population_group: 0,
+                amount: 0x40,
+                lifecycle_flags: 0,
+            }
+        };
+        let neighbor_one = SourceKind13Location {
+            tile_x: 9,
+            tile_y: 9,
+            amount: 320,
+            ..origin
+        };
+        let neighbor_two = SourceKind13Location {
+            tile_x: 10,
+            tile_y: 9,
+            amount: 0,
+            ..origin
+        };
+        let different_group = SourceKind13Location {
+            tile_x: 11,
+            tile_y: 9,
+            population_group: 2,
+            ..origin
+        };
+        let mut table = SourceKind13LocationTable::default();
+        assert!(table.insert(origin));
+        assert!(table.insert(neighbor_one));
+        assert!(table.insert(neighbor_two));
+        assert!(table.insert(different_group));
+        let mut city = SourceCityRecord {
+            tier_population: [0, 8, 0, 0, 0],
+            satisfaction_by_group: [0, 0x58, 0, 0, 0],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            table.apply_source_kind13_decrease(
+                &mut city,
+                2,
+                8,
+                9,
+                100,
+                &[(9, 9), (10, 9), (11, 9), (8, 9)],
+            ),
+            Some(SourceKind13DecreaseResult::Applied {
+                remaining_amount: 0,
+                redistributed_amount: 100,
+            })
+        );
+        assert_eq!(city.tier_population, [0, 6, 0, 0, 0]);
+        assert_eq!(table.location_at(2, 8, 9).unwrap().amount, 0);
+        assert_eq!(table.location_at(2, 9, 9).unwrap().amount, 384);
+        assert_eq!(table.location_at(2, 10, 9).unwrap().amount, 36);
+        assert_eq!(table.location_at(2, 11, 9).unwrap().amount, 200);
+
+        let mut downgrade_table = SourceKind13LocationTable::default();
+        let downgrade_origin = SourceKind13Location {
+            state_bits: 0,
+            amount: 90,
+            ..origin
+        };
+        assert!(downgrade_table.insert(downgrade_origin));
+        let mut downgrade_city = SourceCityRecord {
+            tier_population: [0, 1, 0, 0, 0],
+            ..Default::default()
+        };
+        assert_eq!(
+            downgrade_table.apply_source_kind13_decrease(
+                &mut downgrade_city,
+                2,
+                8,
+                9,
+                20,
+                &[],
+            ),
+            Some(SourceKind13DecreaseResult::DowngradeRequired {
+                target_group: 0,
+                remaining_amount: 70,
+            })
+        );
+        assert_eq!(downgrade_city.tier_population, [0, 1, 0, 0, 0]);
+        assert_eq!(downgrade_table.location_at(2, 8, 9), Some(downgrade_origin));
+    }
+
+    #[test]
     fn kind13_amount_capacities_match_shipped_bgruppe_maxwohn_rows() {
         assert_eq!(SOURCE_KIND13_MAX_RESIDENTS, [2, 6, 15, 25, 40]);
         assert_eq!(SOURCE_KIND13_AMOUNT_CAPACITIES, [0x80, 0x180, 0x3c0, 0x640, 0xa00]);
@@ -2771,6 +3112,39 @@ mod tests {
             .source_amount_capacity(),
             None
         );
+    }
+
+    #[test]
+    fn city_group_satisfaction_replays_bgruppe_selectors_and_denominator_curve() {
+        assert_eq!(SOURCE_CITY_LUXURY_WARE_SLOTS, [0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15]);
+        assert_eq!(SOURCE_CITY_GROUP_FULFILLMENT_TARGETS, [0, 60, 90, 99, 107]);
+        assert_eq!(
+            SOURCE_CITY_GROUP_LUXURY_REQUIREMENTS[4],
+            [true, true, true, true, false, true, true]
+        );
+        assert_eq!(source_city_group_satisfaction_denominator(0, 128, 60), 60);
+        assert_eq!(source_city_group_satisfaction_denominator(0x20, 128, 60), 59);
+
+        let mut city = SourceCityRecord {
+            luxury_satisfaction: [0, 0, 0, 20, 40, 0, 0],
+            overall_satisfaction: 91,
+            growth_blocked: true,
+            ..Default::default()
+        };
+        city.refresh_group_satisfaction();
+        assert_eq!(city.satisfaction_by_group, [128, 128, 85, 77, 23]);
+        assert_eq!(
+            city.source_kind13_transfer_inputs(),
+            SourceKind13TransferInputs {
+                satisfaction_by_group: [128, 128, 85, 77, 23],
+                overall_satisfaction: 91,
+                growth_blocked: true,
+            }
+        );
+
+        city.luxury_satisfaction = [17, 18, 18, 18, 0, 18, 18];
+        city.refresh_group_satisfaction();
+        assert_eq!(city.satisfaction_by_group[4], 128);
     }
 
     #[test]

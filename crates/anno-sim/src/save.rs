@@ -156,7 +156,9 @@ use std::path::Path;
 ///      needed to reconstruct visible NORUINE terminal replay.
 /// v86: kind-13 source records retain their initialized lifecycle state, and
 ///      the 70-record phase dispatcher retains its clocks and physical cursor.
-pub const SAVE_VERSION: u32 = 86;
+/// v87: source city records retain luxury satisfaction operands, group
+///      weights, pressure, and the resulting kind-13 transfer inputs.
+pub const SAVE_VERSION: u32 = 87;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -170,7 +172,7 @@ pub const SAVE_VERSION: u32 = 86;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 86;
+pub const MIN_LOADABLE_VERSION: u32 = 87;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -589,6 +591,7 @@ mod tests {
                 owner_slot: 4,
                 phase: 6,
                 tier_population: [10, 20, 30, 40, 50],
+                ..Default::default()
             }),
         ));
         assert_eq!(
@@ -890,6 +893,7 @@ mod tests {
                 owner_slot: 4,
                 phase: 6,
                 tier_population: [10, 20, 30, 40, 50],
+                ..Default::default()
             })
         );
         assert_eq!(sim2.source_city_dispatch_elapsed_ms, 9_800);
