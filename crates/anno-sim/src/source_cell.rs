@@ -4,7 +4,7 @@
 //! renderer reads its frame selector, activity, storage, and market-progress
 //! fields through `FUN_0047cc80`, `FUN_0047ccd0`, and `FUN_0047cd10`.
 
-use anno_formats::cod::BuildingDef;
+use anno_formats::cod::{BuildingDef, CodFile};
 
 /// The renderer-relevant subset of one source 20-byte map-cell record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -12,6 +12,28 @@ pub struct SourceMapCellState {
     pub island: u8,
     pub x: u8,
     pub y: u8,
+    /// Oriented source-command footprint. `FUN_00463f40` uses these extents
+    /// when its type-7 terminal handler replaces or clears the root.
+    pub footprint_width: u8,
+    pub footprint_height: u8,
+    /// Unrotated dimensions held in the compiled map definition. The
+    /// terminal handler compares these with the selected ruin definition
+    /// before applying the command orientation.
+    pub source_definition_width: u8,
+    pub source_definition_height: u8,
+    /// Low two orientation bits of the original map command. The terminal
+    /// writer forwards these bits to the selected ruin replacement.
+    pub source_orientation: u8,
+    /// Source `Ruinenr` selected by `FUN_00463f40`; `0xff` enters its
+    /// per-tile clear branch instead of issuing a ruin replacement command.
+    pub ruin_id: u8,
+    /// The replacement definition's oriented footprint. The terminal handler
+    /// draws once when this matches the destroyed root, otherwise once per
+    /// rewritten source cell.
+    pub ruin_footprint_width: u8,
+    pub ruin_footprint_height: u8,
+    /// Source kinds 23 through 27 select the shifted strand-ruin table.
+    pub ruin_uses_strand_table: bool,
     /// Low three bits of source byte `+0x03`, scheduled by `FUN_0047daf0`.
     pub phase: u8,
     /// High four bits of source byte `+0x03`.
@@ -37,6 +59,15 @@ pub struct SourceMapCellState {
     pub source_raw_material_amount: u16,
     /// Compiled `Workmenge` at definition offset `+0x28`.
     pub source_work_material_amount: u16,
+    /// Compiled `Maxenergy` at definition offset `+0x64`. The deferred
+    /// category-6 source hit handler compares its map-cell accumulator with
+    /// this fixed-point threshold before emitting the terminal type-7 event.
+    pub source_damage_threshold: u16,
+    /// The live `FUN_0047a650` hit accumulator for this command root. The
+    /// executable stores it in a separate eight-byte keyed record; retaining
+    /// it beside the identified root preserves the same threshold lifetime.
+    #[serde(default)]
+    pub source_damage_accumulator: u16,
     /// Source u16 `+0x10`, advanced by the map-cell scheduler and selected
     /// transfers; kind 7 (`MARKT`) renders this accumulator.
     pub progress: u16,
@@ -62,6 +93,15 @@ impl SourceMapCellState {
             island,
             x,
             y,
+            footprint_width: u8::try_from(definition.size.0).unwrap_or(1).max(1),
+            footprint_height: u8::try_from(definition.size.1).unwrap_or(1).max(1),
+            source_definition_width: u8::try_from(definition.size.0).unwrap_or(1).max(1),
+            source_definition_height: u8::try_from(definition.size.1).unwrap_or(1).max(1),
+            source_orientation: 0,
+            ruin_id: definition.ruinenr.clamp(0, 255) as u8,
+            ruin_footprint_width: 0,
+            ruin_footprint_height: 0,
+            ruin_uses_strand_table: matches!(kind_code, 23..=27),
             phase: phase & 7,
             frame_selector: 0,
             activity: 0,
@@ -73,6 +113,8 @@ impl SourceMapCellState {
             source_production_amount: definition.source_production_amount,
             source_raw_material_amount: definition.source_raw_material_amount,
             source_work_material_amount: definition.source_work_material_amount,
+            source_damage_threshold: definition.source_damage_threshold,
+            source_damage_accumulator: 0,
             progress: 0,
             animation_frame: definition.anim_frame,
             animation_count: definition.anim_anz,
@@ -84,6 +126,58 @@ impl SourceMapCellState {
     #[inline]
     pub fn matches(self, island: u8, x: u16, y: u16) -> bool {
         self.island == island && u16::from(self.x) == x && u16::from(self.y) == y
+    }
+
+    /// Record the oriented extents used by the source map-command writer.
+    pub fn set_footprint(&mut self, width: i32, height: i32) {
+        self.footprint_width = u8::try_from(width).unwrap_or(1).max(1);
+        self.footprint_height = u8::try_from(height).unwrap_or(1).max(1);
+    }
+
+    /// Retain the low orientation bits passed to the terminal map writer.
+    pub fn set_source_orientation(&mut self, orientation: u8) {
+        self.source_orientation = orientation & 3;
+    }
+
+    /// Resolve the terminal handler's ruin table entry from the parsed COD
+    /// definitions. `FUN_00463f40` chooses the shifted table only for the
+    /// source strand-kind range 23 through 27.
+    pub fn configure_terminal_replacement(&mut self, cod: &CodFile) {
+        self.ruin_uses_strand_table = matches!(self.kind_code, 23..=27);
+        let Some(ruin) = cod.ruin_building(self.ruin_id, self.ruin_uses_strand_table) else {
+            return;
+        };
+        self.ruin_footprint_width = u8::try_from(ruin.size.0).unwrap_or(0);
+        self.ruin_footprint_height = u8::try_from(ruin.size.1).unwrap_or(0);
+    }
+
+    /// Number of MSVC `rand()` draws consumed by `FUN_00463f40` before it
+    /// applies this root's replacement command.
+    pub fn source_kind6_terminal_random_draw_count(self) -> usize {
+        if self.ruin_id == crate::building::NO_RUIN_ID {
+            return 0;
+        }
+        if self.ruin_footprint_width == self.source_definition_width
+            && self.ruin_footprint_height == self.source_definition_height
+        {
+            return 1;
+        }
+        usize::from(self.footprint_width) * usize::from(self.footprint_height)
+    }
+
+    /// Apply `FUN_0047a650`'s static-map damage arithmetic. Map-root hits
+    /// use `floor(51 * raw_strength / 128)`, add it as an unsigned 16-bit
+    /// value, and emit the terminal event once the accumulated value reaches
+    /// the compiled `Maxenergy * 32` threshold. The source then frees its
+    /// keyed accumulator record, represented here by resetting the value.
+    pub fn apply_source_kind6_map_hit(&mut self, raw_strength: u16) -> bool {
+        let scaled = source_kind6_map_hit_strength(raw_strength);
+        self.source_damage_accumulator = self.source_damage_accumulator.wrapping_add(scaled);
+        if self.source_damage_accumulator < self.source_damage_threshold {
+            return false;
+        }
+        self.source_damage_accumulator = 0;
+        true
     }
 
     /// Reserve fixed-point output for a type-8 carrier. `FUN_0047d810`
@@ -206,6 +300,14 @@ fn scaled_amount(amount: u16, activity: u8) -> u16 {
     ((u32::from(amount) * u32::from(activity)) >> 7) as u16
 }
 
+/// The non-direct branch of `FUN_0047a650`. Category-6 static map targets
+/// arrive through this branch; raw-strength direct hits are reserved for the
+/// consumer's classification `0x0d` path.
+#[inline]
+pub fn source_kind6_map_hit_strength(raw_strength: u16) -> u16 {
+    ((u32::from(raw_strength) * 51) >> 7) as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +329,61 @@ mod tests {
         assert_eq!(state.activity_frame_selector(4), 0);
         state.set_activity(0);
         assert_eq!(state.frame_selector, 0);
+    }
+
+    #[test]
+    fn retains_the_compiled_category_six_damage_threshold() {
+        let definition = BuildingDef {
+            kind: "HANDWERK".into(),
+            source_damage_threshold: 1_600,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            SourceMapCellState::new(1, 2, 3, &definition, 0)
+                .unwrap()
+                .source_damage_threshold,
+            1_600
+        );
+    }
+
+    #[test]
+    fn category_six_map_hits_use_scaled_strength_and_reset_after_threshold() {
+        let definition = BuildingDef {
+            kind: "HANDWERK".into(),
+            source_damage_threshold: 4,
+            ..Default::default()
+        };
+        let mut state = SourceMapCellState::new(1, 2, 3, &definition, 0).unwrap();
+
+        assert_eq!(source_kind6_map_hit_strength(6), 2);
+        assert!(!state.apply_source_kind6_map_hit(6));
+        assert_eq!(state.source_damage_accumulator, 2);
+        assert!(state.apply_source_kind6_map_hit(6));
+        assert_eq!(state.source_damage_accumulator, 0);
+    }
+
+    #[test]
+    fn terminal_replacement_draw_count_follows_source_footprint_branch() {
+        let definition = BuildingDef {
+            kind: "HANDWERK".into(),
+            size: (2, 3),
+            ruinenr: 4,
+            ..Default::default()
+        };
+        let mut state = SourceMapCellState::new(1, 2, 3, &definition, 0).unwrap();
+
+        state.set_footprint(3, 2);
+        state.ruin_footprint_width = 2;
+        state.ruin_footprint_height = 3;
+        assert_eq!(state.source_kind6_terminal_random_draw_count(), 1);
+
+        state.ruin_footprint_width = 1;
+        state.ruin_footprint_height = 1;
+        assert_eq!(state.source_kind6_terminal_random_draw_count(), 6);
+
+        state.ruin_id = crate::building::NO_RUIN_ID;
+        assert_eq!(state.source_kind6_terminal_random_draw_count(), 0);
     }
 
     #[test]

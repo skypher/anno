@@ -130,7 +130,22 @@ use std::path::Path;
 /// v69: source category-record target-descriptor bytes persist across saves.
 /// v70: immediate category-6 action records persist across saves.
 /// v71: executor-created kind-15 figure records persist across saves.
-pub const SAVE_VERSION: u32 = 71;
+/// v72: kind-15 figure records retain their source `Worktime:` remainder.
+/// v73: source map-cell records retain their compiled hit threshold.
+/// v74: building instances omit the non-source production-fatigue counter.
+/// v75: source category-6 deferred hits, map-root accumulators, and terminal
+///      type-7 events persist across save/load.
+/// v76: source map-cell records retain type-7 replacement footprint and
+///      `Ruinenr` metadata.
+/// v77: source map-cell records retain type-7 ruin table selection and
+///      replacement dimensions for synchronous source-random replay.
+/// v78: pending source map clear/ruin events persist until the renderer has
+///      consumed their frozen terminal-command replacement draws.
+/// v79: source map-cell records distinguish raw definition dimensions from
+///      oriented map footprints for type-7 replacement draw selection.
+/// v80: source map-cell records and pending terminal writes retain source
+///      orientation for the selected ruin command.
+pub const SAVE_VERSION: u32 = 80;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -144,7 +159,7 @@ pub const SAVE_VERSION: u32 = 71;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 71;
+pub const MIN_LOADABLE_VERSION: u32 = 80;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -166,6 +181,9 @@ pub struct SaveState {
     pub source_dynamic_combat_figures: Vec<SourceDynamicCombatFigure>,
     pub source_kind6_actions: Vec<crate::combat::SourceKind6Action>,
     pub source_kind15_combat_figures: Vec<crate::combat::SourceKind15CombatFigure>,
+    pub source_kind6_deferred_hits: Vec<crate::combat::SourceKind6DeferredHit>,
+    pub source_kind6_terminal_events: Vec<crate::simulation::SourceKind6TerminalEvent>,
+    pub tile_clears: Vec<crate::simulation::TileClear>,
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
     pub source_time_ticks: u32,
     pub source_time_remainder_ms: u32,
@@ -231,6 +249,9 @@ impl Simulation {
             source_dynamic_combat_figures: self.source_dynamic_combat_figures.clone(),
             source_kind6_actions: self.source_kind6_actions.clone(),
             source_kind15_combat_figures: self.source_kind15_combat_figures.clone(),
+            source_kind6_deferred_hits: self.source_kind6_deferred_hits.clone(),
+            source_kind6_terminal_events: self.source_kind6_terminal_events.clone(),
+            tile_clears: self.tile_clears.clone(),
             source_kind4_dispatch: self.source_kind4_dispatch,
             source_time_ticks: self.source_time_ticks,
             source_time_remainder_ms: self.source_time_remainder_ms,
@@ -266,6 +287,9 @@ impl Simulation {
         self.source_dynamic_combat_figures = s.source_dynamic_combat_figures;
         self.source_kind6_actions = s.source_kind6_actions;
         self.source_kind15_combat_figures = s.source_kind15_combat_figures;
+        self.source_kind6_deferred_hits = s.source_kind6_deferred_hits;
+        self.source_kind6_terminal_events = s.source_kind6_terminal_events;
+        self.tile_clears = s.tile_clears;
         self.source_kind4_dispatch = s.source_kind4_dispatch;
         self.source_time_ticks = s.source_time_ticks;
         self.source_time_remainder_ms = s.source_time_remainder_ms;
@@ -341,6 +365,9 @@ mod tests {
             source_dynamic_combat_figures: vec![],
             source_kind6_actions: vec![],
             source_kind15_combat_figures: vec![],
+            source_kind6_deferred_hits: vec![],
+            source_kind6_terminal_events: vec![],
+            tile_clears: vec![],
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
@@ -439,6 +466,15 @@ mod tests {
                 island: 1,
                 x: 10,
                 y: 20,
+                footprint_width: 2,
+                footprint_height: 3,
+                source_definition_width: 2,
+                source_definition_height: 3,
+                source_orientation: 0,
+                ruin_id: 4,
+                ruin_footprint_width: 2,
+                ruin_footprint_height: 3,
+                ruin_uses_strand_table: false,
                 phase: 3,
                 frame_selector: 12,
                 activity: 96,
@@ -450,6 +486,8 @@ mod tests {
                 source_production_amount: 32,
                 source_raw_material_amount: 64,
                 source_work_material_amount: 16,
+                source_damage_threshold: 640,
+                source_damage_accumulator: 192,
                 progress: 512,
                 animation_frame: 2,
                 animation_count: 4,
@@ -562,8 +600,30 @@ mod tests {
                 direction: 0,
                 launcher_runtime_slot: 12,
                 source_step_amount: crate::combat::SOURCE_KIND15_STEP_AMOUNT,
+                remaining_work_time: 0.96,
                 source_flags: crate::combat::SOURCE_KIND15_EXECUTOR_FLAGS,
             });
+        sim.source_kind6_deferred_hits
+            .push(crate::combat::SourceKind6DeferredHit {
+                due_at: 63,
+                action: sim.source_kind6_actions[0],
+            });
+        sim.source_kind6_terminal_events
+            .push(crate::simulation::SourceKind6TerminalEvent {
+                target: crate::source_route::SourceTargetDescriptor::from_bytes([0x34, 1, 10, 20]),
+                event_kind: 7,
+            });
+        sim.tile_clears.push(crate::simulation::TileClear {
+            island_id: 1,
+            tile_x: 10,
+            tile_y: 20,
+            width: 2,
+            height: 3,
+            source_orientation: 0,
+            ruin_id: 4,
+            ruin_uses_strand_table: false,
+            source_ruin_draws: vec![12],
+        });
         let mut source_spearman =
             crate::combat::MilitaryUnit::new(crate::combat::UnitType::NativeSpearman, 6, 12, 14);
         source_spearman.source_island_id = Some(1);
@@ -650,6 +710,15 @@ mod tests {
                 island: 1,
                 x: 10,
                 y: 20,
+                footprint_width: 2,
+                footprint_height: 3,
+                source_definition_width: 2,
+                source_definition_height: 3,
+                source_orientation: 0,
+                ruin_id: 4,
+                ruin_footprint_width: 2,
+                ruin_footprint_height: 3,
+                ruin_uses_strand_table: false,
                 phase: 3,
                 frame_selector: 12,
                 activity: 96,
@@ -661,6 +730,8 @@ mod tests {
                 source_production_amount: 32,
                 source_raw_material_amount: 64,
                 source_work_material_amount: 16,
+                source_damage_threshold: 640,
+                source_damage_accumulator: 192,
                 progress: 512,
                 animation_frame: 2,
                 animation_count: 4,
@@ -669,6 +740,20 @@ mod tests {
             }]
         );
         assert_eq!(sim2.source_map_cell_states[0].market_frame_selector(4), 3);
+        assert_eq!(
+            sim2.tile_clears,
+            vec![crate::simulation::TileClear {
+                island_id: 1,
+                tile_x: 10,
+                tile_y: 20,
+                width: 2,
+                height: 3,
+                source_orientation: 0,
+                ruin_id: 4,
+                ruin_uses_strand_table: false,
+                source_ruin_draws: vec![12],
+            }]
+        );
         assert_eq!(
             sim2.source_kind13_locations.active_locations(),
             vec![crate::data_bridge::SourceKind13Location {
@@ -746,7 +831,22 @@ mod tests {
                 direction: 0,
                 launcher_runtime_slot: 12,
                 source_step_amount: crate::combat::SOURCE_KIND15_STEP_AMOUNT,
+                remaining_work_time: 0.96,
                 source_flags: crate::combat::SOURCE_KIND15_EXECUTOR_FLAGS,
+            }]
+        );
+        assert_eq!(
+            sim2.source_kind6_deferred_hits,
+            vec![crate::combat::SourceKind6DeferredHit {
+                due_at: 63,
+                action: sim2.source_kind6_actions[0],
+            }]
+        );
+        assert_eq!(
+            sim2.source_kind6_terminal_events,
+            vec![crate::simulation::SourceKind6TerminalEvent {
+                target: crate::source_route::SourceTargetDescriptor::from_bytes([0x34, 1, 10, 20]),
+                event_kind: 7,
             }]
         );
         assert_eq!(

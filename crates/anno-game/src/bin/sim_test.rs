@@ -346,14 +346,13 @@ fn main() {
         let def = &sim.building_defs[b.def_id as usize];
         if def.output_good != Good::None && shown.insert(def.output_good) {
             println!(
-                "  {:?}: eff={}/128 in1={} in2={} out={}/{} cycles={}",
+                "  {:?}: eff={}/128 in1={} in2={} out={}/{}",
                 def.output_good,
                 b.efficiency,
                 b.input_1_stock,
                 b.input_2_stock,
                 b.output_stock,
                 def.storage_capacity,
-                b.total_work,
             );
             if shown.len() >= 8 {
                 break;

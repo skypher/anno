@@ -141,11 +141,9 @@ pub struct BuildingDef {
     /// → … → Aristocrat) is gated on this. False for fixed-tier
     /// buildings that can't be promoted.
     pub upgradeable: bool,
-    /// Maximum cumulative production work the building can do
-    /// before needing repair / overhaul. RE: haeuser.cod
-    /// `Maxenergy` field — varies 3..230 with most common values
-    /// 5/50/115. 0 means uncapped (default for buildings without
-    /// the field).
+    /// Authored building `Maxenergy` from haeuser.cod. The source compiles
+    /// it as `round(Maxenergy * 32)` at definition offset `+0x64`, where
+    /// `FUN_0047a650` compares it with accumulated category-6 raw damage.
     pub max_energy: u16,
     /// Ore-deposit size for ore-source buildings. RE: haeuser.cod
     /// `Erzbergnr` — `ERZBERG_KLEIN` (small, 80t per Tim Howgego
@@ -231,9 +229,6 @@ pub struct BuildingInstance {
     /// Production timer (counts down from cycle_time).
     pub production_timer_ms: u32,
 
-    /// Accumulated production work.
-    pub total_work: u16,
-
     /// Construction time remaining in ms. While > 0 the building is placed
     /// but not yet operational: production is gated, carriers are not
     /// dispatched, and the renderer applies a blue tint with a progress bar.
@@ -313,7 +308,6 @@ impl BuildingInstance {
             input_2_stock: 0,
             output_stock: 0,
             production_timer_ms: 0,
-            total_work: 0,
             construction_ms_remaining: 0,
             construction_ms_total: 0,
             health: BUILDING_MAX_HEALTH,

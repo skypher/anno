@@ -922,13 +922,22 @@ fn try_place_building(
     instance.tools_needed = def.cost_tools;
     instance.bricks_needed = def.cost_bricks;
     let source_cell_state = instance.source_placement_command.and_then(|_| {
-        anno_sim::source_cell::SourceMapCellState::new(
+        let mut state = anno_sim::source_cell::SourceMapCellState::new(
             island_number,
             tile_x as u8,
             tile_y as u8,
             cod_b,
             ((sim.game_clock / 10) & 7) as u8,
-        )
+        )?;
+        let (footprint_width, footprint_height) = if matches!(orient & 3, 1 | 3) {
+            (cod_b.size.1, cod_b.size.0)
+        } else {
+            cod_b.size
+        };
+        state.set_footprint(footprint_width, footprint_height);
+        state.set_source_orientation(orient);
+        state.configure_terminal_replacement(cod);
+        Some(state)
     });
     sim.buildings.push(instance);
     if let Some(state) = source_cell_state {
@@ -941,57 +950,60 @@ fn try_place_building(
     PlaceOutcome::Placed
 }
 
-fn is_strand_ruin_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "STRAND" | "STRANDMUND" | "STRANDECKA" | "STRANDECKI" | "STRANDVARI"
-    )
-}
-
-fn removed_tile_was_strand(cod: &CodFile, removed: &[IslandTile], x: u16, y: u16) -> bool {
-    removed.iter().any(|tile| {
-        tile.x as u16 == x
-            && tile.y as u16 == y
-            && cod
-                .building_by_gfx(tile.building_id as i32)
-                .map(|b| is_strand_ruin_kind(&b.kind))
-                .unwrap_or(false)
-    })
-}
-
-fn push_ruin_tiles<F: FnMut() -> u16>(
+fn push_ruin_tiles(
     island: &mut Island,
     cod: &CodFile,
     clear: TileClear,
-    removed: &[IslandTile],
-    next_rand: &mut F,
 ) {
     if clear.ruin_id == anno_sim::building::NO_RUIN_ID {
         return;
     }
 
-    let base_strand = removed_tile_was_strand(cod, removed, clear.tile_x, clear.tile_y);
-    let Some(base_ruin) = cod.ruin_building(clear.ruin_id, base_strand) else {
+    let Some(base_ruin) = cod.ruin_building(clear.ruin_id, clear.ruin_uses_strand_table) else {
         return;
     };
 
-    if base_ruin.size == (clear.width as i32, clear.height as i32) {
-        let rand_value = next_rand();
-        let Some(ruin) = cod.ruin_variant_building(clear.ruin_id, base_strand, rand_value) else {
+    let ruin_size = if matches!(clear.source_orientation & 3, 1 | 3) {
+        (base_ruin.size.1, base_ruin.size.0)
+    } else {
+        base_ruin.size
+    };
+    if ruin_size == (clear.width as i32, clear.height as i32) {
+        let Some(&rand_value) = clear.source_ruin_draws.first() else {
             return;
         };
-        let base_gfx = ruin.gfx as u16;
-        for dy in 0..clear.height {
-            for dx in 0..clear.width {
-                island.tiles.push(IslandTile {
-                    building_id: base_gfx + dy as u16 * clear.width as u16 + dx as u16,
-                    x: clear.tile_x as u8 + dx,
-                    y: clear.tile_y as u8 + dy,
-                    orientation: 0,
-                    anim_count: 0,
-                    flags: 0,
-                });
-            }
+        let Some(ruin) =
+            cod.ruin_variant_building(clear.ruin_id, clear.ruin_uses_strand_table, rand_value)
+        else {
+            return;
+        };
+        let definition_offset = ruin
+            .source_id
+            .checked_sub(anno_formats::szs::INSELHAUS_SOURCE_ID_BASE)
+            .and_then(|offset| u16::try_from(offset).ok());
+        let Some(definition_offset) = definition_offset else {
+            return;
+        };
+        let command = anno_sim::building::SourceBuildingCommand {
+            definition_offset,
+            orientation: clear.source_orientation,
+            variant: 0,
+            metadata: 0,
+            map_owner_slot: 0,
+            random_seed: 0,
+            dynamic_object_owner: 0,
+        };
+        for (_, x, y, sprite) in
+            source_command_gfx_tiles(clear.island_id, clear.tile_x, clear.tile_y, command, cod)
+        {
+            island.tiles.push(IslandTile {
+                building_id: sprite,
+                x: x as u8,
+                y: y as u8,
+                orientation: 0,
+                anim_count: 0,
+                flags: 0,
+            });
         }
         return;
     }
@@ -1000,9 +1012,16 @@ fn push_ruin_tiles<F: FnMut() -> u16>(
         for dx in (0..clear.width).rev() {
             let x = clear.tile_x + dx as u16;
             let y = clear.tile_y + dy as u16;
-            let strand = removed_tile_was_strand(cod, removed, x, y);
-            let rand_value = next_rand();
-            let Some(ruin) = cod.ruin_variant_building(clear.ruin_id, strand, rand_value) else {
+            let draw_index = usize::from(dy) * usize::from(clear.width)
+                + usize::from(clear.width - 1 - dx);
+            let Some(&rand_value) = clear.source_ruin_draws.get(draw_index) else {
+                continue;
+            };
+            let Some(ruin) = cod.ruin_variant_building(
+                clear.ruin_id,
+                clear.ruin_uses_strand_table,
+                rand_value,
+            ) else {
                 continue;
             };
             island.tiles.push(IslandTile {
@@ -1017,31 +1036,22 @@ fn push_ruin_tiles<F: FnMut() -> u16>(
     }
 }
 
-fn apply_tile_clear_event<F: FnMut() -> u16>(
-    islands: &mut [Island],
-    cod: &CodFile,
-    clear: TileClear,
-    next_rand: &mut F,
-) {
+fn apply_tile_clear_event(islands: &mut [Island], cod: &CodFile, clear: TileClear) {
     let Some(island) = islands.iter_mut().find(|i| i.number == clear.island_id) else {
         return;
     };
 
     let right = clear.tile_x + clear.width as u16;
     let bottom = clear.tile_y + clear.height as u16;
-    let mut removed = Vec::new();
     island.tiles.retain(|tile| {
         let in_footprint = tile.x as u16 >= clear.tile_x
             && (tile.x as u16) < right
             && tile.y as u16 >= clear.tile_y
             && (tile.y as u16) < bottom;
-        if in_footprint {
-            removed.push(*tile);
-        }
         !in_footprint
     });
 
-    push_ruin_tiles(island, cod, clear, &removed, next_rand);
+    push_ruin_tiles(island, cod, clear);
 }
 
 fn main() {
@@ -3304,8 +3314,7 @@ fn main() {
             if !sim.tile_clears.is_empty() {
                 let drained: Vec<_> = sim.tile_clears.drain(..).collect();
                 for clear in drained {
-                    let mut next_rand = || sim.next_source_rand();
-                    apply_tile_clear_event(&mut islands, &cod, clear, &mut next_rand);
+                    apply_tile_clear_event(&mut islands, &cod, clear);
                 }
                 if speech_enabled {
                     if let (Some(sfx), Some(handle)) = (
@@ -4907,10 +4916,6 @@ fn main() {
                         lines.push("DEPLETED".to_string());
                     }
                 }
-                // Maxenergy progress bar (RE: haeuser.cod Maxenergy).
-                if def.max_energy > 0 {
-                    lines.push(format!("wear: {}/{} cycles", b.total_work, def.max_energy,));
-                }
                 // Defensive cannons (RE: haeuser.cod Kanon).
                 if def.defensive_cannons > 0 {
                     lines.push(format!(
@@ -6228,9 +6233,9 @@ mod tests {
         CodFile::parse(&data).expect("parse haeuser.cod")
     }
 
-    fn seeded_rand(seed: u32) -> impl FnMut() -> u16 {
+    fn seeded_draw(seed: u32) -> u16 {
         let mut rng = anno_sim::source_rand::SourceRand::new(seed);
-        move || rng.next()
+        rng.next()
     }
 
     #[test]
@@ -6255,9 +6260,11 @@ mod tests {
                 tile_y: 4,
                 width: 1,
                 height: 1,
+                source_orientation: 0,
                 ruin_id: 0,
+                ruin_uses_strand_table: false,
+                source_ruin_draws: vec![seeded_draw(3)],
             },
-            &mut seeded_rand(3),
         );
 
         assert_eq!(islands[0].tiles.len(), 1);
@@ -6295,9 +6302,11 @@ mod tests {
                 tile_y: 2,
                 width: 1,
                 height: 1,
+                source_orientation: 0,
                 ruin_id: 0,
+                ruin_uses_strand_table: true,
+                source_ruin_draws: vec![seeded_draw(3)],
             },
-            &mut seeded_rand(3),
         );
 
         assert_eq!(islands[0].tiles.len(), 1);
@@ -6329,9 +6338,11 @@ mod tests {
                 tile_y: 1,
                 width: 2,
                 height: 3,
+                source_orientation: 0,
                 ruin_id: 8,
+                ruin_uses_strand_table: false,
+                source_ruin_draws: vec![seeded_draw(1)],
             },
-            &mut seeded_rand(1),
         );
 
         let base = (cod.constants["GFXKONTOR"] + 144) as u16;
@@ -6376,9 +6387,11 @@ mod tests {
                 tile_y: 4,
                 width: 1,
                 height: 1,
+                source_orientation: 0,
                 ruin_id: 4,
+                ruin_uses_strand_table: false,
+                source_ruin_draws: vec![seeded_draw(1)],
             },
-            &mut seeded_rand(1),
         );
 
         assert_eq!(islands[0].tiles.len(), 1);

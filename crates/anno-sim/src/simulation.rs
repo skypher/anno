@@ -62,18 +62,36 @@ impl SubsystemTimer {
     }
 }
 
-/// Static-map mutation emitted when a building is destroyed.
+/// Static-map mutation emitted when a source map-command root is removed.
 ///
-/// `ruin_id` is the source `Ruinenr` byte from haeuser.cod. `0xff`
-/// means the original clears the footprint without placing a ruin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ruin_id` is the source `Ruinenr` byte from haeuser.cod. `0xff` means
+/// `FUN_00463f40` clears the footprint without placing a ruin.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TileClear {
     pub island_id: u8,
     pub tile_x: u16,
     pub tile_y: u16,
     pub width: u8,
     pub height: u8,
+    /// Low source-command orientation bits forwarded to the ruin writer.
+    pub source_orientation: u8,
     pub ruin_id: u8,
+    /// The terminal handler's source-kind 23..=27 branch selects a shifted
+    /// strand ruin table instead of the ordinary ruin table.
+    pub ruin_uses_strand_table: bool,
+    /// MSVC `rand()` outputs consumed synchronously by `FUN_00463f40`.
+    /// Renderer replay uses these values without advancing simulation RNG.
+    pub source_ruin_draws: Vec<u16>,
+}
+
+/// Terminal map command emitted by `FUN_0047a650` after a deferred
+/// category-6 hit reaches a command root's compiled damage threshold.
+/// `FUN_0046a8c0` packages this as descriptor class `0x34` with event kind
+/// seven before dispatching the map-root replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind6TerminalEvent {
+    pub target: SourceTargetDescriptor,
+    pub event_kind: u8,
 }
 
 /// The main game simulation state.
@@ -124,6 +142,12 @@ pub struct Simulation {
     /// Kind-15 figures constructed by `FUN_00447f00` from emitted category-6
     /// actions. They remain outside the category-1 through -6 candidate pool.
     pub source_kind15_combat_figures: Vec<SourceKind15CombatFigure>,
+    /// Deferred kind-1 records allocated by `FUN_00447880` for category-6
+    /// actions. The source drains due records before its ordinary simulation
+    /// subsystems run.
+    pub source_kind6_deferred_hits: Vec<combat::SourceKind6DeferredHit>,
+    /// Type-7 terminal commands emitted by completed map-root accumulators.
+    pub source_kind6_terminal_events: Vec<SourceKind6TerminalEvent>,
     /// Source player globals that select type-4 terminal-route dispatch.
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
     /// `DAT_005b6040`: source simulation clock in 100-ms ticks.
@@ -424,6 +448,8 @@ impl Simulation {
             source_dynamic_combat_figures: Vec::new(),
             source_kind6_actions: Vec::new(),
             source_kind15_combat_figures: Vec::new(),
+            source_kind6_deferred_hits: Vec::new(),
+            source_kind6_terminal_events: Vec::new(),
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
@@ -584,6 +610,7 @@ impl Simulation {
         }
         let action = combat::source_kind6_action(&attacker, selected)?;
         let next_ready_at = combat::source_kind6_action_ready_at(self.source_time_ticks, &attacker)?;
+        let impact_due_at = combat::source_kind6_impact_due_at(self.source_time_ticks, &attacker)?;
         let launcher_height = self
             .source_dynamic_combat_figures
             .get(dynamic_index)?
@@ -593,6 +620,13 @@ impl Simulation {
         figure.direction = action.direction;
         figure.source_action_ready_at = next_ready_at;
         self.source_kind6_actions.push(action);
+        if self.source_kind6_deferred_hits.len() < combat::SOURCE_KIND6_DEFERRED_HIT_CAPACITY {
+            self.source_kind6_deferred_hits
+                .push(combat::SourceKind6DeferredHit {
+                    due_at: impact_due_at,
+                    action,
+                });
+        }
         if let Some(kind15_figure) = kind15_figure {
             self.source_kind15_combat_figures.push(kind15_figure);
         }
@@ -829,6 +863,8 @@ impl Simulation {
     /// Single simulation step (max 200ms).
     fn step(&mut self, dt_ms: u32) {
         self.advance_source_clock(dt_ms);
+        self.tick_source_kind6_deferred_hits();
+        self.tick_source_kind15_combat_figures(dt_ms);
 
         // 1. Building production
         if self.timer_production.advance(dt_ms) {
@@ -865,6 +901,124 @@ impl Simulation {
         // Entity movement (every step)
         self.tick_entities(dt_ms);
         self.tick_source_land_figures(dt_ms);
+    }
+
+    /// Advance the generic kind-15 visual records installed by
+    /// `FUN_00447f00`. The source removal path clears their live slot, so a
+    /// completed record is removed from this live-only collection.
+    fn tick_source_kind15_combat_figures(&mut self, dt_ms: u32) {
+        self.source_kind15_combat_figures
+            .retain_mut(|figure| !combat::advance_source_kind15_figure(figure, dt_ms));
+    }
+
+    /// Drain due kind-1 records exactly as `FUN_00478ab0`. The executor's
+    /// queued action still names its selected live target; category-6 target
+    /// records redirect through their retained static map descriptor before
+    /// the map-root accumulator receives the scaled source strength.
+    fn tick_source_kind6_deferred_hits(&mut self) {
+        let queued_hits = std::mem::take(&mut self.source_kind6_deferred_hits);
+        for hit in queued_hits {
+            if hit.due_at > self.source_time_ticks {
+                self.source_kind6_deferred_hits.push(hit);
+                continue;
+            }
+
+            let Some(target) = self.source_kind6_static_map_target(hit.action.target_descriptor)
+            else {
+                continue;
+            };
+            let terminal_root = self
+                .source_map_cell_states
+                .iter_mut()
+                .find(|state| {
+                    state.matches(
+                        target.bytes()[1],
+                        u16::from(target.bytes()[2]),
+                        u16::from(target.bytes()[3]),
+                    )
+                })
+                .and_then(|state| {
+                    state
+                        .apply_source_kind6_map_hit(hit.action.raw_strength)
+                        .then_some(*state)
+                });
+            if let Some(root) = terminal_root {
+                self.apply_source_kind6_terminal_map_command(root);
+            }
+        }
+    }
+
+    /// Replay the event-kind-seven branch of `FUN_0046a630`: its
+    /// `FUN_00463f40` consumer removes the command root and rewrites the
+    /// oriented footprint with the root's `Ruinenr` replacement or clear.
+    fn apply_source_kind6_terminal_map_command(&mut self, root: SourceMapCellState) {
+        let target = SourceTargetDescriptor::from_source_kind34_island_cell(
+            root.island,
+            root.x,
+            root.y,
+        );
+        self.source_kind6_terminal_events
+            .push(SourceKind6TerminalEvent {
+                target,
+                event_kind: 7,
+            });
+        let source_ruin_draws = (0..root.source_kind6_terminal_random_draw_count())
+            .map(|_| self.next_source_rand())
+            .collect();
+        self.tile_clears.push(TileClear {
+            island_id: root.island,
+            tile_x: u16::from(root.x),
+            tile_y: u16::from(root.y),
+            width: root.footprint_width,
+            height: root.footprint_height,
+            source_orientation: root.source_orientation,
+            ruin_id: root.ruin_id,
+            ruin_uses_strand_table: root.ruin_uses_strand_table,
+            source_ruin_draws,
+        });
+        self.source_map_cell_states.retain(|state| {
+            !state.matches(root.island, u16::from(root.x), u16::from(root.y))
+        });
+        self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+
+        for building in &mut self.buildings {
+            if building.active
+                && building.island_id == root.island
+                && building.tile_x == u16::from(root.x)
+                && building.tile_y == u16::from(root.y)
+            {
+                building.active = false;
+                building.health = 0;
+                building.source_dynamic_object_slot = None;
+            }
+        }
+    }
+
+    /// Resolve the static command-root descriptor consumed by the deferred
+    /// source map-hit handler. A category-6 action descriptor identifies a
+    /// live target slot whose `+0x10` descriptor is the static root.
+    fn source_kind6_static_map_target(
+        &self,
+        descriptor: SourceTargetDescriptor,
+    ) -> Option<SourceTargetDescriptor> {
+        let target = match descriptor.kind() {
+            6 => {
+                let bytes = descriptor.bytes();
+                let runtime_slot = u16::from_le_bytes([bytes[2], bytes[3]]);
+                self.source_dynamic_combat_figures
+                    .iter()
+                    .find(|figure| {
+                        figure.active
+                            && figure.figure_kind == 6
+                            && figure.candidate_list_key == bytes[1]
+                            && figure.runtime_slot == runtime_slot
+                    })?
+                    .target_descriptor
+            }
+            0x32 | 0x33 | 0x34 => descriptor,
+            _ => return None,
+        };
+        matches!(target.kind(), 0x32 | 0x33 | 0x34).then_some(target)
     }
 
     /// Replay the kind-12 city dispatcher in `FUN_0047f8a0`. Its city pool
@@ -3421,6 +3575,13 @@ mod tests {
         );
         assert_eq!(action.kind15_figure_definition_id, Some(112));
         assert_eq!(sim.source_kind6_actions, vec![action]);
+        assert_eq!(
+            sim.source_kind6_deferred_hits,
+            vec![crate::combat::SourceKind6DeferredHit {
+                due_at: 29,
+                action,
+            }]
+        );
         assert_eq!(sim.source_dynamic_combat_figures[0].direction, 2);
         assert_eq!(sim.source_dynamic_combat_figures[0].source_action_ready_at, 69);
         assert_eq!(
@@ -3432,10 +3593,125 @@ mod tests {
                 direction: 2,
                 launcher_runtime_slot: 0,
                 source_step_amount: crate::combat::SOURCE_KIND15_STEP_AMOUNT,
+                remaining_work_time: 0.96,
                 source_flags: crate::combat::SOURCE_KIND15_EXECUTOR_FLAGS,
             }]
         );
         assert!(sim.dispatch_source_kind6_action(0, 0, false, 0).is_none());
+    }
+
+    #[test]
+    fn deferred_category_six_map_hit_accumulates_and_emits_type_seven_terminal_event() {
+        let mut sim = Simulation::new();
+        let mut expected_rng = Simulation::new();
+        expected_rng.seed_source_rand(23);
+        let expected_ruin_draw = expected_rng.next_source_rand();
+        sim.seed_source_rand(23);
+        let target = SourceTargetDescriptor::from_source_kind34_island_cell(3, 4, 5);
+        sim.source_dynamic_combat_figures.push(SourceDynamicCombatFigure {
+            active: true,
+            figure_kind: 6,
+            candidate_list_key: 2,
+            figure_definition_id: 0x1f,
+            direction: 0,
+            source_payload: 0,
+            position: (0.0, 0.0),
+            position_z: 0.0,
+            source_energy: 285,
+            source_action_ready_at: 0,
+            target_descriptor: target,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            owner: 1,
+            state: 0,
+            flags: 0,
+            notification: 0,
+            runtime_slot: 9,
+            auxiliary_kind: 0,
+            name_index: 0,
+        });
+        let definition = anno_formats::cod::BuildingDef {
+            kind: "HANDWERK".into(),
+            size: (2, 3),
+            source_damage_threshold: 4,
+            ruinenr: 4,
+            ..Default::default()
+        };
+        sim.buildings
+            .push(crate::building::BuildingInstance::new(0, 3, 4, 5, 1));
+        let mut state = SourceMapCellState::new(3, 4, 5, &definition, 0).unwrap();
+        state.ruin_footprint_width = 2;
+        state.ruin_footprint_height = 3;
+        sim.source_map_cell_states.push(state);
+        let action = crate::combat::SourceKind6Action {
+            attacker_position: (0.0, 0.0),
+            attacker_runtime_slot: 0,
+            raw_strength: 6,
+            attacker_figure_kind: 6,
+            direction: 0,
+            flags: crate::combat::SOURCE_KIND6_ACTION_EVENT_FLAGS,
+            target_descriptor: SourceTargetDescriptor::from_bytes([6, 2, 9, 0]),
+            kind15_figure_definition_id: Some(112),
+        };
+        sim.source_kind6_deferred_hits = vec![
+            crate::combat::SourceKind6DeferredHit { due_at: 7, action },
+            crate::combat::SourceKind6DeferredHit { due_at: 8, action },
+        ];
+
+        sim.source_time_ticks = 7;
+        sim.tick_source_kind6_deferred_hits();
+        assert_eq!(sim.source_map_cell_states[0].source_damage_accumulator, 2);
+        assert_eq!(sim.source_kind6_deferred_hits.len(), 1);
+        assert!(sim.source_kind6_terminal_events.is_empty());
+
+        sim.source_time_ticks = 8;
+        sim.tick_source_kind6_deferred_hits();
+        assert!(sim.source_map_cell_states.is_empty());
+        assert!(sim.source_kind6_deferred_hits.is_empty());
+        assert!(!sim.buildings[0].active);
+        assert_eq!(sim.buildings[0].health, 0);
+        assert_eq!(
+            sim.source_kind6_terminal_events,
+            vec![SourceKind6TerminalEvent {
+                target,
+                event_kind: 7,
+            }]
+        );
+        assert_eq!(sim.source_map_cell_revision, 1);
+        assert_eq!(
+            sim.tile_clears,
+            vec![TileClear {
+                island_id: 3,
+                tile_x: 4,
+                tile_y: 5,
+                width: 2,
+                height: 3,
+                source_orientation: 0,
+                ruin_id: 4,
+                ruin_uses_strand_table: false,
+                source_ruin_draws: vec![expected_ruin_draw],
+            }]
+        );
+        assert_eq!(sim.next_source_rand(), expected_rng.next_source_rand());
+    }
+
+    #[test]
+    fn source_kind15_figure_expires_after_its_authored_worktime() {
+        let mut sim = Simulation::new();
+        sim.source_kind15_combat_figures
+            .push(crate::combat::SourceKind15CombatFigure {
+                active: true,
+                figure_definition_id: 112,
+                position: (0.5, 0.0, 4.0),
+                direction: 2,
+                launcher_runtime_slot: 0,
+                source_step_amount: crate::combat::SOURCE_KIND15_STEP_AMOUNT,
+                remaining_work_time: 0.96,
+                source_flags: crate::combat::SOURCE_KIND15_EXECUTOR_FLAGS,
+            });
+
+        sim.tick(960);
+
+        assert!(sim.source_kind15_combat_figures.is_empty());
     }
 
     #[test]

@@ -1012,9 +1012,12 @@ pub fn source_map_cell_states_from_scenario(
             if !matches!(definition.source_kind_code(), Some(1..=8 | 30)) {
                 continue;
             }
-            if let Some(state) =
+            if let Some(mut state) =
                 SourceMapCellState::new(island.number, tile.x, tile.y, definition, 0)
             {
+                state.set_footprint(width, height);
+                state.set_source_orientation(tile.orientation);
+                state.configure_terminal_replacement(cod);
                 states.push(state);
             }
         }

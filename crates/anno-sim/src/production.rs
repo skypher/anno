@@ -25,18 +25,6 @@ pub fn tick_building(building: &mut BuildingInstance, def: &BuildingDef, dt_ms: 
     if !building.active || !building.is_built() {
         return 0;
     }
-    // Maxenergy cap: once cumulative work hits the per-building
-    // limit (RE: haeuser.cod `Maxenergy`), the building stops
-    // producing — analogous to needing repair / overhaul. 0 means
-    // uncapped. Repair happens passively: each tick while
-    // fatigued decays `total_work` by `def.max_energy / 32`
-    // (rounded up), so a fully-fatigued building recovers over
-    // roughly 32 ticks before resuming production.
-    if def.max_energy > 0 && building.total_work >= def.max_energy {
-        let decay = (def.max_energy / 32).max(1);
-        building.total_work = building.total_work.saturating_sub(decay);
-        return 0;
-    }
     // Ore-deposit depletion: when a mine's remaining-ore counter
     // is 0, production stops permanently. RE: haeuser.cod
     // `Erzbergnr` + Tim Howgego's resources appendix (small 80t /
@@ -93,7 +81,6 @@ pub fn tick_building(building: &mut BuildingInstance, def: &BuildingDef, dt_ms: 
     // circuit at the top of this function.
     let produced = def.output_rate;
     building.output_stock = (building.output_stock + produced).min(def.storage_capacity);
-    building.total_work += 1;
     if def.ore_deposit != crate::building::OreDeposit::None {
         building.remaining_ore = building.remaining_ore.saturating_sub(produced);
     }
@@ -205,36 +192,13 @@ mod tests {
     }
 
     #[test]
-    fn maxenergy_fatigue_pauses_then_repairs() {
+    fn maxenergy_does_not_gate_production() {
         let mut def = test_def();
-        def.max_energy = 32; // small cap so we can fatigue quickly
+        def.max_energy = 32;
         let mut b = BuildingInstance::new(1, 0, 0, 0, 0);
         b.input_1_stock = 5_000;
-        // Force the building into a fatigued state.
-        b.total_work = 32;
-        // First tick should reject production AND decay total_work.
         let produced = tick_building(&mut b, &def, 2_000);
-        assert_eq!(produced, 0);
-        assert!(
-            b.total_work < 32,
-            "total_work should decay during fatigue, was {}",
-            b.total_work
-        );
-        // Ticking until repair completes brings total_work back to 0.
-        for _ in 0..200 {
-            tick_building(&mut b, &def, 2_000);
-            if b.total_work == 0 {
-                break;
-            }
-        }
-        // After repair, production can resume — a single tick
-        // should bump total_work from 0 to a non-zero value.
-        tick_building(&mut b, &def, 2_000);
-        assert!(
-            b.total_work > 0,
-            "production should resume post-repair, total_work={}",
-            b.total_work
-        );
+        assert_eq!(produced, def.output_rate);
     }
 
     #[test]

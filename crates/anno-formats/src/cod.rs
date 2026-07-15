@@ -175,6 +175,10 @@ pub struct BuildingDef {
     /// Compiled `Workmenge` at definition offset `0x28`, in 1/32-unit
     /// map-cell storage scale.
     pub source_work_material_amount: u16,
+    /// Compiled definition offset `+0x64`, populated from `Maxenergy:` by
+    /// `FUN_0046248d..0x004624c4` as `round(Maxenergy * 32)`. The deferred
+    /// category-6 hit handler accumulates raw strength against this value.
+    pub source_damage_threshold: u16,
     /// Source `NoShotFlg` bit consumed by `FUN_0046f6d0` when it constructs
     /// the ship-route obstacle overlay.
     pub no_shot: bool,
@@ -210,6 +214,7 @@ impl Default for BuildingDef {
             source_production_amount: 0,
             source_raw_material_amount: 0,
             source_work_material_amount: 0,
+            source_damage_threshold: 0,
             no_shot: false,
             ruinenr: 255,
             properties: HashMap::new(),
@@ -461,6 +466,17 @@ impl CodFile {
             if let Some(val_str) = line.strip_prefix("Baugfx:") {
                 current.baugfx = Self::eval(&constants, val_str.trim());
                 directive_values.insert("Baugfx".to_string(), current.baugfx);
+                continue;
+            }
+
+            // `FUN_0046248d..0x004624c4` multiplies Maxenergy by 32 before
+            // storing it at compiled building-definition offset `+0x64`.
+            if let Some(val_str) = line.strip_prefix("Maxenergy:") {
+                current.source_damage_threshold =
+                    Self::eval_scaled_32(&constants, val_str.trim());
+                current
+                    .properties
+                    .insert("Maxenergy".to_string(), val_str.trim().to_string());
                 continue;
             }
 
@@ -919,6 +935,14 @@ mod tests {
         assert_eq!(cod.buildings[0].source_production_amount, 24);
         assert_eq!(cod.buildings[0].source_raw_material_amount, 16);
         assert_eq!(cod.buildings[0].source_work_material_amount, 64);
+    }
+
+    #[test]
+    fn maxenergy_compiles_to_the_source_damage_threshold() {
+        let cod = CodFile::parse(b"@Nummer: 1\nMaxenergy: 50\n")
+            .expect("parse plaintext COD");
+
+        assert_eq!(cod.buildings[0].source_damage_threshold, 1_600);
     }
 
     #[test]

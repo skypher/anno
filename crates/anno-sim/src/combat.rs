@@ -213,6 +213,19 @@ pub struct SourceKind6Action {
     pub kind15_figure_definition_id: Option<u16>,
 }
 
+/// One occupied kind-1 record in `FUN_00478a60`'s 150-slot deferred-event
+/// pool. `FUN_00447880` writes the action payload into this record after it
+/// starts the optional kind-15 visual; `FUN_00478ab0` dispatches it once the
+/// absolute source-clock tick is due.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind6DeferredHit {
+    pub due_at: u32,
+    pub action: SourceKind6Action,
+}
+
+/// The source event pool contains 150 records of stride 28 bytes.
+pub const SOURCE_KIND6_DEFERRED_HIT_CAPACITY: usize = 150;
+
 /// The category-6 caller always sets the two event flag bits that its
 /// immediate executor receives.
 pub const SOURCE_KIND6_ACTION_EVENT_FLAGS: u8 = 0x03;
@@ -287,12 +300,18 @@ pub struct SourceKind15CombatFigure {
     pub launcher_runtime_slot: u16,
     /// Runtime field `+0x18`, set to `0.02` by the executor.
     pub source_step_amount: f32,
+    /// Runtime field `+0x14`, initialized from the shot definition's
+    /// `Worktime:` and consumed by the generic figure update.
+    pub remaining_work_time: f32,
     /// Runtime field `+0x11`: `FUN_00447f00` clears bit four and sets bit two.
     pub source_flags: u8,
 }
 
 pub const SOURCE_KIND15_STEP_AMOUNT: f32 = 0.02;
 pub const SOURCE_KIND15_EXECUTOR_FLAGS: u8 = 0x04;
+/// `FUN_00451890` multiplies its millisecond update argument by this value
+/// before applying each live figure's source step amount.
+pub const SOURCE_GENERIC_FIGURE_TIME_SCALE: f32 = 0.05;
 
 /// `FUN_0045e170` scans this shared table for categories 1, 2, 3, and 5.
 pub(crate) const SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY: u16 = 150;
@@ -1537,6 +1556,19 @@ pub fn source_kind6_action_ready_at(
         })
 }
 
+/// Recover the absolute `FUN_00478a60` due tick for a category-6 action.
+/// The executor reads the compiled launcher's `Shottime:` field at `+0x50`
+/// and adds it to `DAT_005b6040` without any additional conversion.
+pub fn source_kind6_impact_due_at(
+    source_time_ticks: u32,
+    attacker: &SourceCombatCandidate,
+) -> Option<u32> {
+    (attacker.figure_kind == 6)
+        .then(|| attacker.combat_definition())
+        .flatten()
+        .map(|definition| source_time_ticks.wrapping_add(definition.runtime_shot_delay_ticks))
+}
+
 /// Build the exact category-6 action input written by `FUN_004546e0` after
 /// target selection. This does not apply compatibility damage: the source
 /// executor updates launcher state and, when its definition has a nonzero
@@ -1606,8 +1638,33 @@ pub fn source_kind15_figure_from_action(
         direction: action.direction,
         launcher_runtime_slot: action.attacker_runtime_slot,
         source_step_amount: SOURCE_KIND15_STEP_AMOUNT,
+        remaining_work_time: definition.runtime_work_time,
         source_flags: SOURCE_KIND15_EXECUTOR_FLAGS,
     })
+}
+
+/// Advance one kind-15 figure through `FUN_00451890`'s generic duration
+/// branch. Its zero velocities leave the launch position fixed; after its
+/// authored worktime is exhausted, executor flag `0x04` routes it through
+/// `FUN_00443520`, which removes the live record.
+pub fn advance_source_kind15_figure(
+    figure: &mut SourceKind15CombatFigure,
+    dt_ms: u32,
+) -> bool {
+    if !figure.active {
+        return true;
+    }
+
+    let consumed =
+        dt_ms as f32 * SOURCE_GENERIC_FIGURE_TIME_SCALE * figure.source_step_amount;
+    if consumed < figure.remaining_work_time {
+        figure.remaining_work_time -= consumed;
+        return false;
+    }
+
+    figure.remaining_work_time = 0.0;
+    figure.active = false;
+    true
 }
 
 /// Apply `FUN_00458ac0`'s `metric < 0x61` row filter and rank the resulting
@@ -2893,9 +2950,11 @@ mod tests {
         assert!(source_kind6_action_is_ready(19, 19));
         assert!(!source_kind6_action_is_ready(18, 19));
         assert_eq!(source_kind6_action_ready_at(19, &attacker), Some(69));
+        assert_eq!(source_kind6_impact_due_at(19, &attacker), Some(29));
 
         let non_category_six = source_candidate(4, 14, 90, 0);
         assert_eq!(source_kind6_action_ready_at(19, &non_category_six), None);
+        assert_eq!(source_kind6_impact_due_at(19, &non_category_six), None);
     }
 
     #[test]
@@ -2956,10 +3015,32 @@ mod tests {
                 direction: 3,
                 launcher_runtime_slot: 0x1234,
                 source_step_amount: SOURCE_KIND15_STEP_AMOUNT,
+                remaining_work_time: 0.96,
                 source_flags: SOURCE_KIND15_EXECUTOR_FLAGS,
             })
         );
         assert_eq!(source_kind15_launch_offset(8, 0.5), (0.0, -0.5));
+    }
+
+    #[test]
+    fn source_kind15_lifetime_uses_generic_step_and_removes_on_expiry() {
+        let action = SourceKind6Action {
+            attacker_position: (0.0, 0.0),
+            attacker_runtime_slot: 0,
+            raw_strength: 6,
+            attacker_figure_kind: 6,
+            direction: 0,
+            flags: SOURCE_KIND6_ACTION_EVENT_FLAGS,
+            target_descriptor: SourceTargetDescriptor::from_bytes([1, 0, 0, 0]),
+            kind15_figure_definition_id: Some(112),
+        };
+        let mut figure = source_kind15_figure_from_action(action, 0.0).unwrap();
+
+        assert!(!advance_source_kind15_figure(&mut figure, 100));
+        assert!((figure.remaining_work_time - 0.86).abs() < f32::EPSILON);
+        assert!(advance_source_kind15_figure(&mut figure, 860));
+        assert!(!figure.active);
+        assert_eq!(figure.remaining_work_time, 0.0);
     }
 
     #[test]
