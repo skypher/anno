@@ -158,7 +158,9 @@ use std::path::Path;
 ///      the 70-record phase dispatcher retains its clocks and physical cursor.
 /// v87: source city records retain luxury satisfaction operands, group
 ///      weights, pressure, and the resulting kind-13 transfer inputs.
-pub const SAVE_VERSION: u32 = 87;
+/// v88: source city records retain pending kind-13 BGruppe promotion
+///      reservations, their origin coordinates, and the promotion block bit.
+pub const SAVE_VERSION: u32 = 88;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -172,7 +174,7 @@ pub const SAVE_VERSION: u32 = 87;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 87;
+pub const MIN_LOADABLE_VERSION: u32 = 88;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";

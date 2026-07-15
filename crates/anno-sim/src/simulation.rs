@@ -14,7 +14,7 @@ use crate::combat::{
 use crate::coverage::CoverageMap;
 use crate::data_bridge::{
     SourceCityRecord, SourceCityTable, SourceKind4Occupant, SourceKind13DispatchState,
-    SourceKind13LocationTable,
+    SourceKind13LocationTable, SourceKind13PromotionDefinition,
 };
 use crate::economy;
 use crate::entity::{ActionType, CargoRoute, Figure};
@@ -147,6 +147,10 @@ pub struct Simulation {
     pub source_static_map_backing_cells: Vec<SourceMapCellState>,
     /// Live source kind-13 records retained by the fixed `DAT_005a77e8` table.
     pub source_kind13_locations: SourceKind13LocationTable,
+    /// Immutable BGruppe housing definitions reconstructed from haeuser.cod.
+    /// The executable reloads this table at startup; save snapshots retain
+    /// only the mutable kind-13 city and location records that refer to it.
+    pub source_kind13_promotion_definitions: [Option<SourceKind13PromotionDefinition>; 5],
     /// Phase clocks and physical source-table cursor for `FUN_0047b9c0`.
     pub source_kind13_dispatch: SourceKind13DispatchState,
     /// Fixed source city-record pool read by `FUN_0047f8a0`.
@@ -465,6 +469,7 @@ impl Simulation {
             source_static_map_roots: Vec::new(),
             source_static_map_backing_cells: Vec::new(),
             source_kind13_locations: SourceKind13LocationTable::default(),
+            source_kind13_promotion_definitions: std::array::from_fn(|_| None),
             source_kind13_dispatch: SourceKind13DispatchState::default(),
             source_cities: SourceCityTable::default(),
             source_kind4_occupants: Vec::new(),

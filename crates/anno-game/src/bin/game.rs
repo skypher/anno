@@ -8101,6 +8101,8 @@ fn init_simulation(
         anno_sim::data_bridge::source_static_map_backing_cells_from_scenario(szs, cod);
     sim.source_kind13_locations =
         anno_sim::data_bridge::source_kind13_locations_from_scenario(szs, cod);
+    sim.source_kind13_promotion_definitions =
+        anno_sim::data_bridge::source_kind13_promotion_definitions(cod);
     sim.source_cities = anno_sim::data_bridge::source_cities_from_scenario(szs);
     sim.source_kind4_occupants = anno_sim::data_bridge::source_kind4_occupants_from_scenario(szs);
     sim.buildings = instances;

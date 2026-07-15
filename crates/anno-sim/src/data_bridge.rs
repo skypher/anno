@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use anno_formats::cod::{BuildingDef as CodBuilding, CodFile};
 use anno_formats::szs::{LandFigureDefinition, LandFigureFamily, SzsFile};
 
-use crate::building::{BuildingDef, BuildingInstance};
+use crate::building::{BuildingDef, BuildingInstance, SourceBuildingCommand};
 use crate::source_cell::SourceMapCellState;
 use crate::source_route::{
     SourceDynamicMapObject, SourceDynamicMapObjectTable, SourceTargetDescriptor,
@@ -85,6 +85,40 @@ impl SourceKind13Location {
             3 => Some(SOURCE_KIND13_AMOUNT_CAPACITIES[3]),
             4 => Some(SOURCE_KIND13_AMOUNT_CAPACITIES[4]),
             _ => None,
+        }
+    }
+
+    /// Replay the `FUN_0047bfa0` lifecycle predicate for a target BGruppe.
+    /// `FUN_0047bbc0` uses it after a downgrade and `FUN_0047c080` uses it
+    /// before promoting a residence to the next tier.
+    pub const fn source_transition_active_for_group(self, target_group: u8) -> bool {
+        let state = self.state_byte();
+        let flags = self.lifecycle_flags;
+        match target_group {
+            0 => flags & 4 != 0 || state & 0x80 != 0,
+            1 => state & 0x80 != 0 && flags & 0x000c != 0,
+            2 => {
+                state & 0x80 != 0
+                    && flags & 0x0010 != 0
+                    && flags & 0x000c != 0
+                    && (flags & 0x0020 != 0 || flags & 0x0100 != 0)
+            }
+            3 => {
+                state & 0x80 != 0
+                    && flags & 0x0010 != 0
+                    && flags & 0x0008 != 0
+                    && (flags & 0x0020 != 0 || flags & 0x0100 != 0)
+                    && flags & 0x0040 != 0
+            }
+            4 => {
+                state & 0x80 != 0
+                    && flags & 0x0010 != 0
+                    && flags & 0x0008 != 0
+                    && flags & 0x0100 != 0
+                    && flags & 0x0040 != 0
+                    && flags & 0x0080 != 0
+            }
+            _ => false,
         }
     }
 }
@@ -268,6 +302,10 @@ pub struct SourceCityRecord {
     /// kind-13 amount changes in `FUN_0047b410`.
     #[serde(default)]
     pub growth_blocked: bool,
+    /// Source city byte `+0x257`, bit zero. `FUN_0047c080` permits a
+    /// material-gated BGruppe promotion only while this bit is clear.
+    #[serde(default)]
+    pub promotion_blocked: bool,
     /// Source city u16s `+0x234..+0x23c`, one pending kind-13 promotion
     /// amount per target BGruppe in whole residents.
     #[serde(default)]
@@ -296,6 +334,7 @@ impl Default for SourceCityRecord {
             satisfaction_by_group: [0; 5],
             overall_satisfaction: 0,
             growth_blocked: false,
+            promotion_blocked: false,
             promotion_reservations: [0; 5],
             promotion_reservation_positions: [(0, 0); 5],
         }
@@ -656,6 +695,128 @@ pub enum SourceKind13DecreaseResult {
     },
 }
 
+/// Fixed-point construction operands read by the promotion branch of
+/// `FUN_0047c080`. All six quantities are in the source's 1/32-good scale:
+/// `HAUS_BAUKOST` stores its three costs at definition offsets
+/// `+0x4c/+0x4e/+0x50`, and the city record stores the available balances at
+/// `+0x132/+0x13e/+0x14a` after subtracting their paired reservations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceKind13PromotionMaterials {
+    pub target_group: u8,
+    pub tools_cost_fixed: u16,
+    pub wood_cost_fixed: u16,
+    pub bricks_cost_fixed: u16,
+    pub available_tools_fixed: u16,
+    pub available_wood_fixed: u16,
+    pub available_bricks_fixed: u16,
+}
+
+impl SourceKind13PromotionMaterials {
+    const fn permits(self, target_group: u8) -> bool {
+        self.target_group == target_group
+            && self.tools_cost_fixed <= self.available_tools_fixed
+            && self.wood_cost_fixed <= self.available_wood_fixed
+            && self.bricks_cost_fixed <= self.available_bricks_fixed
+    }
+}
+
+/// One immutable `DAT_0061fa84[BGruppe]` promotion definition reconstructed
+/// from the compiled `haeuser.cod` ordering. `FUN_0047c080` reads the costs
+/// from the base definition before selecting one of these replacement
+/// INSELHAUS definition offsets with a later `rand()` draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceKind13PromotionDefinition {
+    pub target_group: u8,
+    /// Unrotated compiled definition dimensions read by `FUN_00463830`
+    /// before `FUN_00467940` selects the replacement orientation.
+    pub source_size: (u8, u8),
+    pub tools_cost_fixed: u16,
+    pub wood_cost_fixed: u16,
+    pub bricks_cost_fixed: u16,
+    /// Entries are ordered by `rand() % RandAnz`; each is an INSELHAUS
+    /// definition offset, namely compiled `Id - 20000`.
+    pub variant_definition_offsets: Vec<u16>,
+}
+
+impl SourceKind13PromotionDefinition {
+    /// Build the material-gate operands for this target definition.
+    pub const fn materials(
+        &self,
+        available_tools_fixed: u16,
+        available_wood_fixed: u16,
+        available_bricks_fixed: u16,
+    ) -> SourceKind13PromotionMaterials {
+        SourceKind13PromotionMaterials {
+            target_group: self.target_group,
+            tools_cost_fixed: self.tools_cost_fixed,
+            wood_cost_fixed: self.wood_cost_fixed,
+            bricks_cost_fixed: self.bricks_cost_fixed,
+            available_tools_fixed,
+            available_wood_fixed,
+            available_bricks_fixed,
+        }
+    }
+
+    /// The source replacement definition selected by the corresponding
+    /// `FUN_0047c080` random draw.
+    pub fn variant_definition_offset(&self, rand_value: u16) -> Option<u16> {
+        let count = self.variant_definition_offsets.len();
+        (count != 0)
+            .then(|| self.variant_definition_offsets[usize::from(rand_value) % count])
+    }
+
+    /// Encode the `FUN_004631b0` command emitted by a promoted residence
+    /// after `FUN_00467940` selected `orientation`. `variant_random` selects
+    /// the contiguous BGruppe definition; `command_random` supplies the
+    /// independent low-five-bit random seed written into the command word.
+    pub fn source_promotion_command(
+        &self,
+        location: SourceKind13Location,
+        orientation: u8,
+        variant_random: u16,
+        command_random: u16,
+        dynamic_object_owner: u8,
+    ) -> Option<SourceBuildingCommand> {
+        Some(SourceBuildingCommand {
+            definition_offset: self.variant_definition_offset(variant_random)?,
+            orientation: orientation & 3,
+            variant: 0,
+            metadata: location.island_id,
+            map_owner_slot: location.source_owner & 7,
+            random_seed: (command_random & 0x1f) as u8,
+            dynamic_object_owner,
+        })
+    }
+}
+
+/// A BGruppe replacement selected by `FUN_0047c080`. The map-command layer
+/// must use this event to emit the corresponding `FUN_00463ef0` preparation
+/// and `FUN_004631b0` INSELHAUS command; the source changes the live
+/// kind-13 record's group before that queued command is consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceKind13Promotion {
+    pub island_id: u8,
+    pub tile_x: u8,
+    pub tile_y: u8,
+    pub target_group: u8,
+}
+
+/// Result of the source `FUN_0047c080` increase path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceKind13IncreaseResult {
+    /// Final fixed-point amount retained at the origin after source caps and
+    /// both ordered neighbor-transfer loops.
+    pub remaining_amount: u16,
+    /// Sum of the fixed-point units accepted by neighbors in this call.
+    pub redistributed_amount: u16,
+    /// A reservation is created only when this increase first exceeds the
+    /// current group's capacity and no target-group reservation is pending.
+    pub reservation_created: bool,
+    /// Present exactly when the material and lifecycle gates selected a
+    /// higher BGruppe replacement command.
+    pub promotion: Option<SourceKind13Promotion>,
+}
+
 impl Default for SourceKind13LocationTable {
     fn default() -> Self {
         Self {
@@ -801,6 +962,157 @@ impl SourceKind13LocationTable {
         Some(SourceKind13DecreaseResult::Applied {
             remaining_amount: remaining as u16,
             redistributed_amount: redistributed as u16,
+        })
+    }
+
+    /// Replay `FUN_0047c080` for one positive kind-13 amount change.
+    ///
+    /// `neighbors` is the ordered `LAB_00472ad0` callback buffer. The source
+    /// makes two distinct passes over it: first half of an eligible promotion
+    /// is given to target-group roots, then (only when that target group has
+    /// no residents) one quarter is given to under-half-capacity roots of the
+    /// selected group. `materials` supplies the three already-reserved city
+    /// balances and target definition costs used only by the promotion gate.
+    pub fn apply_source_kind13_increase(
+        &mut self,
+        city: &mut SourceCityRecord,
+        island_id: u8,
+        tile_x: u8,
+        tile_y: u8,
+        increase: i32,
+        neighbors: &[(u8, u8)],
+        materials: Option<SourceKind13PromotionMaterials>,
+    ) -> Option<SourceKind13IncreaseResult> {
+        if increase <= 0 {
+            return None;
+        }
+        let origin = self.location_at(island_id, tile_x, tile_y)?;
+        let old_group = usize::from(origin.population_group);
+        let current_capacity = i32::from(*SOURCE_KIND13_AMOUNT_CAPACITIES.get(old_group)?);
+        let mut amount = i32::from(origin.amount).checked_add(increase)?;
+        city.tier_population[old_group] = city.tier_population[old_group]
+            .wrapping_sub(u32::from(origin.amount >> 6));
+
+        let mut selected_group = origin.population_group;
+        let mut selected_capacity = current_capacity;
+        let mut redistributed = 0_i32;
+        let mut reservation_created = false;
+        let mut promotion = None;
+
+        if amount > current_capacity {
+            let target_group = origin.population_group.checked_add(1)?;
+            if let Some(&target_capacity) = SOURCE_KIND13_AMOUNT_CAPACITIES.get(usize::from(target_group))
+            {
+                let target = usize::from(target_group);
+                let reservation_matches = city.promotion_reservations[target] != 0
+                    && city.promotion_reservation_positions[target] == (tile_x, tile_y)
+                    && city.phase != ((origin.state_byte() >> 3) & 7);
+
+                if reservation_matches {
+                    if city.overall_satisfaction > 0x7f
+                        && city.satisfaction_by_group[target] > 0x7f
+                    {
+                        if city.tier_population[target] != 0 {
+                            let mut pending = amount / 2;
+                            amount -= pending;
+                            for &(neighbor_x, neighbor_y) in neighbors {
+                                if pending == 0 || (neighbor_x, neighbor_y) == (tile_x, tile_y) {
+                                    continue;
+                                }
+                                let Some(neighbor) = self.location_at(island_id, neighbor_x, neighbor_y)
+                                else {
+                                    continue;
+                                };
+                                if neighbor.population_group != target_group {
+                                    continue;
+                                }
+
+                                city.tier_population[target] = city.tier_population[target]
+                                    .wrapping_sub(u32::from(neighbor.amount >> 6));
+                                let transfer = pending.min((i32::from(target_capacity) - i32::from(neighbor.amount)).max(0));
+                                let neighbor = self.location_at_mut(island_id, neighbor_x, neighbor_y)?;
+                                neighbor.amount = (i32::from(neighbor.amount) + transfer) as u16;
+                                pending -= transfer;
+                                redistributed += transfer;
+                                city.tier_population[target] = city.tier_population[target]
+                                    .wrapping_add(u32::from(neighbor.amount >> 6));
+                            }
+                            amount += pending;
+                        }
+
+                        if !city.promotion_blocked
+                            && current_capacity < amount
+                            && origin.source_transition_active_for_group(target_group)
+                            && materials.is_some_and(|materials| materials.permits(target_group))
+                        {
+                            selected_group = target_group;
+                            selected_capacity = i32::from(target_capacity);
+                            promotion = Some(SourceKind13Promotion {
+                                island_id,
+                                tile_x,
+                                tile_y,
+                                target_group,
+                            });
+                        }
+                    }
+
+                    let selected = usize::from(selected_group);
+                    if city.tier_population[target] == 0 && selected_capacity < amount {
+                        let mut pending = amount / 4;
+                        amount -= pending;
+                        for &(neighbor_x, neighbor_y) in neighbors {
+                            if pending == 0 || (neighbor_x, neighbor_y) == (tile_x, tile_y) {
+                                continue;
+                            }
+                            let Some(neighbor) = self.location_at(island_id, neighbor_x, neighbor_y)
+                            else {
+                                continue;
+                            };
+                            if neighbor.population_group != selected_group
+                                || i32::from(neighbor.amount) > selected_capacity / 2
+                            {
+                                continue;
+                            }
+
+                            city.tier_population[selected] = city.tier_population[selected]
+                                .wrapping_sub(u32::from(neighbor.amount >> 6));
+                            let transfer = pending
+                                .min((selected_capacity - i32::from(neighbor.amount)).max(0));
+                            let neighbor = self.location_at_mut(island_id, neighbor_x, neighbor_y)?;
+                            neighbor.amount = (i32::from(neighbor.amount) + transfer) as u16;
+                            pending -= transfer;
+                            redistributed += transfer;
+                            city.tier_population[selected] = city.tier_population[selected]
+                                .wrapping_add(u32::from(neighbor.amount >> 6));
+                        }
+                        amount += pending;
+                    }
+
+                    city.promotion_reservations[target] = 0;
+                    city.promotion_reservation_positions[target] = (0xff, 0xff);
+                } else if city.promotion_reservations[target] == 0 {
+                    city.promotion_reservations[target] =
+                        source_kind13_population_units(amount).try_into().ok()?;
+                    city.promotion_reservation_positions[target] = (tile_x, tile_y);
+                    let origin = self.location_at_mut(island_id, tile_x, tile_y)?;
+                    origin.state_bits = (origin.state_bits & 0xc7) | ((city.phase & 7) << 3);
+                    reservation_created = true;
+                }
+            }
+        }
+
+        amount = amount.min(selected_capacity);
+        let selected = usize::from(selected_group);
+        city.tier_population[selected] = city.tier_population[selected]
+            .wrapping_add_signed(source_kind13_population_units(amount));
+        let origin = self.location_at_mut(island_id, tile_x, tile_y)?;
+        origin.population_group = selected_group;
+        origin.amount = amount.try_into().ok()?;
+        Some(SourceKind13IncreaseResult {
+            remaining_amount: origin.amount,
+            redistributed_amount: redistributed.try_into().ok()?,
+            reservation_created,
+            promotion,
         })
     }
 
@@ -1736,6 +2048,54 @@ fn source_map_roots_from_scenario(
     }
 
     states
+}
+
+/// Reconstruct the five `DAT_0061fa84[BGruppe]` housing definitions used by
+/// `FUN_0047bbc0` and `FUN_0047c080`.
+///
+/// The haeuser loader stores the first parsed nested `WOHNUNG` definition for
+/// each BGruppe. Its `HAUS_BAUKOST` fields are shifted left five when compiled
+/// (`1602_exe.c:67386-67451`), while its `RandAnz/RandAdd` layout selects the
+/// contiguous replacement definition before `FUN_004631b0` writes the map
+/// command.
+pub fn source_kind13_promotion_definitions(
+    cod: &CodFile,
+) -> [Option<SourceKind13PromotionDefinition>; 5] {
+    std::array::from_fn(|group| {
+        let group = group as u8;
+        let base = cod.source_population_group_building(group)?;
+        let fixed_cost = |key: &str| {
+            (base.properties
+                .get(key)
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0)
+                .max(0)
+                as u16)
+                .wrapping_shl(5)
+        };
+        let variant_count = base.rand_anz.max(1);
+        let source_size = (
+            u8::try_from(base.size.0).ok()?.max(1),
+            u8::try_from(base.size.1).ok()?.max(1),
+        );
+        let variant_definition_offsets = (0..variant_count)
+            .map(|rand_value| {
+                let variant = cod.source_population_group_variant(group, rand_value)?;
+                let offset = variant
+                    .source_id
+                    .checked_sub(anno_formats::szs::INSELHAUS_SOURCE_ID_BASE)?;
+                u16::try_from(offset).ok()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(SourceKind13PromotionDefinition {
+            target_group: group,
+            source_size,
+            tools_cost_fixed: fixed_cost("Werkzeug"),
+            wood_cost_fixed: fixed_cost("Holz"),
+            bricks_cost_fixed: fixed_cost("Ziegel"),
+            variant_definition_offsets,
+        })
+    })
 }
 
 /// Extract the placement anchors feeding the source kind-13 location table.
@@ -2941,6 +3301,88 @@ mod tests {
     }
 
     #[test]
+    fn kind13_promotion_definitions_preserve_cost_scale_and_variant_order() {
+        let base = anno_formats::szs::INSELHAUS_SOURCE_ID_BASE;
+        let housing = |source_id, rand_anz, properties| CodBuilding {
+            source_id,
+            rand_anz,
+            rand_add: 1,
+            properties,
+            ..Default::default()
+        };
+        let group_one = std::collections::HashMap::from([
+            ("ProdKind".into(), "WOHNUNG".into()),
+            ("BGruppe".into(), "1".into()),
+            ("Werkzeug".into(), "3".into()),
+            ("Holz".into(), "4".into()),
+            ("Ziegel".into(), "5".into()),
+        ]);
+        let variant = std::collections::HashMap::from([
+            ("ProdKind".into(), "WOHNUNG".into()),
+            ("BGruppe".into(), "1".into()),
+        ]);
+        let cod = CodFile {
+            constants: Default::default(),
+            buildings: vec![
+                housing(base + 11, 3, group_one),
+                housing(base + 12, 0, variant.clone()),
+                housing(base + 13, 0, variant),
+            ],
+        };
+
+        let definitions = source_kind13_promotion_definitions(&cod);
+        assert_eq!(
+            definitions[1],
+            Some(SourceKind13PromotionDefinition {
+                target_group: 1,
+                source_size: (1, 1),
+                tools_cost_fixed: 96,
+                wood_cost_fixed: 128,
+                bricks_cost_fixed: 160,
+                variant_definition_offsets: vec![11, 12, 13],
+            })
+        );
+        assert_eq!(
+            definitions[1]
+                .as_ref()
+                .and_then(|definition| definition.variant_definition_offset(4)),
+            Some(12)
+        );
+        assert_eq!(
+            definitions[1].as_ref().and_then(|definition| {
+                definition.source_promotion_command(
+                    SourceKind13Location {
+                        island_id: 4,
+                        tile_x: 9,
+                        tile_y: 7,
+                        orientation: 0,
+                        variant: 0,
+                        source_owner: 5,
+                        phase: 0,
+                        state_bits: 0,
+                        population_group: 1,
+                        amount: 0x40,
+                        lifecycle_flags: 0,
+                    },
+                    3,
+                    4,
+                    0x1234,
+                    2,
+                )
+            }),
+            Some(SourceBuildingCommand {
+                definition_offset: 12,
+                orientation: 3,
+                variant: 0,
+                metadata: 4,
+                map_owner_slot: 5,
+                random_seed: 0x14,
+                dynamic_object_owner: 2,
+            })
+        );
+    }
+
+    #[test]
     fn kind13_location_table_uses_source_hash_probe_and_city_slice() {
         let mut table = SourceKind13LocationTable::default();
         let first = SourceKind13Location {
@@ -3083,6 +3525,179 @@ mod tests {
         );
         assert_eq!(downgrade_city.tier_population, [0, 1, 0, 0, 0]);
         assert_eq!(downgrade_table.location_at(2, 8, 9), Some(downgrade_origin));
+    }
+
+    #[test]
+    fn kind13_transition_predicate_replays_every_bgruppe_lifecycle_mask() {
+        let base = SourceKind13Location {
+            island_id: 0,
+            tile_x: 0,
+            tile_y: 0,
+            orientation: 0,
+            variant: 0,
+            source_owner: 0,
+            phase: 0,
+            state_bits: 0,
+            population_group: 0,
+            amount: 0x40,
+            lifecycle_flags: 0,
+        };
+        assert!(SourceKind13Location {
+            lifecycle_flags: 4,
+            ..base
+        }
+        .source_transition_active_for_group(0));
+        assert!(SourceKind13Location {
+            state_bits: 0x80,
+            lifecycle_flags: 0x000c,
+            ..base
+        }
+        .source_transition_active_for_group(1));
+        assert!(SourceKind13Location {
+            state_bits: 0x80,
+            lifecycle_flags: 0x011c,
+            ..base
+        }
+        .source_transition_active_for_group(2));
+        assert!(SourceKind13Location {
+            state_bits: 0x80,
+            lifecycle_flags: 0x0158,
+            ..base
+        }
+        .source_transition_active_for_group(3));
+        assert!(SourceKind13Location {
+            state_bits: 0x80,
+            lifecycle_flags: 0x01d8,
+            ..base
+        }
+        .source_transition_active_for_group(4));
+        assert!(!SourceKind13Location {
+            state_bits: 0x80,
+            lifecycle_flags: 0x0158,
+            ..base
+        }
+        .source_transition_active_for_group(4));
+    }
+
+    #[test]
+    fn kind13_increase_replays_reservation_and_matured_promotion() {
+        let origin = SourceKind13Location {
+            island_id: 2,
+            tile_x: 8,
+            tile_y: 9,
+            orientation: 1,
+            variant: 0,
+            source_owner: 3,
+            phase: 2,
+            state_bits: 0x80,
+            population_group: 0,
+            amount: 100,
+            lifecycle_flags: 0,
+        };
+        let mut reservation_table = SourceKind13LocationTable::default();
+        assert!(reservation_table.insert(origin));
+        let mut reservation_city = SourceCityRecord {
+            phase: 5,
+            tier_population: [1, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        assert_eq!(
+            reservation_table.apply_source_kind13_increase(
+                &mut reservation_city,
+                2,
+                8,
+                9,
+                100,
+                &[],
+                None,
+            ),
+            Some(SourceKind13IncreaseResult {
+                remaining_amount: 0x80,
+                redistributed_amount: 0,
+                reservation_created: true,
+                promotion: None,
+            })
+        );
+        assert_eq!(reservation_city.tier_population, [2, 0, 0, 0, 0]);
+        assert_eq!(reservation_city.promotion_reservations, [0, 3, 0, 0, 0]);
+        assert_eq!(
+            reservation_city.promotion_reservation_positions,
+            [(0, 0), (8, 9), (0, 0), (0, 0), (0, 0)]
+        );
+        assert_eq!(
+            reservation_table.location_at(2, 8, 9).unwrap().state_byte(),
+            0xaa
+        );
+
+        let promotion_origin = SourceKind13Location {
+            amount: 0x80,
+            lifecycle_flags: 0x000c,
+            ..origin
+        };
+        let target_neighbor = SourceKind13Location {
+            tile_x: 9,
+            population_group: 1,
+            amount: 100,
+            ..promotion_origin
+        };
+        let mut promotion_table = SourceKind13LocationTable::default();
+        assert!(promotion_table.insert(promotion_origin));
+        assert!(promotion_table.insert(target_neighbor));
+        let mut promotion_city = SourceCityRecord {
+            phase: 5,
+            tier_population: [2, 1, 0, 0, 0],
+            satisfaction_by_group: [0x80, 0x80, 0, 0, 0],
+            overall_satisfaction: 0x80,
+            promotion_reservations: [0, 5, 0, 0, 0],
+            promotion_reservation_positions: [(0, 0), (8, 9), (0, 0), (0, 0), (0, 0)],
+            ..Default::default()
+        };
+        let materials = SourceKind13PromotionMaterials {
+            target_group: 1,
+            tools_cost_fixed: 32,
+            wood_cost_fixed: 64,
+            bricks_cost_fixed: 96,
+            available_tools_fixed: 32,
+            available_wood_fixed: 64,
+            available_bricks_fixed: 96,
+        };
+        assert_eq!(
+            promotion_table.apply_source_kind13_increase(
+                &mut promotion_city,
+                2,
+                8,
+                9,
+                192,
+                &[(9, 9)],
+                Some(materials),
+            ),
+            Some(SourceKind13IncreaseResult {
+                remaining_amount: 160,
+                redistributed_amount: 160,
+                reservation_created: false,
+                promotion: Some(SourceKind13Promotion {
+                    island_id: 2,
+                    tile_x: 8,
+                    tile_y: 9,
+                    target_group: 1,
+                }),
+            })
+        );
+        assert_eq!(promotion_city.tier_population, [0, 6, 0, 0, 0]);
+        assert_eq!(promotion_city.promotion_reservations, [0; 5]);
+        assert_eq!(
+            promotion_city.promotion_reservation_positions,
+            [(0, 0), (0xff, 0xff), (0, 0), (0, 0), (0, 0)]
+        );
+        assert_eq!(
+            promotion_table.location_at(2, 8, 9),
+            Some(SourceKind13Location {
+                population_group: 1,
+                amount: 160,
+                ..promotion_origin
+            })
+        );
+        assert_eq!(promotion_table.location_at(2, 9, 9).unwrap().amount, 260);
     }
 
     #[test]

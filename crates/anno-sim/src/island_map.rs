@@ -25,6 +25,7 @@ use crate::source_route::{
 struct SourceCivilianPathCell {
     kind_code: u8,
     production_kind_code: u8,
+    kind3_center_cell: bool,
     owner: u8,
     path_class: u8,
 }
@@ -172,11 +173,22 @@ impl IslandMap {
                             civilian_movement_speeds[idx] = u16::from(speeds[3].max(1));
                         }
                         if let Some(path_classes) = def.source_path_classes() {
+                            let source_cell_index = match tile.orientation & 3 {
+                                0 => dy * def.size.0 + dx,
+                                1 => (def.size.1 - 1 - dx) * def.size.0 + dy,
+                                2 => {
+                                    (def.size.1 - 1 - dy) * def.size.0 + (def.size.0 - 1 - dx)
+                                }
+                                _ => dx * def.size.0 + (def.size.0 - 1 - dy),
+                            };
                             civilian_path_cells[idx] = Some(SourceCivilianPathCell {
                                 kind_code: def.source_kind_code().unwrap_or(u8::MAX),
                                 production_kind_code: def
                                     .source_production_kind_code()
                                     .unwrap_or(u8::MAX),
+                                kind3_center_cell: def.source_kind_code() == Some(3)
+                                    && source_cell_index
+                                        == def.size.0.saturating_mul(def.size.1) / 2,
                                 owner: tile.source_owner(),
                                 path_class: path_classes[3],
                             });
@@ -471,6 +483,50 @@ impl IslandMap {
             Ok(_) | Err(crate::source_route::SourcePathSearchError::NoRoute) => Some(neighbors),
             Err(crate::source_route::SourcePathSearchError::OutOfBounds) => None,
         }
+    }
+
+    /// Replay `FUN_00467940` for a kind-13 replacement. The source chooses
+    /// the first qualifying edge in top, bottom, left, right order; a map
+    /// cell qualifies when its compiled outer kind is `1` or `18`, or when it
+    /// is the central compiled cell of outer kind `3`.
+    pub fn source_kind13_replacement_orientation(
+        &self,
+        source_size: (u8, u8),
+        fallback_orientation: u8,
+        origin: (i32, i32),
+    ) -> u8 {
+        let (raw_width, raw_height) = source_size;
+        let (width, height) = if fallback_orientation & 1 == 0 {
+            (i32::from(raw_width), i32::from(raw_height))
+        } else {
+            (i32::from(raw_height), i32::from(raw_width))
+        };
+        let (x, y) = origin;
+        let edge_cell_allowed = |position| {
+            self.civilian_path_cell(position).is_some_and(|cell| {
+                matches!(cell.kind_code, 1 | 18) || cell.kind3_center_cell
+            })
+        };
+        let x_end = (x + width).min(i32::from(self.width));
+        let y_end = (y + height).min(i32::from(self.height));
+
+        if y > 0 && (x..x_end).any(|edge_x| edge_cell_allowed((edge_x, y - 1))) {
+            return 2;
+        }
+        if y + height < i32::from(self.height)
+            && (x..x_end).any(|edge_x| edge_cell_allowed((edge_x, y + height)))
+        {
+            return 0;
+        }
+        if x > 0 && (y..y_end).any(|edge_y| edge_cell_allowed((x - 1, edge_y))) {
+            return 3;
+        }
+        if x + width < i32::from(self.width)
+            && (y..y_end).any(|edge_y| edge_cell_allowed((x + width, edge_y)))
+        {
+            return 1;
+        }
+        fallback_orientation & 3
     }
 
     /// Raw type-0 terrain speed for `FUN_0044a690` TRAEGER movement.
@@ -799,6 +855,7 @@ impl IslandMap {
                 Some(SourceCivilianPathCell {
                     kind_code: 11,
                     production_kind_code: u8::MAX,
+                    kind3_center_cell: false,
                     owner: 0,
                     path_class: 32,
                 });
@@ -1243,6 +1300,53 @@ mod tests {
         assert_eq!(
             map.source_kind13_transfer_neighbor_cells((1, 0)),
             Some(vec![(2, 0)])
+        );
+    }
+
+    #[test]
+    fn kind13_replacement_orientation_replays_source_edge_priority() {
+        let mut map = IslandMap::new_open(1, 6, 6);
+        let cell = |kind_code, kind3_center_cell| {
+            Some(SourceCivilianPathCell {
+                kind_code,
+                production_kind_code: u8::MAX,
+                kind3_center_cell,
+                owner: 0,
+                path_class: 0,
+            })
+        };
+        let index = |x, y| y * 6 + x;
+
+        map.civilian_path_cells[index(2, 1)] = cell(1, false);
+        map.civilian_path_cells[index(1, 2)] = cell(18, false);
+        assert_eq!(
+            map.source_kind13_replacement_orientation((2, 2), 0, (2, 2)),
+            2
+        );
+
+        map.civilian_path_cells[index(2, 1)] = cell(11, false);
+        map.civilian_path_cells[index(2, 4)] = cell(18, false);
+        assert_eq!(
+            map.source_kind13_replacement_orientation((2, 2), 0, (2, 2)),
+            0
+        );
+
+        map.civilian_path_cells[index(2, 4)] = cell(11, false);
+        assert_eq!(
+            map.source_kind13_replacement_orientation((2, 2), 0, (2, 2)),
+            3
+        );
+
+        map.civilian_path_cells[index(1, 2)] = cell(11, false);
+        map.civilian_path_cells[index(4, 3)] = cell(3, true);
+        assert_eq!(
+            map.source_kind13_replacement_orientation((2, 2), 0, (2, 2)),
+            1
+        );
+        map.civilian_path_cells[index(4, 3)] = cell(3, false);
+        assert_eq!(
+            map.source_kind13_replacement_orientation((2, 2), 3, (2, 2)),
+            3
         );
     }
 
