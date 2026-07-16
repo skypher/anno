@@ -2217,6 +2217,10 @@ impl Simulation {
         controller.island_search_deferred_requirement = None;
         controller.island_search_retry_at_ticks = None;
         controller.source_city_rectangles.clear();
+        controller.source_city_construction_queue =
+            SourceControllerCityConstructionQueue::default();
+        controller.source_city_construction_cursor =
+            SourceControllerCityConstructionCursor::default();
         controller.selected_city_active = false;
         controller.action_stack.clear();
         controller.action_budget = 0;
@@ -9491,6 +9495,20 @@ mod tests {
             figure_roster_dirty: false,
             ..Default::default()
         };
+        let mut stale_work = [0_u8; 32];
+        stale_work[0x1c..0x1e].copy_from_slice(&2_i16.to_le_bytes());
+        assert!(sim.source_player_controllers[0]
+            .source_city_construction_queue
+            .insert(SourceControllerCityConstructionWork::from_bytes(stale_work)));
+        sim.source_player_controllers[0].source_city_construction_cursor =
+            SourceControllerCityConstructionCursor {
+                work_index: 1,
+                scan_x: 2,
+                scan_y: 3,
+                remaining: 4,
+                baseline_x: 5,
+                baseline_y: 6,
+            };
 
         sim.tick_source_player_controllers(0);
 
@@ -9510,6 +9528,14 @@ mod tests {
         assert!(!controller.purchase_predecessor_issued);
         assert!(controller.owned_figure_handles.is_empty());
         assert!(!controller.figure_roster_dirty);
+        assert!(controller
+            .source_city_construction_queue
+            .entries()
+            .is_empty());
+        assert_eq!(
+            controller.source_city_construction_cursor,
+            SourceControllerCityConstructionCursor::default()
+        );
     }
 
     #[test]
