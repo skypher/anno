@@ -614,6 +614,27 @@ impl IslandMap {
         true
     }
 
+    /// `FUN_00417bf0`: classify one state-seven construction edge. The
+    /// vertical source directions inspect the two cells at `y ± 2`; the
+    /// horizontal directions inspect `x ± 2`. Both cells must carry source
+    /// map kind one or eighteen.
+    pub fn source_controller_city_construction_edge_clear(
+        &self,
+        x: i32,
+        y: i32,
+        direction: u8,
+    ) -> bool {
+        let offsets = match direction {
+            0 | 2 => [(0, -2), (0, 2)],
+            1 | 3 => [(-2, 0), (2, 0)],
+            _ => return false,
+        };
+        offsets.into_iter().all(|(dx, dy)| {
+            self.source_map_kind_cell((x + dx, y + dy))
+                .is_some_and(|cell| matches!(cell.kind_code, 1 | 18))
+        })
+    }
+
     /// `FUN_0040fe80` from one local map cell and a two-bit direction. The
     /// return is the source's one-based line distance, including its special
     /// single-kind-16 run handling.
@@ -2239,6 +2260,35 @@ mod tests {
         map.source_map_kind_cells[index(6, 1)] = cell(12, 6, 0, 0);
         assert_eq!(map.source_controller_city_green_density(7, 4, 1, 3), 2);
         assert_eq!(map.source_controller_city_ware_five_density(7, 4, 1, 3), 2);
+    }
+
+    #[test]
+    fn controller_city_construction_edge_replays_fun_00417bf0() {
+        let mut map = IslandMap::new_open(1, 8, 8);
+        let index = |x, y| y * 8 + x;
+        let cell = |kind_code| {
+            Some(SourceMapKindCell {
+                kind_code,
+                kind3_center_cell: false,
+                map_owner: 0,
+                ware_slot: 0,
+                map_direction: 0,
+            })
+        };
+
+        map.source_map_kind_cells[index(3, 1)] = cell(1);
+        map.source_map_kind_cells[index(3, 5)] = cell(18);
+        assert!(map.source_controller_city_construction_edge_clear(3, 3, 0));
+        assert!(map.source_controller_city_construction_edge_clear(3, 3, 2));
+
+        map.source_map_kind_cells[index(1, 3)] = cell(1);
+        map.source_map_kind_cells[index(5, 3)] = cell(18);
+        assert!(map.source_controller_city_construction_edge_clear(3, 3, 1));
+        assert!(map.source_controller_city_construction_edge_clear(3, 3, 3));
+
+        map.source_map_kind_cells[index(5, 3)] = cell(11);
+        assert!(!map.source_controller_city_construction_edge_clear(3, 3, 1));
+        assert!(!map.source_controller_city_construction_edge_clear(3, 3, 4));
     }
 
     #[test]
