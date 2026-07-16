@@ -57,6 +57,17 @@ pub struct SourceControllerCityRectangle {
     pub area: u32,
 }
 
+/// One six-word segment record emitted by `FUN_004160c0`. State three samples
+/// exactly one cell from each segment before scoring its surviving candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceControllerCityCandidateSegment {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+    pub length: u32,
+}
+
 /// Walkability grid for a single island.
 #[derive(Debug, Clone)]
 pub struct IslandMap {
@@ -445,6 +456,123 @@ impl IslandMap {
             previous_lines = current_lines;
         }
         rectangles
+    }
+
+    /// Replay `FUN_004160c0` for one expanded action-three rectangle. The
+    /// first source pass emits vertical segments, then the second emits
+    /// horizontal segments, each capped at 256 records in total.
+    pub fn source_controller_city_candidate_segments(
+        &self,
+        owner: u8,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        minimum_horizontal_length: u32,
+        minimum_vertical_length: u32,
+    ) -> Vec<SourceControllerCityCandidateSegment> {
+        let mut segments = Vec::new();
+        for x in x0..x1 {
+            let mut run_start = 0;
+            let mut run_length = 0_u32;
+            for y in y0..y1 {
+                let Some(cell) = self.source_map_kind_cell((x, y)) else {
+                    continue;
+                };
+                if cell.map_owner != owner {
+                    continue;
+                }
+                if source_controller_city_candidate_kind(cell.kind_code)
+                    && self.source_controller_city_horizontal_clear(x, y)
+                {
+                    if run_length == 0 {
+                        run_start = y;
+                    }
+                    run_length = run_length.saturating_add(1);
+                    continue;
+                }
+                if run_length >= minimum_vertical_length && segments.len() < 256 {
+                    segments.push(SourceControllerCityCandidateSegment {
+                        x0: x,
+                        y0: run_start,
+                        x1: x,
+                        y1: run_start + run_length as i32,
+                        length: run_length,
+                    });
+                }
+                run_length = 0;
+            }
+        }
+        for y in y0..y1 {
+            let mut run_start = 0;
+            let mut run_length = 0_u32;
+            for x in x0..x1 {
+                let Some(cell) = self.source_map_kind_cell((x, y)) else {
+                    continue;
+                };
+                if cell.map_owner != owner {
+                    continue;
+                }
+                if source_controller_city_candidate_kind(cell.kind_code)
+                    && self.source_controller_city_vertical_clear(x, y)
+                {
+                    if run_length == 0 {
+                        run_start = x;
+                    }
+                    run_length = run_length.saturating_add(1);
+                    continue;
+                }
+                if run_length >= minimum_horizontal_length && segments.len() < 256 {
+                    segments.push(SourceControllerCityCandidateSegment {
+                        x0: run_start,
+                        y0: y,
+                        x1: run_start + run_length as i32,
+                        y1: y,
+                        length: run_length,
+                    });
+                }
+                run_length = 0;
+            }
+        }
+        segments
+    }
+
+    fn source_controller_city_horizontal_clear(&self, x: i32, y: i32) -> bool {
+        let left = x.min(6);
+        for offset in -left..-3 {
+            if !self.source_controller_city_clearance_kind((x + offset, y)) {
+                return false;
+            }
+        }
+        let right = (i32::from(self.width) - x).min(6);
+        for offset in 3..right {
+            if !self.source_controller_city_clearance_kind((x + offset, y)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn source_controller_city_vertical_clear(&self, x: i32, y: i32) -> bool {
+        let above = y.min(6);
+        for offset in -above..-3 {
+            if !self.source_controller_city_clearance_kind((x, y + offset)) {
+                return false;
+            }
+        }
+        let below = (i32::from(self.height) - y).min(6);
+        for offset in 3..below {
+            if !self.source_controller_city_clearance_kind((x, y + offset)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn source_controller_city_clearance_kind(&self, position: (i32, i32)) -> bool {
+        self.source_map_kind_cell(position)
+            .map(|cell| matches!(cell.kind_code, 10..=12 | 19))
+            .unwrap_or(true)
     }
 
     /// `FUN_00417220` with the state-three `param_4 = 1` look-ahead. The
@@ -1376,6 +1504,10 @@ fn is_walkable_kind(kind: &str) -> bool {
     WALKABLE_KINDS.iter().any(|&k| kind == k)
 }
 
+fn source_controller_city_candidate_kind(kind_code: u8) -> bool {
+    matches!(kind_code, 23 | 26 | 27 | 29 | 30)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1973,6 +2105,48 @@ mod tests {
         map.source_map_kind_cells[index(6, 1)] = cell(12, 6, 0, 0);
         assert_eq!(map.source_controller_city_green_density(7, 4, 1, 3), 2);
         assert_eq!(map.source_controller_city_ware_five_density(7, 4, 1, 3), 2);
+    }
+
+    #[test]
+    fn controller_city_candidate_segments_replay_source_pass_order() {
+        let mut map = IslandMap::new_open(1, 16, 16);
+        let cell = |kind_code, map_owner| {
+            Some(SourceMapKindCell {
+                kind_code,
+                kind3_center_cell: false,
+                map_owner,
+                ware_slot: 0,
+                map_direction: 0,
+            })
+        };
+        let index = |x, y| y * 16 + x;
+
+        for y in 4..10 {
+            map.source_map_kind_cells[index(8, y)] = cell(23, 7);
+        }
+        map.source_map_kind_cells[index(8, 10)] = cell(11, 7);
+        for x in 4..10 {
+            map.source_map_kind_cells[index(x, 12)] = cell(26, 7);
+        }
+        map.source_map_kind_cells[index(10, 12)] = cell(11, 7);
+
+        let segments = map.source_controller_city_candidate_segments(7, 0, 0, 16, 16, 3, 3);
+        assert!(
+            segments.starts_with(&[SourceControllerCityCandidateSegment {
+                x0: 8,
+                y0: 4,
+                x1: 8,
+                y1: 10,
+                length: 6,
+            }])
+        );
+        assert!(segments.contains(&SourceControllerCityCandidateSegment {
+            x0: 4,
+            y0: 12,
+            x1: 10,
+            y1: 12,
+            length: 6,
+        }));
     }
 
     #[test]
