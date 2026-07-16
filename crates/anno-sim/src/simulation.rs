@@ -2510,9 +2510,8 @@ impl Simulation {
         if controller.action_stack.last().copied() != Some(4) {
             return false;
         }
-        let (Some(figure_handle), Some(island_id), Some((candidate_x, candidate_y))) = (
+        let (Some(figure_handle), Some((candidate_x, candidate_y))) = (
             controller.action_figure_handle,
-            controller.action_target_island_id,
             controller.action_source_candidate_tile,
         ) else {
             self.clear_source_controller_city_arrival(player_slot);
@@ -2542,7 +2541,7 @@ impl Simulation {
         let reached = self
             .island_maps
             .iter()
-            .find(|map| map.island_id == island_id)
+            .find(|map| map.island_id == descriptor.bytes()[1])
             .is_some_and(|map| map.source_controller_city_target_reached(descriptor, position));
         if reached {
             return self.complete_source_controller_city_arrival(player_slot);
@@ -9015,6 +9014,61 @@ mod tests {
         assert_eq!(
             sim.source_dynamic_combat_figures[0].target_descriptor,
             SourceTargetDescriptor::from_source_kind34_island_cell(4, 3, 4)
+        );
+    }
+
+    #[test]
+    fn source_controller_state_four_checks_the_descriptor_island_before_city_allocation() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(4, 16, 16));
+        sim.source_dynamic_combat_figures
+            .push(SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 1,
+                candidate_list_key: 4,
+                figure_definition_id: 0x19,
+                direction: 0,
+                source_payload: 0,
+                position: (3.5, 4.5),
+                position_z: 0.0,
+                source_energy: 0,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 0,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 7,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion::default(),
+            });
+        sim.source_player_controllers[0] = SourcePlayerController {
+            action_figure_handle: Some(7),
+            action_target_island_id: Some(7),
+            action_target_tile: Some((4, 4)),
+            action_source_candidate_tile: Some((3, 4)),
+            action_arrival_retries: 4,
+            island_search_cursor: 4,
+            action_stack: vec![4],
+            ..Default::default()
+        };
+
+        assert!(sim.advance_source_controller_city_arrival(0));
+        assert_eq!(sim.source_player_controllers[0].action_stack, vec![8, 7]);
+        assert_eq!(
+            sim.source_cities.record(0),
+            Some(SourceCityRecord {
+                island_id: 7,
+                owner_slot: 0,
+                tile_x: 4,
+                tile_y: 4,
+                ready_at_ticks: 600,
+                ..Default::default()
+            })
         );
     }
 
