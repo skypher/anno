@@ -41,6 +41,8 @@ struct SourceMapKindCell {
     kind_code: u8,
     kind3_center_cell: bool,
     map_owner: u8,
+    ware_slot: u8,
+    map_direction: u8,
 }
 
 /// One six-word candidate record produced by `FUN_00415af0` for the source
@@ -208,6 +210,8 @@ impl IslandMap {
                             kind3_center_cell: def.source_kind_code() == Some(3)
                                 && source_cell_index == def.size.0.saturating_mul(def.size.1) / 2,
                             map_owner: tile.source_owner(),
+                            ware_slot: def.source_ware_slot().unwrap_or(0),
+                            map_direction: tile.orientation & 3,
                         });
                         walkable[idx] = is_walkable;
                         road[idx] = is_road;
@@ -1223,6 +1227,8 @@ impl IslandMap {
                     kind_code: 11,
                     kind3_center_cell: false,
                     map_owner: 0,
+                    ware_slot: 0,
+                    map_direction: 0,
                 });
                 size
             ],
@@ -1713,6 +1719,8 @@ mod tests {
                 kind_code,
                 kind3_center_cell,
                 map_owner: 0,
+                ware_slot: 0,
+                map_direction: 0,
             })
         };
         let index = |x, y| y * 6 + x;
@@ -1758,16 +1766,22 @@ mod tests {
                 kind_code: 10,
                 kind3_center_cell: false,
                 map_owner: 2,
+                ware_slot: 0,
+                map_direction: 0,
             }),
             Some(SourceMapKindCell {
                 kind_code: 25,
                 kind3_center_cell: false,
                 map_owner: 2,
+                ware_slot: 0,
+                map_direction: 0,
             }),
             Some(SourceMapKindCell {
                 kind_code: 11,
                 kind3_center_cell: false,
                 map_owner: 1,
+                ware_slot: 0,
+                map_direction: 0,
             }),
         ];
 
@@ -1784,6 +1798,8 @@ mod tests {
                     kind_code: 10,
                     kind3_center_cell: false,
                     map_owner: 7,
+                    ware_slot: 0,
+                    map_direction: 0,
                 });
             }
         }
