@@ -298,6 +298,156 @@ impl SourceControllerCityConstructionCursor {
     }
 }
 
+/// One probe emitted by `FUN_004126a0` for source controller action ten.
+/// The anchor is retained by `FUN_00412de0` when it selects this probe for
+/// the paired construction command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceControllerCityConstructionProbe {
+    x: i32,
+    y: i32,
+    anchor_x: i32,
+    anchor_y: i32,
+    span: i32,
+}
+
+/// One one-cell scan emitted by `FUN_00412000` for source controller action
+/// eleven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceControllerCityConstructionScan {
+    x: i32,
+    y: i32,
+    span: i32,
+}
+
+/// Replay `FUN_00412000` for the two directions reached by
+/// `FUN_00412b20`. The raw work orientation is the u16 at `+0x1a`.
+fn source_controller_city_action_eleven_scan(
+    cursor: SourceControllerCityConstructionCursor,
+    work: SourceControllerCityConstructionWork,
+    direction: i32,
+) -> Option<SourceControllerCityConstructionScan> {
+    let offset = match direction {
+        -1 => -1,
+        0 => 1,
+        _ => return None,
+    };
+    let orientation = u16::from_le_bytes([work.bytes[0x1a], work.bytes[0x1b]]);
+    let (x, y, span) = match orientation {
+        0 => (
+            cursor.scan_x,
+            cursor.scan_y.wrapping_add(offset),
+            cursor.baseline_x.wrapping_sub(cursor.scan_x),
+        ),
+        1 => (
+            cursor.scan_x.wrapping_add(offset),
+            cursor.scan_y,
+            cursor.baseline_y.wrapping_sub(cursor.scan_y),
+        ),
+        2 => (
+            cursor.scan_x,
+            cursor.scan_y.wrapping_add(offset),
+            cursor.scan_x.wrapping_sub(cursor.baseline_x),
+        ),
+        3 => (
+            cursor.scan_x.wrapping_add(offset),
+            cursor.scan_y,
+            cursor.scan_y.wrapping_sub(cursor.baseline_y),
+        ),
+        _ => return None,
+    };
+    Some(SourceControllerCityConstructionScan { x, y, span })
+}
+
+/// Replay `FUN_004126a0` for the four directions reached by
+/// `FUN_00412de0`. The raw work orientation is the u16 at `+0x1a`.
+fn source_controller_city_action_ten_probe(
+    cursor: SourceControllerCityConstructionCursor,
+    work: SourceControllerCityConstructionWork,
+    direction: i32,
+) -> Option<SourceControllerCityConstructionProbe> {
+    if !matches!(direction, -2..=1) {
+        return None;
+    }
+
+    let scan_x = cursor.scan_x;
+    let scan_y = cursor.scan_y;
+    let orientation = u16::from_le_bytes([work.bytes[0x1a], work.bytes[0x1b]]);
+    let (x, y, anchor_x, anchor_y, span) = match orientation {
+        0 => {
+            let (y_offset, anchor_x, anchor_y) = match direction {
+                -2 => (-3, scan_x.wrapping_sub(2), scan_y.wrapping_sub(1)),
+                -1 => (-2, 0, 0),
+                0 => (1, 0, 0),
+                1 => (2, scan_x.wrapping_sub(2), scan_y.wrapping_add(1)),
+                _ => unreachable!(),
+            };
+            (
+                scan_x.wrapping_sub(3),
+                scan_y.wrapping_add(y_offset),
+                anchor_x,
+                anchor_y,
+                cursor.baseline_x.wrapping_sub(scan_x),
+            )
+        }
+        1 => {
+            let (x_offset, anchor_x, anchor_y) = match direction {
+                -2 => (-3, scan_x.wrapping_sub(1), scan_y.wrapping_sub(2)),
+                -1 => (-2, 0, 0),
+                0 => (1, 0, 0),
+                1 => (2, scan_x.wrapping_add(1), scan_y.wrapping_sub(2)),
+                _ => unreachable!(),
+            };
+            (
+                scan_x.wrapping_add(x_offset),
+                scan_y.wrapping_sub(3),
+                anchor_x,
+                anchor_y,
+                cursor.baseline_y.wrapping_sub(scan_y),
+            )
+        }
+        2 => {
+            let (y_offset, anchor_x, anchor_y) = match direction {
+                -2 => (-3, scan_x.wrapping_add(2), scan_y.wrapping_sub(1)),
+                -1 => (-2, 0, 0),
+                0 => (1, 0, 0),
+                1 => (2, scan_x.wrapping_add(2), scan_y.wrapping_add(1)),
+                _ => unreachable!(),
+            };
+            (
+                scan_x.wrapping_add(2),
+                scan_y.wrapping_add(y_offset),
+                anchor_x,
+                anchor_y,
+                scan_x.wrapping_sub(cursor.baseline_x),
+            )
+        }
+        3 => {
+            let (x_offset, anchor_x, anchor_y) = match direction {
+                -2 => (-3, scan_x.wrapping_sub(1), scan_y.wrapping_add(2)),
+                -1 => (-2, 0, 0),
+                0 => (1, 0, 0),
+                1 => (2, scan_x.wrapping_add(1), scan_y.wrapping_add(2)),
+                _ => unreachable!(),
+            };
+            (
+                scan_x.wrapping_add(x_offset),
+                scan_y.wrapping_add(2),
+                anchor_x,
+                anchor_y,
+                scan_y.wrapping_sub(cursor.baseline_y),
+            )
+        }
+        _ => return None,
+    };
+    Some(SourceControllerCityConstructionProbe {
+        x,
+        y,
+        anchor_x,
+        anchor_y,
+        span,
+    })
+}
+
 /// Controller bytes consumed by the `FUN_0042b4b0` city-management branch.
 ///
 /// The complete controller occupies `0x11e88` bytes in the executable. This
@@ -8490,6 +8640,260 @@ mod tests {
 
         assert!(cursor.advance_after_record(&queue));
         assert_eq!(cursor.work_index, 2);
+    }
+
+    #[test]
+    fn source_controller_action_ten_probe_replays_fun_004126a0() {
+        let work = |orientation: u16| {
+            let mut bytes = [0_u8; 32];
+            bytes[0x1a..0x1c].copy_from_slice(&orientation.to_le_bytes());
+            SourceControllerCityConstructionWork::from_bytes(bytes)
+        };
+        let cursor = SourceControllerCityConstructionCursor {
+            work_index: 0,
+            scan_x: 10,
+            scan_y: 20,
+            remaining: 0,
+            baseline_x: 4,
+            baseline_y: 7,
+        };
+        let cases = [
+            (
+                0,
+                -2,
+                SourceControllerCityConstructionProbe {
+                    x: 7,
+                    y: 17,
+                    anchor_x: 8,
+                    anchor_y: 19,
+                    span: -6,
+                },
+            ),
+            (
+                0,
+                -1,
+                SourceControllerCityConstructionProbe {
+                    x: 7,
+                    y: 18,
+                    anchor_x: 0,
+                    anchor_y: 0,
+                    span: -6,
+                },
+            ),
+            (
+                0,
+                0,
+                SourceControllerCityConstructionProbe {
+                    x: 7,
+                    y: 21,
+                    anchor_x: 0,
+                    anchor_y: 0,
+                    span: -6,
+                },
+            ),
+            (
+                0,
+                1,
+                SourceControllerCityConstructionProbe {
+                    x: 7,
+                    y: 22,
+                    anchor_x: 8,
+                    anchor_y: 21,
+                    span: -6,
+                },
+            ),
+            (
+                1,
+                -2,
+                SourceControllerCityConstructionProbe {
+                    x: 7,
+                    y: 17,
+                    anchor_x: 9,
+                    anchor_y: 18,
+                    span: -13,
+                },
+            ),
+            (
+                1,
+                -1,
+                SourceControllerCityConstructionProbe {
+                    x: 8,
+                    y: 17,
+                    anchor_x: 0,
+                    anchor_y: 0,
+                    span: -13,
+                },
+            ),
+            (
+                1,
+                0,
+                SourceControllerCityConstructionProbe {
+                    x: 11,
+                    y: 17,
+                    anchor_x: 0,
+                    anchor_y: 0,
+                    span: -13,
+                },
+            ),
+            (
+                1,
+                1,
+                SourceControllerCityConstructionProbe {
+                    x: 12,
+                    y: 17,
+                    anchor_x: 11,
+                    anchor_y: 18,
+                    span: -13,
+                },
+            ),
+            (
+                2,
+                -2,
+                SourceControllerCityConstructionProbe {
+                    x: 12,
+                    y: 17,
+                    anchor_x: 12,
+                    anchor_y: 19,
+                    span: 6,
+                },
+            ),
+            (
+                2,
+                -1,
+                SourceControllerCityConstructionProbe {
+                    x: 12,
+                    y: 18,
+                    anchor_x: 0,
+                    anchor_y: 0,
+                    span: 6,
+                },
+            ),
+            (
+                2,
+                0,
+                SourceControllerCityConstructionProbe {
+                    x: 12,
+                    y: 21,
+                    anchor_x: 0,
+                    anchor_y: 0,
+                    span: 6,
+                },
+            ),
+            (
+                2,
+                1,
+                SourceControllerCityConstructionProbe {
+                    x: 12,
+                    y: 22,
+                    anchor_x: 12,
+                    anchor_y: 21,
+                    span: 6,
+                },
+            ),
+            (
+                3,
+                -2,
+                SourceControllerCityConstructionProbe {
+                    x: 7,
+                    y: 22,
+                    anchor_x: 9,
+                    anchor_y: 22,
+                    span: 13,
+                },
+            ),
+            (
+                3,
+                -1,
+                SourceControllerCityConstructionProbe {
+                    x: 8,
+                    y: 22,
+                    anchor_x: 0,
+                    anchor_y: 0,
+                    span: 13,
+                },
+            ),
+            (
+                3,
+                0,
+                SourceControllerCityConstructionProbe {
+                    x: 11,
+                    y: 22,
+                    anchor_x: 0,
+                    anchor_y: 0,
+                    span: 13,
+                },
+            ),
+            (
+                3,
+                1,
+                SourceControllerCityConstructionProbe {
+                    x: 12,
+                    y: 22,
+                    anchor_x: 11,
+                    anchor_y: 22,
+                    span: 13,
+                },
+            ),
+        ];
+
+        for (orientation, direction, expected) in cases {
+            assert_eq!(
+                source_controller_city_action_ten_probe(cursor, work(orientation), direction),
+                Some(expected),
+                "orientation {orientation}, direction {direction}"
+            );
+        }
+        assert_eq!(
+            source_controller_city_action_ten_probe(cursor, work(0), -3),
+            None
+        );
+        assert_eq!(
+            source_controller_city_action_ten_probe(cursor, work(4), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn source_controller_action_eleven_scan_replays_fun_00412000() {
+        let work = |orientation: u16| {
+            let mut bytes = [0_u8; 32];
+            bytes[0x1a..0x1c].copy_from_slice(&orientation.to_le_bytes());
+            SourceControllerCityConstructionWork::from_bytes(bytes)
+        };
+        let cursor = SourceControllerCityConstructionCursor {
+            work_index: 0,
+            scan_x: 10,
+            scan_y: 20,
+            remaining: 0,
+            baseline_x: 4,
+            baseline_y: 7,
+        };
+        let cases = [
+            (0, -1, 10, 19, -6),
+            (0, 0, 10, 21, -6),
+            (1, -1, 9, 20, -13),
+            (1, 0, 11, 20, -13),
+            (2, -1, 10, 19, 6),
+            (2, 0, 10, 21, 6),
+            (3, -1, 9, 20, 13),
+            (3, 0, 11, 20, 13),
+        ];
+
+        for (orientation, direction, x, y, span) in cases {
+            assert_eq!(
+                source_controller_city_action_eleven_scan(cursor, work(orientation), direction),
+                Some(SourceControllerCityConstructionScan { x, y, span }),
+                "orientation {orientation}, direction {direction}"
+            );
+        }
+        assert_eq!(
+            source_controller_city_action_eleven_scan(cursor, work(0), 1),
+            None
+        );
+        assert_eq!(
+            source_controller_city_action_eleven_scan(cursor, work(4), 0),
+            None
+        );
     }
 
     #[test]
