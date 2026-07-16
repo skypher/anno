@@ -804,6 +804,63 @@ pub const SOURCE_KIND15_EXECUTOR_FLAGS: u8 = 0x04;
 /// before applying each live figure's source step amount.
 pub const SOURCE_GENERIC_FIGURE_TIME_SCALE: f32 = 0.05;
 
+/// Install the directional motion written by `FUN_0044a690` for a route
+/// byte produced by `FUN_0046cf70`. The executable stores `Speed * 0.0001`
+/// at definition offset `+0x10`, then multiplies by
+/// 32 and divides by generic-record byte `+0x0f`, which `FUN_00446ca0` fixes
+/// at 32.
+pub fn source_dynamic_route_run_motion(
+    figure_definition_id: u8,
+    command: u8,
+) -> Option<(u8, SourceGenericMotion)> {
+    let speed = match figure_definition_id {
+        0x15 | 0x16 => 500.0,
+        0x17 | 0x18 => 400.0,
+        0x19 | 0x1a => 550.0,
+        0x1b | 0x1c => 600.0,
+        0x1d | 0x1e => 480.0,
+        0x1f | 0x20 => 450.0,
+        _ => return None,
+    } * SOURCE_FIGURE_SPEED_SCALE;
+    let direction = command >> 4;
+    let run_length = f32::from(command & 0x0f);
+    if run_length == 0.0 || !(1..=8).contains(&direction) {
+        return None;
+    }
+    let diagonal = matches!(direction, 2 | 4 | 6 | 8);
+    let component = if diagonal {
+        speed * std::f32::consts::FRAC_1_SQRT_2
+    } else {
+        speed
+    };
+    let (velocity_x, velocity_y) = match direction {
+        1 => (0.0, -component),
+        2 => (component, -component),
+        3 => (component, 0.0),
+        4 => (component, component),
+        5 => (0.0, component),
+        6 => (-component, component),
+        7 => (-component, 0.0),
+        8 => (-component, -component),
+        _ => return None,
+    };
+    Some((
+        direction - 1,
+        SourceGenericMotion {
+            remaining_distance: if diagonal {
+                run_length * std::f32::consts::SQRT_2
+            } else {
+                run_length
+            },
+            scalar_speed: speed,
+            velocity_x,
+            velocity_y,
+            velocity_z: 0.0,
+            terminal_motion_locked: false,
+        },
+    ))
+}
+
 /// `FUN_0045e170` scans this shared table for categories 1, 2, 3, and 5.
 pub const SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY: u16 = 150;
 /// `FUN_00449ca0` scans this category-4 table.

@@ -251,7 +251,9 @@ use std::path::Path;
 ///       separately from city owner `+0x1a`.
 /// v134: source controller state-two island cursor, capability selector,
 ///       selected island, and area thresholds persist across saves.
-pub const SAVE_VERSION: u32 = 134;
+/// v135: shared dynamic category-1/2/3 figures retain their live
+///       `FUN_00455a20` route program and cursor.
+pub const SAVE_VERSION: u32 = 135;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -265,7 +267,7 @@ pub const SAVE_VERSION: u32 = 134;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 134;
+pub const MIN_LOADABLE_VERSION: u32 = 135;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -290,6 +292,7 @@ pub struct SaveState {
     pub source_figure_events: crate::source_figure_event::SourceFigureEventRegistry,
     pub source_kind4_occupants: Vec<SourceKind4Occupant>,
     pub source_dynamic_combat_figures: Vec<SourceDynamicCombatFigure>,
+    pub source_dynamic_route_programs: Vec<crate::simulation::SourceDynamicRouteProgram>,
     pub source_kind6_actions: Vec<crate::combat::SourceKind6Action>,
     pub source_kind4_actions: Vec<crate::combat::SourceKind4Action>,
     pub source_kind13_actions: Vec<crate::combat::SourceKind13Action>,
@@ -385,6 +388,7 @@ impl Simulation {
             source_figure_events: self.source_figure_events.clone(),
             source_kind4_occupants: self.source_kind4_occupants.clone(),
             source_dynamic_combat_figures: self.source_dynamic_combat_figures.clone(),
+            source_dynamic_route_programs: self.source_dynamic_route_programs.clone(),
             source_kind6_actions: self.source_kind6_actions.clone(),
             source_kind4_actions: self.source_kind4_actions.clone(),
             source_kind13_actions: self.source_kind13_actions.clone(),
@@ -452,6 +456,7 @@ impl Simulation {
         self.source_figure_events = s.source_figure_events;
         self.source_kind4_occupants = s.source_kind4_occupants;
         self.source_dynamic_combat_figures = s.source_dynamic_combat_figures;
+        self.source_dynamic_route_programs = s.source_dynamic_route_programs;
         self.source_kind6_actions = s.source_kind6_actions;
         self.source_kind4_actions = s.source_kind4_actions;
         self.source_kind13_actions = s.source_kind13_actions;
@@ -573,6 +578,7 @@ mod tests {
             source_figure_events: crate::source_figure_event::SourceFigureEventRegistry::default(),
             source_kind4_occupants: vec![],
             source_dynamic_combat_figures: vec![],
+            source_dynamic_route_programs: vec![],
             source_kind6_actions: vec![],
             source_kind4_actions: vec![],
             source_kind13_actions: vec![],

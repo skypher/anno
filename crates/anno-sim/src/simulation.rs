@@ -30,9 +30,11 @@ use crate::source_cell::{
 };
 use crate::source_figure_event::SourceFigureEventRegistry;
 use crate::source_route::{
-    source_route_positions, SourceDynamicMapObject, SourceDynamicMapObjectTable,
-    SourcePathBlockedCellDecision, SourcePathTargetRect, SourceResolvedDynamicTarget,
-    SourceTargetDescriptor,
+    encode_source_route_truncated, source_route_positions, SourceDynamicMapObject,
+    SourceDynamicMapObjectTable, SourcePathBlockedCellDecision, SourcePathTargetRect,
+    SourceResolvedDynamicTarget, SourceRouteStep, SourceShipRouteWindow,
+    SourceShipTargetRouteBranch, SourceTargetDescriptor, SOURCE_ROUTE_TERMINATOR,
+    SOURCE_SHIP_ROUTE_CAPACITY, SOURCE_SHIP_ROUTE_RUN_LIMIT,
 };
 use crate::trade::{self, TradeRoute, TradeShip};
 use crate::types::{Good, TICKS_PER_MINUTE};
@@ -44,6 +46,17 @@ pub const AUTOSAVE_INTERVAL_MS: u32 = 599_999;
 pub const SOURCE_VISIBLE_ISLAND_SLOTS: usize = 0x32;
 /// `FUN_00456d00` enters its no-target branch after this many source ticks.
 const SOURCE_KIND4_IDLE_TARGET_DELAY_TICKS: u32 = 20;
+
+/// The generic shared-table route bytes at `+0x124` and their `+0x02`
+/// cursor. Dynamic category-one through -three figures own this state even
+/// though their compatibility records are stored separately in the Rust
+/// simulation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SourceDynamicRouteProgram {
+    runtime_slot: u16,
+    program: Vec<u8>,
+    cursor: usize,
+}
 
 /// Timer state for each subsystem.
 #[derive(Debug, Clone)]
@@ -449,6 +462,8 @@ pub struct Simulation {
     /// equivalent local entity type. Categories 1 through 6 remain available
     /// to the common source candidate producer through these records.
     pub source_dynamic_combat_figures: Vec<SourceDynamicCombatFigure>,
+    /// Route programs for shared dynamic categories one through three.
+    pub(crate) source_dynamic_route_programs: Vec<SourceDynamicRouteProgram>,
     /// Immediate category-6 action records emitted through `FUN_004546e0`.
     /// This observability record is independent from compatibility damage.
     pub source_kind6_actions: Vec<combat::SourceKind6Action>,
@@ -836,6 +851,7 @@ impl Simulation {
             source_figure_events: SourceFigureEventRegistry::default(),
             source_kind4_occupants: Vec::new(),
             source_dynamic_combat_figures: Vec::new(),
+            source_dynamic_route_programs: Vec::new(),
             source_kind6_actions: Vec::new(),
             source_kind4_actions: Vec::new(),
             source_kind13_actions: Vec::new(),
@@ -1246,6 +1262,7 @@ impl Simulation {
             return false;
         }
 
+        let runtime_slot = figure.runtime_slot;
         if let Some(index) = self
             .source_dynamic_combat_figures
             .iter()
@@ -1260,6 +1277,9 @@ impl Simulation {
             self.source_dynamic_combat_figures[index] = figure;
         } else {
             self.source_dynamic_combat_figures.push(figure);
+        }
+        if table == 0 {
+            self.clear_source_dynamic_route_program(runtime_slot);
         }
         true
     }
@@ -1555,6 +1575,164 @@ impl Simulation {
             return false;
         };
         self.source_dynamic_combat_figures[index].target_descriptor = descriptor;
+        self.clear_source_dynamic_route_program(handle);
+        true
+    }
+
+    fn clear_source_dynamic_route_program(&mut self, runtime_slot: u16) {
+        self.source_dynamic_route_programs
+            .retain(|route| route.runtime_slot != runtime_slot);
+    }
+
+    fn replace_source_dynamic_route_program(&mut self, runtime_slot: u16, program: Vec<u8>) {
+        let route = SourceDynamicRouteProgram {
+            runtime_slot,
+            program,
+            cursor: 0,
+        };
+        if let Some(index) = self
+            .source_dynamic_route_programs
+            .iter()
+            .position(|existing| existing.runtime_slot == runtime_slot)
+        {
+            self.source_dynamic_route_programs[index] = route;
+        } else {
+            self.source_dynamic_route_programs.push(route);
+        }
+    }
+
+    fn source_dynamic_route_steps(
+        start: (i32, i32),
+        path: Vec<(i32, i32)>,
+    ) -> Option<Vec<SourceRouteStep>> {
+        let mut previous = start;
+        path.into_iter()
+            .map(|next| {
+                let direction = match (next.0 - previous.0, next.1 - previous.1) {
+                    (0, -1) => 1,
+                    (1, -1) => 2,
+                    (1, 0) => 3,
+                    (1, 1) => 4,
+                    (0, 1) => 5,
+                    (-1, 1) => 6,
+                    (-1, 0) => 7,
+                    (-1, -1) => 8,
+                    _ => return None,
+                };
+                previous = next;
+                Some(SourceRouteStep {
+                    direction,
+                    metadata: 0,
+                })
+            })
+            .collect()
+    }
+
+    /// Execute the state-four `FUN_00455a20` route branch for a shared
+    /// category-one through -three figure whose controller target names a
+    /// static kind-`0x34` island cell. The route program is source-owned live
+    /// state, so a descriptor change or table-slot replacement clears it.
+    fn advance_source_dynamic_descriptor_route(&mut self, runtime_slot: u16) -> bool {
+        let Some((figure_definition_id, descriptor, start)) = self
+            .source_dynamic_combat_figures
+            .iter()
+            .find(|figure| {
+                figure.active
+                    && (1..=3).contains(&figure.figure_kind)
+                    && figure.runtime_slot == runtime_slot
+            })
+            .map(|figure| {
+                (
+                    figure.figure_definition_id,
+                    figure.target_descriptor,
+                    (
+                        figure.position.0.trunc() as i32,
+                        figure.position.1.trunc() as i32,
+                    ),
+                )
+            })
+        else {
+            return false;
+        };
+        if descriptor.kind() != 0x34 {
+            return false;
+        }
+
+        let route_needs_rebuild = self
+            .source_dynamic_route_programs
+            .iter()
+            .find(|route| route.runtime_slot == runtime_slot)
+            .is_none_or(|route| {
+                route
+                    .program
+                    .get(route.cursor)
+                    .is_none_or(|command| command & 0xf0 == 0xc0)
+            });
+        if route_needs_rebuild {
+            let program = self
+                .island_maps
+                .iter()
+                .find_map(|map| map.source_ship_target_rect(descriptor))
+                .and_then(|target| {
+                    self.ocean_map
+                        .as_ref()?
+                        .find_source_ship_path_in_window_for_resolved_target(
+                            start,
+                            target,
+                            SourceShipTargetRouteBranch::Threshold {
+                                approach_radius: 5,
+                                limit: 2,
+                            },
+                            SourceShipRouteWindow::Normal,
+                        )
+                })
+                .and_then(|path| Self::source_dynamic_route_steps(start, path))
+                .and_then(|steps| {
+                    encode_source_route_truncated(
+                        &steps,
+                        SOURCE_SHIP_ROUTE_RUN_LIMIT,
+                        SOURCE_SHIP_ROUTE_CAPACITY,
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| vec![SOURCE_ROUTE_TERMINATOR]);
+            self.replace_source_dynamic_route_program(runtime_slot, program);
+        }
+
+        let command = {
+            let Some(route) = self
+                .source_dynamic_route_programs
+                .iter_mut()
+                .find(|route| route.runtime_slot == runtime_slot)
+            else {
+                return true;
+            };
+            let command = route.program.get(route.cursor).copied();
+            if command.is_some_and(|command| command & 0xf0 != 0xc0) {
+                route.cursor += 1;
+            }
+            command
+        };
+        let Some(command) = command else {
+            return true;
+        };
+        let Some((direction, motion)) =
+            combat::source_dynamic_route_run_motion(figure_definition_id, command)
+        else {
+            return true;
+        };
+        if let Some(figure) = self
+            .source_dynamic_combat_figures
+            .iter_mut()
+            .find(|figure| {
+                figure.active
+                    && (1..=3).contains(&figure.figure_kind)
+                    && figure.runtime_slot == runtime_slot
+            })
+        {
+            figure.direction = direction;
+            figure.source_motion = motion;
+        }
         true
     }
 
@@ -2997,6 +3175,9 @@ impl Simulation {
         }
 
         for runtime_slot in controller_runtime_slots {
+            if self.advance_source_dynamic_descriptor_route(runtime_slot) {
+                continue;
+            }
             let Some(selected) = self.source_kind13_selected_target(runtime_slot) else {
                 continue;
             };
@@ -9228,6 +9409,57 @@ mod tests {
             attacker.source_motion,
             combat::SourceGenericMotion::stationary_turn_delay()
         );
+    }
+
+    #[test]
+    fn source_dynamic_state_four_installs_the_first_static_target_route_run() {
+        let scenario = anno_formats::szs::SzsFile {
+            chunks: Vec::new(),
+            islands: Vec::new(),
+            players: Vec::new(),
+            mission: None,
+            scenario: Default::default(),
+            ships: Vec::new(),
+            land_figures: Vec::new(),
+        };
+        let mut sim = Simulation::new();
+        sim.ocean_map = Some(OceanMap::from_source_scenario(&scenario, &[]));
+        sim.island_maps.push(IslandMap::new_open(7, 16, 16));
+        sim.source_dynamic_combat_figures
+            .push(SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 1,
+                candidate_list_key: 7,
+                figure_definition_id: 0x15,
+                direction: 0,
+                source_payload: 0,
+                position: (1.5, 3.5),
+                position_z: 0.0,
+                source_energy: 195,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_source_kind34_island_cell(7, 12, 3),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 0,
+                state: 4,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 0,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion::default(),
+            });
+
+        sim.tick_source_dynamic_combat_motion(20);
+
+        let figure = &sim.source_dynamic_combat_figures[0];
+        assert_eq!(figure.direction, 2);
+        assert_eq!(figure.source_motion.remaining_distance, 2.0);
+        assert_eq!(figure.source_motion.scalar_speed, 0.05);
+        assert_eq!(figure.source_motion.velocity_x, 0.05);
+        assert_eq!(figure.source_motion.velocity_y, 0.0);
+        assert_eq!(sim.source_dynamic_route_programs[0].program[0], 0x32);
     }
 
     #[test]
