@@ -234,7 +234,9 @@ use std::path::Path;
 ///       city-strength targets, and source player-state bytes.
 /// v124: source figure purchases retain the shared category-1/2/3/5 control
 ///       bytes that gate `0x84d` ownership transfers.
-pub const SAVE_VERSION: u32 = 124;
+/// v125: source player-controller timers, action stacks, city gates, and
+///       category-1/2/3 roster state retain `FUN_0042b4b0` scheduling.
+pub const SAVE_VERSION: u32 = 125;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -248,7 +250,7 @@ pub const SAVE_VERSION: u32 = 124;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 124;
+pub const MIN_LOADABLE_VERSION: u32 = 125;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -289,6 +291,9 @@ pub struct SaveState {
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
     pub source_shared_figure_control_flags:
         [u8; crate::combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY as usize],
+    pub source_player_controllers:
+        [crate::simulation::SourcePlayerController; crate::combat::SOURCE_KIND4_PLAYER_SLOT_COUNT],
+    pub source_player_controller_cursor: u8,
     pub source_time_ticks: u32,
     pub source_time_remainder_ms: u32,
     pub source_resource_environment_elapsed_ms: u32,
@@ -379,6 +384,8 @@ impl Simulation {
             tile_clears: self.tile_clears.clone(),
             source_kind4_dispatch: self.source_kind4_dispatch,
             source_shared_figure_control_flags: self.source_shared_figure_control_flags,
+            source_player_controllers: self.source_player_controllers.clone(),
+            source_player_controller_cursor: self.source_player_controller_cursor,
             source_time_ticks: self.source_time_ticks,
             source_time_remainder_ms: self.source_time_remainder_ms,
             source_resource_environment_elapsed_ms: self.source_resource_environment_elapsed_ms,
@@ -443,6 +450,8 @@ impl Simulation {
         self.tile_clears = s.tile_clears;
         self.source_kind4_dispatch = s.source_kind4_dispatch;
         self.source_shared_figure_control_flags = s.source_shared_figure_control_flags;
+        self.source_player_controllers = s.source_player_controllers;
+        self.source_player_controller_cursor = s.source_player_controller_cursor;
         self.source_time_ticks = s.source_time_ticks;
         self.source_time_remainder_ms = s.source_time_remainder_ms;
         self.source_resource_environment_elapsed_ms = s.source_resource_environment_elapsed_ms;
@@ -562,6 +571,10 @@ mod tests {
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_shared_figure_control_flags: [0;
                 crate::combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY as usize],
+            source_player_controllers: std::array::from_fn(|_| {
+                crate::simulation::SourcePlayerController::default()
+            }),
+            source_player_controller_cursor: 0,
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
             source_resource_environment_elapsed_ms: 0,
@@ -845,6 +858,23 @@ mod tests {
             faction_states: [0x0c, 0x0c, 0, 0x0c, 0x0d, 0x0e, 0x0b],
         };
         sim.source_shared_figure_control_flags[9] = 0x40;
+        sim.source_player_controller_cursor = 4;
+        sim.source_player_controllers[2] = crate::simulation::SourcePlayerController {
+            initialized: true,
+            action_timer_ms: 47,
+            city_management_timer_ms: 9_999,
+            maintenance_timer_ms: 2_998,
+            desired_figure_count: 3,
+            figure_capacity: 4,
+            city_management_profile_present: true,
+            active_city_owner: Some(2),
+            selected_city_active: false,
+            city_management_disabled: false,
+            action_stack: vec![8, 9],
+            purchase_predecessor_issued: false,
+            owned_figure_handles: vec![4, 7],
+            figure_roster_dirty: true,
+        };
         let mut source_route_program = crate::combat::default_source_kind4_route_program();
         source_route_program[0] = 0x31;
         source_route_program[1] = 0x42;
@@ -1401,6 +1431,26 @@ mod tests {
             }
         );
         assert_eq!(sim2.source_shared_figure_control_flags[9], 0x40);
+        assert_eq!(sim2.source_player_controller_cursor, 4);
+        assert_eq!(
+            sim2.source_player_controllers[2],
+            crate::simulation::SourcePlayerController {
+                initialized: true,
+                action_timer_ms: 47,
+                city_management_timer_ms: 9_999,
+                maintenance_timer_ms: 2_998,
+                desired_figure_count: 3,
+                figure_capacity: 4,
+                city_management_profile_present: true,
+                active_city_owner: Some(2),
+                selected_city_active: false,
+                city_management_disabled: false,
+                action_stack: vec![8, 9],
+                purchase_predecessor_issued: false,
+                owned_figure_handles: vec![4, 7],
+                figure_roster_dirty: true,
+            }
+        );
         assert_eq!(
             sim2.source_kind4_occupants,
             vec![crate::data_bridge::SourceKind4Occupant {

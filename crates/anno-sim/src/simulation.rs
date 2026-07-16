@@ -160,6 +160,69 @@ pub struct SourceFigurePurchaseEvent {
     pub amount: u16,
 }
 
+/// Controller bytes consumed by the `FUN_0042b4b0` city-management branch.
+///
+/// The complete controller occupies `0x11e88` bytes in the executable. This
+/// preserves the fields that select and pace `FUN_00422150` / `FUN_00422030`:
+/// the action stack, live category-1/2/3 roster, active city, and its three
+/// scheduler timers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourcePlayerController {
+    /// Has `FUN_0040f580` initialized this controller slot?
+    pub initialized: bool,
+    /// Controller `+0x4`, decremented by `FUN_0042b4b0` and replenished by 50.
+    pub action_timer_ms: i32,
+    /// Controller `+0x0c`, the city-management timer replenished by 10,000.
+    pub city_management_timer_ms: i32,
+    /// Controller `+0x14`, retained for the adjacent 6,000-ms management path.
+    pub maintenance_timer_ms: i32,
+    /// Controller `+0x18`, the desired controlled-figure count.
+    pub desired_figure_count: u32,
+    /// Controller `+0x4dc`, computed by `FUN_00423710` before this branch.
+    pub figure_capacity: u32,
+    /// Controller `+0x10638`: a non-null city-management profile enables the
+    /// ten-second `FUN_00424bf0` branch.
+    pub city_management_profile_present: bool,
+    /// Owner byte of the controller's `+0x3e7c` active city, when present.
+    pub active_city_owner: Option<u8>,
+    /// Whether `FUN_0040fcb0` accepts the selected map city.
+    pub selected_city_active: bool,
+    /// Source `PLAYER4 + 0x70` bit six, which bypasses `FUN_00424bf0`.
+    pub city_management_disabled: bool,
+    /// Controller `+0x24` / `+0x34` action stack. The city purchase path only
+    /// runs while its top action is greater than eight.
+    pub action_stack: Vec<u8>,
+    /// Result of the preceding `FUN_00421d30` priority branch. A true value
+    /// means that function issued a city action and therefore suppresses a
+    /// purchase on this city-management pass.
+    pub purchase_predecessor_issued: bool,
+    /// Controller `+0x10734` roster rebuilt by `FUN_0044f000`.
+    pub owned_figure_handles: Vec<u16>,
+    /// Player byte `+0x7d`: `FUN_0042b4b0` rebuilds the roster when set.
+    pub figure_roster_dirty: bool,
+}
+
+impl Default for SourcePlayerController {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            action_timer_ms: 0,
+            city_management_timer_ms: 0,
+            maintenance_timer_ms: 0,
+            desired_figure_count: 0,
+            figure_capacity: 0,
+            city_management_profile_present: false,
+            active_city_owner: None,
+            selected_city_active: false,
+            city_management_disabled: false,
+            action_stack: Vec::new(),
+            purchase_predecessor_issued: false,
+            owned_figure_handles: Vec::new(),
+            figure_roster_dirty: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum SourceSharedFigureEntity {
     MilitaryUnit(usize),
@@ -343,6 +406,10 @@ pub struct Simulation {
     /// controller can purchase the corresponding figure.
     pub source_shared_figure_control_flags:
         [u8; combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY as usize],
+    /// Per-player controller state used by `FUN_0042b4b0`.
+    pub source_player_controllers: [SourcePlayerController; combat::SOURCE_KIND4_PLAYER_SLOT_COUNT],
+    /// `DAT_006b111c`: physical player cursor for the controller scheduler.
+    pub source_player_controller_cursor: u8,
     /// `DAT_005b6040`: source simulation clock in 100-ms ticks.
     pub source_time_ticks: u32,
     /// Milliseconds not yet promoted into `source_time_ticks`.
@@ -690,6 +757,8 @@ impl Simulation {
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_shared_figure_control_flags: [0; combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY
                 as usize],
+            source_player_controllers: std::array::from_fn(|_| SourcePlayerController::default()),
+            source_player_controller_cursor: 0,
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
             source_resource_environment_elapsed_ms: 0,
@@ -1470,6 +1539,8 @@ impl Simulation {
         }
         self.source_shared_figure_control_flags[usize::from(event.figure_handle)] &= !0x40;
         self.transfer_source_shared_figure(entity, event.buyer);
+        self.mark_source_controller_figure_roster_dirty(seller);
+        self.mark_source_controller_figure_roster_dirty(event.buyer);
 
         if self.source_purchase_actor_is_eligible(event.buyer) {
             if let Some(player) = self.players.get_mut(usize::from(event.buyer)) {
@@ -1528,6 +1599,161 @@ impl Simulation {
         };
         self.execute_source_figure_purchase(event);
         Some(event)
+    }
+
+    /// Set player byte `+0x7d`, causing the next `FUN_0042b4b0` pass for this
+    /// controller to rebuild `+0x10734` through `FUN_0044f000`.
+    pub fn mark_source_controller_figure_roster_dirty(&mut self, player_slot: u8) {
+        if let Some(controller) = self
+            .source_player_controllers
+            .get_mut(usize::from(player_slot))
+        {
+            controller.figure_roster_dirty = true;
+        }
+    }
+
+    fn initialize_source_player_controller(&mut self, player_slot: usize) {
+        if self
+            .source_player_controllers
+            .get(player_slot)
+            .is_none_or(|controller| controller.initialized)
+        {
+            return;
+        }
+
+        let faction_state = self
+            .source_kind4_dispatch
+            .faction_states
+            .get(player_slot)
+            .copied()
+            .unwrap_or(u8::MAX);
+        let action_timer_ms = i32::from(self.next_source_rand() & 0x0fff);
+        let controller = &mut self.source_player_controllers[player_slot];
+        controller.initialized = true;
+        controller.action_timer_ms = action_timer_ms;
+        controller.city_management_timer_ms = 20_000;
+        controller.maintenance_timer_ms = 3_000;
+        if faction_state == 0x0c {
+            controller.desired_figure_count = 3;
+        }
+        controller.figure_roster_dirty = true;
+    }
+
+    fn refresh_source_player_controller_roster(&mut self, player_slot: usize) {
+        let owner = player_slot as u8;
+        let handles = (0..combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY)
+            .filter(|&handle| {
+                let Some(entity) = self.source_shared_figure_entity(handle) else {
+                    return false;
+                };
+                self.source_shared_figure_purchase_fields(entity)
+                    .is_some_and(|(kind, figure_owner, _, _)| {
+                        (1..=3).contains(&kind) && figure_owner == owner
+                    })
+            })
+            .collect();
+        let controller = &mut self.source_player_controllers[player_slot];
+        controller.owned_figure_handles = handles;
+        controller.figure_roster_dirty = false;
+    }
+
+    fn tick_source_player_controller_city_management(
+        &mut self,
+        player_slot: usize,
+    ) -> Option<SourceFigurePurchaseEvent> {
+        let controller = &self.source_player_controllers[player_slot];
+        if controller.city_management_disabled
+            || !controller.city_management_profile_present
+            || controller.desired_figure_count == 0
+            || controller.active_city_owner != Some(player_slot as u8)
+            || controller.selected_city_active
+        {
+            return None;
+        }
+
+        let action_top = controller.action_stack.last().copied().unwrap_or_default();
+        if action_top <= 8
+            || controller.purchase_predecessor_issued
+            || !controller.owned_figure_handles.is_empty()
+        {
+            return None;
+        }
+
+        let figure_capacity = controller.figure_capacity;
+        self.source_controller_purchase_figure(player_slot as u8, 0, figure_capacity)
+    }
+
+    /// Replay the scheduling portion of `FUN_0042b4b0`. The source decrements
+    /// all active-controller timers first, then advances its physical player
+    /// cursor until a pass performs no controller work. Only the recovered
+    /// `FUN_00424bf0` -> `FUN_00422150` -> `FUN_00422030` purchase branch is
+    /// executed here; other action-stack handlers retain their own paths.
+    fn tick_source_player_controllers(&mut self, dt_ms: u32) {
+        if !self.source_kind4_dispatch.remote_owner_dispatch_enabled {
+            return;
+        }
+
+        for player_slot in 0..combat::SOURCE_KIND4_PLAYER_SLOT_COUNT {
+            self.initialize_source_player_controller(player_slot);
+            let faction_state = self.source_kind4_dispatch.faction_states[player_slot];
+            if !matches!(faction_state, 0x0c | 0x0e) {
+                continue;
+            }
+            let controller = &mut self.source_player_controllers[player_slot];
+            if controller.action_timer_ms > -50 {
+                controller.action_timer_ms =
+                    controller.action_timer_ms.saturating_sub(dt_ms as i32);
+            }
+            if controller.city_management_timer_ms >= 0 {
+                controller.city_management_timer_ms = controller
+                    .city_management_timer_ms
+                    .saturating_sub(dt_ms as i32);
+            }
+            if controller.maintenance_timer_ms >= 0 {
+                controller.maintenance_timer_ms =
+                    controller.maintenance_timer_ms.saturating_sub(dt_ms as i32);
+            }
+        }
+
+        let mut continue_scheduler = true;
+        while continue_scheduler {
+            let player_slot = usize::from(self.source_player_controller_cursor);
+            let faction_state = self.source_kind4_dispatch.faction_states[player_slot];
+            let mut no_controller_work = true;
+
+            if faction_state == 0x0c {
+                if self.source_player_controllers[player_slot].figure_roster_dirty {
+                    self.refresh_source_player_controller_roster(player_slot);
+                }
+                if self.source_player_controllers[player_slot].action_timer_ms < 1 {
+                    self.source_player_controllers[player_slot].action_timer_ms = self
+                        .source_player_controllers[player_slot]
+                        .action_timer_ms
+                        .saturating_add(50);
+                    no_controller_work = false;
+                }
+                if self.source_player_controllers[player_slot].city_management_profile_present
+                    && self.source_player_controllers[player_slot].city_management_timer_ms < 0
+                {
+                    let _ = self.tick_source_player_controller_city_management(player_slot);
+                    self.source_player_controllers[player_slot].city_management_timer_ms = self
+                        .source_player_controllers[player_slot]
+                        .city_management_timer_ms
+                        .saturating_add(10_000);
+                    no_controller_work = false;
+                }
+            }
+
+            self.source_player_controller_cursor =
+                self.source_player_controller_cursor.wrapping_add(1);
+            if usize::from(self.source_player_controller_cursor)
+                == combat::SOURCE_KIND4_PLAYER_SLOT_COUNT
+            {
+                self.source_player_controller_cursor = 0;
+                return;
+            }
+            continue_scheduler = !no_controller_work;
+        }
     }
 
     fn tick_events(&mut self) {
@@ -1614,6 +1840,7 @@ impl Simulation {
 
         self.tick_source_city_dispatch(dt_ms);
         self.tick_source_kind13_dispatch(dt_ms);
+        self.tick_source_player_controllers(dt_ms);
 
         // Entity movement (every step)
         self.tick_entities(dt_ms);
@@ -7308,6 +7535,94 @@ mod tests {
 
         sim.players[0].gold = 1_050;
         assert_eq!(sim.source_controller_purchase_figure(0, 0, 1), None);
+    }
+
+    #[test]
+    fn source_controller_scheduler_runs_the_due_city_purchase_branch() {
+        let mut sim = Simulation::new();
+        sim.players = vec![Player::new_human(0), Player::new_ai(1, 0)];
+        sim.players[0].gold = 1_051;
+        sim.source_kind4_dispatch.remote_owner_dispatch_enabled = true;
+        sim.source_kind4_dispatch.faction_states = [0x0c, 0, 7, 7, 7, 7, 7];
+
+        let mut ship = TradeShip::new(1, 0, 0, 0);
+        ship.source_figure_kind = Some(1);
+        ship.source_runtime_slot = Some(7);
+        ship.source_figure_definition_id = Some(0x15);
+        ship.source_energy = 150;
+        sim.trade_ships.push(ship);
+        sim.set_source_figure_purchase_enabled(7, true);
+
+        sim.source_player_controllers[0] = SourcePlayerController {
+            initialized: true,
+            action_timer_ms: 1,
+            city_management_timer_ms: -1,
+            maintenance_timer_ms: 0,
+            desired_figure_count: 3,
+            figure_capacity: 1,
+            city_management_profile_present: true,
+            active_city_owner: Some(0),
+            selected_city_active: false,
+            city_management_disabled: false,
+            action_stack: vec![9],
+            purchase_predecessor_issued: false,
+            owned_figure_handles: vec![],
+            figure_roster_dirty: false,
+        };
+
+        sim.tick_source_player_controllers(1);
+
+        assert_eq!(sim.trade_ships[0].owner, 0);
+        assert_eq!(sim.players[0].gold, 1);
+        assert_eq!(sim.players[1].gold, 21_050);
+        assert_eq!(sim.source_player_controllers[0].action_timer_ms, 50);
+        assert_eq!(
+            sim.source_player_controllers[0].city_management_timer_ms,
+            9_999
+        );
+        assert!(sim.source_player_controllers[0].figure_roster_dirty);
+    }
+
+    #[test]
+    fn source_controller_scheduler_preserves_the_predecessor_gate() {
+        let mut sim = Simulation::new();
+        sim.players = vec![Player::new_human(0), Player::new_ai(1, 0)];
+        sim.players[0].gold = 1_051;
+        sim.source_kind4_dispatch.remote_owner_dispatch_enabled = true;
+        sim.source_kind4_dispatch.faction_states = [0x0c, 0, 7, 7, 7, 7, 7];
+
+        let mut ship = TradeShip::new(1, 0, 0, 0);
+        ship.source_figure_kind = Some(1);
+        ship.source_runtime_slot = Some(7);
+        ship.source_figure_definition_id = Some(0x15);
+        ship.source_energy = 150;
+        sim.trade_ships.push(ship);
+        sim.set_source_figure_purchase_enabled(7, true);
+        sim.source_player_controllers[0] = SourcePlayerController {
+            initialized: true,
+            action_timer_ms: 1,
+            city_management_timer_ms: -1,
+            maintenance_timer_ms: 0,
+            desired_figure_count: 3,
+            figure_capacity: 1,
+            city_management_profile_present: true,
+            active_city_owner: Some(0),
+            selected_city_active: false,
+            city_management_disabled: false,
+            action_stack: vec![9],
+            purchase_predecessor_issued: true,
+            owned_figure_handles: vec![],
+            figure_roster_dirty: false,
+        };
+
+        sim.tick_source_player_controllers(1);
+
+        assert_eq!(sim.trade_ships[0].owner, 1);
+        assert_eq!(sim.players[0].gold, 1_051);
+        assert_eq!(
+            sim.source_player_controllers[0].city_management_timer_ms,
+            9_999
+        );
     }
 
     #[test]
