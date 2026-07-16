@@ -1525,6 +1525,30 @@ impl Simulation {
         }
     }
 
+    /// Write the live `FUN_004458f0` target descriptor used by the controller
+    /// before it calls `FUN_004489e0` for a selected shared figure.
+    fn set_source_shared_figure_target_descriptor(
+        &mut self,
+        handle: u16,
+        descriptor: SourceTargetDescriptor,
+    ) -> bool {
+        let Some(entity) = self.source_shared_figure_entity(handle) else {
+            return false;
+        };
+        match entity {
+            SourceSharedFigureEntity::MilitaryUnit(index) => {
+                self.military_units[index].source_target_descriptor = Some(descriptor);
+            }
+            SourceSharedFigureEntity::TradeShip(index) => {
+                self.trade_ships[index].source_target_descriptor = Some(descriptor);
+            }
+            SourceSharedFigureEntity::DynamicFigure(index) => {
+                self.source_dynamic_combat_figures[index].target_descriptor = descriptor;
+            }
+        }
+        true
+    }
+
     fn source_shared_figure_purchase_fields(
         &self,
         entity: SourceSharedFigureEntity,
@@ -2266,12 +2290,21 @@ impl Simulation {
             3 => (source_x - 2, source_y),
             _ => (source_x, source_y - 2),
         };
+        let target_island_id = self.source_player_controllers[player_slot].island_search_cursor;
+        let figure_target = SourceTargetDescriptor::from_source_kind34_island_cell(
+            target_island_id,
+            source_x as u8,
+            source_y as u8,
+        );
+        if !self.set_source_shared_figure_target_descriptor(figure_handle, figure_target) {
+            return false;
+        }
         let controller = &mut self.source_player_controllers[player_slot];
         controller.action_figure_handle = Some(figure_handle);
         controller.action_source_candidate_tile = Some((source_x, source_y));
         controller.action_target_direction = Some(direction);
         controller.action_target_tile = Some((target_x as u8, target_y as u8));
-        controller.action_target_island_id = Some(controller.island_search_cursor);
+        controller.action_target_island_id = Some(target_island_id);
         if !controller.action_stack.contains(&4) {
             controller.action_stack.push(4);
         }
@@ -8621,6 +8654,22 @@ mod tests {
         ));
         assert!(sim.source_controller_city_has_large_population(0));
         assert!(!sim.source_controller_city_has_large_population(1));
+    }
+
+    #[test]
+    fn source_controller_writes_kind34_target_to_selected_shared_figure() {
+        let mut sim = Simulation::new();
+        let mut unit = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 0, 0);
+        unit.source_figure_kind = Some(1);
+        unit.source_live_runtime_slot = Some(7);
+        sim.military_units.push(unit);
+
+        let descriptor = SourceTargetDescriptor::from_source_kind34_island_cell(4, 12, 13);
+        assert!(sim.set_source_shared_figure_target_descriptor(7, descriptor));
+        assert_eq!(
+            sim.military_units[0].source_target_descriptor,
+            Some(descriptor)
+        );
     }
 
     #[test]
