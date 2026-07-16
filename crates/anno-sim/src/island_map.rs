@@ -647,6 +647,13 @@ impl IslandMap {
         distance
     }
 
+    /// Source map-word direction bits `13..14` used by `FUN_004172e0` to
+    /// choose its line-distance ray and final construction offset.
+    pub fn source_controller_city_map_direction(&self, x: i32, y: i32) -> Option<u8> {
+        self.source_map_kind_cell((x, y))
+            .map(|cell| cell.map_direction)
+    }
+
     /// `FUN_00417120` over a clamped local square.
     pub fn source_controller_city_green_density(
         &self,

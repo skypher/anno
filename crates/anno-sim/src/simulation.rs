@@ -213,6 +213,12 @@ pub struct SourcePlayerController {
     /// Controller `+0x1db4` / `+0x1db8`, the state-three target tile passed
     /// to the `FUN_004084d0` construction command in state four.
     pub action_target_tile: Option<(u8, u8)>,
+    /// Controller `+0x1dc0` / `+0x1dc4`, the segment-head candidate selected
+    /// by state three before it applies the construction offset.
+    pub action_source_candidate_tile: Option<(i32, i32)>,
+    /// Controller `+0x1dbc`, the source map-word direction retained with the
+    /// selected state-three construction target.
+    pub action_target_direction: Option<u8>,
     /// Controller `+0x1dc8`, advanced before every state-two island probe and
     /// wrapped through the source's fifty physical island slots.
     pub island_search_cursor: u8,
@@ -280,6 +286,8 @@ impl Default for SourcePlayerController {
             action_figure_handle: None,
             action_target_island_id: None,
             action_target_tile: None,
+            action_source_candidate_tile: None,
+            action_target_direction: None,
             island_search_cursor: 0,
             island_search_requirement: None,
             island_search_selected_island_id: None,
@@ -1863,6 +1871,8 @@ impl Simulation {
         controller.action_figure_handle = None;
         controller.action_target_island_id = None;
         controller.action_target_tile = None;
+        controller.action_source_candidate_tile = None;
+        controller.action_target_direction = None;
         controller.island_search_cursor = 0;
         controller.island_search_requirement = None;
         controller.island_search_selected_island_id = None;
@@ -2138,6 +2148,154 @@ impl Simulation {
         false
     }
 
+    /// `FUN_0040f4d0`: any source city owned by this controller with at least
+    /// 1200 residents across its five BGRUPPE totals selects the short
+    /// state-three line-distance branch.
+    fn source_controller_city_has_large_population(&self, player_slot: usize) -> bool {
+        self.source_cities.active_records().into_iter().any(|city| {
+            city.owner_slot == player_slot as u8
+                && city.tier_population.into_iter().sum::<u32>() >= 0x4b0
+        })
+    }
+
+    /// Replay `FUN_004172e0`: consume state three, choose the strict-largest
+    /// action-two rectangle, score one head from each `FUN_004160c0` segment,
+    /// and queue state four for the first strict green-density maximum.
+    pub fn advance_source_controller_city_candidate_search(&mut self, player_slot: usize) -> bool {
+        let Some(controller) = self.source_player_controllers.get(player_slot) else {
+            return false;
+        };
+        if controller.action_stack.last().copied() != Some(3) {
+            return false;
+        }
+        let Some(island_id) = controller.island_search_selected_island_id else {
+            return false;
+        };
+        let Some(map) = self
+            .island_maps
+            .iter()
+            .find(|map| map.island_id == island_id)
+        else {
+            return false;
+        };
+
+        let rectangles = controller.source_city_rectangles.clone();
+        let area_threshold = controller.island_search_area_threshold;
+        let desired_figure_count = controller.desired_figure_count;
+        let selected_figure = controller
+            .action_figure_handle
+            .or_else(|| controller.owned_figure_handles.first().copied());
+        self.source_player_controllers[player_slot].action_stack.pop();
+
+        let mut rectangle = None;
+        let mut largest_area = 0_u32;
+        for candidate in rectangles {
+            if largest_area < candidate.area {
+                largest_area = candidate.area;
+                rectangle = Some(candidate);
+            }
+        }
+        let Some(rectangle) = rectangle else {
+            self.source_player_controllers[player_slot].action_stack.push(3);
+            return false;
+        };
+        let rounded_quarter_threshold =
+            (area_threshold.wrapping_add((area_threshold >> 31) & 3)) >> 2;
+        if i64::from(rounded_quarter_threshold) >= i64::from(rectangle.area) {
+            self.source_player_controllers[player_slot].action_stack.push(3);
+            return false;
+        }
+
+        let faction_state = self
+            .source_kind4_dispatch
+            .faction_states
+            .get(player_slot)
+            .copied()
+            .unwrap_or(u8::MAX);
+        let minimum_segment_length = if faction_state == 0x0c { 4 } else { 3 };
+        let long_line_mode = self.source_controller_city_has_large_population(player_slot)
+            || desired_figure_count > 1;
+        let segments = map.source_controller_city_candidate_segments(
+            7,
+            i32::from(rectangle.x0) - 1,
+            i32::from(rectangle.y0) - 1,
+            i32::from(rectangle.x1) + 1,
+            i32::from(rectangle.y1) + 1,
+            minimum_segment_length,
+            minimum_segment_length,
+        );
+        let mut selected = None;
+        let mut best_green_density = 0_u32;
+        for segment in segments {
+            let (x, y) = if segment.x0 == segment.x1 {
+                (segment.x0, segment.y0 + 1)
+            } else {
+                (segment.x0 + 1, segment.y0)
+            };
+            if !map.source_controller_city_boundary_clear(x, y) {
+                continue;
+            }
+            let Some(direction) = map.source_controller_city_map_direction(x, y) else {
+                continue;
+            };
+            let line_distance =
+                map.source_controller_city_line_distance(7, x, y, direction.wrapping_sub(1) & 3);
+            let green_density = map.source_controller_city_green_density(7, x, y, 0x20);
+            let ware_five_density = map.source_controller_city_ware_five_density(7, x, y, 0x0c);
+            let eligible = if long_line_mode {
+                line_distance > 12
+            } else {
+                line_distance > 21 && ware_five_density > 60
+            };
+            if eligible && best_green_density < green_density {
+                selected = Some((x, y, direction));
+                best_green_density = green_density;
+            }
+        }
+        let Some((source_x, source_y, direction)) = selected else {
+            self.source_player_controllers[player_slot].action_stack.push(3);
+            return false;
+        };
+        let Some(figure_handle) = selected_figure else {
+            return false;
+        };
+
+        let (target_x, target_y) = match direction {
+            1 => (source_x + 1, source_y),
+            2 => (source_x, source_y + 1),
+            3 => (source_x - 2, source_y),
+            _ => (source_x, source_y - 2),
+        };
+        let controller = &mut self.source_player_controllers[player_slot];
+        controller.action_figure_handle = Some(figure_handle);
+        controller.action_source_candidate_tile = Some((source_x, source_y));
+        controller.action_target_direction = Some(direction);
+        controller.action_target_tile = Some((target_x as u8, target_y as u8));
+        controller.action_target_island_id = Some(controller.island_search_cursor);
+        if !controller.action_stack.contains(&4) {
+            controller.action_stack.push(4);
+        }
+        true
+    }
+
+    /// Recovered action cases from `FUN_00429aa0` that have complete local
+    /// suppliers. State four remains figure-motion driven by `FUN_00417690`.
+    fn dispatch_source_controller_action(&mut self, player_slot: usize) {
+        match self.source_player_controllers[player_slot]
+            .action_stack
+            .last()
+            .copied()
+        {
+            Some(2) => {
+                let _ = self.advance_source_controller_city_area_search(player_slot);
+            }
+            Some(3) => {
+                let _ = self.advance_source_controller_city_candidate_search(player_slot);
+            }
+            _ => {}
+        }
+    }
+
     /// Complete the successful `FUN_00417690` state-four arrival. State three
     /// has already selected the owned figure and target tile; this routine
     /// replays the resulting `FUN_004084d0` city allocation, records the
@@ -2229,7 +2387,8 @@ impl Simulation {
     /// Replay the scheduling portion of `FUN_0042b4b0`. The source decrements
     /// all active-controller timers first, then advances its physical player
     /// cursor until a pass performs no controller work. Only the recovered
-    /// `FUN_00424bf0` -> `FUN_00422150` -> `FUN_00422030` purchase branch is
+    /// `FUN_00429aa0` action-two/action-three cases and the
+    /// `FUN_00424bf0` -> `FUN_00422150` -> `FUN_00422030` purchase branch are
     /// executed here; other action-stack handlers retain their own paths.
     fn tick_source_player_controllers(&mut self, dt_ms: u32) {
         if !self.source_kind4_dispatch.remote_owner_dispatch_enabled {
@@ -2273,6 +2432,7 @@ impl Simulation {
                         .source_player_controllers[player_slot]
                         .action_timer_ms
                         .saturating_add(50);
+                    self.dispatch_source_controller_action(player_slot);
                     no_controller_work = false;
                 }
                 if self.source_player_controllers[player_slot]
@@ -8401,6 +8561,66 @@ mod tests {
         let controller = &sim.source_player_controllers[0];
         assert!(controller.source_city_rectangles.is_empty());
         assert!(controller.action_stack.is_empty());
+    }
+
+    #[test]
+    fn source_controller_scheduler_dispatches_action_two_on_its_50ms_gate() {
+        let mut sim = Simulation::new();
+        sim.source_kind4_dispatch.remote_owner_dispatch_enabled = true;
+        sim.source_kind4_dispatch.faction_states[0] = 0x0c;
+        sim.island_maps.push(IslandMap::new_open(4, 8, 8));
+        sim.source_player_controllers[0] = SourcePlayerController {
+            initialized: true,
+            action_timer_ms: 0,
+            island_search_selected_island_id: Some(4),
+            island_search_area_threshold: 1,
+            action_stack: vec![2],
+            ..Default::default()
+        };
+
+        sim.tick_source_player_controllers(0);
+        let controller = &sim.source_player_controllers[0];
+        assert_eq!(controller.action_timer_ms, 50);
+        assert!(controller.source_city_rectangles.is_empty());
+        assert!(controller.action_stack.is_empty());
+    }
+
+    #[test]
+    fn source_controller_state_three_requeues_when_no_segment_survives() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(4, 8, 8));
+        sim.source_player_controllers[0] = SourcePlayerController {
+            island_search_cursor: 4,
+            island_search_selected_island_id: Some(4),
+            island_search_area_threshold: 400,
+            source_city_rectangles: vec![SourceControllerCityRectangle {
+                x0: 0,
+                y0: 0,
+                x1: 6,
+                y1: 6,
+                area: 200,
+            }],
+            action_stack: vec![3],
+            ..Default::default()
+        };
+
+        assert!(!sim.advance_source_controller_city_candidate_search(0));
+        assert_eq!(sim.source_player_controllers[0].action_stack, vec![3]);
+    }
+
+    #[test]
+    fn source_controller_state_three_population_mode_uses_all_bgruppe_totals() {
+        let mut sim = Simulation::new();
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                owner_slot: 0,
+                tier_population: [200, 200, 200, 200, 400],
+                ..Default::default()
+            })
+        ));
+        assert!(sim.source_controller_city_has_large_population(0));
+        assert!(!sim.source_controller_city_has_large_population(1));
     }
 
     #[test]
