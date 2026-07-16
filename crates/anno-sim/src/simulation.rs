@@ -205,9 +205,9 @@ impl SourceControllerCityConstructionWork {
 }
 
 /// The `FUN_00417aa0` construction-work queue. The source retains at most
-/// 256 records, rejects priorities at most one, and replaces the first
-/// lowest-priority entry only when a full queue contains a priority at most
-/// three and the incoming priority exceeds three.
+/// 256 records, rejects priorities at most one, and, when full, replaces the
+/// first stored entry whose priority is at most three only for an incoming
+/// priority above three.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct SourceControllerCityConstructionQueue {
     entries: Vec<SourceControllerCityConstructionWork>,
@@ -231,18 +231,14 @@ impl SourceControllerCityConstructionQueue {
         if work.priority() <= 3 {
             return false;
         }
-        let Some((index, priority)) = self
+        let Some(index) = self
             .entries
             .iter()
             .enumerate()
-            .min_by_key(|(_, entry)| entry.priority())
-            .map(|(index, entry)| (index, entry.priority()))
+            .find_map(|(index, entry)| (entry.priority() <= 3).then_some(index))
         else {
             return false;
         };
-        if priority > 3 {
-            return false;
-        }
         self.entries[index] = work;
         true
     }
@@ -8364,24 +8360,36 @@ mod tests {
 
     #[test]
     fn source_controller_construction_queue_replays_fun_00417aa0_priority_rules() {
-        let work = |priority: i16| {
+        let work = |priority: i16, marker: u8| {
             let mut bytes = [0_u8; 32];
+            bytes[0] = marker;
             bytes[0x1c..0x1e].copy_from_slice(&priority.to_le_bytes());
             SourceControllerCityConstructionWork::from_bytes(bytes)
         };
         let mut queue = SourceControllerCityConstructionQueue::default();
 
-        assert!(!queue.insert(work(1)));
-        assert!(queue.insert(work(2)));
+        assert!(!queue.insert(work(1, 0)));
+        assert!(queue.insert(work(2, 0)));
         for _ in 1..SourceControllerCityConstructionQueue::CAPACITY {
-            assert!(queue.insert(work(4)));
+            assert!(queue.insert(work(4, 0)));
         }
         assert_eq!(queue.entries().len(), 0x100);
 
-        assert!(queue.insert(work(4)));
+        assert!(queue.insert(work(4, 0)));
         assert_eq!(queue.entries()[0].priority(), 4);
-        assert!(!queue.insert(work(3)));
-        assert!(!queue.insert(work(5)));
+        assert!(!queue.insert(work(3, 0)));
+        assert!(!queue.insert(work(5, 0)));
+
+        let mut ordered = SourceControllerCityConstructionQueue::default();
+        assert!(ordered.insert(work(4, 0)));
+        assert!(ordered.insert(work(3, 1)));
+        assert!(ordered.insert(work(2, 2)));
+        for _ in 3..SourceControllerCityConstructionQueue::CAPACITY {
+            assert!(ordered.insert(work(4, 0)));
+        }
+        assert!(ordered.insert(work(5, 5)));
+        assert_eq!(ordered.entries()[1].bytes()[0], 5);
+        assert_eq!(ordered.entries()[2].bytes()[0], 2);
     }
 
     #[test]
