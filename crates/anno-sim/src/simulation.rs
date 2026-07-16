@@ -150,6 +150,23 @@ pub struct SourceCombatTerminalEvent {
     pub kill_credit: bool,
 }
 
+/// One `0x84d` source figure-purchase record. The source event first credits
+/// the current owner and transfers the shared figure handle, then dispatches
+/// the same record with its phase cleared to debit the buyer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceFigurePurchaseEvent {
+    pub buyer: u8,
+    pub figure_handle: u16,
+    pub amount: u16,
+}
+
+#[derive(Clone, Copy)]
+enum SourceSharedFigureEntity {
+    MilitaryUnit(usize),
+    TradeShip(usize),
+    DynamicFigure(usize),
+}
+
 /// Live target identity for a terminal source motion slice. The source keeps
 /// the figure record alive until its reinitialized slice reaches zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -321,6 +338,11 @@ pub struct Simulation {
     pub source_combat_terminal_slices: Vec<SourceCombatTerminalSlice>,
     /// Source player globals that select type-4 terminal-route dispatch.
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
+    /// Shared category-1/2/3/5 control byte at `DAT_004cf500 + handle *
+    /// 0x218`. `FUN_0044ef40` and `FUN_0044df80` require bit six before a
+    /// controller can purchase the corresponding figure.
+    pub source_shared_figure_control_flags:
+        [u8; combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY as usize],
     /// `DAT_005b6040`: source simulation clock in 100-ms ticks.
     pub source_time_ticks: u32,
     /// Milliseconds not yet promoted into `source_time_ticks`.
@@ -666,6 +688,8 @@ impl Simulation {
             source_combat_terminal_events: Vec::new(),
             source_combat_terminal_slices: Vec::new(),
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
+            source_shared_figure_control_flags: [0; combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY
+                as usize],
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
             source_resource_environment_elapsed_ms: 0,
@@ -1283,6 +1307,227 @@ impl Simulation {
 
     fn next_rand(&mut self) -> u64 {
         self.next_source_rand() as u64
+    }
+
+    fn source_purchase_actor_is_eligible(&self, player_slot: u8) -> bool {
+        player_slot == self.source_kind4_dispatch.active_player_slot
+            || (self.source_kind4_dispatch.remote_owner_dispatch_enabled
+                && self
+                    .source_kind4_dispatch
+                    .faction_states
+                    .get(usize::from(player_slot))
+                    .is_some_and(|state| (0x0b..=0x0e).contains(state)))
+    }
+
+    fn source_shared_figure_entity(&self, handle: u16) -> Option<SourceSharedFigureEntity> {
+        if handle >= combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY {
+            return None;
+        }
+
+        self.source_dynamic_combat_figures
+            .iter()
+            .rposition(|figure| {
+                figure.active
+                    && matches!(figure.figure_kind, 1 | 2 | 3 | 5)
+                    && figure.runtime_slot == handle
+            })
+            .map(SourceSharedFigureEntity::DynamicFigure)
+            .or_else(|| {
+                self.military_units
+                    .iter()
+                    .position(|unit| {
+                        unit.active
+                            && !unit.source_terminal_pending
+                            && matches!(unit.source_figure_kind, Some(1 | 2 | 3 | 5))
+                            && unit.source_live_runtime_slot == Some(handle)
+                    })
+                    .map(SourceSharedFigureEntity::MilitaryUnit)
+            })
+            .or_else(|| {
+                self.trade_ships
+                    .iter()
+                    .position(|ship| {
+                        ship.active
+                            && matches!(ship.source_figure_kind, Some(1 | 2 | 3 | 5))
+                            && ship.source_runtime_slot == Some(handle)
+                    })
+                    .map(SourceSharedFigureEntity::TradeShip)
+            })
+    }
+
+    fn source_shared_figure_owner(&self, entity: SourceSharedFigureEntity) -> u8 {
+        match entity {
+            SourceSharedFigureEntity::MilitaryUnit(index) => self.military_units[index].owner,
+            SourceSharedFigureEntity::TradeShip(index) => self.trade_ships[index].owner,
+            SourceSharedFigureEntity::DynamicFigure(index) => {
+                self.source_dynamic_combat_figures[index].owner
+            }
+        }
+    }
+
+    fn source_shared_figure_purchase_fields(
+        &self,
+        entity: SourceSharedFigureEntity,
+    ) -> Option<(u8, u8, u16, u16)> {
+        match entity {
+            SourceSharedFigureEntity::MilitaryUnit(index) => {
+                let unit = &self.military_units[index];
+                Some((
+                    unit.source_figure_kind?,
+                    unit.owner,
+                    unit.source_figure_definition_id?,
+                    unit.source_energy,
+                ))
+            }
+            SourceSharedFigureEntity::TradeShip(index) => {
+                let ship = &self.trade_ships[index];
+                Some((
+                    ship.source_figure_kind?,
+                    ship.owner,
+                    ship.source_figure_definition_id?,
+                    ship.source_energy,
+                ))
+            }
+            SourceSharedFigureEntity::DynamicFigure(index) => {
+                let figure = &self.source_dynamic_combat_figures[index];
+                Some((
+                    figure.figure_kind,
+                    figure.owner,
+                    u16::from(figure.figure_definition_id),
+                    figure.source_energy,
+                ))
+            }
+        }
+    }
+
+    fn transfer_source_shared_figure(&mut self, entity: SourceSharedFigureEntity, buyer: u8) {
+        let replacement_kind = self
+            .source_kind4_dispatch
+            .faction_states
+            .get(usize::from(buyer))
+            .copied()
+            .and_then(|state| match state {
+                0x0e => Some(3),
+                0 | 0x0c => Some(1),
+                _ => None,
+            });
+
+        match entity {
+            SourceSharedFigureEntity::MilitaryUnit(index) => {
+                let unit = &mut self.military_units[index];
+                unit.owner = buyer;
+                if let Some(kind) = replacement_kind {
+                    unit.source_figure_kind = Some(kind);
+                }
+            }
+            SourceSharedFigureEntity::TradeShip(index) => {
+                let ship = &mut self.trade_ships[index];
+                ship.owner = buyer;
+                if let Some(kind) = replacement_kind {
+                    ship.source_figure_kind = Some(kind);
+                }
+            }
+            SourceSharedFigureEntity::DynamicFigure(index) => {
+                let figure = &mut self.source_dynamic_combat_figures[index];
+                figure.owner = buyer;
+                if let Some(kind) = replacement_kind {
+                    figure.figure_kind = kind;
+                }
+            }
+        }
+    }
+
+    /// Mirror `FUN_0044ef90`'s bit-six transfer-control write for one shared
+    /// category-1/2/3/5 figure handle.
+    pub fn set_source_figure_purchase_enabled(&mut self, handle: u16, enabled: bool) {
+        if let Some(flags) = self
+            .source_shared_figure_control_flags
+            .get_mut(usize::from(handle))
+        {
+            *flags = (*flags & !0x40) | (u8::from(enabled) << 6);
+        }
+    }
+
+    /// Execute the source `0x84d` figure-purchase event. The transfer phase
+    /// credits an eligible seller, clears bit six through opcode `0x20`,
+    /// changes ownership through opcode five, and immediately dispatches the
+    /// matching buyer-debit phase.
+    pub fn execute_source_figure_purchase(&mut self, event: SourceFigurePurchaseEvent) {
+        let Some(entity) = self.source_shared_figure_entity(event.figure_handle) else {
+            return;
+        };
+        if self.source_shared_figure_control_flags[usize::from(event.figure_handle)] & 0x40 == 0 {
+            return;
+        }
+
+        let seller = self.source_shared_figure_owner(entity);
+        if !self.source_purchase_actor_is_eligible(seller) {
+            return;
+        }
+
+        if let Some(player) = self.players.get_mut(usize::from(seller)) {
+            player.gold += i32::from(event.amount);
+        }
+        self.source_shared_figure_control_flags[usize::from(event.figure_handle)] &= !0x40;
+        self.transfer_source_shared_figure(entity, event.buyer);
+
+        if self.source_purchase_actor_is_eligible(event.buyer) {
+            if let Some(player) = self.players.get_mut(usize::from(event.buyer)) {
+                player.gold -= i32::from(event.amount);
+            }
+        }
+    }
+
+    /// Execute `FUN_00422030` for one source player controller. The caller
+    /// supplies its live owned-figure count and `+0x4dc` capacity; this
+    /// routine scans shared handles in source-table order and retains the
+    /// first strict minimum before emitting `0x84d`.
+    pub fn source_controller_purchase_figure(
+        &mut self,
+        buyer: u8,
+        owned_figure_count: u32,
+        figure_capacity: u32,
+    ) -> Option<SourceFigurePurchaseEvent> {
+        if owned_figure_count >= figure_capacity {
+            return None;
+        }
+
+        let mut selected = None;
+        let mut best_cost = 100_000_i32;
+        for handle in 0..combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY {
+            if self.source_shared_figure_control_flags[usize::from(handle)] & 0x40 == 0 {
+                continue;
+            }
+            let Some(entity) = self.source_shared_figure_entity(handle) else {
+                continue;
+            };
+            let Some((figure_kind, owner, definition_id, source_energy)) =
+                self.source_shared_figure_purchase_fields(entity)
+            else {
+                continue;
+            };
+            if !(1..=3).contains(&figure_kind) || owner == buyer {
+                continue;
+            }
+            let cost =
+                anno_formats::szs::source_figure_purchase_cost(definition_id, source_energy) as i32;
+            if cost < best_cost {
+                best_cost = cost;
+                selected = Some(handle);
+            }
+        }
+
+        let handle = selected?;
+        if best_cost >= self.players.get(usize::from(buyer))?.gold {
+            return None;
+        }
+        let event = SourceFigurePurchaseEvent {
+            buyer,
+            figure_handle: handle,
+            amount: best_cost as u16,
+        };
+        self.execute_source_figure_purchase(event);
+        Some(event)
     }
 
     fn tick_events(&mut self) {
@@ -6970,6 +7215,99 @@ mod tests {
             sim.source_dynamic_combat_figures[2].source_action_ready_at,
             47
         );
+    }
+
+    #[test]
+    fn source_figure_purchase_transfers_a_controlled_shared_handle() {
+        let mut sim = Simulation::new();
+        sim.players = vec![
+            Player::new_human(0),
+            Player::new_ai(1, 0),
+            Player::new_human(2),
+        ];
+        sim.players[1].gold = 200;
+        sim.players[2].gold = 1_000;
+        sim.source_kind4_dispatch.remote_owner_dispatch_enabled = true;
+        sim.source_kind4_dispatch.faction_states[1] = 0x0c;
+        sim.source_kind4_dispatch.faction_states[2] = 0x0e;
+        sim.source_dynamic_combat_figures
+            .push(SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 1,
+                candidate_list_key: 4,
+                figure_definition_id: 0x19,
+                direction: 0,
+                source_payload: 0,
+                position: (1.25, 3.25),
+                position_z: 0.0,
+                source_energy: 195,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 1,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 9,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion::default(),
+            });
+
+        let event = SourceFigurePurchaseEvent {
+            buyer: 2,
+            figure_handle: 9,
+            amount: 120,
+        };
+        sim.execute_source_figure_purchase(event);
+        assert_eq!(sim.source_dynamic_combat_figures[0].owner, 1);
+        assert_eq!(sim.players[1].gold, 200);
+        assert_eq!(sim.players[2].gold, 1_000);
+
+        sim.set_source_figure_purchase_enabled(9, true);
+        sim.execute_source_figure_purchase(event);
+
+        assert_eq!(sim.source_dynamic_combat_figures[0].owner, 2);
+        assert_eq!(sim.source_dynamic_combat_figures[0].figure_kind, 3);
+        assert_eq!(sim.players[1].gold, 320);
+        assert_eq!(sim.players[2].gold, 880);
+        assert_eq!(sim.source_shared_figure_control_flags[9] & 0x40, 0);
+    }
+
+    #[test]
+    fn source_controller_purchase_uses_handle_order_and_strict_gold_gate() {
+        let mut sim = Simulation::new();
+        sim.players = vec![Player::new_human(0), Player::new_ai(1, 0)];
+        sim.players[0].gold = 1_051;
+        sim.source_kind4_dispatch.remote_owner_dispatch_enabled = true;
+        sim.source_kind4_dispatch.faction_states[1] = 0x0c;
+
+        let ship = |handle| {
+            let mut ship = TradeShip::new(1, 0, 0, 0);
+            ship.source_figure_kind = Some(1);
+            ship.source_runtime_slot = Some(handle);
+            ship.source_figure_definition_id = Some(0x15);
+            ship.source_energy = 150;
+            ship
+        };
+        sim.trade_ships = vec![ship(7), ship(3)];
+        sim.set_source_figure_purchase_enabled(7, true);
+        sim.set_source_figure_purchase_enabled(3, true);
+
+        let event = sim
+            .source_controller_purchase_figure(0, 0, 1)
+            .expect("strictly affordable source candidate");
+        assert_eq!(event.figure_handle, 3);
+        assert_eq!(event.amount, 1_050);
+        assert_eq!(sim.players[0].gold, 1);
+        assert_eq!(sim.players[1].gold, 21_050);
+        assert_eq!(sim.trade_ships[0].owner, 1);
+        assert_eq!(sim.trade_ships[1].owner, 0);
+
+        sim.players[0].gold = 1_050;
+        assert_eq!(sim.source_controller_purchase_figure(0, 0, 1), None);
     }
 
     #[test]

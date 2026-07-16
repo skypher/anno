@@ -232,7 +232,9 @@ use std::path::Path;
 ///       `DAT_005b7750` score-input arrays.
 /// v123: diplomacy retains PLAYER4's `FUN_00475c60` policy flags, thresholds,
 ///       city-strength targets, and source player-state bytes.
-pub const SAVE_VERSION: u32 = 123;
+/// v124: source figure purchases retain the shared category-1/2/3/5 control
+///       bytes that gate `0x84d` ownership transfers.
+pub const SAVE_VERSION: u32 = 124;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -246,7 +248,7 @@ pub const SAVE_VERSION: u32 = 123;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 123;
+pub const MIN_LOADABLE_VERSION: u32 = 124;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -285,6 +287,8 @@ pub struct SaveState {
     pub source_combat_terminal_slices: Vec<crate::simulation::SourceCombatTerminalSlice>,
     pub tile_clears: Vec<crate::simulation::TileClear>,
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
+    pub source_shared_figure_control_flags:
+        [u8; crate::combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY as usize],
     pub source_time_ticks: u32,
     pub source_time_remainder_ms: u32,
     pub source_resource_environment_elapsed_ms: u32,
@@ -374,6 +378,7 @@ impl Simulation {
             source_combat_terminal_slices: self.source_combat_terminal_slices.clone(),
             tile_clears: self.tile_clears.clone(),
             source_kind4_dispatch: self.source_kind4_dispatch,
+            source_shared_figure_control_flags: self.source_shared_figure_control_flags,
             source_time_ticks: self.source_time_ticks,
             source_time_remainder_ms: self.source_time_remainder_ms,
             source_resource_environment_elapsed_ms: self.source_resource_environment_elapsed_ms,
@@ -437,6 +442,7 @@ impl Simulation {
         self.source_combat_terminal_slices = s.source_combat_terminal_slices;
         self.tile_clears = s.tile_clears;
         self.source_kind4_dispatch = s.source_kind4_dispatch;
+        self.source_shared_figure_control_flags = s.source_shared_figure_control_flags;
         self.source_time_ticks = s.source_time_ticks;
         self.source_time_remainder_ms = s.source_time_remainder_ms;
         self.source_resource_environment_elapsed_ms = s.source_resource_environment_elapsed_ms;
@@ -554,6 +560,8 @@ mod tests {
             source_combat_terminal_slices: vec![],
             tile_clears: vec![],
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
+            source_shared_figure_control_flags: [0;
+                crate::combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY as usize],
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
             source_resource_environment_elapsed_ms: 0,
@@ -836,6 +844,7 @@ mod tests {
             remote_owner_dispatch_enabled: true,
             faction_states: [0x0c, 0x0c, 0, 0x0c, 0x0d, 0x0e, 0x0b],
         };
+        sim.source_shared_figure_control_flags[9] = 0x40;
         let mut source_route_program = crate::combat::default_source_kind4_route_program();
         source_route_program[0] = 0x31;
         source_route_program[1] = 0x42;
@@ -1391,6 +1400,7 @@ mod tests {
                 faction_states: [0x0c, 0x0c, 0, 0x0c, 0x0d, 0x0e, 0x0b],
             }
         );
+        assert_eq!(sim2.source_shared_figure_control_flags[9], 0x40);
         assert_eq!(
             sim2.source_kind4_occupants,
             vec![crate::data_bridge::SourceKind4Occupant {

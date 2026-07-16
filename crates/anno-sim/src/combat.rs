@@ -748,7 +748,9 @@ pub struct SourceDynamicCombatFigure {
     pub flags: u8,
     /// Notification byte at spawn-record offset `+0x17`.
     pub notification: u8,
-    /// Category-local table slot at spawn-record offset `+0x18`.
+    /// Spawn-record slot at `+0x18`. For shared categories 1, 2, 3, and 5,
+    /// this is the global `DAT_004cf358` handle; categories 4 and 6 instead
+    /// address their category-specific tables.
     pub runtime_slot: u16,
     /// Auxiliary category byte at spawn-record offset `+0x1a`.
     pub auxiliary_kind: u8,
@@ -803,7 +805,7 @@ pub const SOURCE_KIND15_EXECUTOR_FLAGS: u8 = 0x04;
 pub const SOURCE_GENERIC_FIGURE_TIME_SCALE: f32 = 0.05;
 
 /// `FUN_0045e170` scans this shared table for categories 1, 2, 3, and 5.
-pub(crate) const SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY: u16 = 150;
+pub const SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY: u16 = 150;
 /// `FUN_00449ca0` scans this category-4 table.
 pub(crate) const SOURCE_DYNAMIC_KIND4_SLOT_CAPACITY: u16 = 400;
 /// `FUN_0045e110` scans this category-6 table.

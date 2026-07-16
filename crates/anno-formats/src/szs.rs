@@ -674,6 +674,27 @@ pub struct SourceCombatDefinition {
     pub runtime_shot_figure_id: Option<u16>,
 }
 
+/// Compiled source definition field `Preis` at offset `+0x54`. The
+/// `FUN_00441210` name table has 119 entries; only the six ship base
+/// definitions assign this field in `figuren.cod`, while their `ObjFill`
+/// variants inherit the same value and every other entry remains zero.
+pub const fn source_figure_purchase_price(id: u16) -> u32 {
+    match id {
+        0x15 | 0x16 => 1_000,
+        0x17 | 0x18 => 1_800,
+        0x19 | 0x1a => 1_300,
+        0x1b | 0x1c => 2_400,
+        0x1d | 0x1e => 2_000,
+        0x1f | 0x20 => 2_000,
+        _ => 0,
+    }
+}
+
+/// `FUN_00422030`'s candidate cost: `(Preis >> 7) × live energy`.
+pub const fn source_figure_purchase_cost(id: u16, source_energy: u16) -> u32 {
+    (source_figure_purchase_price(id) >> 7) * source_energy as u32
+}
+
 impl SourceCombatDefinition {
     /// Resolve every combat-capable compiled figure ID currently identified
     /// in the source definition table. IDs without a score-bearing figure
@@ -2143,6 +2164,17 @@ mod tests {
         assert_eq!(SourceCombatDefinition::from_id(0), None);
         assert_eq!(SourceCombatDefinition::from_id(0x27), None);
         assert_eq!(SourceCombatDefinition::from_id(0x77), None);
+    }
+
+    #[test]
+    fn source_figure_purchase_cost_matches_compiled_preis_field() {
+        assert_eq!(source_figure_purchase_price(0x15), 1_000);
+        assert_eq!(source_figure_purchase_price(0x16), 1_000);
+        assert_eq!(source_figure_purchase_price(0x1b), 2_400);
+        assert_eq!(source_figure_purchase_price(0x20), 2_000);
+        assert_eq!(source_figure_purchase_price(0x25), 0);
+        assert_eq!(source_figure_purchase_cost(0x15, 150), 1_050);
+        assert_eq!(source_figure_purchase_cost(0x1b, 360), 6_480);
     }
 
     #[test]
