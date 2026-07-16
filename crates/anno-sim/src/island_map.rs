@@ -776,7 +776,11 @@ impl IslandMap {
         descriptor: SourceTargetDescriptor,
     ) -> Option<(i32, i32)> {
         match descriptor.kind() {
-            0x33 | 0x34 if descriptor.bytes()[1] == self.island_id => self
+            0x33 if descriptor.bytes()[1] == self.island_id => self.local_to_source_world((
+                i32::from(descriptor.bytes()[2]),
+                i32::from(descriptor.bytes()[3]),
+            )),
+            0x34 if descriptor.bytes()[1] == self.island_id => self
                 .source_static_target_root((
                     i32::from(descriptor.bytes()[2]),
                     i32::from(descriptor.bytes()[3]),
@@ -807,7 +811,7 @@ impl IslandMap {
                 let index = self.local_index(local)?;
                 let (width, height) = *self.source_land_target_sizes.get(index)?.as_ref()?;
                 SourcePathTargetRect::new(
-                    self.local_to_source_world(self.source_static_target_root(local)?)?,
+                    self.local_to_source_world(local)?,
                     usize::from(width),
                     usize::from(height),
                 )
