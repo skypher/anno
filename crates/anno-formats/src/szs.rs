@@ -261,12 +261,12 @@ impl ShipClass {
         )
     }
 
-    /// Per-cargo-slot maximum quantity for this ship class,
-    /// in the 100-units-per-ton scale used by the SHIP4
-    /// cargo_slots high-16-bit value. Audit-derived from the
-    /// shipping corpus (`probe_cargo_per_class`):
+    /// Per-cargo-slot maximum quantity for this ship class.
+    /// `FUN_00448120` stores the source 1/32-good quantity in cargo bits
+    /// `8..=21`; the SHIP4 manifest preserves the same packed entry.
+    /// Audit-derived from the shipping corpus (`probe_cargo_per_class`):
     ///
-    ///   SmallTrader   1600 (16 t/slot × 7 slots = 112 t)
+    ///   SmallTrader   1600
     ///   LargeTrader   1600
     ///   SmallWarship  1600
     ///   LargeWarship  1600
@@ -374,27 +374,12 @@ pub struct Ship {
     /// loader also copies the raw byte to its shared category-1/2/3 slot at
     /// `+0x1a2`, where `FUN_00454250` reads it as a score-state tier.
     pub heading_byte: u8,
-    /// Up to 7 cargo manifest slots at record offsets 0x174,
-    /// 0x17C, 0x184, 0x18C, 0x194, 0x19C, 0x1A4 (stride 8 with
-    /// the +4 word always zero). Cross-scenario audit:
-    ///
-    ///   * High 16 bits of each non-zero u32 are clean
-    ///     multiples of 32 — most commonly 0x0640 (= 1600).
-    ///     These look like quantities in a 100-unit-per-ton
-    ///     scale (16 tons = 1600 units).
-    ///   * Per-class max quantity (`probe_cargo_per_class`):
-    ///     SmallTrader/LargeTrader/SmallWarship/LargeWarship
-    ///     all cap at 1600 units; PirateShip caps at 800.
-    ///   * Low 16 bits cluster around a small set of values
-    ///     (20 distinct across the corpus) — likely a good /
-    ///     ware identifier, but the encoding doesn't match a
-    ///     simple small-int good_id (values up to ~10000
-    ///     occur), so semantics aren't pinned to a binary
-    ///     function yet.
-    ///
-    /// The raw u32 array is exposed so downstream callers can
-    /// surface ship cargo without committing to a specific
-    /// (good, qty) decode.
+    /// Up to 7 packed cargo entries at record offsets 0x174, 0x17C, 0x184,
+    /// 0x18C, 0x194, 0x19C, 0x1A4 (stride 8 with the +4 word always zero).
+    /// `FUN_00448120` decodes the low byte as the source ware, bits `8..=21`
+    /// as its exact 1/32-good quantity, and bits `22..=31` as entry metadata.
+    /// The raw array remains available because source special wares are not
+    /// all represented by the local `Good` enum.
     pub cargo_slots: [u32; 7],
 }
 
@@ -441,6 +426,11 @@ pub struct LandFigure {
     /// Initial animation state passed to `FUN_00446d90` at record offset
     /// 0x19.
     pub animation_state: u8,
+    /// Type-4 alternate-state selector at record offset `0x1c`.
+    /// `FUN_0045fac0` copies it to runtime offset `+0x126`; when the live
+    /// target clears, `FUN_00458190` advances it through the two descriptors
+    /// in `state_payload`.
+    pub state_selector: u8,
     /// Four-byte type-4 descriptor copied by `FUN_0045fac0` from record
     /// offsets 0x12..0x15 into the live per-slot state read by
     /// `FUN_00456d00`.
@@ -1331,13 +1321,13 @@ pub struct PlayerSlotInit {
     /// exposed for downstream callers.
     pub slot_u16_0x18: u16,
     /// Seven u32 values at slot offsets 0xC0, 0xC8, … 0xF0
-    /// (stride 8; padding +4 uniformly zero). Sourced from the
-    /// runtime player struct's `+0xF0` array in
-    /// `1602_exe.c::FUN_00478160:85440`. Cross-scenario audit
-    /// surfaces a similar 0/3 pattern to `relationships` but
-    /// with a different masking — Tutorial0 slot 0 has
-    /// `[3, 3, 3, 3, 3, 0, 3]` here vs `[0, 0, 0, 0, 3, 3, 3]`
-    /// in `relationships`. Concrete semantics aren't yet RE'd.
+    /// (stride 8; padding +4 uniformly zero). `FUN_00478160`
+    /// copies these from the directed `DAT_005b7770` table, which
+    /// `FUN_0045cd20` reads to exclude a candidate only for code
+    /// `3`. Cross-scenario audit surfaces a similar 0/3 pattern to
+    /// `relationships` but with a different masking — Tutorial0
+    /// slot 0 has `[3, 3, 3, 3, 3, 0, 3]` here versus
+    /// `[0, 0, 0, 0, 3, 3, 3]` in `relationships`.
     pub relations_0xc0: [u32; 7],
     /// Seven u32 values at slot offsets 0x1C0, 0x1C8, … 0x1F0
     /// (stride 8). Sourced from the runtime player struct's
@@ -1351,12 +1341,11 @@ pub struct PlayerSlotInit {
     /// `(slot << 8) | event_type` per-slot event log.
     /// Tutorial0 leaves it all-zero.
     pub events_0x1c0: [u32; 7],
-    /// Seven u32 values at slot offsets 0x140, 0x148, … 0x170
-    /// (stride 8; the upper four bytes between each element are
-    /// uniformly zero across all 434 surveyed slots). Each row
-    /// has one entry per player slot, so this is almost certainly
-    /// the per-slot relationship matrix the engine seeds into
-    /// the diplomacy table at scenario load.
+    /// Seven u32 values at slot offsets 0x140, 0x148, … 0x170.
+    /// `FUN_00478160` copies these from `DAT_005b77b0`, the
+    /// directed attitude table handled by `FUN_00476130` / event
+    /// `0x30`. The upper four bytes between each element are
+    /// uniformly zero across all 434 surveyed slots.
     ///
     /// Cross-scenario pattern (Tutorial0 / Plague / Atoll all
     /// agree, with Magnate0 modulating only the AI rows):
@@ -1574,6 +1563,7 @@ impl SzsFile {
                     owner: record[0x18],
                     direction: record[0x1b],
                     animation_state: record[0x19],
+                    state_selector: record[0x1c],
                     state_descriptor: record[0x12..0x16]
                         .try_into()
                         .expect("SOLDAT3 state descriptor has fixed width"),
@@ -1903,6 +1893,7 @@ mod tests {
         record[0x19] = 5;
         record[0x12..0x16].copy_from_slice(&[9, 8, 7, 6]);
         record[0x1b] = 7;
+        record[0x1c] = 1;
         record[0x1d] = 0xfe;
         record[0x1e..0x26].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
 
@@ -1923,6 +1914,7 @@ mod tests {
         assert_eq!(figure.owner, 3);
         assert_eq!(figure.direction, 7);
         assert_eq!(figure.animation_state, 5);
+        assert_eq!(figure.state_selector, 1);
         assert_eq!(figure.state_descriptor, [9, 8, 7, 6]);
         assert_eq!(figure.state_flags, 2);
         assert_eq!(figure.state_payload, [1, 2, 3, 4, 5, 6, 7, 8]);
@@ -3891,8 +3883,8 @@ mod tests {
         // Tutorial0 starts the player with one ship loaded with
         // three goods. Audit surfaces the raw u32 cargo entries
         // 0x03C00003, 0x03C00011, 0x03200033 at slot 0 of the
-        // SHIP4 record's cargo manifest (high16 = quantity,
-        // low16 = good identifier of unknown encoding).
+        // SHIP4 record's cargo manifest. `FUN_00448120` decodes their
+        // low byte as ware and bits 8 through 21 as quantity.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -3913,20 +3905,19 @@ mod tests {
             [62915075, 62916561, 52429875, 0, 0, 0, 0],
             "Tutorial0 starting cargo"
         );
-        // The high 16 bits of each non-zero entry should be a
-        // quantity-style multiple of 32 in the observed range.
+        // The decoded quantity retains the source's 1/32-good alignment.
         for slot in &szs.ships[0].cargo_slots {
             if *slot == 0 {
                 continue;
             }
-            let high = (slot >> 16) as u16;
+            let quantity = ((slot >> 8) & 0x3fff) as u16;
             assert!(
-                high % 32 == 0,
-                "high16 should be a multiple of 32, got 0x{high:04X}"
+                quantity % 32 == 0,
+                "quantity should be a multiple of 32, got 0x{quantity:04X}"
             );
             assert!(
-                high > 0 && high <= 4000,
-                "high16 should fall within observed range, got {high}"
+                quantity > 0 && quantity <= 4000,
+                "quantity should fall within observed range, got {quantity}"
             );
         }
     }

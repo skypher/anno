@@ -18,7 +18,7 @@ use crate::source_route::{
     SourcePathTargetRect, SourceTargetDescriptor, source_kind6_target_direction,
 };
 use anno_formats::szs::{
-    LandFigureDefinition, SourceCombatDefinition, SourceShotFigureDefinition,
+    LandFigureDefinition, LandFigureFamily, SourceCombatDefinition, SourceShotFigureDefinition,
 };
 
 /// `FUN_00446ca0` initializes byte zero of each newly allocated type-4
@@ -39,6 +39,84 @@ pub const SOURCE_KIND4_TERMINAL_IDLE_REMAINING: f32 = 2.0;
 /// `FUN_00456d00` pairs the terminal remaining amount with this source
 /// motion rate, producing a two-second dispatch pause.
 pub const SOURCE_KIND4_TERMINAL_IDLE_RATE: f32 = 0.02;
+/// SHIP4 reserves seven packed cargo entries at offsets `0x174 + 8i`.
+pub const SOURCE_SHIP_CARGO_SLOT_COUNT: usize = 7;
+/// `FUN_00446a60` supplies this per-entry quantity cap for source ship
+/// categories one through three.
+pub const SOURCE_SHIP_CARGO_SLOT_QUANTITY_CAPACITY: u16 = 0x640;
+/// `FUN_0045fac0` clears the type-4 record before loading it and never writes
+/// its `+0x08` cargo-metadata word, which `FUN_00458000` forwards to `0x849`.
+pub const SOURCE_KIND4_BOARDING_CARGO_METADATA: u16 = 0;
+
+/// A source cargo entry packs its ware in bits `0..=7`, its exact quantity in
+/// bits `8..=21`, and the source entry metadata in bits `22..=31`.
+pub const fn source_ship_cargo_slot_ware(slot: u32) -> u8 {
+    slot as u8
+}
+
+/// Extract the source's 1/32-good quantity from one packed ship cargo entry.
+pub const fn source_ship_cargo_slot_quantity(slot: u32) -> u16 {
+    ((slot >> 8) & 0x3fff) as u16
+}
+
+/// Extract the upper ten metadata bits from one packed ship cargo entry.
+pub const fn source_ship_cargo_slot_metadata(slot: u32) -> u16 {
+    (slot >> 22) as u16
+}
+
+const fn source_ship_cargo_slot(ware: u8, quantity: u16, metadata: u16) -> u32 {
+    u32::from(ware)
+        | (u32::from(quantity.min(SOURCE_SHIP_CARGO_SLOT_QUANTITY_CAPACITY)) << 8)
+        | (u32::from(metadata & 0x03ff) << 22)
+}
+
+/// `FUN_00448120` first fills matching entries, then empty entries, preserving
+/// its quantity-weighted upper-ten-bit metadata blend. The caller must have
+/// applied `FUN_00458000`'s separate free-slot gate before this mutation.
+pub fn source_add_ship_cargo(slots: &mut [u32], ware: u8, metadata: u16, quantity: u16) {
+    let mut remaining = quantity;
+    for slot in slots.iter_mut() {
+        if remaining == 0 {
+            break;
+        }
+        if source_ship_cargo_slot_ware(*slot) != ware {
+            continue;
+        }
+        let current_quantity = source_ship_cargo_slot_quantity(*slot);
+        let added = remaining.min(SOURCE_SHIP_CARGO_SLOT_QUANTITY_CAPACITY - current_quantity);
+        if added == 0 {
+            continue;
+        }
+        let updated_quantity = current_quantity + added;
+        let updated_metadata = ((u32::from(source_ship_cargo_slot_metadata(*slot))
+            * u32::from(current_quantity)
+            + u32::from(metadata & 0x03ff) * u32::from(added))
+            / u32::from(updated_quantity)) as u16;
+        *slot = source_ship_cargo_slot(ware, updated_quantity, updated_metadata);
+        remaining -= added;
+    }
+
+    for slot in slots.iter_mut() {
+        if remaining == 0 {
+            break;
+        }
+        if source_ship_cargo_slot_ware(*slot) != 0 {
+            continue;
+        }
+        let added = remaining.min(SOURCE_SHIP_CARGO_SLOT_QUANTITY_CAPACITY);
+        *slot = source_ship_cargo_slot(ware, added, metadata);
+        remaining -= added;
+    }
+}
+
+/// `FUN_00458000` only emits its `0x849` mutation after finding a zero-byte
+/// source cargo slot in the target's fixed table.
+pub fn source_ship_cargo_has_free_slot(slots: &[u32]) -> bool {
+    slots
+        .iter()
+        .copied()
+        .any(|slot| source_ship_cargo_slot_ware(slot) == 0)
+}
 
 /// Locally reconstructed entity participating in the source candidate list
 /// assembled by `FUN_00453da0` and consumed by
@@ -66,7 +144,8 @@ pub struct SourceCombatCandidate {
     pub source_energy: u16,
     /// Shared category-1/2/3 slot byte `+0x1a2`. The SHIP4 loader copies
     /// raw record byte `0x42` here; `FUN_00454250` maps it to a target
-    /// strength multiplier independently from the source movement direction.
+    /// strength multiplier and `FUN_00447880` uses its nonzero value as the
+    /// integer action-cooldown divisor, independently from movement heading.
     pub source_score_state: u8,
     /// Raw SHIP4 entries at `0x132 + 8i`. The loader resolves their low-16
     /// source IDs before placing the translated policy entries at `+0x1f4`.
@@ -230,6 +309,30 @@ pub struct SourceKind6SelectedTarget {
     pub direction: u8,
 }
 
+/// A score-ranked category-4 row whose direct descriptor and source ray both
+/// passed `FUN_00453e50`'s attack envelope. Category-4 and category-6 share
+/// the candidate score body but enqueue distinct `FUN_00447880` effects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceKind4SelectedTarget {
+    pub target: SourceCombatCandidate,
+    pub target_descriptor: SourceTargetDescriptor,
+    pub metric: u16,
+    pub score: u16,
+    pub direction: u8,
+}
+
+/// A score-ranked category-one through -three row whose direct target ray
+/// passed `FUN_00453e50`. The controller uses its direction to choose an
+/// attack-facing turn through `FUN_00454760` before any action dispatch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceKind13SelectedTarget {
+    pub target: SourceCombatCandidate,
+    pub target_descriptor: SourceTargetDescriptor,
+    pub metric: u16,
+    pub score: u16,
+    pub direction: u8,
+}
+
 /// The action record populated by `FUN_004546e0` before it immediately calls
 /// `FUN_00447880`. The record preserves the launcher identity, raw source
 /// strength, selected descriptor, and the two action flags consumed by the
@@ -267,6 +370,69 @@ pub struct SourceKind6DeferredHit {
     pub action: SourceKind6Action,
 }
 
+/// The category-4 `FUN_004546e0` event consumed by `FUN_00447880`. Unlike
+/// category 6, this executor does not create a kind-15 figure; it resets the
+/// land figure's movement state and stores the selected live descriptor in a
+/// deferred type-one record.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind4Action {
+    /// Event offsets `+0x00/+0x04`: the attacker's live source position.
+    pub attacker_position: (f32, f32),
+    /// Event offset `+0x08`: category-4 runtime slot.
+    pub attacker_runtime_slot: u16,
+    /// Event offset `+0x0a`: raw energy-adjusted source damage.
+    pub raw_strength: u16,
+    /// Event offset `+0x0c`: source category, always four on this path.
+    pub attacker_figure_kind: u8,
+    /// Event offset `+0x0d`: direct-ray direction from `FUN_00453e50`.
+    pub direction: u8,
+    /// Event offset `+0x0e`: `FUN_00456d00` passes bit zero and the same
+    /// direction twice, producing `0x03`.
+    pub flags: u8,
+    /// Event offsets `+0x10..+0x13`: selected category-1 through -6 target.
+    pub target_descriptor: SourceTargetDescriptor,
+}
+
+/// A type-one deferred record allocated by the category-4 branch of
+/// `FUN_00447880` and later consumed by `FUN_00445930`.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind4DeferredHit {
+    pub due_at: u32,
+    pub action: SourceKind4Action,
+}
+
+/// The category-one through -three `FUN_004546e0` action payload. These
+/// shared-table attackers use the same 20-byte input layout as category four,
+/// but their raw strength comes from their live score-state tier rather than
+/// their current energy.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind13Action {
+    /// Event offsets `+0x00/+0x04`: the attacker's live source position.
+    pub attacker_position: (f32, f32),
+    /// Event offset `+0x08`: shared category-local runtime slot.
+    pub attacker_runtime_slot: u16,
+    /// Event offset `+0x0a`: score-state-tiered compiled hit-point strength.
+    pub raw_strength: u16,
+    /// Event offset `+0x0c`: source category one, two, or three.
+    pub attacker_figure_kind: u8,
+    /// Event offset `+0x0d`: selected attack-facing direction.
+    pub direction: u8,
+    /// Event offset `+0x0e`: anchor-match bit zero and ray-side bit one.
+    pub flags: u8,
+    /// Event offsets `+0x10..+0x13`: selected live target descriptor.
+    pub target_descriptor: SourceTargetDescriptor,
+    /// Compiled `Shotfignr:` passed to `FUN_00447e90` when nonzero.
+    pub kind14_figure_definition_id: Option<u16>,
+}
+
+/// A type-one deferred record allocated by the category-one through -three
+/// branch of `FUN_00447880` and consumed by `FUN_00445930`.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind13DeferredHit {
+    pub due_at: u32,
+    pub action: SourceKind13Action,
+}
+
 /// The source event pool contains 150 records of stride 28 bytes.
 pub const SOURCE_KIND6_DEFERRED_HIT_CAPACITY: usize = 150;
 
@@ -274,8 +440,200 @@ pub const SOURCE_KIND6_DEFERRED_HIT_CAPACITY: usize = 150;
 /// immediate executor receives.
 pub const SOURCE_KIND6_ACTION_EVENT_FLAGS: u8 = 0x03;
 
+/// The category-4 caller in `FUN_00456d00` supplies the same flag payload as
+/// the category-6 `FUN_00458ac0` caller.
+pub const SOURCE_KIND4_ACTION_EVENT_FLAGS: u8 = 0x03;
+
 /// `FUN_0045cd20` writes at most 32 rows for each source figure.
 const SOURCE_COMBAT_CANDIDATE_CAPACITY: usize = 0x20;
+
+/// `FUN_00452370` installs this stationary controller delay after it turns a
+/// category-one through -three figure through `FUN_00454760`.
+pub const SOURCE_TURN_CONTROLLER_DELAY: f32 = 10.0;
+
+/// Generic source-record motion fields at `+0x14/+0x18/+0x1c/+0x20/+0x24`
+/// and terminal bit two at `+0x11`.
+/// `FUN_0045d380` initializes a spawned record at rest; `FUN_0044a690`
+/// replaces this state for a directional movement segment.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceGenericMotion {
+    pub remaining_distance: f32,
+    pub scalar_speed: f32,
+    pub velocity_x: f32,
+    pub velocity_y: f32,
+    pub velocity_z: f32,
+    pub terminal_motion_locked: bool,
+}
+
+impl SourceGenericMotion {
+    pub fn stationary_from_loader_flags(flags: u8) -> Self {
+        Self {
+            remaining_distance: if flags == 0 { 0.02 } else { 2.5 },
+            scalar_speed: SOURCE_TERMINAL_STATIONARY_SPEED,
+            velocity_x: 0.0,
+            velocity_y: 0.0,
+            velocity_z: 0.0,
+            terminal_motion_locked: false,
+        }
+    }
+
+    /// Construct the zero-vector delay written immediately before
+    /// `FUN_00454760` dispatches a changed runtime heading.
+    pub const fn stationary_turn_delay() -> Self {
+        Self {
+            remaining_distance: SOURCE_TURN_CONTROLLER_DELAY,
+            scalar_speed: SOURCE_TERMINAL_STATIONARY_SPEED,
+            velocity_x: 0.0,
+            velocity_y: 0.0,
+            velocity_z: 0.0,
+            terminal_motion_locked: false,
+        }
+    }
+
+    pub fn has_directional_vector(self) -> bool {
+        self.scalar_speed != 0.0
+            && (self.velocity_x != 0.0 || self.velocity_y != 0.0 || self.velocity_z != 0.0)
+    }
+
+    pub fn terminal_remainder(self, figure_kind: u8, direction: u8) -> Self {
+        if self.terminal_motion_locked {
+            return self;
+        }
+        let has_directional_vector = self.has_directional_vector();
+        let remaining_distance = source_terminal_motion_slice_remaining(
+            figure_kind,
+            direction,
+            self.remaining_distance,
+            has_directional_vector,
+        );
+        if has_directional_vector {
+            Self {
+                remaining_distance,
+                ..self
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
+/// `FUN_004477d0` accepts the already-advanced position when it reanchors an
+/// action to its recorded launch location.
+pub const SOURCE_ACTION_REANCHOR_TOLERANCE: f32 = 0.1;
+/// `FUN_004477d0` writes this remaining distance after a position mismatch.
+pub const SOURCE_ACTION_REANCHOR_REMAINING_DISTANCE: f32 = 0.01;
+
+/// `FUN_00458ac0` leaves every category-six controller with this one-unit
+/// zero-vector dwell segment, whether or not it emitted an action.
+pub const SOURCE_KIND6_CONTROLLER_DWELL_DISTANCE: f32 = 1.0;
+
+pub const fn source_kind6_controller_dwell_motion() -> SourceGenericMotion {
+    SourceGenericMotion {
+        remaining_distance: SOURCE_KIND6_CONTROLLER_DWELL_DISTANCE,
+        scalar_speed: SOURCE_TERMINAL_STATIONARY_SPEED,
+        velocity_x: 0.0,
+        velocity_y: 0.0,
+        velocity_z: 0.0,
+        terminal_motion_locked: false,
+    }
+}
+
+/// Apply `FUN_004477d0` to an action's recorded launch position. At the
+/// source's ±0.1 position tolerance it retains the current coordinates and
+/// recovers the `FUN_00446120` remainder. Otherwise it restores the recorded
+/// x/y point, clears the motion vector and bit one, and installs the source's
+/// `0.02` speed with a `0.01` controller slice.
+pub fn source_action_reanchor(
+    position: &mut (f32, f32),
+    motion: &mut SourceGenericMotion,
+    figure_kind: u8,
+    direction: u8,
+    recorded_position: (f32, f32),
+) -> bool {
+    let position_matches = (position.0 - recorded_position.0).abs()
+        <= SOURCE_ACTION_REANCHOR_TOLERANCE
+        && (position.1 - recorded_position.1).abs() <= SOURCE_ACTION_REANCHOR_TOLERANCE;
+    if position_matches {
+        *motion = motion.terminal_remainder(figure_kind, direction);
+        return true;
+    }
+
+    *position = recorded_position;
+    *motion = SourceGenericMotion {
+        remaining_distance: SOURCE_ACTION_REANCHOR_REMAINING_DISTANCE,
+        scalar_speed: SOURCE_TERMINAL_STATIONARY_SPEED,
+        velocity_x: 0.0,
+        velocity_y: 0.0,
+        velocity_z: 0.0,
+        terminal_motion_locked: false,
+    };
+    false
+}
+
+impl Default for SourceGenericMotion {
+    fn default() -> Self {
+        Self::stationary_from_loader_flags(0)
+    }
+}
+
+/// Select the attack-facing direction used by `FUN_00452370` after
+/// `FUN_00453e50` has supplied a zero-based target ray. The source compares
+/// `target + 2` and `target - 2` modulo eight; equal turn distances retain
+/// the latter candidate because its comparison is strict.
+pub fn source_combat_turn_direction(current_direction: u8, target_direction: u8) -> u8 {
+    let current_direction = current_direction & 7;
+    let target_direction = target_direction & 7;
+    let clockwise_candidate = target_direction.wrapping_add(2) & 7;
+    let clockwise_distance = (current_direction.wrapping_sub(clockwise_candidate) & 7)
+        .min(clockwise_candidate.wrapping_sub(current_direction) & 7);
+    let counterclockwise_candidate = target_direction.wrapping_sub(2) & 7;
+    let counterclockwise_distance = (current_direction.wrapping_sub(counterclockwise_candidate)
+        & 7)
+        .min(counterclockwise_candidate.wrapping_sub(current_direction) & 7);
+
+    if clockwise_distance < counterclockwise_distance {
+        clockwise_candidate
+    } else {
+        counterclockwise_candidate
+    }
+}
+
+/// Apply `FUN_00452370`'s changed-facing transition. `Some(direction)` means
+/// that `FUN_00454760` must dispatch the returned heading; the generic source
+/// record is then held at the source's stationary controller delay.
+pub fn begin_source_combat_turn(
+    current_direction: u8,
+    target_direction: u8,
+    motion: &mut SourceGenericMotion,
+) -> Option<u8> {
+    let next_direction = source_combat_turn_direction(current_direction, target_direction);
+    if next_direction == (current_direction & 7) {
+        return None;
+    }
+    *motion = SourceGenericMotion::stationary_turn_delay();
+    Some(next_direction)
+}
+
+/// Advance the generic `FUN_00451890` motion prefix for one live source
+/// record. The caller owns the zero-distance controller dispatch that follows
+/// this prefix in the executable.
+pub fn advance_source_generic_motion(
+    motion: &mut SourceGenericMotion,
+    position: &mut (f32, f32),
+    position_z: &mut f32,
+    dt_ms: u32,
+) -> bool {
+    if motion.scalar_speed <= 0.0 || motion.remaining_distance <= 0.0 {
+        return motion.remaining_distance <= 0.0;
+    }
+    let available_time = dt_ms as f32 * SOURCE_GENERIC_FIGURE_TIME_SCALE;
+    let motion_time = available_time.min(motion.remaining_distance / motion.scalar_speed);
+    position.0 += motion_time * motion.velocity_x;
+    position.1 += motion_time * motion.velocity_y;
+    *position_z += motion_time * motion.velocity_z;
+    motion.remaining_distance = (motion.remaining_distance - motion_time * motion.scalar_speed).max(0.0);
+    motion.remaining_distance <= 0.0
+}
 
 /// One live dynamic figure supplied by an `0x84a` spawn record and installed
 /// through `FUN_0045deb0`/`FUN_0045d380`. This retains the fields that the
@@ -302,12 +660,21 @@ pub struct SourceDynamicCombatFigure {
     pub position_z: f32,
     /// Source energy at spawn-record offset `+0x0a`.
     pub source_energy: u16,
+    /// Shared category-1/2/3 table byte `+0x1a2`. `FUN_0045d380` clears it
+    /// on allocation; `FUN_0045e1f0` opcode `0x19` adds its byte-eight
+    /// payload before `FUN_00452370` uses it for scoring and cooldowns.
+    #[serde(default)]
+    pub source_score_state: u8,
     /// Category-6 table offset `+0x0c`: the unsigned source-clock timestamp
     /// below which `FUN_00458ac0` may not emit another action. The loader
     /// initializes it from `DAT_005b6040`; a successful dispatch adds
     /// `Worktime * 10` source ticks.
     #[serde(default)]
     pub source_action_ready_at: u32,
+    /// Packed source cargo entries when this dynamic record occupies a shared
+    /// category-1 ship slot addressed by `FUN_00458000`.
+    #[serde(default)]
+    pub source_cargo_slots: [u32; SOURCE_SHIP_CARGO_SLOT_COUNT],
     /// Target descriptor at spawn-record offset `+0x0c`.
     pub target_descriptor: SourceTargetDescriptor,
     /// Follow-up descriptor at spawn-record offset `+0x10`.
@@ -326,6 +693,9 @@ pub struct SourceDynamicCombatFigure {
     pub auxiliary_kind: u8,
     /// Source string-table index at spawn-record offset `+0x1b`.
     pub name_index: u8,
+    /// Generic source-record motion at `+0x14/+0x18/+0x1c/+0x20/+0x24`.
+    #[serde(default)]
+    pub source_motion: SourceGenericMotion,
 }
 
 /// Live kind-15 figure initialized by `FUN_00447f00` after a category-6
@@ -348,6 +718,20 @@ pub struct SourceKind15CombatFigure {
     /// `Worktime:` and consumed by the generic figure update.
     pub remaining_work_time: f32,
     /// Runtime field `+0x11`: `FUN_00447f00` clears bit four and sets bit two.
+    pub source_flags: u8,
+}
+
+/// Live kind-14 figure initialized by `FUN_00447e90` for a category-one
+/// through -three action. Unlike kind 15, it remains at the launcher's exact
+/// position and carries no direction field.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind14CombatFigure {
+    pub active: bool,
+    pub figure_definition_id: u16,
+    pub position: (f32, f32, f32),
+    pub launcher_runtime_slot: u16,
+    pub source_step_amount: f32,
+    pub remaining_work_time: f32,
     pub source_flags: u8,
 }
 
@@ -395,7 +779,7 @@ pub fn source_combat_candidate_buffer(
         else {
             continue;
         };
-        if !unit.active || !(1..=6).contains(&figure_kind) {
+        if !unit.active || unit.source_terminal_pending || !(1..=6).contains(&figure_kind) {
             continue;
         }
         let position = if unit.source_position_initialized {
@@ -456,7 +840,7 @@ pub fn source_combat_candidate_buffer(
             runtime_slot: figure.runtime_slot,
             figure_definition_id: Some(u16::from(figure.figure_definition_id)),
             source_energy: figure.source_energy,
-            source_score_state: 0,
+            source_score_state: figure.source_score_state,
             source_kind6_policy_raw_slots: [0; 8],
             source_kind6_policy_ware_slots: [0; 8],
             source_kind6_target_descriptor_payload: None,
@@ -495,7 +879,7 @@ pub fn source_combat_candidate_pairs(
             if target.entity == attacker.entity
                 || target.candidate_list_key != Some(candidate_list_key)
                 || target.owner == attacker.owner
-                || diplomacy.get(attacker.owner, target.owner) == Diplomacy::Allied
+                || diplomacy.source_relationship_excludes_combat(attacker.owner, target.owner)
                 || ((1..=3).contains(&attacker.figure_kind)
                     && (1..=3).contains(&target.figure_kind))
             {
@@ -557,14 +941,15 @@ fn source_combat_pair_coordinate(value: f32) -> Option<i32> {
         .then_some(scaled as i32)
 }
 
-/// Source player globals read by `FUN_00456d00` before it decides whether a
-/// terminal type-4 program may construct another route. `active_player_slot`
-/// models `DAT_005bacb0`; `single_player` models the flag initialized from
-/// `DAT_005bafdc < 2`; `faction_states` preserves `PLAYER4 + 4` values.
+/// Source player globals read by the dynamic-figure dispatchers.
+/// `active_player_slot` models `DAT_005bacb0`; `single_player` models the
+/// flag initialized from `DAT_005bafdc < 2`; `remote_owner_dispatch_enabled`
+/// models `DAT_005bafc8`; `faction_states` preserves `PLAYER4 + 4` values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceKind4DispatchState {
     pub active_player_slot: u8,
     pub single_player: bool,
+    pub remote_owner_dispatch_enabled: bool,
     pub faction_states: [u8; SOURCE_KIND4_PLAYER_SLOT_COUNT],
 }
 
@@ -573,6 +958,7 @@ impl Default for SourceKind4DispatchState {
         Self {
             active_player_slot: 0,
             single_player: true,
+            remote_owner_dispatch_enabled: false,
             faction_states: [0, 0x0c, 0x0c, 0x0c, 0x0d, 0x0e, 0x0b],
         }
     }
@@ -592,6 +978,7 @@ impl SourceKind4DispatchState {
         Self {
             active_player_slot,
             single_player: true,
+            remote_owner_dispatch_enabled: false,
             faction_states,
         }
     }
@@ -607,6 +994,21 @@ impl SourceKind4DispatchState {
                     .get(usize::from(owner))
                     .is_some_and(|state| (0x0b..=0x0e).contains(state)))
     }
+
+    /// Apply `FUN_00445930`'s terminal figure-control gate. The active owner
+    /// is always permitted. Other owners require `DAT_005bafc8`, initialized
+    /// when `DAT_005bafdc < 2`, and a player state in `0x09` or
+    /// `0x0b..=0x0e`. `FUN_00446020` also tests the per-player figure count
+    /// for state `0x0b`, but that clause is subsumed here by the preceding
+    /// inclusive `0x0b..=0x0e` source range.
+    pub fn allows_terminal_figure_control(self, attacker_owner: u8) -> bool {
+        attacker_owner == self.active_player_slot
+            || (self.single_player
+                && self
+                    .faction_states
+                    .get(usize::from(attacker_owner))
+                    .is_some_and(|state| *state == 0x09 || (0x0b..=0x0e).contains(state)))
+    }
 }
 
 pub const fn default_source_kind4_route_radius() -> u8 {
@@ -620,9 +1022,82 @@ pub const fn default_source_kind4_route_program() -> [u8; SOURCE_KIND4_ROUTE_PRO
     ]
 }
 
+/// `FUN_0046d130`: walk a packed type-4 direction program backwards from its
+/// current cursor and accumulate at most `steps` raw-grid cells. `FUN_00458100`
+/// uses this with five steps when a figure reaches a Klinik target.
+pub fn source_kind4_reverse_route_offset(program: &[u8], cursor: u8, mut steps: u32) -> (i32, i32) {
+    let mut x = 0;
+    let mut y = 0;
+    let mut cursor = i32::from(cursor);
+
+    while cursor >= 0 && steps != 0 {
+        let command = program.get(cursor as usize).copied().unwrap_or_default();
+        let count = u32::from(command & 0x0f).min(steps) as i32;
+        match command >> 4 {
+            1 => y += count,
+            2 => {
+                x -= count;
+                y += count;
+            }
+            3 => x -= count,
+            4 => {
+                x -= count;
+                y -= count;
+            }
+            5 => y -= count,
+            6 => {
+                x += count;
+                y -= count;
+            }
+            7 => x += count,
+            8 => {
+                x += count;
+                y += count;
+            }
+            _ => {}
+        }
+        steps -= u32::from(command & 0x0f).min(steps);
+        cursor -= 1;
+    }
+
+    (x, y)
+}
+
 const SOURCE_MOTION_TIME_SCALE: f32 = 0.05;
 const SOURCE_FIGURE_SPEED_SCALE: f32 = 0.0001;
 const SOURCE_DIAGONAL_DISTANCE: f32 = std::f32::consts::SQRT_2;
+/// `FUN_00446120` installs this scalar speed for a terminal figure that has
+/// no active motion vector.
+pub const SOURCE_TERMINAL_STATIONARY_SPEED: f32 = 0.02;
+
+/// Recover the remaining `FUN_00446120` motion distance written after a
+/// terminal `0x0c` control. Type four doubles its stored half-cell distance,
+/// takes the directional remainder to the next grid boundary, then restores
+/// the half-cell scale. Other categories use the same directional remainder
+/// without that initial doubling. A stationary figure receives the source's
+/// `0.02` distance and scalar speed.
+pub fn source_terminal_motion_slice_remaining(
+    figure_kind: u8,
+    direction: u8,
+    remaining_distance: f32,
+    has_motion_vector: bool,
+) -> f32 {
+    if !has_motion_vector {
+        return SOURCE_TERMINAL_STATIONARY_SPEED;
+    }
+
+    let distance = if figure_kind == 4 {
+        remaining_distance * 2.0
+    } else {
+        remaining_distance
+    };
+    let remainder = if direction & 1 == 0 {
+        distance - distance.floor()
+    } else {
+        distance - (distance * std::f32::consts::FRAC_1_SQRT_2).floor() * SQRT_2
+    };
+    remainder * 0.5
+}
 
 /// Maximum engagement detection range in tiles. Combat will be
 /// initiated against any hostile inside this radius; the per-type
@@ -846,6 +1321,10 @@ pub struct MilitaryUnit {
     /// records for consumers that read the payload directly.
     #[serde(default)]
     pub source_kind6_target_descriptor_payload: Option<[u8; 2]>,
+    /// Packed SHIP4 cargo entries. `FUN_00448120` mutates these while a
+    /// type-4 land figure boards a category-1 ship target.
+    #[serde(default)]
+    pub source_cargo_slots: [u32; SOURCE_SHIP_CARGO_SLOT_COUNT],
     /// Type-4 origin descriptor restored from `SOLDAT3`.
     #[serde(default)]
     pub source_origin_descriptor: Option<SourceTargetDescriptor>,
@@ -872,6 +1351,15 @@ pub struct MilitaryUnit {
     /// `FUN_00451890` type-4 remaining distance in engine tile units.
     #[serde(default)]
     pub source_step_remaining: f32,
+    /// Terminal-control bit four from `FUN_0045e1f0`. While set, this figure
+    /// is excluded from combat and completes only the `FUN_00446120` slice
+    /// retained in `source_terminal_remaining`.
+    #[serde(default)]
+    pub source_terminal_pending: bool,
+    /// Remaining source motion distance after `FUN_00446120` reinitializes a
+    /// terminal figure's current slice.
+    #[serde(default)]
+    pub source_terminal_remaining: f32,
     /// `FUN_00456d00` writes the source remaining-motion field to `2.0`
     /// after an ordinary terminal route program or failed route build.
     #[serde(default)]
@@ -1021,6 +1509,7 @@ impl MilitaryUnit {
             source_kind6_policy_raw_slots: [0; 8],
             source_kind6_policy_ware_slots: [0; 8],
             source_kind6_target_descriptor_payload: None,
+            source_cargo_slots: [0; SOURCE_SHIP_CARGO_SLOT_COUNT],
             source_origin_descriptor: None,
             source_target_descriptor: None,
             source_route_radius: SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
@@ -1028,6 +1517,8 @@ impl MilitaryUnit {
             source_route_program: default_source_kind4_route_program(),
             source_route_program_cursor: 0,
             source_step_remaining: 0.0,
+            source_terminal_pending: false,
+            source_terminal_remaining: 0.0,
             source_idle_remaining: 0.0,
             source_motion_target: None,
             source_position_x: 0.0,
@@ -1074,7 +1565,7 @@ impl MilitaryUnit {
     }
 
     pub fn is_alive(&self) -> bool {
-        self.active && self.health > 0.02 // Original threshold: 0x3ca3d70a ≈ 0.02
+        self.active && !self.source_terminal_pending && self.health > 0.02 // Original threshold: 0x3ca3d70a ≈ 0.02
     }
 }
 
@@ -1090,12 +1581,58 @@ pub enum Diplomacy {
     War = 2,
 }
 
+/// The only payloads emitted by `FUN_004760e0` for the directed `0x2f`
+/// relationship event. The discriminant is the event payload; its resulting
+/// `DAT_005b7770` byte is recovered by [`Self::relationship_code`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SourceRelationshipEvent {
+    SetCode0 = 0,
+    SetCode2 = 1,
+    SetCode3 = 3,
+}
+
+impl SourceRelationshipEvent {
+    /// Decode the raw event byte used at source record offset `+0x08`.
+    pub const fn from_payload(payload: u8) -> Option<Self> {
+        match payload {
+            0 => Some(Self::SetCode0),
+            1 => Some(Self::SetCode2),
+            3 => Some(Self::SetCode3),
+            _ => None,
+        }
+    }
+
+    /// `FUN_004766a0`'s `0x2f` handler stores this byte after receiving the
+    /// corresponding `FUN_004760e0` payload.
+    pub const fn relationship_code(self) -> u32 {
+        match self {
+            Self::SetCode0 => 0,
+            Self::SetCode2 => 2,
+            Self::SetCode3 => 3,
+        }
+    }
+}
+
 /// Nation interaction matrix (who can fight whom).
-/// Original: DAT_005b7770, indexed by (attacker_nation * 0x50 + defender_nation) * 8.
+/// `source_relation_codes` preserves the directed `DAT_005b7770` bytes,
+/// indexed by `(attacker_nation * 0x50 + defender_nation) * 8`; the
+/// `source_attitude_codes` preserves `DAT_005b77b0`'s separate directed
+/// state; the compatibility relation matrix serves local non-source systems.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiplomacyMatrix {
     /// 7×7 matrix (max 7 players).
     relations: [[Diplomacy; 7]; 7],
+    /// Raw directed source relationship codes. `FUN_0045cd20` excludes a
+    /// candidate only when this byte is `3`; codes `0`, `1`, and `2` remain
+    /// distinct for the source diplomacy event machine.
+    #[serde(default = "default_source_relation_codes")]
+    source_relation_codes: [[u32; 7]; 7],
+    /// Raw directed attitude states at `DAT_005b77b0 + 0xa0 * source +
+    /// 8 * target`. `FUN_00476130` emits event `0x30` for this matrix, which
+    /// is distinct from the `DAT_005b7770` relation event `0x2f`.
+    #[serde(default = "default_source_attitude_codes")]
+    source_attitude_codes: [[u8; 7]; 7],
     /// Trade-agreement matrix (manual sec. 7.2). Symmetric: a trade
     /// agreement between players a and b is bilateral. Once
     /// concluded, each side can inspect the other's warehouses.
@@ -1114,6 +1651,18 @@ fn default_trade_matrix() -> [[bool; 7]; 7] {
     [[false; 7]; 7]
 }
 
+fn default_source_relation_codes() -> [[u32; 7]; 7] {
+    let mut codes = [[0; 7]; 7];
+    for (slot, row) in codes.iter_mut().enumerate() {
+        row[slot] = 3;
+    }
+    codes
+}
+
+fn default_source_attitude_codes() -> [[u8; 7]; 7] {
+    [[0; 7]; 7]
+}
+
 impl DiplomacyMatrix {
     pub fn new() -> Self {
         let mut relations = [[Diplomacy::Neutral; 7]; 7];
@@ -1123,6 +1672,8 @@ impl DiplomacyMatrix {
         }
         Self {
             relations,
+            source_relation_codes: default_source_relation_codes(),
+            source_attitude_codes: default_source_attitude_codes(),
             trade_agreement: [[false; 7]; 7],
             trade_agreement_broken: [[false; 7]; 7],
         }
@@ -1134,6 +1685,7 @@ impl DiplomacyMatrix {
             for j in 0..7 {
                 if i != j {
                     dm.relations[i][j] = Diplomacy::War;
+                    dm.source_relation_codes[i][j] = 0;
                 }
             }
         }
@@ -1148,16 +1700,131 @@ impl DiplomacyMatrix {
     }
 
     pub fn set(&mut self, a: u8, b: u8, state: Diplomacy) {
-        if a as usize >= 7 && b as usize >= 7 {
+        if a as usize >= 7 || b as usize >= 7 {
             return;
         }
         self.relations[a as usize][b as usize] = state;
         self.relations[b as usize][a as usize] = state;
+        let source_code = match state {
+            Diplomacy::Allied => 3,
+            Diplomacy::Neutral | Diplomacy::War => 0,
+        };
+        self.source_relation_codes[a as usize][b as usize] = source_code;
+        self.source_relation_codes[b as usize][a as usize] = source_code;
         // Manual sec. 7.2: declaring war breaks any trade agreement.
         if state == Diplomacy::War {
             self.trade_agreement[a as usize][b as usize] = false;
             self.trade_agreement[b as usize][a as usize] = false;
         }
+    }
+
+    /// Preserve one directed `DAT_005b7770` relationship code. The source
+    /// candidate producer uses only code `3` as its non-combat exclusion; the
+    /// compatibility matrix mirrors that boundary without discarding raw
+    /// codes `0` through `2`.
+    pub fn set_source_relationship_code(&mut self, attacker: u8, target: u8, code: u32) {
+        if attacker as usize >= 7 || target as usize >= 7 {
+            return;
+        }
+        self.source_relation_codes[attacker as usize][target as usize] = code;
+        self.relations[attacker as usize][target as usize] = if attacker == target || code == 3 {
+            Diplomacy::Allied
+        } else {
+            Diplomacy::Neutral
+        };
+    }
+
+    /// Return the directed source relation byte preserved from PLAYER4.
+    pub fn source_relationship_code(&self, attacker: u8, target: u8) -> u32 {
+        self.source_relation_codes
+            .get(attacker as usize)
+            .and_then(|row| row.get(target as usize))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// `FUN_0045cd20` admits a directed target exactly when this predicate is
+    /// false: only source relationship code `3` suppresses the combat row.
+    pub fn source_relationship_excludes_combat(&self, attacker: u8, target: u8) -> bool {
+        self.source_relationship_code(attacker, target) == 3
+    }
+
+    /// Return the directed source attitude byte at `DAT_005b77b0`.
+    pub fn source_attitude_code(&self, source: u8, target: u8) -> u8 {
+        self.source_attitude_codes
+            .get(source as usize)
+            .and_then(|row| row.get(target as usize))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Preserve one directed `DAT_005b77b0` attitude byte from PLAYER4.
+    /// Scenario loading copies this table directly and does not apply the
+    /// reciprocal update rules of a later `0x30` event.
+    pub fn set_source_attitude_code(&mut self, source: u8, target: u8, code: u8) {
+        if source as usize >= 7 || target as usize >= 7 {
+            return;
+        }
+        self.source_attitude_codes[source as usize][target as usize] = code;
+    }
+
+    /// Execute the directed `FUN_004760e0` / `0x2f` relation transition.
+    /// The constructor allocates a source event only when the requested raw
+    /// value differs from the current entry, so this returns false for an
+    /// out-of-range or duplicate transition.
+    pub fn apply_source_relationship_event(
+        &mut self,
+        source: u8,
+        target: u8,
+        event: SourceRelationshipEvent,
+    ) -> bool {
+        if source as usize >= 7 || target as usize >= 7 {
+            return false;
+        }
+        let code = event.relationship_code();
+        if self.source_relationship_code(source, target) == code {
+            return false;
+        }
+        self.set_source_relationship_code(source, target, code);
+        true
+    }
+
+    /// Decode and execute the raw `FUN_004760e0` event payload. Values other
+    /// than `0`, `1`, and `3` are not constructed by that source function.
+    pub fn apply_source_relationship_payload(
+        &mut self,
+        source: u8,
+        target: u8,
+        payload: u8,
+    ) -> bool {
+        match SourceRelationshipEvent::from_payload(payload) {
+            Some(event) => self.apply_source_relationship_event(source, target, event),
+            None => false,
+        }
+    }
+
+    /// Execute the directed `FUN_00476130` / `0x30` attitude transition.
+    /// The source constructor submits only payloads `0`, `1`, and `3`, and
+    /// suppresses the event if the source-to-target byte already equals that
+    /// payload. The `0x30` handler writes reciprocal bytes `0/0`, `1/2`, or
+    /// `3/3`, respectively.
+    pub fn apply_source_attitude_payload(&mut self, source: u8, target: u8, payload: u8) -> bool {
+        if source as usize >= 7 || target as usize >= 7 {
+            return false;
+        }
+        if !matches!(payload, 0 | 1 | 3) || self.source_attitude_code(source, target) == payload {
+            return false;
+        }
+
+        let (forward, reverse) = match payload {
+            0 => (0, 0),
+            1 => (1, 2),
+            3 => (3, 3),
+            _ => return false,
+        };
+        self.source_attitude_codes[source as usize][target as usize] = forward;
+        self.source_attitude_codes[target as usize][source as usize] = reverse;
+        true
     }
 
     /// Returns true if `a` and `b` have a concluded trade agreement.
@@ -1434,6 +2101,31 @@ fn source_kind4_definition(unit: &MilitaryUnit) -> Option<LandFigureDefinition> 
         .and_then(LandFigureDefinition::from_id)
 }
 
+/// Build the ware and exact quantity written by `FUN_00458000` for a
+/// boarding type-4 figure. The source derives the ware from the low byte of
+/// its compiled land-figure definition and scales the live energy to one
+/// `0x640` cargo entry by that definition's runtime energy cap.
+pub fn source_kind4_boarding_cargo(unit: &MilitaryUnit) -> Option<(u8, u16)> {
+    let definition = source_kind4_definition(unit)?;
+    let ware = u8::try_from(definition.id).ok()?.checked_add(0x18)?;
+    let quantity = (u32::from(unit.source_energy)
+        * u32::from(SOURCE_SHIP_CARGO_SLOT_QUANTITY_CAPACITY)
+        / u32::from(definition.source_runtime_energy_cap())) as u16;
+    Some((ware, quantity))
+}
+
+/// Map the compiled source land-figure family used by `FUN_00446ca0` onto
+/// the local category-4 combat projection.
+pub fn source_kind4_unit_type(figure_definition_id: u16) -> Option<UnitType> {
+    match LandFigureDefinition::from_id(figure_definition_id)?.family {
+        LandFigureFamily::Infantry => Some(UnitType::Infantry),
+        LandFigureFamily::Cavalry => Some(UnitType::Cavalry),
+        LandFigureFamily::Musketeer => Some(UnitType::Musketeer),
+        LandFigureFamily::Cannoneer => Some(UnitType::Cannon),
+        LandFigureFamily::NativeSpearman => Some(UnitType::NativeSpearman),
+    }
+}
+
 /// `FUN_00456d00` computes this caller-side value before passing it as
 /// `param_3` to `FUN_00454250`. The caller does not divide by `Worktime`.
 fn source_kind4_attacker_strength(unit: &MilitaryUnit, definition: LandFigureDefinition) -> u32 {
@@ -1496,20 +2188,16 @@ pub fn source_combat_candidate_target_strength(candidate: &SourceCombatCandidate
     u16::try_from(strength).ok()
 }
 
-/// Score one category-6 candidate through the common `FUN_00454250` body.
-/// `FUN_00458ac0` supplies its un-normalized caller strength, whereas the
+/// Score one type-4 or type-6 candidate through the common `FUN_00454250`
+/// body. Both callers supply the same un-normalized attacker strength; the
 /// target branch is recovered by [`source_combat_candidate_target_strength`].
 /// The caller's `metric <= 0x60` candidate-list filter belongs to dispatch
 /// construction and is intentionally not imposed by this score primitive.
-pub fn source_kind6_candidate_score(
+fn source_common_candidate_score(
     attacker: &SourceCombatCandidate,
     target: &SourceCombatCandidate,
     candidate_metric: u16,
 ) -> Option<u16> {
-    if attacker.figure_kind != 6 {
-        return None;
-    }
-
     let attacker_definition = attacker.combat_definition()?;
     let target_definition = target.combat_definition()?;
     let attacker_strength = source_combat_raw_strength(
@@ -1546,11 +2234,114 @@ pub fn source_kind6_candidate_score(
     u16::try_from(score).ok()
 }
 
+/// Score a category-4 attacker against any category admitted by
+/// `FUN_0045cd20`. `FUN_00456d00` passes its raw land-figure strength to the
+/// same `FUN_00454250` score body used by the category-6 dispatcher.
+pub fn source_kind4_live_candidate_score(
+    attacker: &SourceCombatCandidate,
+    target: &SourceCombatCandidate,
+    candidate_metric: u16,
+) -> Option<u16> {
+    if attacker.figure_kind != 4 {
+        return None;
+    }
+    let score_radius = u32::from(attacker.combat_definition()?.runtime_shot_radius)
+        + SOURCE_KIND4_CANDIDATE_SCORE_RADIUS_MARGIN;
+    (u32::from(candidate_metric) <= score_radius)
+        .then(|| source_common_candidate_score(attacker, target, candidate_metric))?
+}
+
+/// Score one category-6 candidate through the common `FUN_00454250` body.
+pub fn source_kind6_candidate_score(
+    attacker: &SourceCombatCandidate,
+    target: &SourceCombatCandidate,
+    candidate_metric: u16,
+) -> Option<u16> {
+    (attacker.figure_kind == 6)
+        .then(|| source_common_candidate_score(attacker, target, candidate_metric))?
+}
+
+/// Score a category-one through -three attacker through `FUN_00454250`'s
+/// shared score body. `FUN_00452370` has already received its bounded rows
+/// from `FUN_0045cd20`; unlike the category-four direct-action wrapper, this
+/// branch does not apply an additional score-radius cutoff before sorting.
+pub fn source_kind13_live_candidate_score(
+    attacker: &SourceCombatCandidate,
+    target: &SourceCombatCandidate,
+    candidate_metric: u16,
+) -> Option<u16> {
+    (1..=3)
+        .contains(&attacker.figure_kind)
+        .then(|| source_common_candidate_score(attacker, target, candidate_metric))?
+}
+
 /// `FUN_00458ac0` permits an action precisely when its category-6 table
 /// timestamp is no greater than `DAT_005b6040`. This is an ordinary unsigned
 /// comparison, not a wrapping elapsed-time calculation.
 pub const fn source_kind6_action_is_ready(source_time_ticks: u32, ready_at: u32) -> bool {
     ready_at <= source_time_ticks
+}
+
+/// Recover the category-one through -three timestamp written by
+/// `FUN_00447880`. Its shared `+0x1a2` state byte must be nonzero; the source
+/// converts the compiled `Worktime` to source ticks, divides toward zero by
+/// that byte, and adds the result to `DAT_005b6040`.
+pub fn source_kind13_action_ready_at(
+    source_time_ticks: u32,
+    attacker: &SourceCombatCandidate,
+) -> Option<u32> {
+    if !(1..=3).contains(&attacker.figure_kind) || attacker.source_score_state == 0 {
+        return None;
+    }
+    let work_ticks = (attacker.combat_definition()?.runtime_work_time * 10.0) as u32;
+    Some(source_time_ticks.wrapping_add(work_ticks / u32::from(attacker.source_score_state)))
+}
+
+/// Apply `FUN_0045e1f0`'s category-one through -three opcode `0x19` update
+/// to the shared `+0x1a2` byte. The source performs an eight-bit addition.
+pub const fn source_kind13_score_state_after_event(state: u8, payload: u8) -> u8 {
+    state.wrapping_add(payload)
+}
+
+/// Recover the type-one due tick assigned by `FUN_00447880` after a
+/// category-one through -three action. The common deferred pool receives the
+/// compiled `Shottime:` without another unit conversion.
+pub fn source_kind13_impact_due_at(
+    source_time_ticks: u32,
+    attacker: &SourceCombatCandidate,
+) -> Option<u32> {
+    (1..=3)
+        .contains(&attacker.figure_kind)
+        .then(|| attacker.combat_definition())
+        .flatten()
+        .map(|definition| source_time_ticks.wrapping_add(definition.runtime_shot_delay_ticks))
+}
+
+/// Match two live target descriptors with `FUN_00445480`'s action-anchor
+/// equality. Figure descriptors ignore their candidate-list byte, island-cell
+/// descriptors use their source-specific identity fields, and coordinate
+/// descriptors compare the coordinates decoded by `FUN_00445590`.
+pub fn source_target_descriptor_matches_action_anchor(
+    left: SourceTargetDescriptor,
+    right: SourceTargetDescriptor,
+) -> bool {
+    let left_bytes = left.bytes();
+    let right_bytes = right.bytes();
+    if left_bytes[0] != right_bytes[0] {
+        return false;
+    }
+
+    match left.kind() {
+        1..=6 | 0x22 | 0x39 => left_bytes[2..4] == right_bytes[2..4],
+        0x32 | 0x33 => left_bytes[1..4] == right_bytes[1..4],
+        0x34 => left_bytes[1] == right_bytes[1],
+        0x35 | 0x36 => left_bytes[1..3] == right_bytes[1..3],
+        SourceTargetDescriptor::WORLD_COORDINATE_KIND
+        | SourceTargetDescriptor::FIXED_POINT_COORDINATE_KIND => {
+            left.source_land_route_coordinate() == right.source_land_route_coordinate()
+        }
+        _ => false,
+    }
 }
 
 /// Apply the owner gate at the entry to `FUN_00458ac0`. The executable
@@ -1613,6 +2404,35 @@ pub fn source_kind6_impact_due_at(
         .map(|definition| source_time_ticks.wrapping_add(definition.runtime_shot_delay_ticks))
 }
 
+/// Recover the category-4 timestamp written by `FUN_00447880` into
+/// `DAT_0051c688`. The executable loads definition `+0x14` (`Worktime`),
+/// multiplies it by the binary-confirmed `-10.0` at `0x496380`, converts the
+/// result toward zero, then subtracts it from the source clock.
+pub fn source_kind4_action_ready_at(
+    source_time_ticks: u32,
+    attacker: &SourceCombatCandidate,
+) -> Option<u32> {
+    (attacker.figure_kind == 4)
+        .then(|| attacker.combat_definition())
+        .flatten()
+        .map(|definition| {
+            source_time_ticks.wrapping_add((definition.runtime_work_time * 10.0) as u32)
+        })
+}
+
+/// Recover the absolute type-one due tick for a category-4 action. The
+/// category-4 executor allocates its record with the launcher's compiled
+/// `Shottime:` delay exactly as the category-6 branch does.
+pub fn source_kind4_impact_due_at(
+    source_time_ticks: u32,
+    attacker: &SourceCombatCandidate,
+) -> Option<u32> {
+    (attacker.figure_kind == 4)
+        .then(|| attacker.combat_definition())
+        .flatten()
+        .map(|definition| source_time_ticks.wrapping_add(definition.runtime_shot_delay_ticks))
+}
+
 /// Build the exact category-6 action input written by `FUN_004546e0` after
 /// target selection. This does not apply compatibility damage: the source
 /// executor updates launcher state and, when its definition has a nonzero
@@ -1639,6 +2459,88 @@ pub fn source_kind6_action(
         flags: SOURCE_KIND6_ACTION_EVENT_FLAGS,
         target_descriptor: selected.target_descriptor,
         kind15_figure_definition_id: definition.runtime_shot_figure_id,
+    })
+}
+
+/// Build the category-4 action payload written by `FUN_004546e0`. Its
+/// target is deferred to the shared type-one pool; `FUN_00445930` resolves
+/// the descriptor against the then-live category table.
+pub fn source_kind4_action(
+    attacker: &SourceCombatCandidate,
+    selected: SourceKind4SelectedTarget,
+) -> Option<SourceKind4Action> {
+    if attacker.figure_kind != 4 {
+        return None;
+    }
+    let definition = attacker.combat_definition()?;
+    let raw_strength = source_combat_raw_strength(
+        attacker.source_energy,
+        definition.runtime_energy_cap,
+        definition.runtime_hit_points,
+    );
+    Some(SourceKind4Action {
+        attacker_position: attacker.position,
+        attacker_runtime_slot: attacker.runtime_slot,
+        raw_strength: u16::try_from(raw_strength).ok()?,
+        attacker_figure_kind: attacker.figure_kind,
+        direction: selected.direction,
+        flags: SOURCE_KIND4_ACTION_EVENT_FLAGS,
+        target_descriptor: selected.target_descriptor,
+    })
+}
+
+/// Build the category-one through -three action payload written by
+/// `FUN_00452370` through `FUN_004546e0`. Bit zero says the selected live
+/// target still matches the attacker's persistent `+0x1c` anchor; bit one
+/// records which of the direct ray's two attack facings was selected.
+pub fn source_kind13_action(
+    attacker: &SourceCombatCandidate,
+    selected: SourceKind13SelectedTarget,
+    attack_direction: u8,
+    action_anchor: SourceTargetDescriptor,
+) -> Option<SourceKind13Action> {
+    if !(1..=3).contains(&attacker.figure_kind) {
+        return None;
+    }
+    let raw_strength = source_combat_candidate_target_strength(attacker)?;
+    let definition = attacker.combat_definition()?;
+    let anchor_match = source_target_descriptor_matches_action_anchor(
+        selected.target_descriptor,
+        action_anchor,
+    );
+    let ray_side_bit = ((selected.direction.wrapping_sub(attack_direction)) & 7) < 4;
+    Some(SourceKind13Action {
+        attacker_position: attacker.position,
+        attacker_runtime_slot: attacker.runtime_slot,
+        raw_strength,
+        attacker_figure_kind: attacker.figure_kind,
+        direction: attack_direction,
+        flags: u8::from(anchor_match) | (u8::from(ray_side_bit) << 1),
+        target_descriptor: selected.target_descriptor,
+        kind14_figure_definition_id: definition.runtime_shot_figure_id,
+    })
+}
+
+/// Materialize the fixed-position kind-14 record constructed by
+/// `FUN_00447e90`. The caller's action bit one becomes runtime bit four.
+pub fn source_kind14_figure_from_action(
+    action: SourceKind13Action,
+    launcher_height: f32,
+) -> Option<SourceKind14CombatFigure> {
+    let figure_definition_id = action.kind14_figure_definition_id?;
+    let definition = SourceShotFigureDefinition::from_id(figure_definition_id)?;
+    Some(SourceKind14CombatFigure {
+        active: true,
+        figure_definition_id,
+        position: (
+            action.attacker_position.0,
+            action.attacker_position.1,
+            launcher_height,
+        ),
+        launcher_runtime_slot: action.attacker_runtime_slot,
+        source_step_amount: SOURCE_KIND15_STEP_AMOUNT,
+        remaining_work_time: definition.runtime_work_time,
+        source_flags: SOURCE_KIND15_EXECUTOR_FLAGS | ((action.flags & 2) << 3),
     })
 }
 
@@ -1711,6 +2613,26 @@ pub fn advance_source_kind15_figure(
     true
 }
 
+/// Advance a kind-14 visual through the same generic work-time consumption
+/// used by `FUN_00451890` for the kind-15 path.
+pub fn advance_source_kind14_figure(
+    figure: &mut SourceKind14CombatFigure,
+    dt_ms: u32,
+) -> bool {
+    if !figure.active {
+        return true;
+    }
+    let consumed =
+        dt_ms as f32 * SOURCE_GENERIC_FIGURE_TIME_SCALE * figure.source_step_amount;
+    if consumed < figure.remaining_work_time {
+        figure.remaining_work_time -= consumed;
+        return false;
+    }
+    figure.remaining_work_time = 0.0;
+    figure.active = false;
+    true
+}
+
 /// Apply `FUN_00458ac0`'s `metric < 0x61` row filter and rank the resulting
 /// `FUN_00454250` scores. Candidate rows arrive in the source pair-producer
 /// order, so equal scores retain that source row order until the executable's
@@ -1737,11 +2659,125 @@ pub fn source_kind6_ranked_candidates(
     ranked
 }
 
+/// Rank every live category row admitted to a type-4 attacker by the
+/// `FUN_0045cd20` pair producer and `FUN_00454250` score body. Equal scores
+/// retain the pair producer's physical row order.
+pub fn source_kind4_ranked_live_candidates(
+    attacker: &SourceCombatCandidate,
+    candidates: &[SourceCombatCandidate],
+    diplomacy: &DiplomacyMatrix,
+) -> Vec<SourceKind6RankedCandidate> {
+    let mut ranked = source_combat_candidate_pairs(attacker, candidates, diplomacy)
+        .into_iter()
+        .filter_map(|pair| {
+            source_kind4_live_candidate_score(attacker, &pair.target, pair.metric).map(|score| {
+                SourceKind6RankedCandidate {
+                    target: pair.target,
+                    metric: pair.metric,
+                    score,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.score.cmp(&left.score));
+    ranked
+}
+
+/// Rank category-one through -three candidates in the row and tie order
+/// consumed by `FUN_00452370`. The pair producer supplies the fixed 32-row
+/// cap and excludes same-class ship targets before the common score body
+/// orders the remaining rows.
+pub fn source_kind13_ranked_live_candidates(
+    attacker: &SourceCombatCandidate,
+    candidates: &[SourceCombatCandidate],
+    diplomacy: &DiplomacyMatrix,
+) -> Vec<SourceKind6RankedCandidate> {
+    let mut ranked = source_combat_candidate_pairs(attacker, candidates, diplomacy)
+        .into_iter()
+        .filter_map(|pair| {
+            source_kind13_live_candidate_score(attacker, &pair.target, pair.metric).map(|score| {
+                SourceKind6RankedCandidate {
+                    target: pair.target,
+                    metric: pair.metric,
+                    score,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.score.cmp(&left.score));
+    ranked
+}
+
+/// Select the first score-ranked category-one through -three row whose target
+/// geometry passes the direct radius gate used by `FUN_00453e50`. The caller
+/// resolves the category-six descriptor form against its current map state;
+/// all other live figure categories use their one-cell runtime footprint.
+pub fn source_kind13_select_live_target(
+    attacker: &SourceCombatCandidate,
+    candidates: &[SourceCombatCandidate],
+    diplomacy: &DiplomacyMatrix,
+    mut resolve_descriptor: impl FnMut(SourceTargetDescriptor) -> Option<SourcePathTargetRect>,
+) -> Option<SourceKind13SelectedTarget> {
+    let attacker_position = source_kind6_action_coordinate(attacker.position)?;
+    let attacker_shot_radius = attacker.combat_definition()?.runtime_shot_radius;
+    source_kind13_ranked_live_candidates(attacker, candidates, diplomacy)
+        .into_iter()
+        .find_map(|candidate| {
+            let target_descriptor = candidate.target.source_kind6_action_target_descriptor()?;
+            let target = match candidate.target.source_kind6_target_geometry()? {
+                SourceKind6TargetGeometry::Point(target) => Some(target),
+                SourceKind6TargetGeometry::Descriptor(descriptor) => resolve_descriptor(descriptor),
+            }?;
+            source_kind6_target_direction(attacker_position, target, attacker_shot_radius).map(
+                |direction| SourceKind13SelectedTarget {
+                    target: candidate.target,
+                    target_descriptor,
+                    metric: candidate.metric,
+                    score: candidate.score,
+                    direction,
+                },
+            )
+        })
+}
+
+/// Select the first score-ranked category-4 row whose resolved descriptor is
+/// inside the direct attack radius. `FUN_00453e50` uses the same doubled
+/// live-coordinate conversion and octant direction as `FUN_00454050`; the
+/// caller supplies the source-island ray test that this pure selector cannot
+/// perform without map state.
+pub fn source_kind4_select_live_target(
+    attacker: &SourceCombatCandidate,
+    candidates: &[SourceCombatCandidate],
+    diplomacy: &DiplomacyMatrix,
+    mut resolve_descriptor: impl FnMut(SourceTargetDescriptor) -> Option<SourcePathTargetRect>,
+) -> Option<SourceKind4SelectedTarget> {
+    let attacker_position = source_kind6_action_coordinate(attacker.position)?;
+    let attacker_shot_radius = attacker.combat_definition()?.runtime_shot_radius;
+    source_kind4_ranked_live_candidates(attacker, candidates, diplomacy)
+        .into_iter()
+        .find_map(|candidate| {
+            let target_descriptor = candidate.target.source_kind6_action_target_descriptor()?;
+            let target = match candidate.target.source_kind6_target_geometry()? {
+                SourceKind6TargetGeometry::Point(target) => Some(target),
+                SourceKind6TargetGeometry::Descriptor(descriptor) => resolve_descriptor(descriptor),
+            }?;
+            source_kind6_target_direction(attacker_position, target, attacker_shot_radius).map(
+                |direction| SourceKind4SelectedTarget {
+                    target: candidate.target,
+                    target_descriptor,
+                    metric: candidate.metric,
+                    score: candidate.score,
+                    direction,
+                },
+            )
+        })
+}
+
 /// Select the first score-ranked row whose target geometry passes
 /// `FUN_00458d80`. Descriptor-form targets are resolved through the caller's
 /// live map state; point targets use the direct one-cell source footprint.
-/// The `FUN_00458e60` player-state predicate and action cooldown are applied
-/// by the dispatch layer after this geometry gate.
+/// The dispatch layer supplies only rows accepted by `FUN_00458e60`; the
+/// action cooldown is checked there as well.
 pub fn source_kind6_select_target(
     attacker: &SourceCombatCandidate,
     candidates: &[SourceCombatCandidate],
@@ -2089,6 +3125,10 @@ pub fn tick_unit_orders_with_maps_and_source_rand_and_dispatch_state_and_target_
     mut resolve_target: impl FnMut(SourceTargetDescriptor) -> Option<SourcePathTargetRect>,
 ) {
     for u in units.iter_mut() {
+        if u.source_terminal_pending {
+            tick_source_terminal_motion_slice(u, dt_ms, island_maps);
+            continue;
+        }
         if !u.is_alive() {
             continue;
         }
@@ -2143,6 +3183,69 @@ pub fn tick_unit_orders_with_maps_and_source_rand_and_dispatch_state_and_target_
                 _ => u.direction,
             };
         }
+    }
+}
+
+/// Advance only the motion slice retained by `FUN_0045e1f0` after terminal
+/// control. `FUN_00451890` removes the source figure as soon as this slice
+/// reaches zero and never begins another route run.
+fn tick_source_terminal_motion_slice(
+    unit: &mut MilitaryUnit,
+    dt_ms: u32,
+    island_maps: &[crate::island_map::IslandMap],
+) {
+    if !unit.source_position_initialized {
+        unit.source_position_x = unit.tile_x as f32 * 0.5 + 0.25;
+        unit.source_position_y = unit.tile_y as f32 * 0.5 + 0.25;
+        unit.source_position_initialized = true;
+    }
+
+    let mut speed = SOURCE_TERMINAL_STATIONARY_SPEED;
+    let mut direction = None;
+    if unit.source_figure_kind == Some(4)
+        && unit.source_motion_target.is_some()
+        && unit.source_terminal_remaining > f32::EPSILON
+    {
+        if let (Some(definition_id), Some(island_id)) =
+            (unit.source_figure_definition_id, unit.source_island_id)
+        {
+            if let (Some(definition), Some(map)) = (
+                anno_formats::szs::LandFigureDefinition::from_id(definition_id),
+                island_maps.iter().find(|map| map.island_id == island_id),
+            ) {
+                if let Some(local) = map.source_world_to_local((unit.tile_x, unit.tile_y)) {
+                    if let Some(terrain_wegspeed) =
+                        map.source_land_movement_speed(definition.source_speed_type(), local)
+                    {
+                        speed = definition.source_move_speed() as f32
+                            * SOURCE_FIGURE_SPEED_SCALE
+                            * 32.0
+                            / terrain_wegspeed.max(1) as f32;
+                        direction = unit.source_motion_target.map(|next| {
+                            ((next.0 - unit.tile_x).signum() as f32, (next.1 - unit.tile_y).signum() as f32)
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let distance =
+        (dt_ms as f32 * SOURCE_MOTION_TIME_SCALE * speed).min(unit.source_terminal_remaining);
+    if let Some((step_x, step_y)) = direction {
+        let divisor = if step_x != 0.0 && step_y != 0.0 {
+            SOURCE_DIAGONAL_DISTANCE
+        } else {
+            1.0
+        };
+        unit.source_position_x += step_x * distance / divisor;
+        unit.source_position_y += step_y * distance / divisor;
+    }
+    unit.source_terminal_remaining -= distance;
+    if unit.source_terminal_remaining <= f32::EPSILON {
+        unit.source_terminal_remaining = 0.0;
+        unit.active = false;
+        unit.health = 0.0;
     }
 }
 
@@ -2488,10 +3591,18 @@ fn source_kind4_next_program_run_endpoint(unit: &mut MilitaryUnit) -> Option<(i3
     ))
 }
 
-fn source_kind4_program_is_terminal(unit: &MilitaryUnit) -> bool {
+/// Whether the source type-4 direction program is at its terminal opcode.
+/// `FUN_00456d00` may only rebuild the candidate target table at this point.
+pub fn source_kind4_route_program_is_terminal(unit: &MilitaryUnit) -> bool {
     unit.source_route_program
         .get(usize::from(unit.source_route_program_cursor))
-        .map_or(true, |command| command & 0xf0 == 0xc0 || command & 0x0f == 0)
+        .map_or(true, |command| {
+            command & 0xf0 == 0xc0 || command & 0x0f == 0
+        })
+}
+
+fn source_kind4_program_is_terminal(unit: &MilitaryUnit) -> bool {
+    source_kind4_route_program_is_terminal(unit)
 }
 
 /// `FUN_00456d00` clears a resolved terminal descriptor only when
@@ -2869,7 +3980,9 @@ mod tests {
             position: (120.0, 130.0),
             position_z: 0.0,
             source_energy: 320,
+            source_score_state: 0,
             source_action_ready_at: 0,
+            source_cargo_slots: [0; SOURCE_SHIP_CARGO_SLOT_COUNT],
             target_descriptor: SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             owner: 3,
@@ -2879,6 +3992,7 @@ mod tests {
             runtime_slot: 8,
             auxiliary_kind: 0,
             name_index: 0,
+            source_motion: SourceGenericMotion::default(),
         };
 
         let candidates = source_combat_candidate_buffer(&[land, warship], &[trader], &[dynamic]);
@@ -3055,6 +4169,32 @@ mod tests {
     }
 
     #[test]
+    fn source_ship_cargo_matches_fun_00448120_entry_updates() {
+        let mut slots = [0; SOURCE_SHIP_CARGO_SLOT_COUNT];
+        slots[0] = (7_u32 << 22) | (1_500_u32 << 8) | 0x19;
+
+        source_add_ship_cargo(&mut slots, 0x19, 3, 200);
+
+        assert_eq!(source_ship_cargo_slot_ware(slots[0]), 0x19);
+        assert_eq!(source_ship_cargo_slot_quantity(slots[0]), 0x640);
+        assert_eq!(source_ship_cargo_slot_metadata(slots[0]), 6);
+        assert_eq!(source_ship_cargo_slot_ware(slots[1]), 0x19);
+        assert_eq!(source_ship_cargo_slot_quantity(slots[1]), 100);
+        assert_eq!(source_ship_cargo_slot_metadata(slots[1]), 3);
+    }
+
+    #[test]
+    fn source_kind_four_boarding_cargo_scales_live_energy_to_one_slot() {
+        let mut unit = source_kind4_unit(0, 1, 0, 0);
+        unit.source_figure_definition_id = Some(1);
+        unit.source_energy = LandFigureDefinition::from_id(1)
+            .expect("source land definition is known")
+            .source_runtime_energy_cap();
+
+        assert_eq!(source_kind4_boarding_cargo(&unit), Some((0x19, 0x640)));
+    }
+
+    #[test]
     fn source_candidate_target_strength_matches_fun_00454250_branches() {
         // `FUN_00454250` reads the shared category-1/2/3 score-state byte
         // and maps it to 0, 1, 2, 4, or 6 times the compiled hit-point term.
@@ -3128,6 +4268,115 @@ mod tests {
     }
 
     #[test]
+    fn source_kind13_cooldown_divides_worktime_ticks_by_its_live_state_byte() {
+        let mut attacker = source_candidate(1, 0x19, 195, 4);
+        assert_eq!(source_kind13_action_ready_at(19, &attacker), Some(31));
+
+        attacker.source_score_state = 0;
+        assert_eq!(source_kind13_action_ready_at(19, &attacker), None);
+
+        attacker.figure_kind = 4;
+        attacker.source_score_state = 4;
+        assert_eq!(source_kind13_action_ready_at(19, &attacker), None);
+    }
+
+    #[test]
+    fn source_kind13_score_event_wraps_the_shared_state_byte() {
+        assert_eq!(source_kind13_score_state_after_event(3, 4), 7);
+        assert_eq!(source_kind13_score_state_after_event(0xff, 2), 1);
+    }
+
+    #[test]
+    fn source_action_anchor_descriptor_match_uses_fun_00445480_fields() {
+        // Kinds 1..=6 compare the runtime slot only, not the candidate-list
+        // byte carried at offset one.
+        assert!(source_target_descriptor_matches_action_anchor(
+            SourceTargetDescriptor::from_bytes([1, 2, 0x34, 0x12]),
+            SourceTargetDescriptor::from_bytes([1, 9, 0x34, 0x12]),
+        ));
+        assert!(!source_target_descriptor_matches_action_anchor(
+            SourceTargetDescriptor::from_bytes([1, 2, 0x34, 0x12]),
+            SourceTargetDescriptor::from_bytes([1, 2, 0x35, 0x12]),
+        ));
+
+        assert!(source_target_descriptor_matches_action_anchor(
+            SourceTargetDescriptor::from_bytes([0x32, 7, 3, 4]),
+            SourceTargetDescriptor::from_bytes([0x32, 7, 3, 4]),
+        ));
+        assert!(!source_target_descriptor_matches_action_anchor(
+            SourceTargetDescriptor::from_bytes([0x32, 7, 3, 4]),
+            SourceTargetDescriptor::from_bytes([0x32, 7, 3, 5]),
+        ));
+
+        // Kind 0x34 is an island-wide action anchor, while kinds 0x35/0x36
+        // retain their island and dynamic-object slot but ignore byte three.
+        assert!(source_target_descriptor_matches_action_anchor(
+            SourceTargetDescriptor::from_bytes([0x34, 7, 3, 4]),
+            SourceTargetDescriptor::from_bytes([0x34, 7, 9, 9]),
+        ));
+        assert!(source_target_descriptor_matches_action_anchor(
+            SourceTargetDescriptor::from_bytes([0x35, 7, 3, 4]),
+            SourceTargetDescriptor::from_bytes([0x35, 7, 3, 9]),
+        ));
+        assert!(!source_target_descriptor_matches_action_anchor(
+            SourceTargetDescriptor::from_bytes([0x35, 7, 3, 4]),
+            SourceTargetDescriptor::from_bytes([0x36, 7, 3, 4]),
+        ));
+
+        let coordinate = SourceTargetDescriptor::from_source_land_route_coordinate(8, 10)
+            .expect("even source route coordinate is representable");
+        assert!(source_target_descriptor_matches_action_anchor(
+            coordinate, coordinate
+        ));
+        assert!(!source_target_descriptor_matches_action_anchor(
+            coordinate,
+            SourceTargetDescriptor::from_bytes([0x38, 0, 8, 10]),
+        ));
+    }
+
+    #[test]
+    fn source_kind13_action_preserves_anchor_and_ray_side_bits() {
+        let mut attacker = source_candidate(1, 0x19, 195, 3);
+        attacker.runtime_slot = 12;
+        attacker.position = (7.25, 9.5);
+        let descriptor = SourceTargetDescriptor::from_bytes([4, 3, 8, 0]);
+        let selected = SourceKind13SelectedTarget {
+            target: source_candidate(4, 14, 90, 0),
+            target_descriptor: descriptor,
+            metric: 8,
+            score: 40,
+            direction: 2,
+        };
+
+        assert_eq!(
+            source_kind13_action(&attacker, selected, 0, descriptor),
+            Some(SourceKind13Action {
+                attacker_position: (7.25, 9.5),
+                attacker_runtime_slot: 12,
+                raw_strength: 12,
+                attacker_figure_kind: 1,
+                direction: 0,
+                flags: 3,
+                target_descriptor: descriptor,
+                kind14_figure_definition_id: Some(113),
+            })
+        );
+
+        // The opposite candidate facing clears ray-side bit one. A distinct
+        // persistent target leaves only that bit in the action flags.
+        assert_eq!(
+            source_kind13_action(
+                &attacker,
+                selected,
+                4,
+                SourceTargetDescriptor::from_bytes([4, 3, 9, 0]),
+            )
+            .map(|action| action.flags),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn source_kind6_owner_gate_matches_the_source_player_state_range() {
         assert!(source_kind6_owner_dispatch_allows(3, 3, false, 0));
         assert!(!source_kind6_owner_dispatch_allows(3, 2, false, 0x0c));
@@ -3135,6 +4384,186 @@ mod tests {
         assert!(source_kind6_owner_dispatch_allows(3, 2, true, 0x0b));
         assert!(source_kind6_owner_dispatch_allows(3, 2, true, 0x0e));
         assert!(!source_kind6_owner_dispatch_allows(3, 2, true, 0x0f));
+    }
+
+    #[test]
+    fn source_terminal_figure_control_gate_matches_fun_00445930() {
+        let mut state = SourceKind4DispatchState::default();
+        state.active_player_slot = 2;
+        state.single_player = false;
+        state.faction_states = [0, 0x09, 0, 0x0b, 0x0c, 0x0e, 0x0f];
+
+        assert!(state.allows_terminal_figure_control(2));
+        assert!(!state.allows_terminal_figure_control(1));
+        assert!(!state.allows_terminal_figure_control(3));
+
+        state.single_player = true;
+        assert!(state.allows_terminal_figure_control(1));
+        assert!(state.allows_terminal_figure_control(3));
+        assert!(state.allows_terminal_figure_control(4));
+        assert!(state.allows_terminal_figure_control(5));
+        assert!(!state.allows_terminal_figure_control(6));
+        assert!(!state.allows_terminal_figure_control(7));
+    }
+
+    #[test]
+    fn source_terminal_motion_slice_matches_fun_00446120_directional_remainder() {
+        assert_eq!(
+            source_terminal_motion_slice_remaining(4, 0, 0.75, true),
+            0.25
+        );
+        assert!(
+            (source_terminal_motion_slice_remaining(4, 1, 0.75, true)
+                - (1.5
+                    - (1.5 * std::f32::consts::FRAC_1_SQRT_2).floor() * SOURCE_DIAGONAL_DISTANCE)
+                    * 0.5)
+                .abs()
+                < f32::EPSILON
+        );
+        assert_eq!(
+            source_terminal_motion_slice_remaining(4, 0, 0.0, false),
+            SOURCE_TERMINAL_STATIONARY_SPEED
+        );
+    }
+
+    #[test]
+    fn source_generic_motion_terminal_remainder_preserves_vector_and_locked_state() {
+        let moving = SourceGenericMotion {
+            remaining_distance: 1.5,
+            scalar_speed: 0.25,
+            velocity_x: 0.25,
+            velocity_y: 0.0,
+            velocity_z: 0.125,
+            terminal_motion_locked: false,
+        };
+        assert_eq!(
+            moving.terminal_remainder(1, 2),
+            SourceGenericMotion {
+                remaining_distance: 0.25,
+                ..moving
+            }
+        );
+
+        let locked = SourceGenericMotion {
+            remaining_distance: 1.5,
+            scalar_speed: SOURCE_TERMINAL_STATIONARY_SPEED,
+            velocity_x: 0.0,
+            velocity_y: 0.0,
+            velocity_z: 0.0,
+            terminal_motion_locked: true,
+        };
+        assert_eq!(locked.terminal_remainder(1, 0), locked);
+    }
+
+    #[test]
+    fn source_action_reanchor_matches_fun_004477d0_motion_branches() {
+        let moving = SourceGenericMotion {
+            remaining_distance: 1.5,
+            scalar_speed: 0.25,
+            velocity_x: 0.25,
+            velocity_y: -0.125,
+            velocity_z: 0.5,
+            terminal_motion_locked: false,
+        };
+        let mut matching_position = (1.05, 1.95);
+        let mut matching_motion = moving;
+
+        assert!(source_action_reanchor(
+            &mut matching_position,
+            &mut matching_motion,
+            1,
+            0,
+            (1.0, 2.0),
+        ));
+        assert_eq!(matching_position, (1.05, 1.95));
+        assert_eq!(
+            matching_motion,
+            SourceGenericMotion {
+                remaining_distance: 0.25,
+                ..moving
+            }
+        );
+
+        let mut mismatching_position = (1.11, 2.0);
+        let mut mismatching_motion = moving;
+        assert!(!source_action_reanchor(
+            &mut mismatching_position,
+            &mut mismatching_motion,
+            1,
+            0,
+            (1.0, 2.0),
+        ));
+        assert_eq!(mismatching_position, (1.0, 2.0));
+        assert_eq!(
+            mismatching_motion,
+            SourceGenericMotion {
+                remaining_distance: SOURCE_ACTION_REANCHOR_REMAINING_DISTANCE,
+                scalar_speed: SOURCE_TERMINAL_STATIONARY_SPEED,
+                velocity_x: 0.0,
+                velocity_y: 0.0,
+                velocity_z: 0.0,
+                terminal_motion_locked: false,
+            }
+        );
+    }
+
+    #[test]
+    fn source_generic_motion_prefix_consumes_time_before_controller_dispatch() {
+        let mut motion = SourceGenericMotion {
+            remaining_distance: 0.25,
+            scalar_speed: 0.25,
+            velocity_x: 0.25,
+            velocity_y: -0.125,
+            velocity_z: 0.5,
+            terminal_motion_locked: false,
+        };
+        let mut position = (1.0, 2.0);
+        let mut position_z = 3.0;
+
+        assert!(!advance_source_generic_motion(
+            &mut motion,
+            &mut position,
+            &mut position_z,
+            1,
+        ));
+        assert!((motion.remaining_distance - 0.2375).abs() < f32::EPSILON);
+        assert!((position.0 - 1.0125).abs() < f32::EPSILON);
+        assert!((position.1 - 1.99375).abs() < f32::EPSILON);
+        assert!((position_z - 3.025).abs() < f32::EPSILON);
+
+        assert!(advance_source_generic_motion(
+            &mut motion,
+            &mut position,
+            &mut position_z,
+            19,
+        ));
+        assert_eq!(motion.remaining_distance, 0.0);
+        assert!((position.0 - 1.25).abs() < f32::EPSILON);
+        assert!((position.1 - 1.875).abs() < f32::EPSILON);
+        assert!((position_z - 3.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn source_combat_turn_uses_fun_00452370_facing_choice_and_delay() {
+        // The two attack facings are target ± 2. An equal-distance choice
+        // keeps the target - 2 branch because the source comparison is strict.
+        assert_eq!(source_combat_turn_direction(2, 2), 0);
+        assert_eq!(source_combat_turn_direction(4, 2), 4);
+        assert_eq!(source_combat_turn_direction(6, 0), 6);
+
+        let mut motion = SourceGenericMotion {
+            remaining_distance: 1.5,
+            scalar_speed: 0.25,
+            velocity_x: 0.25,
+            velocity_y: 0.0,
+            velocity_z: 0.0,
+            terminal_motion_locked: true,
+        };
+        assert_eq!(begin_source_combat_turn(2, 2, &mut motion), Some(0));
+        assert_eq!(motion, SourceGenericMotion::stationary_turn_delay());
+
+        assert_eq!(begin_source_combat_turn(0, 2, &mut motion), None);
+        assert_eq!(motion, SourceGenericMotion::stationary_turn_delay());
     }
 
     #[test]
@@ -3348,6 +4777,55 @@ mod tests {
     }
 
     #[test]
+    fn source_kind13_selection_uses_shared_rows_then_the_direct_target_ray() {
+        let mut attacker = source_candidate(1, 0x19, 195, 0);
+        attacker.candidate_list_key = Some(4);
+
+        let mut same_class_ship = source_candidate(2, 0x19, 195, 0);
+        same_class_ship.entity = SourceCombatCandidateEntity::DynamicFigure(1);
+        same_class_ship.candidate_list_key = Some(4);
+        same_class_ship.owner = 1;
+        same_class_ship.position = (0.5, 0.0);
+
+        let mut target = source_candidate(4, 1, 60, 0);
+        target.entity = SourceCombatCandidateEntity::DynamicFigure(2);
+        target.candidate_list_key = Some(4);
+        target.owner = 1;
+        target.position = (1.0, 0.0);
+
+        let ranked = source_kind13_ranked_live_candidates(
+            &attacker,
+            &[attacker, same_class_ship, target],
+            &DiplomacyMatrix::new(),
+        );
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].target, target);
+
+        let selected = source_kind13_select_live_target(
+            &attacker,
+            &[attacker, same_class_ship, target],
+            &DiplomacyMatrix::new(),
+            |_| None,
+        );
+        assert_eq!(
+            selected.map(|selected| {
+                (
+                    selected.target,
+                    selected.target_descriptor,
+                    selected.metric,
+                    selected.direction,
+                )
+            }),
+            Some((
+                target,
+                SourceTargetDescriptor::from_bytes([4, 4, 2, 0]),
+                8,
+                2,
+            ))
+        );
+    }
+
+    #[test]
     fn source_combat_pair_producer_keeps_the_first_32_source_rows() {
         let mut attacker = source_candidate(6, 0x1f, 285, 0);
         attacker.candidate_list_key = Some(7);
@@ -3437,6 +4915,29 @@ mod tests {
         let cannon_score = source_kind4_candidate_score(&attacker, &farther_cannon, 20)
             .expect("cannon is in the source score envelope");
         assert!(infantry_score > cannon_score);
+
+        let source_attacker = source_candidate(4, 9, 45, 0);
+        let source_infantry = source_candidate(4, 1, 60, 0);
+        assert_eq!(
+            source_kind4_live_candidate_score(&source_attacker, &source_infantry, 6),
+            Some(infantry_score)
+        );
+
+        let mut source_ship = source_candidate(1, 0x19, 195, 17);
+        source_ship.entity = SourceCombatCandidateEntity::DynamicFigure(1);
+        source_ship.owner = 1;
+        source_ship.position = (1.0, 0.0);
+        assert_eq!(
+            source_kind4_ranked_live_candidates(
+                &source_attacker,
+                &[source_attacker, source_ship],
+                &DiplomacyMatrix::new(),
+            )
+            .into_iter()
+            .map(|row| row.target.entity)
+            .collect::<Vec<_>>(),
+            vec![SourceCombatCandidateEntity::DynamicFigure(1)]
+        );
 
         let mut units = vec![attacker, nearby_infantry, farther_cannon];
         acquire_source_kind4_candidates(&mut units, &DiplomacyMatrix::new());
@@ -3588,6 +5089,55 @@ mod tests {
         dm.set(0, 1, Diplomacy::War);
         assert_eq!(dm.get(0, 1), Diplomacy::War);
         assert_eq!(dm.get(1, 0), Diplomacy::War); // Symmetric
+    }
+
+    #[test]
+    fn source_relation_codes_keep_directed_fun_0045cd20_exclusion() {
+        let mut dm = DiplomacyMatrix::new();
+        dm.set_source_relationship_code(0, 1, 1);
+        dm.set_source_relationship_code(1, 0, 3);
+
+        assert_eq!(dm.source_relationship_code(0, 1), 1);
+        assert_eq!(dm.source_relationship_code(1, 0), 3);
+        assert!(!dm.source_relationship_excludes_combat(0, 1));
+        assert!(dm.source_relationship_excludes_combat(1, 0));
+        assert_eq!(dm.get(0, 1), Diplomacy::Neutral);
+        assert_eq!(dm.get(1, 0), Diplomacy::Allied);
+    }
+
+    #[test]
+    fn source_relationship_event_matches_fun_004760e0_payloads() {
+        let mut dm = DiplomacyMatrix::new();
+        dm.set_source_relationship_code(0, 1, 3);
+
+        assert!(dm.apply_source_relationship_event(0, 1, SourceRelationshipEvent::SetCode0));
+        assert_eq!(dm.source_relationship_code(0, 1), 0);
+        assert_eq!(dm.source_relationship_code(1, 0), 0);
+        assert!(!dm.apply_source_relationship_event(0, 1, SourceRelationshipEvent::SetCode0));
+
+        assert!(dm.apply_source_relationship_event(0, 1, SourceRelationshipEvent::SetCode2));
+        assert_eq!(dm.source_relationship_code(0, 1), 2);
+        assert!(dm.apply_source_relationship_event(0, 1, SourceRelationshipEvent::SetCode3));
+        assert_eq!(dm.source_relationship_code(0, 1), 3);
+        assert!(!dm.apply_source_relationship_event(7, 1, SourceRelationshipEvent::SetCode0));
+        assert!(!dm.apply_source_relationship_payload(0, 1, 2));
+    }
+
+    #[test]
+    fn source_attitude_event_matches_fun_00476130_pair_updates() {
+        let mut dm = DiplomacyMatrix::new();
+        assert!(dm.apply_source_attitude_payload(0, 1, 1));
+        assert_eq!(dm.source_attitude_code(0, 1), 1);
+        assert_eq!(dm.source_attitude_code(1, 0), 2);
+        assert!(!dm.apply_source_attitude_payload(0, 1, 1));
+
+        assert!(dm.apply_source_attitude_payload(0, 1, 3));
+        assert_eq!(dm.source_attitude_code(0, 1), 3);
+        assert_eq!(dm.source_attitude_code(1, 0), 3);
+        assert!(dm.apply_source_attitude_payload(0, 1, 0));
+        assert_eq!(dm.source_attitude_code(0, 1), 0);
+        assert_eq!(dm.source_attitude_code(1, 0), 0);
+        assert!(!dm.apply_source_attitude_payload(0, 1, 2));
     }
 
     #[test]
@@ -4015,6 +5565,15 @@ mod tests {
             Some((4, 0))
         );
         assert_eq!(unit.source_route_program_cursor, 2);
+    }
+
+    #[test]
+    fn source_kind_four_reverse_route_offset_matches_fun_0046d130() {
+        let program = [0x31, 0x52, SOURCE_KIND4_ROUTE_PROGRAM_TERMINATOR];
+
+        assert_eq!(source_kind4_reverse_route_offset(&program, 2, 5), (-1, -2));
+        assert_eq!(source_kind4_reverse_route_offset(&program, 2, 2), (0, -2));
+        assert_eq!(source_kind4_reverse_route_offset(&program, 0, 5), (-1, 0));
     }
 
     #[test]

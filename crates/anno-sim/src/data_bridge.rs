@@ -481,6 +481,11 @@ pub struct SourceKind4Occupant {
     pub direction: u8,
     /// Initial source animation selected by `FUN_00446d90`.
     pub animation_state: u8,
+    /// Runtime offset `+0x126`, loaded from `SOLDAT3 +0x1c`. When state bit
+    /// zero is set and no live target remains, `FUN_00458190` advances this
+    /// selector through the two descriptors in `state_payload`.
+    #[serde(default)]
+    pub state_selector: u8,
     /// Type-4 descriptor consumed by `FUN_00456d00` after scenario load.
     pub state_descriptor: SourceTargetDescriptor,
     /// `DAT_0051c688`: source-clock timestamp used by `FUN_00456d00` for
@@ -616,6 +621,7 @@ pub fn source_kind4_occupants_from_scenario(szs: &SzsFile) -> Vec<SourceKind4Occ
             owner: figure.owner,
             direction: figure.direction,
             animation_state: figure.animation_state,
+            state_selector: figure.state_selector,
             state_descriptor: SourceTargetDescriptor::from_bytes(figure.state_descriptor),
             idle_timestamp_ticks: figure
                 .definition()
@@ -2394,21 +2400,11 @@ pub fn kontor_warehouses_from_szs(
     out
 }
 
-/// Seed an initial `DiplomacyMatrix` from PLAYER4's per-slot
-/// `relationships` arrays. The audit-derived value mapping is
-/// HEURISTIC (binary semantics not yet pinned — see TaskList
-/// #126):
-///
-///   0 → Neutral (no explicit relationship; default state)
-///   1 → Neutral (rare, possibly cooldown — treat as neutral)
-///   2 → Neutral (rare, possibly treaty-pending — treat as neutral)
-///   3 → Neutral (peace/pact)
-///
-/// Currently all four PLAYER4 codes resolve to `Neutral`,
-/// because we don't have a confident "this code means war"
-/// reading. Callers should still apply additional War-edge
-/// seeding (e.g. native-ship spawn → War with slot 5) on top
-/// of this matrix.
+/// Seed the two directed source diplomacy tables from PLAYER4. In
+/// `FUN_00478160`, slot offset `0xC0` receives `DAT_005b7770` and slot offset
+/// `0x140` receives `DAT_005b77b0`; both arrays use the source's eight-byte
+/// per-target stride. `FUN_0045cd20` excludes a combat candidate only when
+/// the former table's byte is `3`.
 pub fn diplomacy_from_player4_relationships(
     players: &[anno_formats::szs::PlayerSlotInit],
 ) -> crate::combat::DiplomacyMatrix {
@@ -2416,28 +2412,20 @@ pub fn diplomacy_from_player4_relationships(
     let n = players.len().min(7);
     for i in 0..n {
         for j in 0..n {
-            if i == j {
-                continue;
-            }
-            let code = players[i].relationships[j];
-            let state = code_to_diplomacy(code);
-            // Only downgrade default Neutral to War / upgrade
-            // to Allied; never overwrite an already-set War.
-            if dm.get(i as u8, j as u8) != crate::combat::Diplomacy::War {
-                dm.set(i as u8, j as u8, state);
-            }
+            dm.set_source_relationship_code(i as u8, j as u8, players[i].relations_0xc0[j]);
+            dm.set_source_attitude_code(i as u8, j as u8, players[i].relationships[j] as u8);
         }
     }
     dm
 }
 
-/// Map a raw PLAYER4 relationship code to the sim's
-/// `Diplomacy` enum. Heuristic-only; see
-/// `diplomacy_from_player4_relationships` doc-comment.
+/// Map a raw PLAYER4 `relations_0xc0` code to the source candidate exclusion
+/// state recovered from `FUN_0045cd20`.
 pub fn code_to_diplomacy(code: u32) -> crate::combat::Diplomacy {
     use crate::combat::Diplomacy;
     match code {
-        0..=3 => Diplomacy::Neutral,
+        3 => Diplomacy::Allied,
+        0..=2 => Diplomacy::Neutral,
         _ => Diplomacy::Neutral,
     }
 }
@@ -2513,6 +2501,7 @@ pub fn warships_from_ships(ships: &[anno_formats::szs::Ship]) -> Vec<crate::comb
             unit.source_kind6_policy_raw_slots = s.source_kind6_policy_raw_slots();
             unit.source_kind6_target_descriptor_payload =
                 Some(s.source_kind6_target_descriptor_payload());
+            unit.source_cargo_slots = s.cargo_slots;
             unit.direction = s.source_direction;
             Some(unit)
         })
@@ -2586,6 +2575,7 @@ pub fn traders_from_ships(
             t.source_kind6_policy_raw_slots = s.source_kind6_policy_raw_slots();
             t.source_kind6_target_descriptor_payload =
                 Some(s.source_kind6_target_descriptor_payload());
+            t.source_cargo_slots = s.cargo_slots;
             t.source_target_approach_radius = cargo_config.target_approach_radius_for(class);
             t
         })
@@ -2810,6 +2800,7 @@ mod tests {
                     owner: 2,
                     direction: 7,
                     animation_state: 3,
+                    state_selector: 1,
                     state_descriptor: [0x38, 0, 16, 32],
                     state_flags: 1,
                     state_payload: [9; 8],
@@ -2828,6 +2819,7 @@ mod tests {
                     owner: 1,
                     direction: 0,
                     animation_state: 0,
+                    state_selector: 0,
                     state_descriptor: [0; 4],
                     state_flags: 0,
                     state_payload: [0; 8],
@@ -2852,6 +2844,7 @@ mod tests {
                 owner: 2,
                 direction: 7,
                 animation_state: 3,
+                state_selector: 1,
                 state_descriptor: SourceTargetDescriptor::from_bytes([0x38, 0, 16, 32]),
                 idle_timestamp_ticks: 0,
                 state_flags: 1,
@@ -4261,36 +4254,38 @@ mod tests {
     }
 
     #[test]
-    fn diplomacy_from_relationships_defaults_neutral_for_now() {
+    fn diplomacy_from_player4_seeds_both_directed_source_diplomacy_tables() {
         use crate::combat::Diplomacy;
         use anno_formats::szs::PlayerSlotInit;
-        // Synthesise three slots with the typical pattern:
-        // slots 0..=2 with relationships [0, 0, 0, 3, 3, 3, 3].
-        let mk = |relationships: [u32; 7]| PlayerSlotInit {
+        let mk = |relations_0xc0: [u32; 7], relationships: [u32; 7]| PlayerSlotInit {
+            relations_0xc0,
             relationships,
             ..Default::default()
         };
         let players = vec![
-            mk([0, 0, 0, 3, 3, 3, 3]),
-            mk([0, 0, 0, 3, 3, 3, 3]),
-            mk([0, 0, 0, 3, 3, 3, 3]),
+            mk([0, 1, 2, 3, 3, 3, 3], [3, 0, 1, 2, 3, 3, 3]),
+            mk([0, 0, 0, 3, 3, 3, 3], [0, 3, 0, 2, 3, 3, 3]),
+            mk([0, 0, 0, 3, 3, 3, 3], [1, 0, 3, 2, 3, 3, 3]),
+            mk([3, 3, 3, 0, 0, 0, 0], [2, 2, 3, 0, 0, 0, 0]),
         ];
         let dm = diplomacy_from_player4_relationships(&players);
-        // Heuristic mapping currently produces Neutral for
-        // every pair — until the code semantics are pinned,
-        // we don't synthesise War from these arrays alone.
-        for i in 0..3u8 {
-            for j in 0..3u8 {
-                if i == j {
-                    continue;
-                }
-                assert_eq!(
-                    dm.get(i, j),
-                    Diplomacy::Neutral,
-                    "default mapping should be Neutral for ({i}, {j})"
-                );
-            }
-        }
+        assert_eq!(dm.get(0, 1), Diplomacy::Neutral);
+        assert_eq!(dm.get(1, 2), Diplomacy::Neutral);
+        assert_eq!(dm.get(0, 3), Diplomacy::Allied);
+        assert_eq!(dm.get(3, 2), Diplomacy::Allied);
+        assert_eq!(dm.source_relationship_code(0, 1), 1);
+        assert_eq!(dm.source_relationship_code(0, 2), 2);
+        assert_eq!(dm.source_relationship_code(0, 0), 0);
+        assert_eq!(dm.source_relationship_code(1, 2), 0);
+        assert_eq!(dm.source_relationship_code(0, 3), 3);
+        assert_eq!(dm.source_relationship_code(3, 2), 3);
+        assert_eq!(dm.source_attitude_code(0, 1), 0);
+        assert_eq!(dm.source_attitude_code(0, 2), 1);
+        assert_eq!(dm.source_attitude_code(0, 0), 3);
+        assert_eq!(dm.source_attitude_code(0, 3), 2);
+        assert_eq!(dm.source_attitude_code(3, 2), 3);
+        assert_eq!(code_to_diplomacy(1), Diplomacy::Neutral);
+        assert_eq!(code_to_diplomacy(2), Diplomacy::Neutral);
     }
 
     #[test]

@@ -12,6 +12,7 @@
 //!   3. Arrives at warehouse, loads/unloads goods
 //!   4. Advances to next stop in route (loops back to first)
 
+use crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT;
 use crate::source_route::{SourceShipRouteWindow, SourceTargetDescriptor};
 use crate::types::Good;
 use crate::warehouse::Warehouse;
@@ -232,6 +233,11 @@ pub struct TradeShip {
     /// `+0x18/+0x19`, used by `FUN_00445650` for a category-6 target row.
     #[serde(default)]
     pub source_kind6_target_descriptor_payload: Option<[u8; 2]>,
+    /// SHIP4's seven packed source cargo entries. This remains distinct from
+    /// the compatibility trade-route cargo list because `FUN_00448120`
+    /// carries both source special wares and 1/32-good quantities.
+    #[serde(default)]
+    pub source_cargo_slots: [u32; SOURCE_SHIP_CARGO_SLOT_COUNT],
     /// Authored ship name from SHIP4 when available.
     #[serde(default)]
     pub name: String,
@@ -348,6 +354,7 @@ impl TradeShip {
             source_kind6_policy_raw_slots: [0; 8],
             source_kind6_policy_ware_slots: [0; 8],
             source_kind6_target_descriptor_payload: None,
+            source_cargo_slots: [0; SOURCE_SHIP_CARGO_SLOT_COUNT],
             name: String::new(),
             route_id,
             world_x,

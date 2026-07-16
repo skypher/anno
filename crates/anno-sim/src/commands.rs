@@ -19,6 +19,13 @@ pub enum Command {
     SetTaxRate { player: u8, tier: u8, rate: u8 },
     /// Set bilateral relation between `a` and `b` (kept symmetric).
     SetDiplomacy { a: u8, b: u8, state: Diplomacy },
+    /// Execute one directed source `FUN_004760e0` relationship event. The
+    /// raw payload is applied by the `0x2f` handler to `DAT_005b7770`; it is
+    /// not the separate `0x30` attitude-matrix event.
+    ApplySourceRelationshipEvent { source: u8, target: u8, payload: u8 },
+    /// Execute one directed source `FUN_00476130` attitude event. Its raw
+    /// payload is applied by the separate `0x30` handler to `DAT_005b77b0`.
+    ApplySourceAttitudeEvent { source: u8, target: u8, payload: u8 },
     /// Buy `qty` of `good` at the current market price (deducts gold).
     Buy { player: u8, good: Good, qty: u16 },
     /// Sell `qty` of `good` at the current market price (credits gold).
@@ -193,6 +200,50 @@ mod tests {
             assert_eq!(qty, 25);
         } else {
             panic!();
+        }
+    }
+
+    #[test]
+    fn round_trip_source_relationship_event_command() {
+        let command = Command::ApplySourceRelationshipEvent {
+            source: 2,
+            target: 4,
+            payload: 1,
+        };
+        let back = Command::decode(&command.encode()).expect("decode source relationship event");
+        match back {
+            Command::ApplySourceRelationshipEvent {
+                source,
+                target,
+                payload,
+            } => {
+                assert_eq!(source, 2);
+                assert_eq!(target, 4);
+                assert_eq!(payload, 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_source_attitude_event_command() {
+        let command = Command::ApplySourceAttitudeEvent {
+            source: 2,
+            target: 4,
+            payload: 1,
+        };
+        let back = Command::decode(&command.encode()).expect("decode source attitude event");
+        match back {
+            Command::ApplySourceAttitudeEvent {
+                source,
+                target,
+                payload,
+            } => {
+                assert_eq!(source, 2);
+                assert_eq!(target, 4);
+                assert_eq!(payload, 1);
+            }
+            _ => panic!("wrong variant"),
         }
     }
 }

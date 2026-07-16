@@ -198,7 +198,33 @@ use std::path::Path;
 ///       retain the `FUN_0044bd00` / `FUN_0045bfc0` lifecycle state.
 /// v106: source terrain-event four-phase scheduling counters retain the
 ///       `FUN_0046b920` candidate-emission cadence.
-pub const SAVE_VERSION: u32 = 106;
+/// v107: Klinik terminal relocations retain their shared deferred-event rows.
+/// v108: type-4 alternate-state selectors retain `SOLDAT3 +0x1c` across
+///       scenario snapshots and replay.
+/// v109: category-4 direct attacks retain their `FUN_004546e0` actions and
+///       deferred type-one rows across save/load.
+/// v110: terminal category-1 through -4 figure-control events retain the
+///       `FUN_00443bf0` / `FUN_0045e1f0` terminal-state transition.
+/// v111: terminal military figures retain the `FUN_00446120` motion slice
+///       until `FUN_00451890` reaches its removal boundary.
+/// v112: stationary terminal category-one through -three records retain
+///       their `FUN_0045d380` motion slice until generic removal.
+/// v113: dynamic category-one through -three records retain the directional
+///       `FUN_0044a690` state used by their terminal motion slice.
+/// v114: dynamic terminal slices retain the generic record's vertical and
+///       bit-two locked-motion state inspected by `FUN_00446120`.
+/// v115: dynamic category-one through -three records retain the dedicated
+///       `FUN_0045e1f0` opcode-`0x19` score-state byte, action payloads,
+///       and deferred type-one records.
+/// v116: category-one through -three `Shotfignr:` launches retain live
+///       `FUN_00447e90` kind-14 records.
+/// v117: source player state retains `DAT_005bafc8`, which gates remote
+///       category-six controller actions.
+/// v118: diplomacy retains directed `DAT_005b7770` relationship codes for
+///       source combat candidate filtering.
+/// v119: diplomacy retains directed `DAT_005b77b0` attitude codes for the
+///       source `FUN_00476130` event path.
+pub const SAVE_VERSION: u32 = 119;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -212,7 +238,7 @@ pub const SAVE_VERSION: u32 = 106;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 106;
+pub const MIN_LOADABLE_VERSION: u32 = 119;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -238,9 +264,17 @@ pub struct SaveState {
     pub source_kind4_occupants: Vec<SourceKind4Occupant>,
     pub source_dynamic_combat_figures: Vec<SourceDynamicCombatFigure>,
     pub source_kind6_actions: Vec<crate::combat::SourceKind6Action>,
+    pub source_kind4_actions: Vec<crate::combat::SourceKind4Action>,
+    pub source_kind13_actions: Vec<crate::combat::SourceKind13Action>,
+    pub source_kind14_combat_figures: Vec<crate::combat::SourceKind14CombatFigure>,
     pub source_kind15_combat_figures: Vec<crate::combat::SourceKind15CombatFigure>,
     pub source_kind6_deferred_hits: Vec<crate::combat::SourceKind6DeferredHit>,
+    pub source_kind4_deferred_hits: Vec<crate::combat::SourceKind4DeferredHit>,
+    pub source_kind13_deferred_hits: Vec<crate::combat::SourceKind13DeferredHit>,
+    pub source_kind4_deferred_relocations: Vec<crate::simulation::SourceKind4DeferredRelocation>,
     pub source_kind6_terminal_events: Vec<crate::simulation::SourceKind6TerminalEvent>,
+    pub source_combat_terminal_events: Vec<crate::simulation::SourceCombatTerminalEvent>,
+    pub source_combat_terminal_slices: Vec<crate::simulation::SourceCombatTerminalSlice>,
     pub tile_clears: Vec<crate::simulation::TileClear>,
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
     pub source_time_ticks: u32,
@@ -319,9 +353,17 @@ impl Simulation {
             source_kind4_occupants: self.source_kind4_occupants.clone(),
             source_dynamic_combat_figures: self.source_dynamic_combat_figures.clone(),
             source_kind6_actions: self.source_kind6_actions.clone(),
+            source_kind4_actions: self.source_kind4_actions.clone(),
+            source_kind13_actions: self.source_kind13_actions.clone(),
+            source_kind14_combat_figures: self.source_kind14_combat_figures.clone(),
             source_kind15_combat_figures: self.source_kind15_combat_figures.clone(),
             source_kind6_deferred_hits: self.source_kind6_deferred_hits.clone(),
+            source_kind4_deferred_hits: self.source_kind4_deferred_hits.clone(),
+            source_kind13_deferred_hits: self.source_kind13_deferred_hits.clone(),
+            source_kind4_deferred_relocations: self.source_kind4_deferred_relocations.clone(),
             source_kind6_terminal_events: self.source_kind6_terminal_events.clone(),
+            source_combat_terminal_events: self.source_combat_terminal_events.clone(),
+            source_combat_terminal_slices: self.source_combat_terminal_slices.clone(),
             tile_clears: self.tile_clears.clone(),
             source_kind4_dispatch: self.source_kind4_dispatch,
             source_time_ticks: self.source_time_ticks,
@@ -374,9 +416,17 @@ impl Simulation {
         self.source_kind4_occupants = s.source_kind4_occupants;
         self.source_dynamic_combat_figures = s.source_dynamic_combat_figures;
         self.source_kind6_actions = s.source_kind6_actions;
+        self.source_kind4_actions = s.source_kind4_actions;
+        self.source_kind13_actions = s.source_kind13_actions;
+        self.source_kind14_combat_figures = s.source_kind14_combat_figures;
         self.source_kind15_combat_figures = s.source_kind15_combat_figures;
         self.source_kind6_deferred_hits = s.source_kind6_deferred_hits;
+        self.source_kind4_deferred_hits = s.source_kind4_deferred_hits;
+        self.source_kind13_deferred_hits = s.source_kind13_deferred_hits;
+        self.source_kind4_deferred_relocations = s.source_kind4_deferred_relocations;
         self.source_kind6_terminal_events = s.source_kind6_terminal_events;
+        self.source_combat_terminal_events = s.source_combat_terminal_events;
+        self.source_combat_terminal_slices = s.source_combat_terminal_slices;
         self.tile_clears = s.tile_clears;
         self.source_kind4_dispatch = s.source_kind4_dispatch;
         self.source_time_ticks = s.source_time_ticks;
@@ -483,9 +533,17 @@ mod tests {
             source_kind4_occupants: vec![],
             source_dynamic_combat_figures: vec![],
             source_kind6_actions: vec![],
+            source_kind4_actions: vec![],
+            source_kind13_actions: vec![],
+            source_kind14_combat_figures: vec![],
             source_kind15_combat_figures: vec![],
             source_kind6_deferred_hits: vec![],
+            source_kind4_deferred_hits: vec![],
+            source_kind13_deferred_hits: vec![],
+            source_kind4_deferred_relocations: vec![],
             source_kind6_terminal_events: vec![],
+            source_combat_terminal_events: vec![],
+            source_combat_terminal_slices: vec![],
             tile_clears: vec![],
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
@@ -551,6 +609,9 @@ mod tests {
         sim.players[0].satisfaction[0] = 96;
         sim.game_clock = 7777;
         sim.paused = true;
+        sim.diplomacy.set_source_relationship_code(0, 1, 1);
+        sim.diplomacy.set_source_relationship_code(1, 0, 3);
+        assert!(sim.diplomacy.apply_source_attitude_payload(0, 1, 1));
         sim.seed_source_rand(1);
         let _ = sim.next_source_rand();
 
@@ -568,6 +629,10 @@ mod tests {
         assert_eq!(sim2.players[0].satisfaction[0], 96);
         assert_eq!(sim2.game_clock, 7777);
         assert!(sim2.paused);
+        assert_eq!(sim2.diplomacy.source_relationship_code(0, 1), 1);
+        assert_eq!(sim2.diplomacy.source_relationship_code(1, 0), 3);
+        assert_eq!(sim2.diplomacy.source_attitude_code(0, 1), 1);
+        assert_eq!(sim2.diplomacy.source_attitude_code(1, 0), 2);
         assert_eq!(sim2.next_source_rand(), expected_next_rand);
     }
 
@@ -733,6 +798,7 @@ mod tests {
         sim.source_kind4_dispatch = crate::combat::SourceKind4DispatchState {
             active_player_slot: 2,
             single_player: false,
+            remote_owner_dispatch_enabled: true,
             faction_states: [0x0c, 0x0c, 0, 0x0c, 0x0d, 0x0e, 0x0b],
         };
         let mut source_route_program = crate::combat::default_source_kind4_route_program();
@@ -756,6 +822,7 @@ mod tests {
                 owner: 4,
                 direction: 0,
                 animation_state: 0,
+                state_selector: 1,
                 state_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
                     0x38, 0, 16, 32,
                 ]),
@@ -775,7 +842,9 @@ mod tests {
                 position: (18.5, 21.25),
                 position_z: 0.0,
                 source_energy: 320,
+                source_score_state: 0,
                 source_action_ready_at: 53,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
                 target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
                     0x37, 0, 9, 10,
                 ]),
@@ -789,6 +858,7 @@ mod tests {
                 runtime_slot: 12,
                 auxiliary_kind: 2,
                 name_index: 6,
+                source_motion: crate::combat::SourceGenericMotion::stationary_from_loader_flags(1),
             });
         sim.source_kind6_actions
             .push(crate::combat::SourceKind6Action {
@@ -802,6 +872,18 @@ mod tests {
                     6, 1, 9, 0,
                 ]),
                 kind15_figure_definition_id: Some(112),
+            });
+        sim.source_kind4_actions
+            .push(crate::combat::SourceKind4Action {
+                attacker_position: (12.25, 8.25),
+                attacker_runtime_slot: 4,
+                raw_strength: 9,
+                attacker_figure_kind: 4,
+                direction: 2,
+                flags: crate::combat::SOURCE_KIND4_ACTION_EVENT_FLAGS,
+                target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    1, 1, 9, 0,
+                ]),
             });
         sim.source_kind15_combat_figures
             .push(crate::combat::SourceKind15CombatFigure {
@@ -819,10 +901,49 @@ mod tests {
                 due_at: 63,
                 action: sim.source_kind6_actions[0],
             });
+        sim.source_kind4_deferred_hits
+            .push(crate::combat::SourceKind4DeferredHit {
+                due_at: 67,
+                action: sim.source_kind4_actions[0],
+            });
+        sim.source_kind4_deferred_relocations.push(
+            crate::simulation::SourceKind4DeferredRelocation {
+                due_at: 100,
+                island_id: 1,
+                figure_definition_id: 0x1f,
+                origin: (18.5, 21.25),
+                target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    0x38, 0, 40, 42,
+                ]),
+            },
+        );
         sim.source_kind6_terminal_events
             .push(crate::simulation::SourceKind6TerminalEvent {
                 target: crate::source_route::SourceTargetDescriptor::from_bytes([0x34, 1, 10, 20]),
                 event_kind: 7,
+            });
+        sim.source_combat_terminal_events
+            .push(crate::simulation::SourceCombatTerminalEvent {
+                target: crate::source_route::SourceTargetDescriptor::from_bytes([1, 7, 3, 0]),
+                target_figure_kind: 1,
+                target_runtime_slot: 3,
+                target_owner: 1,
+                attacker_figure_kind: 4,
+                attacker_runtime_slot: 0,
+                attacker_owner: Some(0),
+                control_kind: crate::simulation::SOURCE_COMBAT_TERMINAL_CONTROL_KIND,
+                kill_credit: true,
+            });
+        sim.source_combat_terminal_slices
+            .push(crate::simulation::SourceCombatTerminalSlice {
+                target: crate::simulation::SourceCombatTerminalSliceTarget::TradeShip(0),
+                target_figure_kind: 1,
+                target_runtime_slot: 12,
+                remaining_distance: 0.015,
+                scalar_speed: crate::combat::SOURCE_TERMINAL_STATIONARY_SPEED,
+                velocity_x: 0.0,
+                velocity_y: 0.0,
+                velocity_z: 0.0,
             });
         sim.tile_clears.push(crate::simulation::TileClear {
             island_id: 1,
@@ -855,6 +976,8 @@ mod tests {
         source_spearman.source_route_program = source_route_program;
         source_spearman.source_route_program_cursor = 1;
         source_spearman.source_step_remaining = 0.375;
+        source_spearman.source_terminal_pending = true;
+        source_spearman.source_terminal_remaining = 0.125;
         source_spearman.source_idle_remaining = 1.25;
         source_spearman.source_motion_target = Some((14, 16));
         source_spearman.source_position_x = 6.25;
@@ -1083,7 +1206,9 @@ mod tests {
                 position: (18.5, 21.25),
                 position_z: 0.0,
                 source_energy: 320,
+                source_score_state: 0,
                 source_action_ready_at: 53,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
                 target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
                     0x37, 0, 9, 10,
                 ]),
@@ -1097,6 +1222,7 @@ mod tests {
                 runtime_slot: 12,
                 auxiliary_kind: 2,
                 name_index: 6,
+                source_motion: crate::combat::SourceGenericMotion::stationary_from_loader_flags(1),
             }]
         );
         assert_eq!(
@@ -1112,6 +1238,20 @@ mod tests {
                     6, 1, 9, 0,
                 ]),
                 kind15_figure_definition_id: Some(112),
+            }]
+        );
+        assert_eq!(
+            sim2.source_kind4_actions,
+            vec![crate::combat::SourceKind4Action {
+                attacker_position: (12.25, 8.25),
+                attacker_runtime_slot: 4,
+                raw_strength: 9,
+                attacker_figure_kind: 4,
+                direction: 2,
+                flags: crate::combat::SOURCE_KIND4_ACTION_EVENT_FLAGS,
+                target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    1, 1, 9, 0,
+                ]),
             }]
         );
         assert_eq!(
@@ -1135,10 +1275,56 @@ mod tests {
             }]
         );
         assert_eq!(
+            sim2.source_kind4_deferred_hits,
+            vec![crate::combat::SourceKind4DeferredHit {
+                due_at: 67,
+                action: sim2.source_kind4_actions[0],
+            }]
+        );
+        assert_eq!(
+            sim2.source_kind4_deferred_relocations,
+            vec![crate::simulation::SourceKind4DeferredRelocation {
+                due_at: 100,
+                island_id: 1,
+                figure_definition_id: 0x1f,
+                origin: (18.5, 21.25),
+                target_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
+                    0x38, 0, 40, 42,
+                ]),
+            }]
+        );
+        assert_eq!(
             sim2.source_kind6_terminal_events,
             vec![crate::simulation::SourceKind6TerminalEvent {
                 target: crate::source_route::SourceTargetDescriptor::from_bytes([0x34, 1, 10, 20]),
                 event_kind: 7,
+            }]
+        );
+        assert_eq!(
+            sim2.source_combat_terminal_events,
+            vec![crate::simulation::SourceCombatTerminalEvent {
+                target: crate::source_route::SourceTargetDescriptor::from_bytes([1, 7, 3, 0]),
+                target_figure_kind: 1,
+                target_runtime_slot: 3,
+                target_owner: 1,
+                attacker_figure_kind: 4,
+                attacker_runtime_slot: 0,
+                attacker_owner: Some(0),
+                control_kind: crate::simulation::SOURCE_COMBAT_TERMINAL_CONTROL_KIND,
+                kill_credit: true,
+            }]
+        );
+        assert_eq!(
+            sim2.source_combat_terminal_slices,
+            vec![crate::simulation::SourceCombatTerminalSlice {
+                target: crate::simulation::SourceCombatTerminalSliceTarget::TradeShip(0),
+                target_figure_kind: 1,
+                target_runtime_slot: 12,
+                remaining_distance: 0.015,
+                scalar_speed: crate::combat::SOURCE_TERMINAL_STATIONARY_SPEED,
+                velocity_x: 0.0,
+                velocity_y: 0.0,
+                velocity_z: 0.0,
             }]
         );
         assert_eq!(
@@ -1165,6 +1351,7 @@ mod tests {
             crate::combat::SourceKind4DispatchState {
                 active_player_slot: 2,
                 single_player: false,
+                remote_owner_dispatch_enabled: true,
                 faction_states: [0x0c, 0x0c, 0, 0x0c, 0x0d, 0x0e, 0x0b],
             }
         );
@@ -1186,6 +1373,7 @@ mod tests {
                 owner: 4,
                 direction: 0,
                 animation_state: 0,
+                state_selector: 1,
                 state_descriptor: crate::source_route::SourceTargetDescriptor::from_bytes([
                     0x38, 0, 16, 32,
                 ]),
@@ -1219,6 +1407,8 @@ mod tests {
             1.25_f32.to_bits()
         );
         assert_eq!(sim2.military_units[0].source_step_remaining, 0.375);
+        assert!(sim2.military_units[0].source_terminal_pending);
+        assert_eq!(sim2.military_units[0].source_terminal_remaining, 0.125);
         assert_eq!(sim2.military_units[0].source_idle_remaining, 1.25);
         assert_eq!(sim2.military_units[0].source_motion_target, Some((14, 16)));
         assert_eq!(sim2.military_units[0].source_position_x, 6.25);

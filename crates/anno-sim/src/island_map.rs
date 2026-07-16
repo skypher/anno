@@ -330,6 +330,18 @@ impl IslandMap {
         self.contains_local(local.0, local.1).then_some(local)
     }
 
+    /// `FUN_0046a4d0`'s island lookup admits a five-unit source-world border
+    /// around the doubled INSEL5 extent before returning the matching island.
+    #[inline]
+    pub fn source_contains_world_with_margin(&self, world: (i32, i32)) -> bool {
+        let max_x = self.source_world_origin.0 + i32::from(self.width) * 2;
+        let max_y = self.source_world_origin.1 + i32::from(self.height) * 2;
+        world.0 >= self.source_world_origin.0 - 5
+            && world.0 < max_x + 5
+            && world.1 >= self.source_world_origin.1 - 5
+            && world.1 < max_y + 5
+    }
+
     /// Convert a local INSEL5 grid cell to its doubled source-world waypoint.
     /// Type-4 movement advances toward this waypoint in raw world units, so
     /// callers must retain an existing odd coordinate until it naturally
@@ -1161,6 +1173,10 @@ mod tests {
         assert_eq!(map.source_world_to_local((274, 312)), Some((27, 26)));
         assert_eq!(map.source_world_to_local((269, 303)), Some((24, 21)));
         assert_eq!(map.source_world_to_local((348, 260)), None);
+        assert!(map.source_contains_world_with_margin((215, 255)));
+        assert!(!map.source_contains_world_with_margin((214, 255)));
+        assert!(map.source_contains_world_with_margin((352, 311)));
+        assert!(!map.source_contains_world_with_margin((353, 311)));
     }
 
     #[test]

@@ -9,7 +9,8 @@ use crate::building::{BuildingDef, BuildingInstance, SourceBuildingCommand};
 use crate::carrier;
 use crate::civilian;
 use crate::combat::{
-    self, DiplomacyMatrix, MilitaryUnit, SourceDynamicCombatFigure, SourceKind15CombatFigure,
+    self, DiplomacyMatrix, MilitaryUnit, SourceDynamicCombatFigure, SourceKind14CombatFigure,
+    SourceKind15CombatFigure,
 };
 use crate::coverage::CoverageMap;
 use crate::data_bridge::{
@@ -41,6 +42,8 @@ use crate::warehouse::Warehouse;
 pub const AUTOSAVE_INTERVAL_MS: u32 = 599_999;
 /// Physical entry count of the source `DAT_005b6060` visible-island table.
 pub const SOURCE_VISIBLE_ISLAND_SLOTS: usize = 0x32;
+/// `FUN_00456d00` enters its no-target branch after this many source ticks.
+const SOURCE_KIND4_IDLE_TARGET_DELAY_TICKS: u32 = 20;
 
 /// Timer state for each subsystem.
 #[derive(Debug, Clone)]
@@ -127,6 +130,61 @@ impl TileClear {
 pub struct SourceKind6TerminalEvent {
     pub target: SourceTargetDescriptor,
     pub event_kind: u8,
+}
+
+/// Terminal control record created by `FUN_00445930` when a category-one
+/// through -four figure's source energy reaches zero. `FUN_00443bf0` writes
+/// control kind `0x0c`, `FUN_0045e1f0` marks the target's terminal state and
+/// reinitializes its current motion slice, and `FUN_00451890` removes the
+/// live figure when that slice ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceCombatTerminalEvent {
+    pub target: SourceTargetDescriptor,
+    pub target_figure_kind: u8,
+    pub target_runtime_slot: u16,
+    pub target_owner: u8,
+    pub attacker_figure_kind: u8,
+    pub attacker_runtime_slot: u16,
+    pub attacker_owner: Option<u8>,
+    pub control_kind: u8,
+    pub kill_credit: bool,
+}
+
+/// Live target identity for a terminal source motion slice. The source keeps
+/// the figure record alive until its reinitialized slice reaches zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SourceCombatTerminalSliceTarget {
+    TradeShip(usize),
+    DynamicFigure(usize),
+}
+
+/// `FUN_0045e1f0` initializes a terminal figure's remaining motion state;
+/// `FUN_00451890` consumes that state before releasing the live record.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceCombatTerminalSlice {
+    pub target: SourceCombatTerminalSliceTarget,
+    pub target_figure_kind: u8,
+    pub target_runtime_slot: u16,
+    pub remaining_distance: f32,
+    pub scalar_speed: f32,
+    pub velocity_x: f32,
+    pub velocity_y: f32,
+    pub velocity_z: f32,
+}
+
+/// `FUN_00443bf0`'s terminal figure-control kind.
+pub const SOURCE_COMBAT_TERMINAL_CONTROL_KIND: u8 = 0x0c;
+
+/// A type-three entry in the shared `FUN_00478a60` pool. `FUN_00458100`
+/// writes one after a type-4 figure reaches a production-kind-22 Klinik;
+/// `FUN_00478ab0` later turns it into a category-4 `0x84a` spawn.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceKind4DeferredRelocation {
+    pub due_at: u32,
+    pub island_id: u8,
+    pub figure_definition_id: u16,
+    pub origin: (f32, f32),
+    pub target_descriptor: SourceTargetDescriptor,
 }
 
 #[derive(Clone, Copy)]
@@ -224,6 +282,16 @@ pub struct Simulation {
     /// Immediate category-6 action records emitted through `FUN_004546e0`.
     /// This observability record is independent from compatibility damage.
     pub source_kind6_actions: Vec<combat::SourceKind6Action>,
+    /// Immediate category-4 action records emitted through `FUN_004546e0`.
+    /// The source's direct candidate rows do not become land-route targets;
+    /// their delayed type-one effects resolve this recorded descriptor.
+    pub source_kind4_actions: Vec<combat::SourceKind4Action>,
+    /// Immediate category-one through -three actions emitted through
+    /// `FUN_00452370` and `FUN_004546e0`.
+    pub source_kind13_actions: Vec<combat::SourceKind13Action>,
+    /// Kind-14 figures created by category-one through -three `Shotfignr:`
+    /// launches through `FUN_00447e90`.
+    pub source_kind14_combat_figures: Vec<SourceKind14CombatFigure>,
     /// Kind-15 figures constructed by `FUN_00447f00` from emitted category-6
     /// actions. They remain outside the category-1 through -6 candidate pool.
     pub source_kind15_combat_figures: Vec<SourceKind15CombatFigure>,
@@ -231,8 +299,26 @@ pub struct Simulation {
     /// actions. The source drains due records before its ordinary simulation
     /// subsystems run.
     pub source_kind6_deferred_hits: Vec<combat::SourceKind6DeferredHit>,
+    /// Deferred type-one records allocated by the category-4 branch of
+    /// `FUN_00447880`. They occupy the same 150-record pool as category-6
+    /// hits and type-three relocations.
+    pub source_kind4_deferred_hits: Vec<combat::SourceKind4DeferredHit>,
+    /// Deferred category-one through -three type-one records in the shared
+    /// `FUN_00478a60` event pool.
+    pub source_kind13_deferred_hits: Vec<combat::SourceKind13DeferredHit>,
+    /// Deferred type-three relocations from `FUN_00458100`. These share the
+    /// source's 150-event capacity with [`Self::source_kind6_deferred_hits`].
+    pub source_kind4_deferred_relocations: Vec<SourceKind4DeferredRelocation>,
     /// Type-7 terminal commands emitted by completed map-root accumulators.
     pub source_kind6_terminal_events: Vec<SourceKind6TerminalEvent>,
+    /// Terminal figure-control events emitted by category-4 deferred hits.
+    /// These preserve `FUN_00445930`'s `0x0c` transition before the local
+    /// entity model applies its corresponding removal.
+    pub source_combat_terminal_events: Vec<SourceCombatTerminalEvent>,
+    /// Live stationary terminal slices for category-one through -three
+    /// compatibility entities. These use the `FUN_0045d380` initializer:
+    /// remaining distance and scalar speed are both `0.02`.
+    pub source_combat_terminal_slices: Vec<SourceCombatTerminalSlice>,
     /// Source player globals that select type-4 terminal-route dispatch.
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
     /// `DAT_005b6040`: source simulation clock in 100-ms ticks.
@@ -568,9 +654,17 @@ impl Simulation {
             source_kind4_occupants: Vec::new(),
             source_dynamic_combat_figures: Vec::new(),
             source_kind6_actions: Vec::new(),
+            source_kind4_actions: Vec::new(),
+            source_kind13_actions: Vec::new(),
+            source_kind14_combat_figures: Vec::new(),
             source_kind15_combat_figures: Vec::new(),
             source_kind6_deferred_hits: Vec::new(),
+            source_kind4_deferred_hits: Vec::new(),
+            source_kind13_deferred_hits: Vec::new(),
+            source_kind4_deferred_relocations: Vec::new(),
             source_kind6_terminal_events: Vec::new(),
+            source_combat_terminal_events: Vec::new(),
+            source_combat_terminal_slices: Vec::new(),
             source_kind4_dispatch: crate::combat::SourceKind4DispatchState::default(),
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
@@ -653,6 +747,23 @@ impl Simulation {
             &self.trade_ships,
             &self.source_dynamic_combat_figures,
         )
+        .into_iter()
+        .filter(|candidate| {
+            !self.source_combat_terminal_slices.iter().any(|slice| {
+                match (slice.target, candidate.entity) {
+                    (
+                        SourceCombatTerminalSliceTarget::TradeShip(slice_index),
+                        combat::SourceCombatCandidateEntity::TradeShip(candidate_index),
+                    )
+                    | (
+                        SourceCombatTerminalSliceTarget::DynamicFigure(slice_index),
+                        combat::SourceCombatCandidateEntity::DynamicFigure(candidate_index),
+                    ) => slice_index == candidate_index,
+                    _ => false,
+                }
+            })
+        })
+        .collect()
     }
 
     /// Resolve the `FUN_00444fe0` target footprint required by category-6
@@ -720,6 +831,113 @@ impl Simulation {
         })
     }
 
+    /// Run `FUN_00452370`'s shared candidate ranking and direct-target gate
+    /// for one live category-one through -three runtime slot. A changed
+    /// attack-facing direction is installed by the generic-motion controller
+    /// after this selection has completed.
+    pub fn source_kind13_selected_target(
+        &self,
+        runtime_slot: u16,
+    ) -> Option<combat::SourceKind13SelectedTarget> {
+        let candidates = self.source_combat_candidates();
+        let attacker = candidates.iter().find(|candidate| {
+            (1..=3).contains(&candidate.figure_kind) && candidate.runtime_slot == runtime_slot
+        })?;
+        combat::source_kind13_select_live_target(
+            attacker,
+            &candidates,
+            &self.diplomacy,
+            |descriptor| self.source_kind6_target_rect(descriptor),
+        )
+    }
+
+    /// Apply the category-one through -three `FUN_0045e1f0` opcode `0x19`
+    /// payload to the addressed shared-table record.
+    pub fn apply_source_kind13_score_event(&mut self, runtime_slot: u16, payload: u8) -> bool {
+        let Some(figure) = self
+            .source_dynamic_combat_figures
+            .iter_mut()
+            .find(|figure| {
+                figure.active
+                    && (1..=3).contains(&figure.figure_kind)
+                    && figure.runtime_slot == runtime_slot
+            })
+        else {
+            return false;
+        };
+        figure.source_score_state =
+            combat::source_kind13_score_state_after_event(figure.source_score_state, payload);
+        true
+    }
+
+    /// Execute the no-turn category-one through -three action branch in
+    /// `FUN_00452370`. Its immediate executor writes the shared-table
+    /// cooldown, reanchors a matching persistent target, and allocates a
+    /// type-one record in `FUN_00478a60`'s common pool.
+    fn dispatch_source_kind13_action(
+        &mut self,
+        runtime_slot: u16,
+        selected: combat::SourceKind13SelectedTarget,
+    ) -> Option<combat::SourceKind13Action> {
+        let candidates = self.source_combat_candidates();
+        let attacker = *candidates.iter().find(|candidate| {
+            (1..=3).contains(&candidate.figure_kind) && candidate.runtime_slot == runtime_slot
+        })?;
+        let combat::SourceCombatCandidateEntity::DynamicFigure(dynamic_index) = attacker.entity
+        else {
+            return None;
+        };
+        let figure = self.source_dynamic_combat_figures.get(dynamic_index)?;
+        if figure.source_action_ready_at > self.source_time_ticks {
+            return None;
+        }
+        let attack_direction =
+            combat::source_combat_turn_direction(figure.direction, selected.direction);
+        if attack_direction != figure.direction {
+            return None;
+        }
+        let action = combat::source_kind13_action(
+            &attacker,
+            selected,
+            attack_direction,
+            figure.target_descriptor,
+        )?;
+        let next_ready_at =
+            combat::source_kind13_action_ready_at(self.source_time_ticks, &attacker)?;
+        let impact_due_at = combat::source_kind13_impact_due_at(self.source_time_ticks, &attacker)?;
+        let launcher_height = self
+            .source_dynamic_combat_figures
+            .get(dynamic_index)?
+            .position_z;
+        let kind14_figure = combat::source_kind14_figure_from_action(action, launcher_height);
+        let figure = self.source_dynamic_combat_figures.get_mut(dynamic_index)?;
+        figure.direction = action.direction;
+        figure.source_action_ready_at = next_ready_at;
+        if action.flags & 1 != 0 {
+            combat::source_action_reanchor(
+                &mut figure.position,
+                &mut figure.source_motion,
+                figure.figure_kind,
+                figure.direction,
+                action.attacker_position,
+            );
+        }
+        self.source_kind13_actions.push(action);
+        if self.source_deferred_event_count() < combat::SOURCE_KIND6_DEFERRED_HIT_CAPACITY {
+            self.source_kind13_deferred_hits
+                .push(combat::SourceKind13DeferredHit {
+                    due_at: impact_due_at,
+                    action,
+                });
+        }
+        if let Some(kind14_figure) = kind14_figure {
+            if self.source_figure_pool_has_capacity() {
+                self.source_kind14_combat_figures.push(kind14_figure);
+            }
+        }
+        Some(action)
+    }
+
     /// Dispatch one ready category-6 action through `FUN_00458ac0` and its
     /// immediate `FUN_004546e0` record construction. The two external
     /// arguments retain the source globals used by the entry owner gate; they
@@ -739,56 +957,70 @@ impl Simulation {
         else {
             return None;
         };
-        if !combat::source_kind6_owner_dispatch_allows(
-            attacker.owner,
-            active_owner,
-            remote_owner_dispatch_enabled,
-            attacker_owner_state,
-        ) {
-            return None;
-        }
-        let ready_at = self
-            .source_dynamic_combat_figures
-            .get(dynamic_index)?
-            .source_action_ready_at;
-        if !combat::source_kind6_action_is_ready(self.source_time_ticks, ready_at) {
-            return None;
-        }
-        let selected = combat::source_kind6_select_target(
-            &attacker,
-            &candidates,
-            &self.diplomacy,
-            |descriptor| self.source_kind6_target_rect(descriptor),
-        )?;
-        if !combat::source_kind6_target_policy_allows(attacker_owner_state, &selected.target) {
-            return None;
-        }
-        let action = combat::source_kind6_action(&attacker, selected)?;
-        let next_ready_at =
-            combat::source_kind6_action_ready_at(self.source_time_ticks, &attacker)?;
-        let impact_due_at = combat::source_kind6_impact_due_at(self.source_time_ticks, &attacker)?;
-        let launcher_height = self
-            .source_dynamic_combat_figures
-            .get(dynamic_index)?
-            .position_z;
-        let kind15_figure = combat::source_kind15_figure_from_action(action, launcher_height);
-        let figure = self.source_dynamic_combat_figures.get_mut(dynamic_index)?;
-        figure.direction = action.direction;
-        figure.source_action_ready_at = next_ready_at;
-        self.source_kind6_actions.push(action);
-        if self.source_kind6_deferred_hits.len() < combat::SOURCE_KIND6_DEFERRED_HIT_CAPACITY {
-            self.source_kind6_deferred_hits
-                .push(combat::SourceKind6DeferredHit {
-                    due_at: impact_due_at,
-                    action,
-                });
-        }
-        if let Some(kind15_figure) = kind15_figure {
-            if self.source_figure_pool_has_capacity() {
-                self.source_kind15_combat_figures.push(kind15_figure);
+        let action = (|| {
+            if !combat::source_kind6_owner_dispatch_allows(
+                attacker.owner,
+                active_owner,
+                remote_owner_dispatch_enabled,
+                attacker_owner_state,
+            ) {
+                return None;
             }
+            let ready_at = self
+                .source_dynamic_combat_figures
+                .get(dynamic_index)?
+                .source_action_ready_at;
+            if !combat::source_kind6_action_is_ready(self.source_time_ticks, ready_at) {
+                return None;
+            }
+            // `FUN_00458ac0` applies `FUN_00458e60` to each ranked row and
+            // continues after a rejected row, so exclude those rows before
+            // the source ranking/geometry pass.
+            let eligible_candidates = candidates
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    combat::source_kind6_target_policy_allows(attacker_owner_state, candidate)
+                })
+                .collect::<Vec<_>>();
+            let selected = combat::source_kind6_select_target(
+                &attacker,
+                &eligible_candidates,
+                &self.diplomacy,
+                |descriptor| self.source_kind6_target_rect(descriptor),
+            )?;
+            let action = combat::source_kind6_action(&attacker, selected)?;
+            let next_ready_at =
+                combat::source_kind6_action_ready_at(self.source_time_ticks, &attacker)?;
+            let impact_due_at =
+                combat::source_kind6_impact_due_at(self.source_time_ticks, &attacker)?;
+            let launcher_height = self
+                .source_dynamic_combat_figures
+                .get(dynamic_index)?
+                .position_z;
+            let kind15_figure = combat::source_kind15_figure_from_action(action, launcher_height);
+            let figure = self.source_dynamic_combat_figures.get_mut(dynamic_index)?;
+            figure.direction = action.direction;
+            figure.source_action_ready_at = next_ready_at;
+            self.source_kind6_actions.push(action);
+            if self.source_deferred_event_count() < combat::SOURCE_KIND6_DEFERRED_HIT_CAPACITY {
+                self.source_kind6_deferred_hits
+                    .push(combat::SourceKind6DeferredHit {
+                        due_at: impact_due_at,
+                        action,
+                    });
+            }
+            if let Some(kind15_figure) = kind15_figure {
+                if self.source_figure_pool_has_capacity() {
+                    self.source_kind15_combat_figures.push(kind15_figure);
+                }
+            }
+            Some(action)
+        })();
+        if let Some(figure) = self.source_dynamic_combat_figures.get_mut(dynamic_index) {
+            figure.source_motion = combat::source_kind6_controller_dwell_motion();
         }
-        Some(action)
+        action
     }
 
     /// Install a live `0x84a`/`0x84b` figure in the category table selected
@@ -808,7 +1040,21 @@ impl Simulation {
         if figure.figure_kind == 6 {
             figure.source_action_ready_at = self.source_time_ticks;
         }
+        figure.source_motion =
+            combat::SourceGenericMotion::stationary_from_loader_flags(figure.flags);
         if !self.source_figure_pool_has_capacity() {
+            return false;
+        }
+        if self.source_combat_terminal_slices.iter().any(|slice| {
+            matches!(
+                slice.target,
+                SourceCombatTerminalSliceTarget::DynamicFigure(_)
+            ) && combat::source_dynamic_slot_table(slice.target_figure_kind).is_some_and(
+                |(slice_table, _)| {
+                    slice_table == table && slice.target_runtime_slot == figure.runtime_slot
+                },
+            )
+        }) {
             return false;
         }
 
@@ -1034,8 +1280,13 @@ impl Simulation {
         self.advance_source_clock(dt_ms);
         self.tick_source_resource_environment(dt_ms);
         self.tick_source_map_dispatch(dt_ms);
+        self.tick_source_kind4_deferred_hits();
         self.tick_source_kind6_deferred_hits();
+        self.tick_source_kind4_deferred_relocations();
+        self.tick_source_kind14_combat_figures(dt_ms);
         self.tick_source_kind15_combat_figures(dt_ms);
+        self.tick_source_dynamic_combat_motion(dt_ms);
+        self.tick_source_combat_terminal_slices(dt_ms);
 
         // 1. Building production
         if self.timer_production.advance(dt_ms) {
@@ -1083,10 +1334,380 @@ impl Simulation {
             .retain_mut(|figure| !combat::advance_source_kind15_figure(figure, dt_ms));
     }
 
-    /// Drain due kind-1 records exactly as `FUN_00478ab0`. The executor's
-    /// queued action still names its selected live target; category-6 target
-    /// records redirect through their retained static map descriptor before
-    /// the map-root accumulator receives the scaled source strength.
+    /// Advance generic kind-14 launch records created by `FUN_00447e90`.
+    fn tick_source_kind14_combat_figures(&mut self, dt_ms: u32) {
+        self.source_kind14_combat_figures
+            .retain_mut(|figure| !combat::advance_source_kind14_figure(figure, dt_ms));
+    }
+
+    /// Apply the category-six branch of `FUN_00445930`: target category six
+    /// redirects through its static map descriptor before the source damage
+    /// accumulator reaches the terminal command root.
+    fn apply_source_kind6_static_map_hit(
+        &mut self,
+        descriptor: SourceTargetDescriptor,
+        raw_strength: u16,
+    ) {
+        let Some(target) = self.source_kind6_static_map_target(descriptor) else {
+            return;
+        };
+        let terminal_root = self
+            .source_static_map_roots
+            .iter_mut()
+            .find(|state| {
+                state.matches(
+                    target.bytes()[1],
+                    u16::from(target.bytes()[2]),
+                    u16::from(target.bytes()[3]),
+                )
+            })
+            .and_then(|state| {
+                state
+                    .apply_source_kind6_map_hit(raw_strength)
+                    .then_some(*state)
+            });
+        if let Some(root) = terminal_root {
+            self.apply_source_kind6_terminal_map_command(root);
+        }
+    }
+
+    /// Drain category-4 type-one records through `FUN_00445930`'s resolved
+    /// figure-table cases. Categories one through four lose their stored
+    /// source energy; category six redirects into the source map-hit branch.
+    fn tick_source_kind4_deferred_hits(&mut self) {
+        let queued_kind13_hits = std::mem::take(&mut self.source_kind13_deferred_hits);
+        for hit in queued_kind13_hits {
+            if hit.due_at > self.source_time_ticks {
+                self.source_kind13_deferred_hits.push(hit);
+                continue;
+            }
+            self.source_kind4_deferred_hits
+                .push(combat::SourceKind4DeferredHit {
+                    due_at: hit.due_at,
+                    action: combat::SourceKind4Action {
+                        attacker_position: hit.action.attacker_position,
+                        attacker_runtime_slot: hit.action.attacker_runtime_slot,
+                        raw_strength: hit.action.raw_strength,
+                        attacker_figure_kind: hit.action.attacker_figure_kind,
+                        direction: hit.action.direction,
+                        flags: hit.action.flags,
+                        target_descriptor: hit.action.target_descriptor,
+                    },
+                });
+        }
+        let queued_hits = std::mem::take(&mut self.source_kind4_deferred_hits);
+        for hit in queued_hits {
+            if hit.due_at > self.source_time_ticks {
+                self.source_kind4_deferred_hits.push(hit);
+                continue;
+            }
+            if hit.action.target_descriptor.kind() == 6 {
+                self.apply_source_kind6_static_map_hit(
+                    hit.action.target_descriptor,
+                    hit.action.raw_strength,
+                );
+                continue;
+            }
+
+            let candidates = self.source_combat_candidates();
+            let Some(target) = candidates.iter().copied().find(|candidate| {
+                candidate.source_kind6_action_target_descriptor()
+                    == Some(hit.action.target_descriptor)
+            }) else {
+                continue;
+            };
+            if !(1..=4).contains(&target.figure_kind) {
+                continue;
+            }
+            let attacker_owner = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.figure_kind == hit.action.attacker_figure_kind
+                        && candidate.runtime_slot == hit.action.attacker_runtime_slot
+                })
+                .map(|candidate| candidate.owner);
+            let terminal_control_allowed = attacker_owner.is_some_and(|owner| {
+                self.source_kind4_dispatch
+                    .allows_terminal_figure_control(owner)
+            });
+            let damage = hit.action.raw_strength;
+            let mut terminal_military_unit = None;
+            let mut terminal_slice_target = None;
+            let mut terminal_slice_motion = None;
+            let mut terminal = false;
+            match target.entity {
+                combat::SourceCombatCandidateEntity::MilitaryUnit(index) => {
+                    let Some(unit) = self.military_units.get_mut(index) else {
+                        continue;
+                    };
+                    if damage >= unit.source_energy && terminal_control_allowed {
+                        terminal = true;
+                        terminal_military_unit = Some(index);
+                    } else if damage < unit.source_energy {
+                        unit.source_energy -= damage;
+                    }
+                }
+                combat::SourceCombatCandidateEntity::TradeShip(index) => {
+                    let Some(ship) = self.trade_ships.get_mut(index) else {
+                        continue;
+                    };
+                    if damage >= ship.source_energy && terminal_control_allowed {
+                        terminal = true;
+                        if (1..=3).contains(&target.figure_kind) {
+                            terminal_slice_target =
+                                Some(SourceCombatTerminalSliceTarget::TradeShip(index));
+                            terminal_slice_motion = Some(combat::SourceGenericMotion::default());
+                        } else {
+                            ship.active = false;
+                        }
+                    } else if damage < ship.source_energy {
+                        ship.source_energy -= damage;
+                    }
+                }
+                combat::SourceCombatCandidateEntity::DynamicFigure(index) => {
+                    let Some(figure) = self.source_dynamic_combat_figures.get_mut(index) else {
+                        continue;
+                    };
+                    if damage >= figure.source_energy && terminal_control_allowed {
+                        terminal = true;
+                        if (1..=3).contains(&target.figure_kind) {
+                            terminal_slice_target =
+                                Some(SourceCombatTerminalSliceTarget::DynamicFigure(index));
+                            let motion = figure
+                                .source_motion
+                                .terminal_remainder(target.figure_kind, figure.direction);
+                            figure.source_motion = motion;
+                            terminal_slice_motion = Some(motion);
+                        } else {
+                            figure.active = false;
+                        }
+                    } else if damage < figure.source_energy {
+                        figure.source_energy -= damage;
+                    }
+                }
+            }
+            if terminal {
+                if let Some(index) = terminal_military_unit {
+                    if let Some(unit) = self.military_units.get_mut(index) {
+                        unit.source_terminal_pending = true;
+                        unit.source_terminal_remaining =
+                            combat::source_terminal_motion_slice_remaining(
+                                target.figure_kind,
+                                unit.direction,
+                                unit.source_step_remaining,
+                                unit.source_motion_target.is_some(),
+                            );
+                    }
+                }
+                if let (Some(slice_target), Some(motion)) =
+                    (terminal_slice_target, terminal_slice_motion)
+                {
+                    self.source_combat_terminal_slices
+                        .push(SourceCombatTerminalSlice {
+                            target: slice_target,
+                            target_figure_kind: target.figure_kind,
+                            target_runtime_slot: target.runtime_slot,
+                            remaining_distance: motion.remaining_distance,
+                            scalar_speed: motion.scalar_speed,
+                            velocity_x: motion.velocity_x,
+                            velocity_y: motion.velocity_y,
+                            velocity_z: motion.velocity_z,
+                        });
+                }
+                self.source_combat_terminal_events
+                    .push(SourceCombatTerminalEvent {
+                        target: hit.action.target_descriptor,
+                        target_figure_kind: target.figure_kind,
+                        target_runtime_slot: target.runtime_slot,
+                        target_owner: target.owner,
+                        attacker_figure_kind: hit.action.attacker_figure_kind,
+                        attacker_runtime_slot: hit.action.attacker_runtime_slot,
+                        attacker_owner,
+                        control_kind: SOURCE_COMBAT_TERMINAL_CONTROL_KIND,
+                        kill_credit: true,
+                    });
+            }
+        }
+    }
+
+    /// Consume terminal slices initialized by the shared category-one through
+    /// -three loader. `FUN_00451890` uses `dt × 0.05 × scalar_speed` and
+    /// removes the record only after the remaining amount is exhausted.
+    fn tick_source_combat_terminal_slices(&mut self, dt_ms: u32) {
+        let mut completed = Vec::new();
+        let mut advances = Vec::new();
+        self.source_combat_terminal_slices.retain_mut(|slice| {
+            let elapsed = dt_ms as f32 * combat::SOURCE_GENERIC_FIGURE_TIME_SCALE;
+            let motion_time = if slice.scalar_speed > 0.0 {
+                elapsed.min(slice.remaining_distance / slice.scalar_speed)
+            } else {
+                0.0
+            };
+            let consumed = motion_time * slice.scalar_speed;
+            advances.push((
+                slice.target,
+                motion_time,
+                slice.velocity_x,
+                slice.velocity_y,
+                slice.velocity_z,
+            ));
+            if slice.remaining_distance <= consumed {
+                completed.push(slice.target);
+                false
+            } else {
+                slice.remaining_distance -= consumed;
+                true
+            }
+        });
+        for (target, motion_time, velocity_x, velocity_y, velocity_z) in advances {
+            if let SourceCombatTerminalSliceTarget::DynamicFigure(index) = target {
+                if let Some(figure) = self.source_dynamic_combat_figures.get_mut(index) {
+                    figure.position.0 += motion_time * velocity_x;
+                    figure.position.1 += motion_time * velocity_y;
+                    figure.position_z += motion_time * velocity_z;
+                    figure.source_motion.remaining_distance =
+                        (figure.source_motion.remaining_distance
+                            - motion_time * figure.source_motion.scalar_speed)
+                            .max(0.0);
+                }
+            }
+        }
+        for target in completed {
+            match target {
+                SourceCombatTerminalSliceTarget::TradeShip(index) => {
+                    if let Some(ship) = self.trade_ships.get_mut(index) {
+                        ship.active = false;
+                    }
+                }
+                SourceCombatTerminalSliceTarget::DynamicFigure(index) => {
+                    if let Some(figure) = self.source_dynamic_combat_figures.get_mut(index) {
+                        figure.active = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute `FUN_00451890`'s generic motion prefix for nonterminal dynamic
+    /// records. The category-one through -three zero-distance controller is
+    /// reconstructed separately by `FUN_00452370`.
+    fn tick_source_dynamic_combat_motion(&mut self, dt_ms: u32) {
+        let island_bounds = self
+            .island_maps
+            .iter()
+            .map(|map| {
+                (
+                    map.island_id,
+                    map.source_world_origin,
+                    map.width,
+                    map.height,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut controller_runtime_slots = Vec::new();
+        let mut kind6_controller_runtime_slots = Vec::new();
+        for (index, figure) in self.source_dynamic_combat_figures.iter_mut().enumerate() {
+            let terminal_pending = self
+                .source_combat_terminal_slices
+                .iter()
+                .any(|slice| slice.target == SourceCombatTerminalSliceTarget::DynamicFigure(index));
+            if !figure.active || terminal_pending {
+                continue;
+            }
+            let controller_due = combat::advance_source_generic_motion(
+                &mut figure.source_motion,
+                &mut figure.position,
+                &mut figure.position_z,
+                dt_ms,
+            );
+            if controller_due && (1..=3).contains(&figure.figure_kind) {
+                let source_world = (
+                    figure.position.0.trunc() as i32,
+                    figure.position.1.trunc() as i32,
+                );
+                figure.position = (source_world.0 as f32 + 0.5, source_world.1 as f32 + 0.5);
+                figure.candidate_list_key = island_bounds
+                    .iter()
+                    .find(|(_, origin, width, height)| {
+                        let max_x = origin.0 + i32::from(*width) * 2;
+                        let max_y = origin.1 + i32::from(*height) * 2;
+                        source_world.0 >= origin.0 - 5
+                            && source_world.0 < max_x + 5
+                            && source_world.1 >= origin.1 - 5
+                            && source_world.1 < max_y + 5
+                    })
+                    .map_or(0xff, |(island_id, _, _, _)| *island_id);
+                controller_runtime_slots.push(figure.runtime_slot);
+            } else if controller_due && figure.figure_kind == 6 {
+                kind6_controller_runtime_slots.push(figure.runtime_slot);
+            }
+        }
+
+        for runtime_slot in controller_runtime_slots {
+            let Some(selected) = self.source_kind13_selected_target(runtime_slot) else {
+                continue;
+            };
+            let turned = {
+                let Some(figure) = self
+                    .source_dynamic_combat_figures
+                    .iter_mut()
+                    .find(|figure| {
+                        (1..=3).contains(&figure.figure_kind) && figure.runtime_slot == runtime_slot
+                    })
+                else {
+                    continue;
+                };
+                if let Some(next_direction) = combat::begin_source_combat_turn(
+                    figure.direction,
+                    selected.direction,
+                    &mut figure.source_motion,
+                ) {
+                    figure.direction = next_direction;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !turned {
+                self.dispatch_source_kind13_action(runtime_slot, selected);
+            }
+        }
+
+        for runtime_slot in kind6_controller_runtime_slots {
+            self.tick_source_kind6_controller(runtime_slot);
+        }
+    }
+
+    /// Execute the controller-due category-six branch of `FUN_00451890`.
+    /// `FUN_00458ac0` restores its one-unit dwell motion on every exit,
+    /// including owner-gated and targetless invocations.
+    fn tick_source_kind6_controller(&mut self, runtime_slot: u16) {
+        let Some(owner) = self
+            .source_dynamic_combat_figures
+            .iter()
+            .find(|figure| {
+                figure.active && figure.figure_kind == 6 && figure.runtime_slot == runtime_slot
+            })
+            .map(|figure| figure.owner)
+        else {
+            return;
+        };
+        let dispatch = self.source_kind4_dispatch;
+        let owner_state = dispatch
+            .faction_states
+            .get(usize::from(owner))
+            .copied()
+            .unwrap_or(u8::MAX);
+        let _ = self.dispatch_source_kind6_action(
+            runtime_slot,
+            dispatch.active_player_slot,
+            dispatch.remote_owner_dispatch_enabled,
+            owner_state,
+        );
+    }
+
+    /// Drain due category-six kind-one records. Their category-six target
+    /// descriptors always use the static-map branch of `FUN_00445930`.
     fn tick_source_kind6_deferred_hits(&mut self) {
         let queued_hits = std::mem::take(&mut self.source_kind6_deferred_hits);
         for hit in queued_hits {
@@ -1094,30 +1715,115 @@ impl Simulation {
                 self.source_kind6_deferred_hits.push(hit);
                 continue;
             }
+            self.apply_source_kind6_static_map_hit(
+                hit.action.target_descriptor,
+                hit.action.raw_strength,
+            );
+        }
+    }
 
-            let Some(target) = self.source_kind6_static_map_target(hit.action.target_descriptor)
+    /// Drain type-three `FUN_00478ab0` entries. The source allocates a fresh
+    /// category-4 runtime slot when it consumes the record; a full category
+    /// table discards this spawn after the source figure was already removed.
+    fn tick_source_kind4_deferred_relocations(&mut self) {
+        let queued = std::mem::take(&mut self.source_kind4_deferred_relocations);
+        for relocation in queued {
+            if relocation.due_at > self.source_time_ticks {
+                self.source_kind4_deferred_relocations.push(relocation);
+                continue;
+            }
+            if !self.source_figure_pool_has_capacity() {
+                continue;
+            }
+            let Some(runtime_slot) = self.allocate_source_dynamic_kind4_slot() else {
+                continue;
+            };
+            let Some(unit_type) = combat::source_kind4_unit_type(relocation.figure_definition_id)
             else {
                 continue;
             };
-            let terminal_root = self
-                .source_static_map_roots
-                .iter_mut()
-                .find(|state| {
-                    state.matches(
-                        target.bytes()[1],
-                        u16::from(target.bytes()[2]),
-                        u16::from(target.bytes()[3]),
-                    )
-                })
-                .and_then(|state| {
-                    state
-                        .apply_source_kind6_map_hit(hit.action.raw_strength)
-                        .then_some(*state)
-                });
-            if let Some(root) = terminal_root {
-                self.apply_source_kind6_terminal_map_command(root);
-            }
+            let origin_x = ((relocation.origin.0 - 0.25) * 2.0).round() as i32;
+            let origin_y = ((relocation.origin.1 - 0.25) * 2.0).round() as i32;
+            let origin_descriptor = SourceTargetDescriptor::from_bytes([
+                SourceTargetDescriptor::FIXED_POINT_COORDINATE_KIND,
+                (((origin_y >> 8) as u8 & 0x0f) << 4) | ((origin_x >> 8) as u8 & 0x0f),
+                origin_x as u8,
+                origin_y as u8,
+            ]);
+            let target = relocation
+                .target_descriptor
+                .source_land_route_coordinate()
+                .unwrap_or((origin_x, origin_y));
+            let source_energy =
+                anno_formats::szs::LandFigureDefinition::from_id(relocation.figure_definition_id)
+                    .expect("mapped source category-4 definition exists")
+                    .source_runtime_energy_cap();
+            let mut unit = MilitaryUnit::new(unit_type, 0, origin_x, origin_y);
+            unit.source_position_x = relocation.origin.0;
+            unit.source_position_y = relocation.origin.1;
+            unit.source_position_initialized = true;
+            unit.source_island_id = Some(relocation.island_id);
+            unit.source_runtime_slot = Some(runtime_slot);
+            unit.source_live_runtime_slot = Some(runtime_slot);
+            unit.source_candidate_list_key = Some(relocation.island_id);
+            unit.source_figure_kind = Some(4);
+            unit.source_figure_definition_id = Some(relocation.figure_definition_id);
+            unit.source_energy = source_energy;
+            unit.source_kind6_target_descriptor_payload = Some([
+                relocation.target_descriptor.bytes()[2],
+                relocation.target_descriptor.bytes()[3],
+            ]);
+            unit.source_origin_descriptor = Some(origin_descriptor);
+            unit.source_target_descriptor = Some(relocation.target_descriptor);
+            unit.target_x = target.0;
+            unit.target_y = target.1;
+            self.military_units.push(unit);
+            self.source_kind4_occupants.push(SourceKind4Occupant {
+                runtime_slot,
+                figure_definition_id: relocation.figure_definition_id,
+                route_radius: combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
+                route_retry_count: 0,
+                route_program: combat::default_source_kind4_route_program(),
+                route_program_cursor: 0,
+                idle_remaining_bits: 0,
+                origin_descriptor,
+                position: (origin_x as u16, origin_y as u16),
+                island_id: relocation.island_id,
+                owner: 0,
+                direction: 0,
+                animation_state: 0,
+                state_selector: 0,
+                state_descriptor: relocation.target_descriptor,
+                idle_timestamp_ticks: 0,
+                state_flags: 0,
+                state_payload: [0; 8],
+                active: true,
+            });
         }
+    }
+
+    /// `FUN_00478a60` owns one 150-record pool for every deferred event type,
+    /// including category-6 impacts and `FUN_00458100` relocations.
+    fn source_deferred_event_count(&self) -> usize {
+        self.source_kind6_deferred_hits.len()
+            + self.source_kind4_deferred_hits.len()
+            + self.source_kind13_deferred_hits.len()
+            + self.source_kind4_deferred_relocations.len()
+    }
+
+    /// `FUN_00449ca0`: scan the category-4 table for an inactive slot. The
+    /// local type-4 military projection and runtime-only category-4 records
+    /// occupy the same source table.
+    fn allocate_source_dynamic_kind4_slot(&self) -> Option<u16> {
+        (0..combat::SOURCE_DYNAMIC_KIND4_SLOT_CAPACITY).find(|&slot| {
+            !self
+                .military_units
+                .iter()
+                .any(|unit| unit.active && unit.source_runtime_slot == Some(slot))
+                && !self.source_dynamic_combat_figures.iter().any(|figure| {
+                    figure.active && figure.figure_kind == 4 && figure.runtime_slot == slot
+                })
+        })
     }
 
     /// Replay the event-kind-seven branch of `FUN_0046a630`: its
@@ -2312,6 +3018,11 @@ impl Simulation {
             .count()
             + self
                 .source_dynamic_combat_figures
+                .iter()
+                .filter(|figure| figure.active)
+                .count()
+            + self
+                .source_kind14_combat_figures
                 .iter()
                 .filter(|figure| figure.active)
                 .count()
@@ -3596,19 +4307,38 @@ impl Simulation {
     /// until the full type-4 state machine is reconstructed.
     fn tick_source_land_figures(&mut self, dt_ms: u32) {
         self.assign_native_idle_targets();
-        combat::acquire_source_kind4_candidates_with_terrain(
-            &mut self.military_units,
-            &self.diplomacy,
-            &self.island_maps,
-        );
-        let source_kind4_object_targets = self
+        self.apply_source_kind4_state_payload_targets();
+        let source_candidates = self.source_combat_candidates();
+        self.dispatch_source_kind4_live_candidate_actions(&source_candidates);
+        let source_kind4_kind1_arrivals = self
+            .military_units
+            .iter()
+            .enumerate()
+            .filter_map(|(index, unit)| {
+                let descriptor = unit.source_target_descriptor?;
+                (unit.source_runtime_slot.is_some() && descriptor.kind() == 1)
+                    .then_some((index, descriptor))
+            })
+            .collect::<Vec<_>>();
+        let source_kind4_medical_arrivals = self
+            .military_units
+            .iter()
+            .enumerate()
+            .filter_map(|(index, unit)| {
+                let descriptor = unit.source_target_descriptor?;
+                (unit.source_runtime_slot.is_some() && matches!(descriptor.kind(), 0x32 | 0x33))
+                    .then_some((index, descriptor))
+            })
+            .collect::<Vec<_>>();
+        let source_kind4_live_targets = self
             .military_units
             .iter()
             .filter_map(|unit| unit.source_target_descriptor)
-            .filter(|descriptor| matches!(descriptor.kind(), 0x35 | 0x36))
             .filter_map(|descriptor| {
-                self.source_kind6_target_rect(descriptor)
-                    .map(|target| (descriptor, target))
+                combat::source_figure_target_rect(descriptor, &source_candidates, |descriptor| {
+                    self.source_kind6_target_rect(descriptor)
+                })
+                .map(|target| (descriptor, target))
             })
             .collect::<Vec<_>>();
         let mut source_rand = std::mem::take(&mut self.rng_state);
@@ -3620,12 +4350,26 @@ impl Simulation {
             &mut source_rand,
             self.source_kind4_dispatch,
             |descriptor| {
-                source_kind4_object_targets
+                source_kind4_live_targets
                     .iter()
                     .find_map(|(known, target)| (*known == descriptor).then_some(*target))
             },
         );
         self.rng_state = source_rand;
+        let terminal_slots = self
+            .military_units
+            .iter()
+            .filter(|unit| {
+                unit.source_terminal_pending && !unit.active && unit.source_figure_kind == Some(4)
+            })
+            .filter_map(|unit| unit.source_runtime_slot)
+            .collect::<Vec<_>>();
+        for runtime_slot in terminal_slots {
+            self.deactivate_source_kind4_figure(runtime_slot);
+        }
+        self.apply_source_kind4_kind1_arrivals(&source_kind4_kind1_arrivals, &source_candidates);
+        self.apply_source_kind4_medical_arrivals(&source_kind4_medical_arrivals);
+        self.apply_source_kind4_state_payload_targets();
         let dead = combat::tick_combat_with_maps(
             &mut self.military_units,
             &self.diplomacy,
@@ -3641,6 +4385,340 @@ impl Simulation {
             self.deactivate_source_kind4_figure(runtime_slot);
         }
         self.sync_source_kind4_occupants();
+    }
+
+    /// Dispatch direct category-4 attacks from `FUN_0045cd20`'s complete
+    /// candidate population. `FUN_00456d00` sends the selected live row to
+    /// `FUN_004546e0`; it does not install that descriptor as a land-route
+    /// order. The executor records the source cooldown and queues one shared
+    /// type-one hit for later `FUN_00445930` resolution.
+    fn dispatch_source_kind4_live_candidate_actions(
+        &mut self,
+        candidates: &[combat::SourceCombatCandidate],
+    ) {
+        let selections = candidates
+            .iter()
+            .filter_map(|attacker| {
+                let combat::SourceCombatCandidateEntity::MilitaryUnit(attacker_index) =
+                    attacker.entity
+                else {
+                    return None;
+                };
+                let unit = self.military_units.get(attacker_index)?;
+                if !unit.active
+                    || unit.source_figure_kind != Some(4)
+                    || unit.source_target_descriptor.is_some()
+                    || !combat::source_kind4_route_program_is_terminal(unit)
+                {
+                    return None;
+                }
+                let occupant = self.source_kind4_occupants.iter().find(|occupant| {
+                    occupant.active && occupant.runtime_slot == attacker.runtime_slot
+                })?;
+                if occupant.idle_timestamp_ticks > self.source_time_ticks {
+                    return None;
+                }
+                let selected = combat::source_kind4_select_live_target(
+                    attacker,
+                    candidates,
+                    &self.diplomacy,
+                    |descriptor| self.source_kind6_target_rect(descriptor),
+                )?;
+                let target = combat::source_figure_target_rect(
+                    selected.target_descriptor,
+                    candidates,
+                    |descriptor| self.source_kind6_target_rect(descriptor),
+                )?;
+                let terrain_clear = unit.source_island_id.map_or(true, |island_id| {
+                    self.island_maps
+                        .iter()
+                        .find(|map| map.island_id == island_id)
+                        .map_or(true, |map| {
+                            map.source_kind4_line_of_fire_clear(
+                                (unit.tile_x, unit.tile_y),
+                                target.origin,
+                            )
+                        })
+                });
+                terrain_clear.then(|| {
+                    Some((
+                        attacker_index,
+                        attacker.runtime_slot,
+                        combat::source_kind4_action(attacker, selected)?,
+                        combat::source_kind4_action_ready_at(self.source_time_ticks, attacker)?,
+                        combat::source_kind4_impact_due_at(self.source_time_ticks, attacker)?,
+                    ))
+                })?
+            })
+            .collect::<Vec<_>>();
+
+        for (attacker_index, runtime_slot, action, ready_at, impact_due_at) in selections {
+            let Some(unit) = self.military_units.get_mut(attacker_index) else {
+                continue;
+            };
+            if !unit.active
+                || unit.source_target_descriptor.is_some()
+                || unit.source_runtime_slot != Some(runtime_slot)
+            {
+                continue;
+            }
+            unit.direction = action.direction;
+            unit.source_idle_remaining = 0.0;
+            unit.clear_source_route_program();
+            unit.combat_target = -1;
+            if let Some(occupant) = self
+                .source_kind4_occupants
+                .iter_mut()
+                .find(|occupant| occupant.active && occupant.runtime_slot == runtime_slot)
+            {
+                occupant.idle_timestamp_ticks = ready_at;
+            }
+            self.source_kind4_actions.push(action);
+            if self.source_deferred_event_count() < combat::SOURCE_KIND6_DEFERRED_HIT_CAPACITY {
+                self.source_kind4_deferred_hits
+                    .push(combat::SourceKind4DeferredHit {
+                        due_at: impact_due_at,
+                        action,
+                    });
+            }
+        }
+    }
+
+    /// Consume the kind-1 terminal branch of `FUN_00456d00`. Its target is a
+    /// same-owner SHIP4 figure; `FUN_00458000` first requires a free packed
+    /// cargo entry, emits `0x849` to fill the cargo table, then schedules the
+    /// category-4 kind-5 payload `7` deletion of the boarding land figure.
+    fn apply_source_kind4_kind1_arrivals(
+        &mut self,
+        arrivals: &[(usize, SourceTargetDescriptor)],
+        candidates: &[combat::SourceCombatCandidate],
+    ) {
+        for &(actor_index, descriptor) in arrivals {
+            let Some(actor) = self.military_units.get(actor_index).cloned() else {
+                continue;
+            };
+            if !actor.active || actor.source_target_descriptor.is_some() {
+                continue;
+            }
+            let Some(target) = candidates.iter().copied().find(|candidate| {
+                candidate.figure_kind == 1
+                    && candidate.source_kind6_action_target_descriptor() == Some(descriptor)
+                    && candidate.owner == actor.owner
+            }) else {
+                continue;
+            };
+            let Some((ware, quantity)) = combat::source_kind4_boarding_cargo(&actor) else {
+                continue;
+            };
+
+            let boarded = match target.entity {
+                combat::SourceCombatCandidateEntity::MilitaryUnit(target_index) => self
+                    .military_units
+                    .get_mut(target_index)
+                    .filter(|unit| {
+                        unit.active
+                            && combat::source_ship_cargo_has_free_slot(&unit.source_cargo_slots)
+                    })
+                    .map(|unit| {
+                        combat::source_add_ship_cargo(
+                            &mut unit.source_cargo_slots,
+                            ware,
+                            combat::SOURCE_KIND4_BOARDING_CARGO_METADATA,
+                            quantity,
+                        );
+                    })
+                    .is_some(),
+                combat::SourceCombatCandidateEntity::TradeShip(target_index) => self
+                    .trade_ships
+                    .get_mut(target_index)
+                    .filter(|ship| {
+                        ship.active
+                            && combat::source_ship_cargo_has_free_slot(&ship.source_cargo_slots)
+                    })
+                    .map(|ship| {
+                        combat::source_add_ship_cargo(
+                            &mut ship.source_cargo_slots,
+                            ware,
+                            combat::SOURCE_KIND4_BOARDING_CARGO_METADATA,
+                            quantity,
+                        );
+                    })
+                    .is_some(),
+                combat::SourceCombatCandidateEntity::DynamicFigure(target_index) => self
+                    .source_dynamic_combat_figures
+                    .get_mut(target_index)
+                    .filter(|figure| {
+                        figure.active
+                            && combat::source_ship_cargo_has_free_slot(&figure.source_cargo_slots)
+                    })
+                    .map(|figure| {
+                        combat::source_add_ship_cargo(
+                            &mut figure.source_cargo_slots,
+                            ware,
+                            combat::SOURCE_KIND4_BOARDING_CARGO_METADATA,
+                            quantity,
+                        );
+                    })
+                    .is_some(),
+            };
+            if boarded {
+                if let Some(runtime_slot) = actor.source_runtime_slot {
+                    self.deactivate_source_kind4_figure(runtime_slot);
+                }
+            }
+        }
+    }
+
+    /// `FUN_00458100`: a type-4 figure completing a static kind-`0x32` or
+    /// kind-`0x33` route to a production-kind-22 Klinik is removed at once.
+    /// A free shared deferred-event record preserves its definition, island,
+    /// continuous origin, and five-step reverse-route destination for the
+    /// type-three consumer 100 source ticks later.
+    fn apply_source_kind4_medical_arrivals(
+        &mut self,
+        arrivals: &[(usize, SourceTargetDescriptor)],
+    ) {
+        for &(actor_index, descriptor) in arrivals {
+            let Some(actor) = self.military_units.get(actor_index).cloned() else {
+                continue;
+            };
+            if !actor.active || actor.source_target_descriptor.is_some() {
+                continue;
+            }
+            let is_klinik_target = self.source_static_map_roots.iter().any(|cell| {
+                cell.matches(
+                    descriptor.bytes()[1],
+                    u16::from(descriptor.bytes()[2]),
+                    u16::from(descriptor.bytes()[3]),
+                ) && cell.source_production_kind_code == 0x16
+            });
+            if !is_klinik_target {
+                continue;
+            }
+
+            if self.source_deferred_event_count() < combat::SOURCE_KIND6_DEFERRED_HIT_CAPACITY {
+                if let Some(figure_definition_id) = actor.source_figure_definition_id {
+                    let (offset_x, offset_y) = combat::source_kind4_reverse_route_offset(
+                        &actor.source_route_program,
+                        actor.source_route_program_cursor,
+                        5,
+                    );
+                    let origin = if actor.source_position_initialized {
+                        (actor.source_position_x, actor.source_position_y)
+                    } else {
+                        (
+                            actor.tile_x as f32 * 0.5 + 0.25,
+                            actor.tile_y as f32 * 0.5 + 0.25,
+                        )
+                    };
+                    let target_x = actor.tile_x.wrapping_add(offset_x);
+                    let target_y = actor.tile_y.wrapping_add(offset_y);
+                    self.source_kind4_deferred_relocations
+                        .push(SourceKind4DeferredRelocation {
+                            due_at: self.source_time_ticks.wrapping_add(100),
+                            island_id: actor.source_island_id.unwrap_or(descriptor.bytes()[1]),
+                            figure_definition_id,
+                            origin,
+                            target_descriptor: SourceTargetDescriptor::from_bytes([
+                                SourceTargetDescriptor::FIXED_POINT_COORDINATE_KIND,
+                                (((target_y >> 8) as u8 & 0x0f) << 4)
+                                    | ((target_x >> 8) as u8 & 0x0f),
+                                target_x as u8,
+                                target_y as u8,
+                            ]),
+                        });
+                }
+            }
+            if let Some(runtime_slot) = actor.source_runtime_slot {
+                self.deactivate_source_kind4_figure(runtime_slot);
+            }
+        }
+    }
+
+    /// Replay `FUN_00458190` and its category-4 `0x2a` consumer. After a
+    /// type-4 figure has been targetless for 20 source ticks, state bit zero
+    /// advances the stored selector before testing one of the two four-byte
+    /// `SOLDAT3 +0x1e` descriptors. Bit one blocks the selector's wrap from
+    /// entry one to entry zero; a failed scan clears only state bit zero.
+    fn apply_source_kind4_state_payload_targets(&mut self) {
+        let updates: Vec<(u16, Option<(u8, SourceTargetDescriptor)>)> = self
+            .source_kind4_occupants
+            .iter()
+            .filter(|occupant| {
+                occupant.active
+                    && occupant.state_flags & 1 != 0
+                    && self
+                        .source_time_ticks
+                        .wrapping_sub(occupant.idle_timestamp_ticks)
+                        >= SOURCE_KIND4_IDLE_TARGET_DELAY_TICKS
+                    && self.military_units.iter().any(|unit| {
+                        unit.active
+                            && unit.source_runtime_slot == Some(occupant.runtime_slot)
+                            && unit.source_target_descriptor.is_none()
+                    })
+            })
+            .map(|occupant| {
+                let mut selector = occupant.state_selector;
+                for _ in 0..2 {
+                    selector = selector.wrapping_add(1);
+                    if selector > 1 {
+                        if occupant.state_flags & 2 != 0 {
+                            return (occupant.runtime_slot, None);
+                        }
+                        selector = 0;
+                    }
+                    let offset = usize::from(selector) * 4;
+                    if occupant.state_payload[offset] != 0 {
+                        return (
+                            occupant.runtime_slot,
+                            Some((
+                                selector,
+                                SourceTargetDescriptor::from_bytes([
+                                    occupant.state_payload[offset],
+                                    occupant.state_payload[offset + 1],
+                                    occupant.state_payload[offset + 2],
+                                    occupant.state_payload[offset + 3],
+                                ]),
+                            )),
+                        );
+                    }
+                }
+                (occupant.runtime_slot, None)
+            })
+            .collect();
+
+        for (runtime_slot, selection) in updates {
+            match selection {
+                Some((selector, descriptor)) => {
+                    if let Some(unit) = self.military_units.iter_mut().find(|unit| {
+                        unit.active
+                            && unit.source_runtime_slot == Some(runtime_slot)
+                            && unit.source_target_descriptor.is_none()
+                    }) {
+                        unit.source_target_descriptor = Some(descriptor);
+                        unit.source_route_retry_count = 0;
+                    }
+                    if let Some(occupant) = self
+                        .source_kind4_occupants
+                        .iter_mut()
+                        .find(|occupant| occupant.active && occupant.runtime_slot == runtime_slot)
+                    {
+                        occupant.state_selector = selector;
+                        occupant.state_descriptor = descriptor;
+                        occupant.route_retry_count = 0;
+                    }
+                }
+                None => {
+                    if let Some(occupant) = self
+                        .source_kind4_occupants
+                        .iter_mut()
+                        .find(|occupant| occupant.active && occupant.runtime_slot == runtime_slot)
+                    {
+                        occupant.state_flags &= !1;
+                    }
+                }
+            }
+        }
     }
 
     /// Replay the idle-target branch in `FUN_00456d00` for slot-6 SPEER
@@ -3676,10 +4754,11 @@ impl Simulation {
                         self.source_kind4_occupants.iter().any(|occupant| {
                             occupant.active
                                 && occupant.runtime_slot == runtime_slot
+                                && occupant.state_flags & 1 == 0
                                 && self
                                     .source_time_ticks
                                     .wrapping_sub(occupant.idle_timestamp_ticks)
-                                    >= 20
+                                    >= SOURCE_KIND4_IDLE_TARGET_DELAY_TICKS
                         })
                     })
             })
@@ -5094,6 +6173,20 @@ impl Simulation {
                 ));
                 false
             }
+            Command::ApplySourceRelationshipEvent {
+                source,
+                target,
+                payload,
+            } => self
+                .diplomacy
+                .apply_source_relationship_payload(source, target, payload),
+            Command::ApplySourceAttitudeEvent {
+                source,
+                target,
+                payload,
+            } => self
+                .diplomacy
+                .apply_source_attitude_payload(source, target, payload),
             Command::Buy { player, good, qty } => {
                 let pi = player as usize;
                 if pi >= self.players.len() {
@@ -5714,7 +6807,9 @@ mod tests {
             position: (120.0, 130.0),
             position_z: 0.0,
             source_energy: 320,
+            source_score_state: 0,
             source_action_ready_at: 0,
+            source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
             target_descriptor: SourceTargetDescriptor::from_bytes([0x37, 0, 60, 65]),
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             owner,
@@ -5724,6 +6819,7 @@ mod tests {
             runtime_slot,
             auxiliary_kind: 0,
             name_index: 0,
+            source_motion: combat::SourceGenericMotion::default(),
         };
 
         assert!(sim.install_source_dynamic_combat_figure(figure(1, 149, 1)));
@@ -5731,6 +6827,19 @@ mod tests {
         assert_eq!(sim.source_dynamic_combat_figures.len(), 1);
         assert_eq!(sim.source_dynamic_combat_figures[0].figure_kind, 3);
         assert_eq!(sim.source_dynamic_combat_figures[0].owner, 2);
+        sim.source_combat_terminal_slices
+            .push(SourceCombatTerminalSlice {
+                target: SourceCombatTerminalSliceTarget::DynamicFigure(0),
+                target_figure_kind: 3,
+                target_runtime_slot: 149,
+                remaining_distance: combat::SOURCE_TERMINAL_STATIONARY_SPEED,
+                scalar_speed: combat::SOURCE_TERMINAL_STATIONARY_SPEED,
+                velocity_x: 0.0,
+                velocity_y: 0.0,
+                velocity_z: 0.0,
+            });
+        assert!(!sim.install_source_dynamic_combat_figure(figure(1, 149, 0)));
+        sim.source_combat_terminal_slices.clear();
         assert!(!sim.install_source_dynamic_combat_figure(figure(1, 150, 0)));
 
         assert!(sim.install_source_dynamic_combat_figure(figure(4, 399, 3)));
@@ -5759,6 +6868,251 @@ mod tests {
     }
 
     #[test]
+    fn source_dynamic_motion_boundary_snaps_position_and_refreshes_island_key() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(7, 10, 10));
+        sim.source_dynamic_combat_figures
+            .push(SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 1,
+                candidate_list_key: 3,
+                figure_definition_id: 0x19,
+                direction: 2,
+                source_payload: 0,
+                position: (1.25, 3.25),
+                position_z: 0.0,
+                source_energy: 1,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 0,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 0,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion {
+                    remaining_distance: 0.25,
+                    scalar_speed: 0.25,
+                    velocity_x: 0.25,
+                    velocity_y: 0.0,
+                    velocity_z: 0.0,
+                    terminal_motion_locked: false,
+                },
+            });
+
+        sim.tick_source_dynamic_combat_motion(20);
+
+        assert_eq!(sim.source_dynamic_combat_figures[0].position, (1.5, 3.5));
+        assert_eq!(sim.source_dynamic_combat_figures[0].candidate_list_key, 7);
+    }
+
+    #[test]
+    fn source_kind13_score_event_supplies_the_live_candidate_state_byte() {
+        let mut sim = Simulation::new();
+        sim.source_dynamic_combat_figures
+            .push(SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 1,
+                candidate_list_key: 7,
+                figure_definition_id: 0x19,
+                direction: 0,
+                source_payload: 0,
+                position: (0.5, 0.5),
+                position_z: 0.0,
+                source_energy: 195,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 0,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 4,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion::default(),
+            });
+
+        assert!(sim.apply_source_kind13_score_event(4, 3));
+        assert!(sim.apply_source_kind13_score_event(4, 2));
+        assert!(!sim.apply_source_kind13_score_event(5, 1));
+        assert_eq!(sim.source_combat_candidates()[0].source_score_state, 5);
+    }
+
+    #[test]
+    fn source_kind13_action_event_queues_and_delivers_the_shared_type_one_hit() {
+        let mut sim = Simulation::new();
+        sim.source_dynamic_combat_figures.extend([
+            SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 1,
+                candidate_list_key: 7,
+                figure_definition_id: 0x19,
+                direction: 0,
+                source_payload: 0,
+                position: (0.5, 0.5),
+                position_z: 0.0,
+                source_energy: 195,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_bytes([4, 7, 1, 0]),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 0,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 0,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion {
+                    remaining_distance: 1.5,
+                    scalar_speed: 0.25,
+                    velocity_x: 0.25,
+                    velocity_y: 0.0,
+                    velocity_z: 0.125,
+                    terminal_motion_locked: false,
+                },
+            },
+            SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 4,
+                candidate_list_key: 7,
+                figure_definition_id: 1,
+                direction: 0,
+                source_payload: 0,
+                position: (1.5, 0.5),
+                position_z: 0.0,
+                source_energy: 60,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 1,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 1,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion::default(),
+            },
+        ]);
+
+        assert!(sim.apply_source_kind13_score_event(0, 3));
+        let selected = sim
+            .source_kind13_selected_target(0)
+            .expect("the source candidate row has a direct target ray");
+        let action = sim
+            .dispatch_source_kind13_action(0, selected)
+            .expect("the state event makes the category-one action live");
+        assert_eq!(action.raw_strength, 12);
+        assert_eq!(action.flags, 3);
+        assert_eq!(
+            sim.source_dynamic_combat_figures[0].source_motion,
+            combat::SourceGenericMotion {
+                remaining_distance: 0.25,
+                scalar_speed: 0.25,
+                velocity_x: 0.25,
+                velocity_y: 0.0,
+                velocity_z: 0.125,
+                terminal_motion_locked: false,
+            }
+        );
+        assert_eq!(sim.source_kind13_deferred_hits.len(), 1);
+        assert_eq!(
+            sim.source_kind14_combat_figures,
+            vec![SourceKind14CombatFigure {
+                active: true,
+                figure_definition_id: 113,
+                position: (0.5, 0.5, 0.0),
+                launcher_runtime_slot: 0,
+                source_step_amount: combat::SOURCE_KIND15_STEP_AMOUNT,
+                remaining_work_time: 0.96,
+                source_flags: 0x14,
+            }]
+        );
+
+        sim.source_time_ticks = sim.source_kind13_deferred_hits[0].due_at;
+        sim.tick_source_kind4_deferred_hits();
+
+        assert!(sim.source_kind13_deferred_hits.is_empty());
+        assert_eq!(sim.source_dynamic_combat_figures[1].source_energy, 48);
+    }
+
+    #[test]
+    fn source_dynamic_motion_boundary_turns_toward_the_selected_live_target() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(7, 10, 10));
+        sim.source_dynamic_combat_figures.extend([
+            SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 1,
+                candidate_list_key: 7,
+                figure_definition_id: 0x19,
+                direction: 2,
+                source_payload: 0,
+                position: (0.5, 0.5),
+                position_z: 0.0,
+                source_energy: 195,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 0,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 0,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion::default(),
+            },
+            SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 4,
+                candidate_list_key: 7,
+                figure_definition_id: 1,
+                direction: 0,
+                source_payload: 0,
+                position: (1.5, 0.5),
+                position_z: 0.0,
+                source_energy: 60,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 1,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 1,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion::default(),
+            },
+        ]);
+
+        sim.tick_source_dynamic_combat_motion(20);
+
+        let attacker = &sim.source_dynamic_combat_figures[0];
+        assert_eq!(attacker.direction, 0);
+        assert_eq!(
+            attacker.source_motion,
+            combat::SourceGenericMotion::stationary_turn_delay()
+        );
+    }
+
+    #[test]
     fn source_kind6_selection_resolves_the_live_target_descriptor() {
         let mut sim = Simulation::new();
         let figure = |runtime_slot, owner, position, target_descriptor| SourceDynamicCombatFigure {
@@ -5771,7 +7125,9 @@ mod tests {
             position,
             position_z: 0.0,
             source_energy: 285,
+            source_score_state: 0,
             source_action_ready_at: 0,
+            source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
             target_descriptor,
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             owner,
@@ -5781,6 +7137,7 @@ mod tests {
             runtime_slot,
             auxiliary_kind: 0,
             name_index: 0,
+            source_motion: combat::SourceGenericMotion::default(),
         };
         let target_descriptor = SourceTargetDescriptor::from_world_coordinate(1, 0)
             .expect("source coordinate fits the descriptor encoding");
@@ -5827,7 +7184,9 @@ mod tests {
             position,
             position_z: 0.0,
             source_energy: 285,
+            source_score_state: 0,
             source_action_ready_at: 0,
+            source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
             target_descriptor,
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             owner,
@@ -5837,6 +7196,7 @@ mod tests {
             runtime_slot,
             auxiliary_kind: 0,
             name_index: 0,
+            source_motion: combat::SourceGenericMotion::default(),
         };
         let target_descriptor = SourceTargetDescriptor::from_world_coordinate(1, 0)
             .expect("source coordinate fits the descriptor encoding");
@@ -5893,6 +7253,139 @@ mod tests {
             }]
         );
         assert!(sim.dispatch_source_kind6_action(0, 0, false, 0).is_none());
+        assert_eq!(
+            sim.source_dynamic_combat_figures[0].source_motion,
+            combat::source_kind6_controller_dwell_motion()
+        );
+    }
+
+    #[test]
+    fn source_kind6_dispatch_skips_defeated_owner_policy_rows_before_selecting_a_target() {
+        let mut sim = Simulation::new();
+        let figure = |runtime_slot, owner, position, target_descriptor| SourceDynamicCombatFigure {
+            active: true,
+            figure_kind: 6,
+            candidate_list_key: 4,
+            figure_definition_id: 0x1f,
+            direction: 0,
+            source_payload: 0,
+            position,
+            position_z: 0.0,
+            source_energy: 285,
+            source_score_state: 0,
+            source_action_ready_at: 0,
+            source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+            target_descriptor,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            owner,
+            state: 0,
+            flags: 0,
+            notification: 0,
+            runtime_slot,
+            auxiliary_kind: 0,
+            name_index: 0,
+            source_motion: combat::SourceGenericMotion::default(),
+        };
+        let invalid_descriptor = SourceTargetDescriptor::from_world_coordinate(1, 0)
+            .expect("source coordinate fits the descriptor encoding");
+        let valid_descriptor = SourceTargetDescriptor::from_world_coordinate(2, 0)
+            .expect("source coordinate fits the descriptor encoding");
+        let mut invalid_target = figure(2, 1, (1.0, 0.0), invalid_descriptor);
+        invalid_target.figure_kind = 1;
+        invalid_target.figure_definition_id = 0x19;
+        invalid_target.source_energy = 195;
+
+        assert!(sim.install_source_dynamic_combat_figure(figure(
+            0,
+            0,
+            (0.0, 0.0),
+            SourceTargetDescriptor::from_bytes([0; 4]),
+        )));
+        assert!(sim.install_source_dynamic_combat_figure(invalid_target));
+        assert!(sim.install_source_dynamic_combat_figure(figure(
+            1,
+            1,
+            (2.0, 0.0),
+            valid_descriptor,
+        )));
+        sim.source_time_ticks = 19;
+        let candidates = sim.source_combat_candidates();
+        let attacker = *candidates
+            .iter()
+            .find(|candidate| candidate.figure_kind == 6 && candidate.runtime_slot == 0)
+            .expect("launcher remains in the source candidate list");
+        assert_eq!(
+            combat::source_kind6_ranked_candidates(&attacker, &candidates, &sim.diplomacy)[0]
+                .target
+                .entity,
+            crate::combat::SourceCombatCandidateEntity::DynamicFigure(1)
+        );
+
+        let action = sim
+            .dispatch_source_kind6_action(0, 0, true, 0x0e)
+            .expect("the lower-ranked category-six row remains eligible");
+        assert_eq!(
+            action.target_descriptor,
+            SourceTargetDescriptor::from_bytes([6, 4, 2, 0])
+        );
+    }
+
+    #[test]
+    fn source_kind6_controller_dispatches_then_restores_fun_00458ac0_dwell_motion() {
+        let mut sim = Simulation::new();
+        let figure = |runtime_slot, owner, position, target_descriptor| SourceDynamicCombatFigure {
+            active: true,
+            figure_kind: 6,
+            candidate_list_key: 4,
+            figure_definition_id: 0x1f,
+            direction: 0,
+            source_payload: 0,
+            position,
+            position_z: 0.0,
+            source_energy: 285,
+            source_score_state: 0,
+            source_action_ready_at: 0,
+            source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+            target_descriptor,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            owner,
+            state: 0,
+            flags: 0,
+            notification: 0,
+            runtime_slot,
+            auxiliary_kind: 0,
+            name_index: 0,
+            source_motion: combat::SourceGenericMotion::default(),
+        };
+        let target_descriptor = SourceTargetDescriptor::from_world_coordinate(1, 0)
+            .expect("source coordinate fits the descriptor encoding");
+        assert!(sim.install_source_dynamic_combat_figure(figure(
+            0,
+            0,
+            (0.0, 0.0),
+            SourceTargetDescriptor::from_bytes([0; 4]),
+        )));
+        assert!(sim.install_source_dynamic_combat_figure(figure(
+            1,
+            1,
+            (1.0, 0.0),
+            target_descriptor,
+        )));
+        sim.source_time_ticks = 19;
+
+        sim.tick_source_dynamic_combat_motion(20);
+
+        assert_eq!(sim.source_kind6_actions.len(), 1);
+        assert_eq!(sim.source_kind6_actions[0].attacker_runtime_slot, 0);
+        assert_eq!(
+            sim.source_dynamic_combat_figures[0].source_motion,
+            combat::source_kind6_controller_dwell_motion()
+        );
+        assert_eq!(
+            sim.source_dynamic_combat_figures[0].source_action_ready_at,
+            69
+        );
+        assert_eq!(sim.source_kind6_deferred_hits.len(), 1);
     }
 
     #[test]
@@ -5914,7 +7407,9 @@ mod tests {
                 position: (0.0, 0.0),
                 position_z: 0.0,
                 source_energy: 285,
+                source_score_state: 0,
                 source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
                 target_descriptor: target,
                 state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
                 owner: 1,
@@ -5924,6 +7419,7 @@ mod tests {
                 runtime_slot: 9,
                 auxiliary_kind: 0,
                 name_index: 0,
+                source_motion: combat::SourceGenericMotion::default(),
             });
         let definition = anno_formats::cod::BuildingDef {
             kind: "HANDWERK".into(),
@@ -6277,6 +7773,7 @@ mod tests {
             owner: 1,
             direction: 0,
             animation_state: 0,
+            state_selector: 0,
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             idle_timestamp_ticks: 0,
             state_flags: 0,
@@ -6347,6 +7844,7 @@ mod tests {
             owner: 6,
             direction: 0,
             animation_state: 0,
+            state_selector: 0,
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             idle_timestamp_ticks: 0,
             state_flags: 0,
@@ -6390,6 +7888,7 @@ mod tests {
             owner: 0,
             direction: 0,
             animation_state: 0,
+            state_selector: 0,
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             idle_timestamp_ticks: 0,
             state_flags: 0,
@@ -6430,6 +7929,7 @@ mod tests {
             owner: 0,
             direction: 0,
             animation_state: 0,
+            state_selector: 0,
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             idle_timestamp_ticks: 0,
             state_flags: 0,
@@ -6481,6 +7981,7 @@ mod tests {
             owner: 6,
             direction: 0,
             animation_state: 0,
+            state_selector: 0,
             state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
             idle_timestamp_ticks: 8,
             state_flags: 0,
@@ -8650,6 +10151,525 @@ mod tests {
     }
 
     #[test]
+    fn source_kind_four_targetless_payload_cycles_two_descriptors() {
+        let mut sim = Simulation::new();
+        let mut unit = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 0, 0);
+        unit.source_runtime_slot = Some(9);
+        unit.source_figure_kind = Some(4);
+        sim.military_units.push(unit);
+        sim.source_kind4_occupants.push(SourceKind4Occupant {
+            runtime_slot: 9,
+            figure_definition_id: 1,
+            route_radius: crate::combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
+            route_retry_count: 3,
+            route_program: crate::combat::default_source_kind4_route_program(),
+            route_program_cursor: 0,
+            idle_remaining_bits: 0,
+            origin_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            position: (0, 0),
+            island_id: 0,
+            owner: 0,
+            direction: 0,
+            animation_state: 0,
+            state_selector: 0,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            idle_timestamp_ticks: 0,
+            state_flags: 1,
+            state_payload: [0x38, 0, 4, 0, 0x38, 0, 8, 0],
+            active: true,
+        });
+
+        sim.source_time_ticks = SOURCE_KIND4_IDLE_TARGET_DELAY_TICKS;
+        sim.apply_source_kind4_state_payload_targets();
+        assert_eq!(
+            sim.military_units[0].source_target_descriptor,
+            Some(SourceTargetDescriptor::from_bytes([0x38, 0, 8, 0]))
+        );
+        assert_eq!(sim.military_units[0].source_route_retry_count, 0);
+        assert_eq!(sim.source_kind4_occupants[0].state_selector, 1);
+
+        sim.military_units[0].source_target_descriptor = None;
+        sim.source_kind4_occupants[0].state_selector = 1;
+        sim.source_kind4_occupants[0].state_payload = [0x38, 0, 4, 0, 0, 0, 0, 0];
+        sim.apply_source_kind4_state_payload_targets();
+        assert_eq!(
+            sim.military_units[0].source_target_descriptor,
+            Some(SourceTargetDescriptor::from_bytes([0x38, 0, 4, 0]))
+        );
+        assert_eq!(sim.source_kind4_occupants[0].state_selector, 0);
+
+        sim.military_units[0].source_target_descriptor = None;
+        sim.source_kind4_occupants[0].state_selector = 1;
+        sim.source_kind4_occupants[0].state_flags = 3;
+        sim.apply_source_kind4_state_payload_targets();
+        assert_eq!(sim.military_units[0].source_target_descriptor, None);
+        assert_eq!(sim.source_kind4_occupants[0].state_flags, 2);
+    }
+
+    #[test]
+    fn source_kind_four_live_candidates_emit_category_one_terminal_control() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(7, 20, 1));
+
+        let mut attacker = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 0, 0);
+        attacker.source_island_id = Some(7);
+        attacker.source_runtime_slot = Some(0);
+        attacker.source_live_runtime_slot = Some(0);
+        attacker.source_candidate_list_key = Some(7);
+        attacker.source_figure_kind = Some(4);
+        attacker.source_figure_definition_id = Some(1);
+        attacker.source_energy = anno_formats::szs::LandFigureDefinition::from_id(1)
+            .expect("source land definition is known")
+            .source_runtime_energy_cap();
+        sim.military_units.push(attacker);
+        sim.source_kind4_occupants.push(SourceKind4Occupant {
+            runtime_slot: 0,
+            figure_definition_id: 1,
+            route_radius: crate::combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
+            route_retry_count: 0,
+            route_program: crate::combat::default_source_kind4_route_program(),
+            route_program_cursor: 0,
+            idle_remaining_bits: 0,
+            origin_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            position: (0, 0),
+            island_id: 7,
+            owner: 0,
+            direction: 0,
+            animation_state: 0,
+            state_selector: 0,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            idle_timestamp_ticks: 0,
+            state_flags: 0,
+            state_payload: [0; 8],
+            active: true,
+        });
+
+        let mut ship = MilitaryUnit::new(crate::combat::UnitType::SmallWarship, 1, 1, 0);
+        ship.source_live_runtime_slot = Some(3);
+        ship.source_candidate_list_key = Some(7);
+        ship.source_figure_kind = Some(1);
+        ship.source_figure_definition_id = Some(0x19);
+        ship.source_energy = 195;
+        sim.military_units.push(ship);
+
+        let candidates = sim.source_combat_candidates();
+        sim.dispatch_source_kind4_live_candidate_actions(&candidates);
+
+        assert_eq!(sim.military_units[0].source_target_descriptor, None);
+        let action = sim.source_kind4_actions[0];
+        assert_eq!(action.attacker_position, (0.0, 0.0));
+        assert_eq!(action.attacker_runtime_slot, 0);
+        assert_eq!(action.attacker_figure_kind, 4);
+        assert_eq!(action.direction, 2);
+        assert_eq!(action.flags, crate::combat::SOURCE_KIND4_ACTION_EVENT_FLAGS);
+        assert_eq!(
+            action.target_descriptor,
+            SourceTargetDescriptor::from_bytes([1, 7, 3, 0])
+        );
+        assert_eq!(sim.military_units[0].combat_target, -1);
+        assert_eq!(sim.source_kind4_deferred_hits.len(), 1);
+        assert_eq!(
+            sim.source_kind4_occupants[0].idle_timestamp_ticks,
+            crate::combat::source_kind4_action_ready_at(0, &candidates[0])
+                .expect("category-four action readiness")
+        );
+
+        sim.military_units[1].source_energy = action.raw_strength;
+        sim.source_time_ticks = sim.source_kind4_deferred_hits[0].due_at;
+        sim.tick_source_kind4_deferred_hits();
+        assert_eq!(sim.military_units[1].source_energy, action.raw_strength);
+        assert!(sim.military_units[1].source_terminal_pending);
+        assert!(sim.military_units[1].active);
+        sim.tick_source_land_figures(20);
+        assert!(!sim.military_units[1].active);
+        assert_eq!(
+            sim.source_combat_terminal_events,
+            vec![SourceCombatTerminalEvent {
+                target: action.target_descriptor,
+                target_figure_kind: 1,
+                target_runtime_slot: 3,
+                target_owner: 1,
+                attacker_figure_kind: 4,
+                attacker_runtime_slot: 0,
+                attacker_owner: Some(0),
+                control_kind: SOURCE_COMBAT_TERMINAL_CONTROL_KIND,
+                kill_credit: true,
+            }]
+        );
+        assert!(sim.source_kind4_deferred_hits.is_empty());
+    }
+
+    #[test]
+    fn source_kind_four_deferred_hit_removes_category_four_slot_after_terminal_control() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(7, 20, 1));
+
+        let mut attacker = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 0, 0);
+        attacker.source_runtime_slot = Some(0);
+        attacker.source_live_runtime_slot = Some(0);
+        attacker.source_candidate_list_key = Some(7);
+        attacker.source_figure_kind = Some(4);
+        attacker.source_figure_definition_id = Some(1);
+        attacker.source_energy = 60;
+        sim.military_units.push(attacker);
+
+        let mut target = MilitaryUnit::new(crate::combat::UnitType::Infantry, 1, 1, 0);
+        target.source_runtime_slot = Some(1);
+        target.source_live_runtime_slot = Some(1);
+        target.source_candidate_list_key = Some(7);
+        target.source_figure_kind = Some(4);
+        target.source_figure_definition_id = Some(1);
+        target.source_energy = 1;
+        target.source_island_id = Some(7);
+        target.source_motion_target = Some((2, 0));
+        target.source_step_remaining = 0.75;
+        target.direction = 2;
+        sim.military_units.push(target);
+        sim.source_kind4_occupants.push(SourceKind4Occupant {
+            runtime_slot: 1,
+            figure_definition_id: 1,
+            route_radius: crate::combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
+            route_retry_count: 0,
+            route_program: crate::combat::default_source_kind4_route_program(),
+            route_program_cursor: 0,
+            idle_remaining_bits: 0,
+            origin_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            position: (1, 0),
+            island_id: 7,
+            owner: 1,
+            direction: 0,
+            animation_state: 0,
+            state_selector: 0,
+            state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+            idle_timestamp_ticks: 0,
+            state_flags: 0,
+            state_payload: [0; 8],
+            active: true,
+        });
+        let action = combat::SourceKind4Action {
+            attacker_position: (0.0, 0.0),
+            attacker_runtime_slot: 0,
+            raw_strength: 1,
+            attacker_figure_kind: 4,
+            direction: 2,
+            flags: combat::SOURCE_KIND4_ACTION_EVENT_FLAGS,
+            target_descriptor: SourceTargetDescriptor::from_bytes([4, 7, 1, 0]),
+        };
+        sim.source_kind4_deferred_hits
+            .push(combat::SourceKind4DeferredHit { due_at: 0, action });
+
+        sim.tick_source_kind4_deferred_hits();
+
+        assert_eq!(sim.military_units[1].source_energy, 1);
+        assert!(sim.military_units[1].source_terminal_pending);
+        assert!(sim.military_units[1].active);
+        assert_eq!(sim.military_units[1].source_terminal_remaining, 0.25);
+        sim.tick_source_land_figures(1);
+        assert!(sim.military_units[1].active);
+        assert!(sim.military_units[1].source_position_x > 0.75);
+        sim.tick_source_land_figures(20_000);
+        assert!(!sim.military_units[1].active);
+        assert!(!sim.source_kind4_occupants[0].active);
+        assert_eq!(
+            sim.source_combat_terminal_events,
+            vec![SourceCombatTerminalEvent {
+                target: action.target_descriptor,
+                target_figure_kind: 4,
+                target_runtime_slot: 1,
+                target_owner: 1,
+                attacker_figure_kind: 4,
+                attacker_runtime_slot: 0,
+                attacker_owner: Some(0),
+                control_kind: SOURCE_COMBAT_TERMINAL_CONTROL_KIND,
+                kill_credit: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn source_kind_four_terminal_hit_requires_fun_00445930_owner_gate() {
+        let mut sim = Simulation::new();
+        sim.source_kind4_dispatch.active_player_slot = 0;
+        sim.source_kind4_dispatch.single_player = false;
+
+        let mut attacker = MilitaryUnit::new(crate::combat::UnitType::Infantry, 1, 0, 0);
+        attacker.source_runtime_slot = Some(0);
+        attacker.source_live_runtime_slot = Some(0);
+        attacker.source_candidate_list_key = Some(7);
+        attacker.source_figure_kind = Some(4);
+        attacker.source_figure_definition_id = Some(1);
+        attacker.source_energy = 60;
+        sim.military_units.push(attacker);
+
+        let mut target = MilitaryUnit::new(crate::combat::UnitType::SmallWarship, 2, 1, 0);
+        target.source_runtime_slot = Some(1);
+        target.source_live_runtime_slot = Some(1);
+        target.source_candidate_list_key = Some(7);
+        target.source_figure_kind = Some(1);
+        target.source_figure_definition_id = Some(0x19);
+        target.source_energy = 1;
+        sim.military_units.push(target);
+
+        sim.source_kind4_deferred_hits
+            .push(combat::SourceKind4DeferredHit {
+                due_at: 0,
+                action: combat::SourceKind4Action {
+                    attacker_position: (0.0, 0.0),
+                    attacker_runtime_slot: 0,
+                    raw_strength: 1,
+                    attacker_figure_kind: 4,
+                    direction: 2,
+                    flags: combat::SOURCE_KIND4_ACTION_EVENT_FLAGS,
+                    target_descriptor: SourceTargetDescriptor::from_bytes([1, 7, 1, 0]),
+                },
+            });
+
+        sim.tick_source_kind4_deferred_hits();
+
+        assert_eq!(sim.military_units[1].source_energy, 1);
+        assert!(sim.military_units[1].active);
+        assert!(sim.source_combat_terminal_events.is_empty());
+    }
+
+    #[test]
+    fn source_kind_four_terminal_dynamic_slice_waits_for_generic_removal() {
+        let mut sim = Simulation::new();
+        let mut attacker = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 0, 0);
+        attacker.source_runtime_slot = Some(0);
+        attacker.source_live_runtime_slot = Some(0);
+        attacker.source_candidate_list_key = Some(7);
+        attacker.source_figure_kind = Some(4);
+        attacker.source_figure_definition_id = Some(1);
+        attacker.source_energy = 60;
+        sim.military_units.push(attacker);
+        sim.source_dynamic_combat_figures
+            .push(SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 1,
+                candidate_list_key: 7,
+                figure_definition_id: 0x19,
+                direction: 0,
+                source_payload: 0,
+                position: (1.0, 0.0),
+                position_z: 0.0,
+                source_energy: 1,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 1,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 3,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion {
+                    remaining_distance: 1.5,
+                    scalar_speed: 0.25,
+                    velocity_x: 0.25,
+                    velocity_y: 0.0,
+                    velocity_z: 0.0,
+                    terminal_motion_locked: false,
+                },
+            });
+        sim.source_kind4_deferred_hits
+            .push(combat::SourceKind4DeferredHit {
+                due_at: 0,
+                action: combat::SourceKind4Action {
+                    attacker_position: (0.0, 0.0),
+                    attacker_runtime_slot: 0,
+                    raw_strength: 1,
+                    attacker_figure_kind: 4,
+                    direction: 2,
+                    flags: combat::SOURCE_KIND4_ACTION_EVENT_FLAGS,
+                    target_descriptor: SourceTargetDescriptor::from_bytes([1, 7, 3, 0]),
+                },
+            });
+
+        sim.tick_source_kind4_deferred_hits();
+
+        assert!(sim.source_dynamic_combat_figures[0].active);
+        assert_eq!(
+            sim.source_combat_terminal_slices,
+            vec![SourceCombatTerminalSlice {
+                target: SourceCombatTerminalSliceTarget::DynamicFigure(0),
+                target_figure_kind: 1,
+                target_runtime_slot: 3,
+                remaining_distance: 0.25,
+                scalar_speed: 0.25,
+                velocity_x: 0.25,
+                velocity_y: 0.0,
+                velocity_z: 0.0,
+            }]
+        );
+        assert_eq!(
+            sim.source_combat_candidates()
+                .iter()
+                .map(|candidate| candidate.entity)
+                .collect::<Vec<_>>(),
+            vec![combat::SourceCombatCandidateEntity::MilitaryUnit(0)]
+        );
+
+        sim.tick_source_combat_terminal_slices(19);
+        assert!(sim.source_dynamic_combat_figures[0].active);
+        assert!((sim.source_dynamic_combat_figures[0].position.0 - 1.2375).abs() < f32::EPSILON);
+        sim.tick_source_combat_terminal_slices(1);
+        assert!(!sim.source_dynamic_combat_figures[0].active);
+        assert!((sim.source_dynamic_combat_figures[0].position.0 - 1.25).abs() < f32::EPSILON);
+        assert!(sim.source_combat_terminal_slices.is_empty());
+    }
+
+    #[test]
+    fn source_kind_four_kind_one_terminal_boards_same_owner_ship_and_removes_figure() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(7, 8, 1));
+        let descriptor = SourceTargetDescriptor::from_bytes([1, 7, 0x34, 0x12]);
+
+        let mut ship = TradeShip::new(2, 0, 0, 0);
+        ship.source_figure_kind = Some(1);
+        ship.source_candidate_list_key = Some(7);
+        ship.source_runtime_slot = Some(0x1234);
+        ship.source_figure_definition_id = Some(0x15);
+        ship.source_energy = 150;
+        sim.trade_ships.push(ship);
+
+        let mut unit = MilitaryUnit::new(crate::combat::UnitType::Infantry, 2, 0, 0);
+        unit.source_island_id = Some(7);
+        unit.source_runtime_slot = Some(9);
+        unit.source_live_runtime_slot = Some(9);
+        unit.source_candidate_list_key = Some(7);
+        unit.source_figure_kind = Some(4);
+        unit.source_figure_definition_id = Some(1);
+        unit.source_energy = anno_formats::szs::LandFigureDefinition::from_id(1)
+            .expect("source land definition is known")
+            .source_runtime_energy_cap();
+        unit.source_target_descriptor = Some(descriptor);
+        sim.military_units.push(unit);
+
+        sim.tick_source_land_figures(1);
+
+        assert!(!sim.military_units[0].active);
+        assert_eq!(
+            crate::combat::source_ship_cargo_slot_ware(sim.trade_ships[0].source_cargo_slots[0]),
+            0x19
+        );
+        assert_eq!(
+            crate::combat::source_ship_cargo_slot_quantity(
+                sim.trade_ships[0].source_cargo_slots[0]
+            ),
+            crate::combat::SOURCE_SHIP_CARGO_SLOT_QUANTITY_CAPACITY
+        );
+    }
+
+    #[test]
+    fn source_kind_four_kind_one_terminal_keeps_figure_when_ship_has_no_free_slot() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(7, 8, 1));
+        let descriptor = SourceTargetDescriptor::from_bytes([1, 7, 0x34, 0x12]);
+
+        let mut ship = TradeShip::new(2, 0, 0, 0);
+        ship.source_figure_kind = Some(1);
+        ship.source_candidate_list_key = Some(7);
+        ship.source_runtime_slot = Some(0x1234);
+        ship.source_figure_definition_id = Some(0x15);
+        ship.source_energy = 150;
+        ship.source_cargo_slots = [0x19; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT];
+        sim.trade_ships.push(ship);
+
+        let mut unit = MilitaryUnit::new(crate::combat::UnitType::Infantry, 2, 0, 0);
+        unit.source_island_id = Some(7);
+        unit.source_runtime_slot = Some(9);
+        unit.source_live_runtime_slot = Some(9);
+        unit.source_candidate_list_key = Some(7);
+        unit.source_figure_kind = Some(4);
+        unit.source_figure_definition_id = Some(1);
+        unit.source_energy = 10;
+        unit.source_target_descriptor = Some(descriptor);
+        sim.military_units.push(unit);
+
+        sim.tick_source_land_figures(1);
+
+        assert!(sim.military_units[0].active);
+        assert_eq!(sim.military_units[0].source_target_descriptor, None);
+        assert_eq!(
+            sim.trade_ships[0].source_cargo_slots,
+            [0x19; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT]
+        );
+    }
+
+    #[test]
+    fn source_kind_four_klinik_terminal_defers_category_four_relocation() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(7, 8, 2));
+        sim.source_static_map_roots.push(SourceMapCellState {
+            island: 7,
+            x: 1,
+            y: 0,
+            source_production_kind_code: 0x16,
+            ..Default::default()
+        });
+        let descriptor = SourceTargetDescriptor::from_bytes([0x32, 7, 1, 0]);
+        let mut unit = MilitaryUnit::new(crate::combat::UnitType::Infantry, 2, 2, 0);
+        unit.source_island_id = Some(7);
+        unit.source_runtime_slot = Some(9);
+        unit.source_live_runtime_slot = Some(9);
+        unit.source_candidate_list_key = Some(7);
+        unit.source_figure_kind = Some(4);
+        unit.source_figure_definition_id = Some(1);
+        unit.source_target_descriptor = Some(descriptor);
+        unit.source_route_program[..3] = [
+            0x71,
+            0x81,
+            crate::combat::SOURCE_KIND4_ROUTE_PROGRAM_TERMINATOR,
+        ];
+        unit.source_route_program_cursor = 2;
+        sim.military_units.push(unit);
+
+        sim.tick_source_land_figures(1);
+
+        assert!(!sim.military_units[0].active);
+        assert_eq!(sim.source_kind4_deferred_relocations.len(), 1);
+        assert_eq!(
+            sim.source_kind4_deferred_relocations[0],
+            SourceKind4DeferredRelocation {
+                due_at: 100,
+                island_id: 7,
+                figure_definition_id: 1,
+                origin: (1.25, 0.25),
+                target_descriptor: SourceTargetDescriptor::from_bytes([0x38, 0, 4, 1]),
+            }
+        );
+
+        sim.source_time_ticks = 99;
+        sim.tick_source_kind4_deferred_relocations();
+        assert_eq!(sim.military_units.len(), 1);
+        sim.source_time_ticks = 100;
+        sim.tick_source_kind4_deferred_relocations();
+
+        assert_eq!(sim.military_units.len(), 2);
+        let figure = &sim.military_units[1];
+        assert_eq!(figure.source_figure_kind, Some(4));
+        assert_eq!(figure.source_runtime_slot, Some(0));
+        assert_eq!(figure.source_figure_definition_id, Some(1));
+        assert_eq!(
+            (figure.source_position_x, figure.source_position_y),
+            (1.25, 0.25)
+        );
+        assert_eq!(
+            figure.source_origin_descriptor,
+            Some(SourceTargetDescriptor::from_bytes([0x38, 0, 2, 0]))
+        );
+        assert_eq!(
+            figure.source_target_descriptor,
+            Some(SourceTargetDescriptor::from_bytes([0x38, 0, 4, 1]))
+        );
+        assert_eq!(figure.owner, 0);
+        assert_eq!(sim.source_kind4_occupants.len(), 1);
+    }
+
+    #[test]
     fn source_dynamic_table_retains_scenario_hq_slots() {
         let mut sim = Simulation::new();
         sim.source_dynamic_map_objects.push(SourceDynamicMapObject {
@@ -9250,6 +11270,45 @@ mod tests {
         assert_eq!(sim.diplomacy.get(0, 1), Diplomacy::War);
         assert_eq!(sim.diplomacy.get(1, 0), Diplomacy::War);
         assert_eq!(sim.event_log.len(), 2);
+    }
+
+    #[test]
+    fn source_relationship_event_command_updates_only_the_directed_source_byte() {
+        use crate::commands::Command;
+
+        let mut sim = Simulation::new();
+        sim.diplomacy.set_source_relationship_code(0, 1, 3);
+        assert!(sim.apply_command(&Command::ApplySourceRelationshipEvent {
+            source: 0,
+            target: 1,
+            payload: 1,
+        }));
+        assert_eq!(sim.diplomacy.source_relationship_code(0, 1), 2);
+        assert_eq!(sim.diplomacy.source_relationship_code(1, 0), 0);
+        assert!(!sim.apply_command(&Command::ApplySourceRelationshipEvent {
+            source: 0,
+            target: 1,
+            payload: 1,
+        }));
+    }
+
+    #[test]
+    fn source_attitude_event_command_keeps_the_source_pair_asymmetric() {
+        use crate::commands::Command;
+
+        let mut sim = Simulation::new();
+        assert!(sim.apply_command(&Command::ApplySourceAttitudeEvent {
+            source: 0,
+            target: 1,
+            payload: 1,
+        }));
+        assert_eq!(sim.diplomacy.source_attitude_code(0, 1), 1);
+        assert_eq!(sim.diplomacy.source_attitude_code(1, 0), 2);
+        assert!(!sim.apply_command(&Command::ApplySourceAttitudeEvent {
+            source: 0,
+            target: 1,
+            payload: 1,
+        }));
     }
 
     #[test]
