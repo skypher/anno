@@ -308,10 +308,12 @@ pub struct SourceCityRecord {
     /// source city-figure transfer handlers move residents between cities.
     #[serde(default)]
     pub resident_amount: u32,
-    /// Source city u16 `+0xc6`, consulted by `FUN_00423710` before it
-    /// expands a controller's figure capacity from the weighted roster.
-    /// The STADT4-to-runtime initialization of this value is retained as an
-    /// explicit live field until its loader assignment is recovered.
+    /// Source city property-table entry 13 at u16 `+0xc6`, consulted by
+    /// `FUN_00423710` before it expands a controller's figure capacity from
+    /// the weighted roster. `FUN_00468e10` clears the complete 600-byte city
+    /// record on allocation, so this starts at zero rather than coming from
+    /// `STADT4`; `FUN_0047a960` and `FUN_0047a9b0` subsequently replace it
+    /// through the kind-`0x14`, subtype-`0x12` city-property event path.
     #[serde(default)]
     pub controller_figure_capacity_metric: u16,
     /// Source city bytes `+0x164 + 0x0c * i` sampled by `FUN_0047f0c0` for
@@ -379,6 +381,24 @@ impl Default for SourceCityRecord {
 }
 
 impl SourceCityRecord {
+    /// Replay `FUN_0047a960(city, 0x0d, amount)`. The event dispatcher
+    /// `FUN_00480680` truncates its u32 payload to city property 13's u16
+    /// storage after adding `amount` to the prior value.
+    pub fn source_add_controller_figure_capacity_metric(&mut self, amount: u32) {
+        self.controller_figure_capacity_metric = self
+            .controller_figure_capacity_metric
+            .wrapping_add(amount as u16);
+    }
+
+    /// Replay `FUN_0047a9b0(city, 0x0d, amount)`. As in the executable, the
+    /// u32 subtraction is truncated by `FUN_00480680` when it reaches the
+    /// property-table entry at `+0xc6`.
+    pub fn source_sub_controller_figure_capacity_metric(&mut self, amount: u32) {
+        self.controller_figure_capacity_metric = self
+            .controller_figure_capacity_metric
+            .wrapping_sub(amount as u16);
+    }
+
     /// `FUN_0047f790(city)`: the five `+0x220` BGRUPPE totals plus the live
     /// `+0x218` resident amount, with the executable's wrapping u32 sum.
     pub fn source_resident_total(self) -> u32 {
@@ -4019,6 +4039,18 @@ mod tests {
 
         assert_eq!(cities.source_resident_total_for_owner(2), 156);
         assert_eq!(cities.source_resident_total_for_owner(3), 90);
+    }
+
+    #[test]
+    fn city_property_thirteen_starts_zero_and_replays_source_event_truncation() {
+        let mut city = SourceCityRecord::default();
+        assert_eq!(city.controller_figure_capacity_metric, 0);
+
+        city.source_add_controller_figure_capacity_metric(0x1_0021);
+        assert_eq!(city.controller_figure_capacity_metric, 0x21);
+
+        city.source_sub_controller_figure_capacity_metric(0x22);
+        assert_eq!(city.controller_figure_capacity_metric, u16::MAX);
     }
 
     #[test]
