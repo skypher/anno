@@ -1318,6 +1318,9 @@ pub struct PlayerSlotInit {
     /// raw u32 is exposed so callers can correlate it with
     /// observed AI behaviour (e.g. a tech-unlock mask).
     pub slot_u32_0x34: u32,
+    /// PLAYER4 u16 `+0x9c`, the upper bound applied by
+    /// `FUN_00423710` to this player's controller figure capacity.
+    pub controller_figure_capacity_limit_0x9c: u16,
     /// Little-endian u16 at slot offset 0x18..0x1A.
     /// `1602_exe.c::FUN_00478160:85417` reads/writes this as a
     /// `*(u16*)` — the high byte is always 0 in shipping
@@ -1855,6 +1858,7 @@ impl SzsFile {
                 ai_active,
                 name,
                 slot_u32_0x34,
+                controller_figure_capacity_limit_0x9c: read_u16(0x9c),
                 relations_0xc0,
                 relationships,
                 events_0x1c0,
@@ -2541,6 +2545,18 @@ mod tests {
             !szs.islands[0].tiles.is_empty(),
             "First island should have tiles"
         );
+    }
+
+    #[test]
+    fn player4_extracts_controller_figure_capacity_limits() {
+        let mut data = vec![0; PLAYER4_SLOT_BYTES * PLAYER4_MAX_SLOTS];
+        data[0x9c..0x9e].copy_from_slice(&12_u16.to_le_bytes());
+        let second_slot = PLAYER4_SLOT_BYTES + 0x9c;
+        data[second_slot..second_slot + 2].copy_from_slice(&27_u16.to_le_bytes());
+
+        let players = SzsFile::parse_player4(&data);
+        assert_eq!(players[0].controller_figure_capacity_limit_0x9c, 12);
+        assert_eq!(players[1].controller_figure_capacity_limit_0x9c, 27);
     }
 
     #[test]

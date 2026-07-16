@@ -308,6 +308,12 @@ pub struct SourceCityRecord {
     /// source city-figure transfer handlers move residents between cities.
     #[serde(default)]
     pub resident_amount: u32,
+    /// Source city u16 `+0xc6`, consulted by `FUN_00423710` before it
+    /// expands a controller's figure capacity from the weighted roster.
+    /// The STADT4-to-runtime initialization of this value is retained as an
+    /// explicit live field until its loader assignment is recovered.
+    #[serde(default)]
+    pub controller_figure_capacity_metric: u16,
     /// Source city bytes `+0x164 + 0x0c * i` sampled by `FUN_0047f0c0` for
     /// luxury ware slots `0x0f + i`.
     #[serde(default)]
@@ -358,6 +364,7 @@ impl Default for SourceCityRecord {
             phase: 0,
             tier_population: [0; 5],
             resident_amount: 0,
+            controller_figure_capacity_metric: 0,
             luxury_satisfaction: [0; 7],
             satisfaction_weights: source_city_initial_satisfaction_weights(),
             satisfaction_pressure: 0,

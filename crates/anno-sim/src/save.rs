@@ -236,7 +236,8 @@ use std::path::Path;
 ///       bytes that gate `0x84d` ownership transfers.
 /// v125: source player-controller timers, action stacks, city gates, and
 ///       category-1/2/3 roster state retain `FUN_0042b4b0` scheduling.
-pub const SAVE_VERSION: u32 = 125;
+/// v126: the `FUN_00423710` global controller difficulty mode persists.
+pub const SAVE_VERSION: u32 = 126;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -250,7 +251,7 @@ pub const SAVE_VERSION: u32 = 125;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 125;
+pub const MIN_LOADABLE_VERSION: u32 = 126;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -294,6 +295,7 @@ pub struct SaveState {
     pub source_player_controllers:
         [crate::simulation::SourcePlayerController; crate::combat::SOURCE_KIND4_PLAYER_SLOT_COUNT],
     pub source_player_controller_cursor: u8,
+    pub source_controller_difficulty_mode: u8,
     pub source_time_ticks: u32,
     pub source_time_remainder_ms: u32,
     pub source_resource_environment_elapsed_ms: u32,
@@ -386,6 +388,7 @@ impl Simulation {
             source_shared_figure_control_flags: self.source_shared_figure_control_flags,
             source_player_controllers: self.source_player_controllers.clone(),
             source_player_controller_cursor: self.source_player_controller_cursor,
+            source_controller_difficulty_mode: self.source_controller_difficulty_mode,
             source_time_ticks: self.source_time_ticks,
             source_time_remainder_ms: self.source_time_remainder_ms,
             source_resource_environment_elapsed_ms: self.source_resource_environment_elapsed_ms,
@@ -452,6 +455,7 @@ impl Simulation {
         self.source_shared_figure_control_flags = s.source_shared_figure_control_flags;
         self.source_player_controllers = s.source_player_controllers;
         self.source_player_controller_cursor = s.source_player_controller_cursor;
+        self.source_controller_difficulty_mode = s.source_controller_difficulty_mode;
         self.source_time_ticks = s.source_time_ticks;
         self.source_time_remainder_ms = s.source_time_remainder_ms;
         self.source_resource_environment_elapsed_ms = s.source_resource_environment_elapsed_ms;
@@ -575,6 +579,7 @@ mod tests {
                 crate::simulation::SourcePlayerController::default()
             }),
             source_player_controller_cursor: 0,
+            source_controller_difficulty_mode: 2,
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
             source_resource_environment_elapsed_ms: 0,
@@ -859,13 +864,16 @@ mod tests {
         };
         sim.source_shared_figure_control_flags[9] = 0x40;
         sim.source_player_controller_cursor = 4;
+        sim.source_controller_difficulty_mode = 3;
         sim.source_player_controllers[2] = crate::simulation::SourcePlayerController {
             initialized: true,
             action_timer_ms: 47,
             city_management_timer_ms: 9_999,
             maintenance_timer_ms: 2_998,
             desired_figure_count: 3,
+            figure_roster_ratio: 1,
             figure_capacity: 4,
+            figure_capacity_limit: Some(12),
             city_management_profile_present: true,
             active_city_owner: Some(2),
             selected_city_active: false,
@@ -1432,6 +1440,7 @@ mod tests {
         );
         assert_eq!(sim2.source_shared_figure_control_flags[9], 0x40);
         assert_eq!(sim2.source_player_controller_cursor, 4);
+        assert_eq!(sim2.source_controller_difficulty_mode, 3);
         assert_eq!(
             sim2.source_player_controllers[2],
             crate::simulation::SourcePlayerController {
@@ -1440,7 +1449,9 @@ mod tests {
                 city_management_timer_ms: 9_999,
                 maintenance_timer_ms: 2_998,
                 desired_figure_count: 3,
+                figure_roster_ratio: 1,
                 figure_capacity: 4,
+                figure_capacity_limit: Some(12),
                 city_management_profile_present: true,
                 active_city_owner: Some(2),
                 selected_city_active: false,

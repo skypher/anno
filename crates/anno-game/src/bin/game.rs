@@ -8202,6 +8202,7 @@ fn init_simulation(
     sim.diplomacy = anno_sim::data_bridge::diplomacy_from_player4_relationships(&szs.players);
     sim.source_kind4_dispatch =
         anno_sim::data_bridge::source_kind4_dispatch_state_from_scenario(szs);
+    sim.configure_source_controller_figure_capacity_limits(&szs.players);
     sim.building_defs = defs.to_vec();
     sim.source_dynamic_map_objects =
         anno_sim::data_bridge::source_dynamic_map_objects_from_scenario(szs, cod);
