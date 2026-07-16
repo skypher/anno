@@ -447,6 +447,121 @@ impl IslandMap {
         rectangles
     }
 
+    /// `FUN_00417220` with the state-three `param_4 = 1` look-ahead. The
+    /// source follows the selected cell's two-bit map direction, skips eight
+    /// cells, then accepts only if no remaining cell in that ray has kind 19.
+    pub fn source_controller_city_boundary_clear(&self, x: i32, y: i32) -> bool {
+        let Some(cell) = self.source_map_kind_cell((x, y)) else {
+            return false;
+        };
+        let (step_x, step_y, available) = match cell.map_direction {
+            0 => (0, 1, i32::from(self.height) - y - 1),
+            1 => (-1, 0, x),
+            2 => (0, -1, y),
+            _ => (1, 0, i32::from(self.width) - x - 1),
+        };
+        let mut position = (x + step_x * 8, y + step_y * 8);
+        let mut remaining = available - 2;
+        while remaining > 0 {
+            remaining -= 1;
+            let Some(cell) = self.source_map_kind_cell(position) else {
+                // The executable's map allocation includes sea padding beyond
+                // this local island grid.
+                return true;
+            };
+            if cell.kind_code != 19 {
+                return false;
+            }
+            position.0 += step_x;
+            position.1 += step_y;
+        }
+        true
+    }
+
+    /// `FUN_0040fe80` from one local map cell and a two-bit direction. The
+    /// return is the source's one-based line distance, including its special
+    /// single-kind-16 run handling.
+    pub fn source_controller_city_line_distance(
+        &self,
+        owner: u8,
+        x: i32,
+        y: i32,
+        direction: u8,
+    ) -> u32 {
+        let (step_x, step_y, mut remaining) = match direction & 3 {
+            0 => (1, 0, i32::from(self.width) - x - 1),
+            1 => (0, 1, i32::from(self.height) - y - 1),
+            2 => (-1, 0, x),
+            _ => (0, -1, y),
+        };
+        let mut position = (x, y);
+        let mut prior_was_kind_16 = false;
+        let mut distance = 1_u32;
+        while remaining > 0 {
+            remaining -= 1;
+            position.0 += step_x;
+            position.1 += step_y;
+            let Some(cell) = self.source_map_kind_cell(position) else {
+                return distance;
+            };
+            if cell.map_owner != owner && cell.map_owner != 7 {
+                return distance;
+            }
+            if cell.kind_code == 16 && !prior_was_kind_16 {
+                prior_was_kind_16 = true;
+            } else if matches!(cell.kind_code, 1 | 4 | 10..=12 | 18) {
+                prior_was_kind_16 = false;
+            } else {
+                return if distance < 2 { 0 } else { distance };
+            }
+            distance = distance.saturating_add(1);
+        }
+        distance
+    }
+
+    /// `FUN_00417120` over a clamped local square.
+    pub fn source_controller_city_green_density(
+        &self,
+        owner: u8,
+        x: i32,
+        y: i32,
+        radius: i32,
+    ) -> u32 {
+        self.source_controller_city_density(owner, x, y, radius, |cell| {
+            (cell.ware_slot == 0 && cell.kind_code == 12) || matches!(cell.ware_slot, 0x34 | 0x35)
+        })
+    }
+
+    /// `FUN_00417030` over a clamped local square.
+    pub fn source_controller_city_ware_five_density(
+        &self,
+        owner: u8,
+        x: i32,
+        y: i32,
+        radius: i32,
+    ) -> u32 {
+        self.source_controller_city_density(owner, x, y, radius, |cell| cell.ware_slot == 5)
+    }
+
+    fn source_controller_city_density(
+        &self,
+        owner: u8,
+        x: i32,
+        y: i32,
+        radius: i32,
+        predicate: impl Fn(SourceMapKindCell) -> bool,
+    ) -> u32 {
+        let x0 = (x - radius).max(0);
+        let y0 = (y - radius).max(0);
+        let x1 = (x + radius).min(i32::from(self.width));
+        let y1 = (y + radius).min(i32::from(self.height));
+        (y0..y1)
+            .flat_map(|row| (x0..x1).map(move |column| (column, row)))
+            .filter_map(|position| self.source_map_kind_cell(position))
+            .filter(|cell| cell.map_owner == owner && predicate(*cell))
+            .count() as u32
+    }
+
     /// The attenuation write in the latter branch of `FUN_0046b3e0`.
     /// Values below twelve are cleared after the truncating half-step.
     pub fn decay_source_resource_attenuation(&mut self) -> u8 {
@@ -1814,6 +1929,50 @@ mod tests {
                 area: 36,
             }]
         );
+    }
+
+    #[test]
+    fn controller_city_predicates_replay_boundary_distance_and_density_scans() {
+        let mut map = IslandMap::new_open(1, 16, 3);
+        let cell = |kind_code, map_owner, ware_slot, map_direction| {
+            Some(SourceMapKindCell {
+                kind_code,
+                kind3_center_cell: false,
+                map_owner,
+                ware_slot,
+                map_direction,
+            })
+        };
+        let index = |x, y| y * 16 + x;
+
+        // `FUN_00417220` skips the first eight directional cells.
+        map.source_map_kind_cells[index(1, 1)] = cell(11, 7, 0, 3);
+        map.source_map_kind_cells[index(9, 1)] = cell(19, 7, 0, 0);
+        map.source_map_kind_cells[index(10, 1)] = cell(11, 7, 0, 0);
+        assert!(!map.source_controller_city_boundary_clear(1, 1));
+        for x in 10..16 {
+            map.source_map_kind_cells[index(x, 1)] = cell(19, 7, 0, 0);
+        }
+        assert!(map.source_controller_city_boundary_clear(1, 1));
+
+        // One kind-16 cell is admitted, but a second consecutive one stops
+        // the one-based source distance at two.
+        for x in 0..16 {
+            map.source_map_kind_cells[index(x, 0)] = cell(11, 7, 0, 0);
+        }
+        map.source_map_kind_cells[index(1, 0)] = cell(16, 7, 0, 0);
+        map.source_map_kind_cells[index(2, 0)] = cell(16, 7, 0, 0);
+        assert_eq!(map.source_controller_city_line_distance(7, 0, 0, 0), 2);
+        map.source_map_kind_cells[index(2, 0)] = cell(11, 7, 0, 0);
+        assert_eq!(map.source_controller_city_line_distance(7, 0, 0, 0), 16);
+
+        map.source_map_kind_cells[index(2, 1)] = cell(12, 7, 0, 0);
+        map.source_map_kind_cells[index(3, 1)] = cell(11, 7, 0x34, 0);
+        map.source_map_kind_cells[index(4, 1)] = cell(11, 7, 5, 0);
+        map.source_map_kind_cells[index(5, 1)] = cell(11, 7, 5, 0);
+        map.source_map_kind_cells[index(6, 1)] = cell(12, 6, 0, 0);
+        assert_eq!(map.source_controller_city_green_density(7, 4, 1, 3), 2);
+        assert_eq!(map.source_controller_city_ware_five_density(7, 4, 1, 3), 2);
     }
 
     #[test]
