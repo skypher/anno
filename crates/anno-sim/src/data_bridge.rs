@@ -707,6 +707,20 @@ impl SourceCityTable {
         self.slots.iter().flatten().copied().collect()
     }
 
+    /// Count active source cities owned by one player. This mirrors the
+    /// runtime PLAYER4 byte `+0x86`: `FUN_00468ce0` increments it after a
+    /// successful city allocation and `FUN_00468ed0` decrements it when the
+    /// island-local city pointer is released.
+    pub fn source_city_count_for_owner(&self, owner_slot: u8) -> u8 {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|city| city.owner_slot == owner_slot)
+            .count()
+            .try_into()
+            .unwrap_or(u8::MAX)
+    }
+
     /// Sum `FUN_0047f790` across every active source-city record owned by one
     /// player. This is the `local_14` / `local_18` accumulation in
     /// `FUN_00475c60` before its policy-specific modifiers.

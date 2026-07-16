@@ -1883,6 +1883,36 @@ impl Simulation {
             .unwrap_or(controller.active_city_owner == Some(player_slot as u8))
     }
 
+    /// Replay `FUN_0040e570` for one state-two island candidate. The target
+    /// must not contain a city owned by this controller. A foreign city owned
+    /// by faction state zero or `0x0c` is permitted only after that owner's
+    /// live PLAYER4 `+0x86` city count reaches three.
+    fn source_controller_target_island_is_eligible(
+        &self,
+        player_slot: usize,
+        island_id: u8,
+    ) -> bool {
+        self.source_cities.active_records().into_iter().all(|city| {
+            if city.island_id != island_id {
+                return true;
+            }
+            if city.owner_slot == player_slot as u8 {
+                return false;
+            }
+            let faction_state = self
+                .source_kind4_dispatch
+                .faction_states
+                .get(usize::from(city.owner_slot))
+                .copied()
+                .unwrap_or(u8::MAX);
+            !matches!(faction_state, 0 | 0x0c)
+                || self
+                    .source_cities
+                    .source_city_count_for_owner(city.owner_slot)
+                    >= 3
+        })
+    }
+
     /// Complete the successful `FUN_00417690` state-four arrival. State three
     /// has already selected the owned figure and target tile; this routine
     /// replays the resulting `FUN_004084d0` city allocation, records the
@@ -8000,6 +8030,61 @@ mod tests {
 
         assert_eq!(sim.source_player_controllers[1].active_city_slot, Some(5));
         assert_eq!(sim.source_player_controllers[1].active_city_owner, Some(1));
+    }
+
+    #[test]
+    fn source_controller_state_two_island_eligibility_uses_live_city_counts() {
+        let mut sim = Simulation::new();
+        sim.source_kind4_dispatch.faction_states[1] = 0x0c;
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 7,
+                owner_slot: 1,
+                ..Default::default()
+            })
+        ));
+
+        assert!(!sim.source_controller_target_island_is_eligible(0, 7));
+
+        assert!(sim.source_cities.set_record(
+            1,
+            Some(SourceCityRecord {
+                island_id: 3,
+                owner_slot: 1,
+                ..Default::default()
+            })
+        ));
+        assert!(sim.source_cities.set_record(
+            2,
+            Some(SourceCityRecord {
+                island_id: 4,
+                owner_slot: 1,
+                ..Default::default()
+            })
+        ));
+        assert!(sim.source_controller_target_island_is_eligible(0, 7));
+
+        assert!(sim.source_cities.set_record(
+            3,
+            Some(SourceCityRecord {
+                island_id: 7,
+                owner_slot: 0,
+                ..Default::default()
+            })
+        ));
+        assert!(!sim.source_controller_target_island_is_eligible(0, 7));
+
+        assert!(sim.source_cities.set_record(
+            3,
+            Some(SourceCityRecord {
+                island_id: 7,
+                owner_slot: 2,
+                ..Default::default()
+            })
+        ));
+        sim.source_kind4_dispatch.faction_states[2] = 0x0e;
+        assert!(sim.source_controller_target_island_is_eligible(0, 7));
     }
 
     #[test]
