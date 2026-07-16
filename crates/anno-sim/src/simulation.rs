@@ -170,6 +170,10 @@ pub struct SourceFigurePurchaseEvent {
 pub struct SourcePlayerController {
     /// Has `FUN_0040f580` initialized this controller slot?
     pub initialized: bool,
+    /// Controller `+0x08`: source-clock tick at the last
+    /// `FUN_0040f580` initialization. `FUN_00429070` resets the controller
+    /// once the strict 36,000-tick age gate is exceeded.
+    pub initialized_at_ticks: u32,
     /// Controller `+0x4`, decremented by `FUN_0042b4b0` and replenished by 50.
     pub action_timer_ms: i32,
     /// Controller `+0x0c`, the city-management timer replenished by 10,000.
@@ -217,6 +221,7 @@ impl Default for SourcePlayerController {
     fn default() -> Self {
         Self {
             initialized: false,
+            initialized_at_ticks: 0,
             action_timer_ms: 0,
             city_management_timer_ms: 0,
             maintenance_timer_ms: 0,
@@ -1764,11 +1769,17 @@ impl Simulation {
     }
 
     fn initialize_source_player_controller(&mut self, player_slot: usize) {
-        if self
-            .source_player_controllers
-            .get(player_slot)
-            .is_none_or(|controller| controller.initialized)
-        {
+        let needs_initialization =
+            self.source_player_controllers
+                .get(player_slot)
+                .is_some_and(|controller| {
+                    !controller.initialized
+                        || self
+                            .source_time_ticks
+                            .wrapping_sub(controller.initialized_at_ticks)
+                            > 36_000
+                });
+        if !needs_initialization {
             return;
         }
 
@@ -1782,13 +1793,34 @@ impl Simulation {
         let action_timer_ms = i32::from(self.next_source_rand() & 0x0fff);
         let controller = &mut self.source_player_controllers[player_slot];
         controller.initialized = true;
+        controller.initialized_at_ticks = self.source_time_ticks;
         controller.action_timer_ms = action_timer_ms;
         controller.city_management_timer_ms = 20_000;
         controller.maintenance_timer_ms = 3_000;
-        if faction_state == 0x0c {
-            controller.desired_figure_count = 3;
+        controller.desired_figure_count = u32::from(faction_state == 0x0c) * 3;
+        controller.figure_roster_ratio = 0;
+        controller.figure_capacity = 0;
+        controller.city_management_profile_present = false;
+        controller.selected_city_active = false;
+        controller.action_stack.clear();
+        controller.purchase_predecessor_issued = false;
+        controller.owned_figure_handles.clear();
+        controller.figure_roster_dirty = matches!(faction_state, 0x0c | 0x0e);
+        if !controller.figure_roster_dirty {
+            controller.figure_roster_ratio = 1;
+            return;
         }
-        controller.figure_roster_dirty = true;
+        let desired_figure_count = controller.desired_figure_count;
+        self.refresh_source_player_controller_roster(player_slot);
+        let owned_figure_count = self.source_player_controllers[player_slot]
+            .owned_figure_handles
+            .len() as u32;
+        self.source_player_controllers[player_slot].figure_roster_ratio =
+            if desired_figure_count < 2 {
+                1
+            } else {
+                owned_figure_count / desired_figure_count + 1
+            };
     }
 
     fn refresh_source_player_controller_roster(&mut self, player_slot: usize) {
@@ -7720,6 +7752,7 @@ mod tests {
 
         sim.source_player_controllers[0] = SourcePlayerController {
             initialized: true,
+            initialized_at_ticks: 0,
             action_timer_ms: 1,
             city_management_timer_ms: -1,
             maintenance_timer_ms: 0,
@@ -7768,6 +7801,7 @@ mod tests {
         sim.set_source_figure_purchase_enabled(7, true);
         sim.source_player_controllers[0] = SourcePlayerController {
             initialized: true,
+            initialized_at_ticks: 0,
             action_timer_ms: 1,
             city_management_timer_ms: -1,
             maintenance_timer_ms: 0,
@@ -7856,6 +7890,66 @@ mod tests {
 
         assert_eq!(sim.source_player_controllers[1].active_city_slot, Some(5));
         assert_eq!(sim.source_player_controllers[1].active_city_owner, Some(1));
+    }
+
+    #[test]
+    fn source_controller_reinitializes_after_strict_36000_tick_age() {
+        let mut sim = Simulation::new();
+        sim.source_kind4_dispatch.remote_owner_dispatch_enabled = true;
+        sim.source_kind4_dispatch.faction_states[0] = 0x0c;
+        sim.source_time_ticks = 36_001;
+        sim.source_player_controllers[0] = SourcePlayerController {
+            initialized: true,
+            initialized_at_ticks: 0,
+            action_timer_ms: -1,
+            city_management_timer_ms: -1,
+            maintenance_timer_ms: -1,
+            desired_figure_count: 99,
+            figure_roster_ratio: 8,
+            figure_capacity: 9,
+            figure_capacity_limit: Some(12),
+            city_management_profile_present: true,
+            active_city_owner: None,
+            active_city_slot: None,
+            selected_city_active: true,
+            city_management_disabled: false,
+            action_stack: vec![9],
+            purchase_predecessor_issued: true,
+            owned_figure_handles: vec![7],
+            figure_roster_dirty: false,
+        };
+
+        sim.tick_source_player_controllers(0);
+
+        let controller = &sim.source_player_controllers[0];
+        assert_eq!(controller.initialized_at_ticks, 36_001);
+        assert_eq!(controller.desired_figure_count, 3);
+        assert_eq!(controller.figure_roster_ratio, 1);
+        assert_eq!(controller.figure_capacity, 0);
+        assert!(!controller.city_management_profile_present);
+        assert!(!controller.selected_city_active);
+        assert!(controller.action_stack.is_empty());
+        assert!(!controller.purchase_predecessor_issued);
+        assert!(controller.owned_figure_handles.is_empty());
+        assert!(!controller.figure_roster_dirty);
+    }
+
+    #[test]
+    fn source_controller_reset_gate_excludes_exactly_36000_ticks() {
+        let mut sim = Simulation::new();
+        sim.source_time_ticks = 36_000;
+        sim.source_player_controllers[0] = SourcePlayerController {
+            initialized: true,
+            initialized_at_ticks: 0,
+            desired_figure_count: 99,
+            ..Default::default()
+        };
+
+        sim.initialize_source_player_controller(0);
+
+        let controller = &sim.source_player_controllers[0];
+        assert_eq!(controller.initialized_at_ticks, 0);
+        assert_eq!(controller.desired_figure_count, 99);
     }
 
     #[test]

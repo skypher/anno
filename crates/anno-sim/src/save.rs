@@ -242,7 +242,9 @@ use std::path::Path;
 /// v128: removes the synthetic controller `+0x106f8` profile field after an
 ///       executable instruction census found its sole read and no writes.
 /// v129: controller `+0x3e7c` retains its physical source-city slot.
-pub const SAVE_VERSION: u32 = 129;
+/// v130: controller `+0x08` initialization ticks retain the strict
+///       `FUN_00429070` 36,000-tick reset cadence.
+pub const SAVE_VERSION: u32 = 130;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -256,7 +258,7 @@ pub const SAVE_VERSION: u32 = 129;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 129;
+pub const MIN_LOADABLE_VERSION: u32 = 130;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -872,6 +874,7 @@ mod tests {
         sim.source_controller_difficulty_mode = 3;
         sim.source_player_controllers[2] = crate::simulation::SourcePlayerController {
             initialized: true,
+            initialized_at_ticks: 0,
             action_timer_ms: 47,
             city_management_timer_ms: 9_999,
             maintenance_timer_ms: 2_998,
@@ -1451,6 +1454,7 @@ mod tests {
             sim2.source_player_controllers[2],
             crate::simulation::SourcePlayerController {
                 initialized: true,
+                initialized_at_ticks: 0,
                 action_timer_ms: 47,
                 city_management_timer_ms: 9_999,
                 maintenance_timer_ms: 2_998,
