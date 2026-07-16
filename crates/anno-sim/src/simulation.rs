@@ -182,6 +182,72 @@ pub struct SourceCityManagementProfile {
     pub initialized_at_ticks: u32,
 }
 
+/// One raw 32-byte state-seven construction work record at controller offset
+/// `+0x1df4`. `FUN_00417aa0` compares its signed priority word at `+0x1c`;
+/// the producer owns the remaining source fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceControllerCityConstructionWork {
+    bytes: [u8; 32],
+}
+
+impl SourceControllerCityConstructionWork {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self { bytes }
+    }
+
+    pub const fn bytes(self) -> [u8; 32] {
+        self.bytes
+    }
+
+    pub const fn priority(self) -> i16 {
+        i16::from_le_bytes([self.bytes[0x1c], self.bytes[0x1d]])
+    }
+}
+
+/// The `FUN_00417aa0` construction-work queue. The source retains at most
+/// 256 records, rejects priorities at most one, and replaces the first
+/// lowest-priority entry only when a full queue contains a priority at most
+/// three and the incoming priority exceeds three.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct SourceControllerCityConstructionQueue {
+    entries: Vec<SourceControllerCityConstructionWork>,
+}
+
+impl SourceControllerCityConstructionQueue {
+    pub const CAPACITY: usize = 0x100;
+
+    pub fn entries(&self) -> &[SourceControllerCityConstructionWork] {
+        &self.entries
+    }
+
+    pub fn insert(&mut self, work: SourceControllerCityConstructionWork) -> bool {
+        if work.priority() <= 1 {
+            return false;
+        }
+        if self.entries.len() < Self::CAPACITY {
+            self.entries.push(work);
+            return true;
+        }
+        if work.priority() <= 3 {
+            return false;
+        }
+        let Some((index, priority)) = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.priority())
+            .map(|(index, entry)| (index, entry.priority()))
+        else {
+            return false;
+        };
+        if priority > 3 {
+            return false;
+        }
+        self.entries[index] = work;
+        true
+    }
+}
+
 /// Controller bytes consumed by the `FUN_0042b4b0` city-management branch.
 ///
 /// The complete controller occupies `0x11e88` bytes in the executable. This
@@ -260,6 +326,9 @@ pub struct SourcePlayerController {
     /// Controller `+0x510` / `+0x50c` records emitted by the action-two
     /// `FUN_00415e70(..., 7, 5, 5)` rectangle search.
     pub source_city_rectangles: Vec<SourceControllerCityRectangle>,
+    /// Controller `+0x1df0/+0x1df4`: state-seven construction work emitted
+    /// by `FUN_00417c80` through `FUN_00417aa0`.
+    pub source_city_construction_queue: SourceControllerCityConstructionQueue,
     /// Owner byte of the controller's `+0x3e7c` active city, when present.
     pub active_city_owner: Option<u8>,
     /// Physical source-city slot of controller `+0x3e7c`. Source controller
@@ -313,6 +382,7 @@ impl Default for SourcePlayerController {
             island_search_deferred_requirement: None,
             island_search_retry_at_ticks: None,
             source_city_rectangles: Vec::new(),
+            source_city_construction_queue: SourceControllerCityConstructionQueue::default(),
             active_city_owner: None,
             active_city_slot: None,
             selected_city_active: false,
@@ -8239,6 +8309,28 @@ impl Simulation {
 mod tests {
     use super::*;
     use crate::ai::{AiController, AiPersonality, Difficulty};
+
+    #[test]
+    fn source_controller_construction_queue_replays_fun_00417aa0_priority_rules() {
+        let work = |priority: i16| {
+            let mut bytes = [0_u8; 32];
+            bytes[0x1c..0x1e].copy_from_slice(&priority.to_le_bytes());
+            SourceControllerCityConstructionWork::from_bytes(bytes)
+        };
+        let mut queue = SourceControllerCityConstructionQueue::default();
+
+        assert!(!queue.insert(work(1)));
+        assert!(queue.insert(work(2)));
+        for _ in 1..SourceControllerCityConstructionQueue::CAPACITY {
+            assert!(queue.insert(work(4)));
+        }
+        assert_eq!(queue.entries().len(), 0x100);
+
+        assert!(queue.insert(work(4)));
+        assert_eq!(queue.entries()[0].priority(), 4);
+        assert!(!queue.insert(work(3)));
+        assert!(!queue.insert(work(5)));
+    }
 
     #[test]
     fn kind13_dispatch_promotion_debits_city_store_and_emits_replacement_command() {

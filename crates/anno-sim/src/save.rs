@@ -253,7 +253,9 @@ use std::path::Path;
 ///       selected island, and area thresholds persist across saves.
 /// v135: shared dynamic category-1/2/3 figures retain their live
 ///       `FUN_00455a20` route program and cursor.
-pub const SAVE_VERSION: u32 = 135;
+/// v136: player controllers retain `FUN_00417aa0` state-seven construction
+///       work queues.
+pub const SAVE_VERSION: u32 = 136;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -267,7 +269,7 @@ pub const SAVE_VERSION: u32 = 135;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 135;
+pub const MIN_LOADABLE_VERSION: u32 = 136;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
