@@ -268,7 +268,7 @@ impl IslandMap {
             source_land_target_sizes,
             source_kind4_line_of_fire_template,
             fertilities: island.fertilities,
-            source_runtime_classification: source_runtime_island_classification(island.number, 0),
+            source_runtime_classification: source_runtime_island_classification(island.width, 0),
             source_resource_state: IslandSourceResourceState::default(),
         }
     }
@@ -1101,7 +1101,7 @@ impl IslandMap {
                 usize::from(height) * 2,
             ),
             fertilities: [7; 8],
-            source_runtime_classification: source_runtime_island_classification(island_id, 0),
+            source_runtime_classification: 0,
             source_resource_state: IslandSourceResourceState::default(),
         }
     }
@@ -1193,6 +1193,31 @@ mod tests {
         assert!(!map.source_contains_world_with_margin((214, 255)));
         assert!(map.source_contains_world_with_margin((352, 311)));
         assert!(!map.source_contains_world_with_margin((353, 311)));
+    }
+
+    #[test]
+    fn source_runtime_classification_uses_insel5_width() {
+        let mut island = Island {
+            number: 0,
+            width: 0x4c,
+            height: 1,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles: Vec::new(),
+            city: None,
+        };
+
+        assert_eq!(
+            IslandMap::from_island(&island, &[]).source_runtime_classification(),
+            4
+        );
+        island.number = 0x71;
+        island.width = 0x20;
+        assert_eq!(
+            IslandMap::from_island(&island, &[]).source_runtime_classification(),
+            0
+        );
     }
 
     #[test]

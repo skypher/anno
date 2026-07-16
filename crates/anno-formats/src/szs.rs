@@ -1417,8 +1417,8 @@ fn write_chunk(out: &mut Vec<u8>, name: &str, body: &[u8]) {
 impl SzsFile {
     /// Return the u16 installed at island-runtime offset `+0x18` by the
     /// `INSEL5` loader at `0x00469d60`. The loader overwrites the serialized
-    /// word at `0x61` for source island numbers through `0x6e` before copying
-    /// it into the runtime record.
+    /// word at `0x62` for widths through `0x6e` before copying it into the
+    /// runtime record.
     pub fn island_source_runtime_classification(&self, island_index: usize) -> u16 {
         let Some(data) = self
             .chunks
@@ -1431,10 +1431,10 @@ impl SzsFile {
         };
 
         let serialized = data
-            .get(0x61..0x63)
+            .get(0x62..0x64)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
             .unwrap_or(0);
-        source_runtime_island_classification(data[0], serialized)
+        source_runtime_island_classification(data[1], serialized)
     }
 
     /// Decode the resource inputs paired with the `island_index`th parsed
@@ -1964,8 +1964,8 @@ impl SzsFile {
 }
 
 /// Exact `INSEL5` classification rewrite at `0x00469e50`.
-pub const fn source_runtime_island_classification(island_number: u8, serialized: u16) -> u16 {
-    match island_number {
+pub const fn source_runtime_island_classification(island_width: u8, serialized: u16) -> u16 {
+    match island_width {
         0..=0x20 => 0,
         0x21..=0x2a => 1,
         0x2b..=0x37 => 2,
@@ -3714,7 +3714,8 @@ mod tests {
 
         let mut body = vec![0_u8; 0x74];
         body[0] = 0x71;
-        body[0x61..0x63].copy_from_slice(&9_u16.to_le_bytes());
+        body[1] = 0x6f;
+        body[0x62..0x64].copy_from_slice(&9_u16.to_le_bytes());
         let mut encoded = Vec::new();
         write_chunk(&mut encoded, "INSEL5", &body);
         let parsed = SzsFile::parse(&encoded).expect("parse INSEL5 classification");
