@@ -19,7 +19,7 @@ use crate::data_bridge::{
 };
 use crate::economy;
 use crate::entity::{ActionType, CargoRoute, Figure, SourceFigureRecordLayout, SourceWorkerRoute};
-use crate::island_map::IslandMap;
+use crate::island_map::{IslandMap, SourceControllerCityRectangle};
 use crate::ocean_map::OceanMap;
 use crate::player::{Player, PlayerState};
 use crate::population;
@@ -235,6 +235,9 @@ pub struct SourcePlayerController {
     /// Controller `+0x28` / `+0x30` retry gate set by a complete exhausted
     /// unconstrained sweep. The supplier re-enters after 600 source ticks.
     pub island_search_retry_at_ticks: Option<u32>,
+    /// Controller `+0x510` / `+0x50c` records emitted by the action-two
+    /// `FUN_00415e70(..., 7, 5, 5)` rectangle search.
+    pub source_city_rectangles: Vec<SourceControllerCityRectangle>,
     /// Owner byte of the controller's `+0x3e7c` active city, when present.
     pub active_city_owner: Option<u8>,
     /// Physical source-city slot of controller `+0x3e7c`. Source controller
@@ -284,6 +287,7 @@ impl Default for SourcePlayerController {
             island_search_minimum_area: 0,
             island_search_deferred_requirement: None,
             island_search_retry_at_ticks: None,
+            source_city_rectangles: Vec::new(),
             active_city_owner: None,
             active_city_slot: None,
             selected_city_active: false,
@@ -1866,6 +1870,7 @@ impl Simulation {
         controller.island_search_minimum_area = 0;
         controller.island_search_deferred_requirement = None;
         controller.island_search_retry_at_ticks = None;
+        controller.source_city_rectangles.clear();
         controller.selected_city_active = false;
         controller.action_stack.clear();
         controller.action_budget = 0;
@@ -2091,6 +2096,44 @@ impl Simulation {
                 return true;
             }
             return false;
+        }
+        false
+    }
+
+    /// Replay `FUN_00416fd0`: consume state two, retain the source city-search
+    /// rectangle records, and queue state three when their summed area meets
+    /// controller `+0x4e4`.
+    pub fn advance_source_controller_city_area_search(&mut self, player_slot: usize) -> bool {
+        let Some(controller) = self.source_player_controllers.get(player_slot) else {
+            return false;
+        };
+        if controller.action_stack.last().copied() != Some(2) {
+            return false;
+        }
+        let Some(island_id) = controller.island_search_selected_island_id else {
+            return false;
+        };
+        let Some(map) = self
+            .island_maps
+            .iter()
+            .find(|map| map.island_id == island_id)
+        else {
+            return false;
+        };
+        let rectangles = map.source_controller_city_rectangles(7, 5, 5);
+        let total_area: i64 = rectangles
+            .iter()
+            .map(|rectangle| i64::from(rectangle.area))
+            .sum();
+
+        let controller = &mut self.source_player_controllers[player_slot];
+        controller.action_stack.pop();
+        controller.source_city_rectangles = rectangles;
+        if i64::from(controller.island_search_area_threshold) <= total_area
+            && !controller.action_stack.contains(&3)
+        {
+            controller.action_stack.push(3);
+            return true;
         }
         false
     }
@@ -8341,6 +8384,23 @@ mod tests {
         assert_eq!(controller.island_search_cursor, 1);
         assert_eq!(controller.island_search_selected_island_id, Some(1));
         assert_eq!(controller.action_stack, vec![2]);
+    }
+
+    #[test]
+    fn source_controller_state_two_consumes_and_retains_rectangle_search() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(4, 8, 8));
+        sim.source_player_controllers[0] = SourcePlayerController {
+            island_search_selected_island_id: Some(4),
+            island_search_area_threshold: 1,
+            action_stack: vec![2],
+            ..Default::default()
+        };
+
+        assert!(!sim.advance_source_controller_city_area_search(0));
+        let controller = &sim.source_player_controllers[0];
+        assert!(controller.source_city_rectangles.is_empty());
+        assert!(controller.action_stack.is_empty());
     }
 
     #[test]
