@@ -294,12 +294,26 @@ pub const SOURCE_CITY_RECORD_SLOTS: usize = 0x4b;
 pub struct SourceCityRecord {
     /// Source island-table index at city-record byte `+0x18`.
     pub island_id: u8,
-    /// Source map-owner bits at city-record byte `+0x19`.
+    /// Island-local city slot at city-record byte `+0x19`. `FUN_00468ce0`
+    /// supplies the first unoccupied one of the island's eight city pointers;
+    /// map cells retain this same three-bit selector.
     pub source_owner: u8,
     /// Source player slot at city-record byte `+0x1a`.
     pub owner_slot: u8,
     /// Low-three-bit phase byte at `+0x1b`, updated after city processing.
     pub phase: u8,
+    /// Source city byte `+0x1c`, written from the successful construction
+    /// command's target x coordinate by `FUN_00468e10`.
+    #[serde(default)]
+    pub tile_x: u8,
+    /// Source city byte `+0x1d`, written from the construction target y
+    /// coordinate by `FUN_00468e10`.
+    #[serde(default)]
+    pub tile_y: u8,
+    /// Source city dword `+0x1e0`: `FUN_00468e10` sets this to source time
+    /// plus 600 ticks when it allocates the record.
+    #[serde(default)]
+    pub ready_at_ticks: u32,
     /// The five BGRUPPE populations; `FUN_0047f1f0(city, 1)` sums entries
     /// one through four for the kind-12 city-dispatch threshold.
     pub tier_population: [u32; 5],
@@ -364,6 +378,9 @@ impl Default for SourceCityRecord {
             source_owner: 0,
             owner_slot: 0,
             phase: 0,
+            tile_x: 0,
+            tile_y: 0,
+            ready_at_ticks: 0,
             tier_population: [0; 5],
             resident_amount: 0,
             controller_figure_capacity_metric: 0,
@@ -634,18 +651,36 @@ impl SourceCityTable {
         selected
     }
 
-    /// Resolve the physical city slot installed into controller `+0x10638`
-    /// by the successful branch of `FUN_00417690`. The source walks the city
-    /// pointers attached to its selected island and retains the first city
-    /// whose owner byte matches the controller's player slot.
-    pub fn source_controller_city_management_profile_slot(
-        &self,
+    /// Allocate the city-record portion of `FUN_00468ce0` /
+    /// `FUN_00468e10`. The executable reserves the first free physical
+    /// record, assigns the first vacant island-local city pointer, and starts
+    /// its `+0x1e0` readiness clock 600 source ticks in the future.
+    pub fn allocate_source_city(
+        &mut self,
         island_id: u8,
+        tile_x: u8,
+        tile_y: u8,
         owner_slot: u8,
+        source_time_ticks: u32,
     ) -> Option<usize> {
-        self.slots.iter().position(|record| {
-            record.is_some_and(|city| city.island_id == island_id && city.owner_slot == owner_slot)
-        })
+        let source_owner = (0..8).find(|&candidate| {
+            !self
+                .slots
+                .iter()
+                .flatten()
+                .any(|city| city.island_id == island_id && city.source_owner == candidate)
+        })?;
+        let slot = self.slots.iter().position(Option::is_none)?;
+        self.slots[slot] = Some(SourceCityRecord {
+            island_id,
+            source_owner,
+            owner_slot,
+            tile_x,
+            tile_y,
+            ready_at_ticks: source_time_ticks.wrapping_add(600),
+            ..SourceCityRecord::default()
+        });
+        Some(slot)
     }
 
     /// Restore one physical source city slot. Runtime scenario loading fills

@@ -245,7 +245,9 @@ use std::path::Path;
 ///       `FUN_00429070` 36,000-tick reset cadence.
 /// v131: controller city-management profiles retain their physical city slot,
 ///       arrival figure, target island, and action budget.
-pub const SAVE_VERSION: u32 = 131;
+/// v132: source cities retain their allocation tile and `+0x1e0` readiness
+///       tick; controller arrivals retain the state-three target tile.
+pub const SAVE_VERSION: u32 = 132;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -259,7 +261,7 @@ pub const SAVE_VERSION: u32 = 131;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 131;
+pub const MIN_LOADABLE_VERSION: u32 = 132;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -889,6 +891,7 @@ mod tests {
             }),
             action_figure_handle: Some(4),
             action_target_island_id: Some(1),
+            action_target_tile: Some((12, 13)),
             active_city_owner: Some(2),
             active_city_slot: Some(3),
             selected_city_active: false,
@@ -1475,6 +1478,7 @@ mod tests {
                 }),
                 action_figure_handle: Some(4),
                 action_target_island_id: Some(1),
+                action_target_tile: Some((12, 13)),
                 active_city_owner: Some(2),
                 active_city_slot: Some(3),
                 selected_city_active: false,

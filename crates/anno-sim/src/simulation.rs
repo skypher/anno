@@ -210,6 +210,9 @@ pub struct SourcePlayerController {
     /// Controller `+0x1db0`, the selected island index consumed by
     /// `FUN_00417690` to locate its managed city.
     pub action_target_island_id: Option<u8>,
+    /// Controller `+0x1db4` / `+0x1db8`, the state-three target tile passed
+    /// to the `FUN_004084d0` construction command in state four.
+    pub action_target_tile: Option<(u8, u8)>,
     /// Owner byte of the controller's `+0x3e7c` active city, when present.
     pub active_city_owner: Option<u8>,
     /// Physical source-city slot of controller `+0x3e7c`. Source controller
@@ -251,6 +254,7 @@ impl Default for SourcePlayerController {
             city_management_profile: None,
             action_figure_handle: None,
             action_target_island_id: None,
+            action_target_tile: None,
             active_city_owner: None,
             active_city_slot: None,
             selected_city_active: false,
@@ -1825,6 +1829,7 @@ impl Simulation {
         controller.city_management_profile = None;
         controller.action_figure_handle = None;
         controller.action_target_island_id = None;
+        controller.action_target_tile = None;
         controller.selected_city_active = false;
         controller.action_stack.clear();
         controller.action_budget = 0;
@@ -1879,10 +1884,11 @@ impl Simulation {
     }
 
     /// Complete the successful `FUN_00417690` state-four arrival. State three
-    /// has already selected the owned figure and target island; this routine
-    /// records the per-city `+0x10638` profile, raises `+0x18`, restores the
-    /// action budget, and appends the source's state-eight then state-seven
-    /// follow-up actions without duplicating an existing stack entry.
+    /// has already selected the owned figure and target tile; this routine
+    /// replays the resulting `FUN_004084d0` city allocation, records the
+    /// per-city `+0x10638` profile, raises `+0x18`, restores the action budget,
+    /// and appends the source's state-eight then state-seven follow-up actions
+    /// without duplicating an existing stack entry.
     pub fn complete_source_controller_city_arrival(&mut self, player_slot: usize) -> bool {
         let Some(controller) = self.source_player_controllers.get(player_slot) else {
             return false;
@@ -1890,9 +1896,10 @@ impl Simulation {
         if controller.action_stack.last().copied() != Some(4) {
             return false;
         }
-        let (Some(figure_handle), Some(island_id)) = (
+        let (Some(figure_handle), Some(island_id), Some((tile_x, tile_y))) = (
             controller.action_figure_handle,
             controller.action_target_island_id,
+            controller.action_target_tile,
         ) else {
             return false;
         };
@@ -1908,10 +1915,17 @@ impl Simulation {
         self.source_player_controllers[player_slot]
             .action_stack
             .pop();
-        let Some(city_slot) = self
-            .source_cities
-            .source_controller_city_management_profile_slot(island_id, player_slot as u8)
-        else {
+        let Some(city_slot) = self.source_cities.allocate_source_city(
+            island_id,
+            tile_x,
+            tile_y,
+            player_slot as u8,
+            self.source_time_ticks,
+        ) else {
+            let controller = &mut self.source_player_controllers[player_slot];
+            if !controller.action_stack.contains(&3) {
+                controller.action_stack.push(3);
+            }
             return false;
         };
 
@@ -7845,6 +7859,7 @@ mod tests {
             }),
             action_figure_handle: None,
             action_target_island_id: None,
+            action_target_tile: None,
             active_city_owner: Some(0),
             active_city_slot: None,
             selected_city_active: false,
@@ -7900,6 +7915,7 @@ mod tests {
             }),
             action_figure_handle: None,
             action_target_island_id: None,
+            action_target_tile: None,
             active_city_owner: Some(0),
             active_city_slot: None,
             selected_city_active: false,
@@ -7990,22 +8006,6 @@ mod tests {
     fn source_controller_city_arrival_installs_the_physical_city_profile() {
         let mut sim = Simulation::new();
         sim.source_time_ticks = 4_321;
-        assert!(sim.source_cities.set_record(
-            2,
-            Some(SourceCityRecord {
-                island_id: 7,
-                owner_slot: 0,
-                ..Default::default()
-            })
-        ));
-        assert!(sim.source_cities.set_record(
-            5,
-            Some(SourceCityRecord {
-                island_id: 7,
-                owner_slot: 0,
-                ..Default::default()
-            })
-        ));
 
         let mut ship = TradeShip::new(0, 0, 0, 0);
         ship.source_figure_kind = Some(1);
@@ -8015,6 +8015,7 @@ mod tests {
             desired_figure_count: 3,
             action_figure_handle: Some(7),
             action_target_island_id: Some(7),
+            action_target_tile: Some((12, 13)),
             action_stack: vec![8, 4],
             ..Default::default()
         };
@@ -8025,12 +8026,55 @@ mod tests {
         assert_eq!(
             controller.city_management_profile,
             Some(SourceCityManagementProfile {
-                city_slot: 2,
+                city_slot: 0,
                 initialized_at_ticks: 4_321,
+            })
+        );
+        assert_eq!(
+            sim.source_cities.record(0),
+            Some(SourceCityRecord {
+                island_id: 7,
+                source_owner: 0,
+                owner_slot: 0,
+                tile_x: 12,
+                tile_y: 13,
+                ready_at_ticks: 4_921,
+                ..Default::default()
             })
         );
         assert_eq!(controller.action_budget, 14);
         assert_eq!(controller.action_stack, vec![8, 7]);
+    }
+
+    #[test]
+    fn source_controller_city_arrival_requeues_state_three_without_a_city_slot() {
+        let mut sim = Simulation::new();
+        for slot in 0..SourceCityTable::slot_count() {
+            assert!(sim.source_cities.set_record(
+                slot,
+                Some(SourceCityRecord {
+                    island_id: 1,
+                    ..Default::default()
+                })
+            ));
+        }
+
+        let mut ship = TradeShip::new(0, 0, 0, 0);
+        ship.source_figure_kind = Some(1);
+        ship.source_runtime_slot = Some(7);
+        sim.trade_ships.push(ship);
+        sim.source_player_controllers[0] = SourcePlayerController {
+            action_figure_handle: Some(7),
+            action_target_island_id: Some(7),
+            action_target_tile: Some((12, 13)),
+            action_stack: vec![4],
+            ..Default::default()
+        };
+
+        assert!(!sim.complete_source_controller_city_arrival(0));
+        let controller = &sim.source_player_controllers[0];
+        assert!(controller.city_management_profile.is_none());
+        assert_eq!(controller.action_stack, vec![3]);
     }
 
     #[test]
@@ -8055,6 +8099,7 @@ mod tests {
             }),
             action_figure_handle: Some(7),
             action_target_island_id: Some(0),
+            action_target_tile: Some((0, 0)),
             active_city_owner: None,
             active_city_slot: None,
             selected_city_active: true,
@@ -8076,6 +8121,7 @@ mod tests {
         assert!(controller.city_management_profile.is_none());
         assert_eq!(controller.action_figure_handle, None);
         assert_eq!(controller.action_target_island_id, None);
+        assert_eq!(controller.action_target_tile, None);
         assert!(!controller.selected_city_active);
         assert!(controller.action_stack.is_empty());
         assert_eq!(controller.action_budget, 0);
