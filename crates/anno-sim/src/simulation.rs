@@ -8936,6 +8936,14 @@ mod tests {
     #[test]
     fn source_controller_writes_kind34_target_to_selected_dynamic_figure() {
         let mut sim = Simulation::new();
+        let motion = combat::SourceGenericMotion {
+            remaining_distance: 1.5,
+            scalar_speed: 0.05,
+            velocity_x: 0.05,
+            velocity_y: 0.0,
+            velocity_z: 0.0,
+            terminal_motion_locked: false,
+        };
         sim.source_dynamic_combat_figures
             .push(SourceDynamicCombatFigure {
                 active: true,
@@ -8959,7 +8967,13 @@ mod tests {
                 runtime_slot: 7,
                 auxiliary_kind: 0,
                 name_index: 0,
-                source_motion: combat::SourceGenericMotion::default(),
+                source_motion: motion,
+            });
+        sim.source_dynamic_route_programs
+            .push(SourceDynamicRouteProgram {
+                runtime_slot: 7,
+                program: vec![0x32, SOURCE_ROUTE_TERMINATOR],
+                cursor: 0,
             });
 
         let descriptor = SourceTargetDescriptor::from_source_kind34_island_cell(4, 12, 13);
@@ -8968,6 +8982,8 @@ mod tests {
             sim.source_dynamic_combat_figures[0].target_descriptor,
             descriptor
         );
+        assert_eq!(sim.source_dynamic_combat_figures[0].source_motion, motion);
+        assert!(sim.source_dynamic_route_programs.is_empty());
     }
 
     #[test]
