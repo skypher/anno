@@ -588,6 +588,23 @@ impl SourceCityTable {
         })
     }
 
+    /// The direct population arm of controller initialization in
+    /// `FUN_0040f580`: scan physical city slots in order and retain the last
+    /// city owned by `owner_slot` whose BGRUPPE entries 2 through 4 sum to at
+    /// least ten. This is `FUN_0040f430(city, 2, 10)`.
+    pub fn source_controller_populated_city_slot(&self, owner_slot: u8) -> Option<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, record)| {
+                let city = record.as_ref()?;
+                (city.owner_slot == owner_slot
+                    && city.tier_population[2..].iter().copied().sum::<u32>() >= 10)
+                    .then_some(slot)
+            })
+            .last()
+    }
+
     /// Restore one physical source city slot. Runtime scenario loading fills
     /// records in order; save replay and focused source audits may restore a
     /// specific slot directly.
@@ -4039,6 +4056,38 @@ mod tests {
 
         assert_eq!(cities.source_resident_total_for_owner(2), 156);
         assert_eq!(cities.source_resident_total_for_owner(3), 90);
+    }
+
+    #[test]
+    fn controller_populated_city_selection_uses_physical_last_match() {
+        let mut cities = SourceCityTable::default();
+        assert!(cities.set_record(
+            1,
+            Some(SourceCityRecord {
+                owner_slot: 2,
+                tier_population: [0, 99, 9, 0, 0],
+                ..Default::default()
+            })
+        ));
+        assert!(cities.set_record(
+            3,
+            Some(SourceCityRecord {
+                owner_slot: 2,
+                tier_population: [0, 0, 10, 0, 0],
+                ..Default::default()
+            })
+        ));
+        assert!(cities.set_record(
+            4,
+            Some(SourceCityRecord {
+                owner_slot: 2,
+                tier_population: [0, 0, 4, 6, 1],
+                ..Default::default()
+            })
+        ));
+
+        assert_eq!(cities.source_controller_populated_city_slot(2), Some(4));
+        assert_eq!(cities.source_controller_populated_city_slot(3), None);
     }
 
     #[test]

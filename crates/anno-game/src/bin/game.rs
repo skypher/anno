@@ -8217,6 +8217,7 @@ fn init_simulation(
     sim.source_kind13_promotion_definitions =
         anno_sim::data_bridge::source_kind13_promotion_definitions(cod);
     sim.source_cities = anno_sim::data_bridge::source_cities_from_scenario(szs);
+    sim.configure_source_controller_populated_cities();
     sim.source_kind4_occupants = anno_sim::data_bridge::source_kind4_occupants_from_scenario(szs);
     sim.buildings = instances;
     sim.warehouses = warehouses;

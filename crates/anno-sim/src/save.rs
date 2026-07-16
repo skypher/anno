@@ -241,7 +241,8 @@ use std::path::Path;
 ///       `+0x10638`.
 /// v128: removes the synthetic controller `+0x106f8` profile field after an
 ///       executable instruction census found its sole read and no writes.
-pub const SAVE_VERSION: u32 = 128;
+/// v129: controller `+0x3e7c` retains its physical source-city slot.
+pub const SAVE_VERSION: u32 = 129;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -255,7 +256,7 @@ pub const SAVE_VERSION: u32 = 128;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 128;
+pub const MIN_LOADABLE_VERSION: u32 = 129;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -880,6 +881,7 @@ mod tests {
             figure_capacity_limit: Some(12),
             city_management_profile_present: true,
             active_city_owner: Some(2),
+            active_city_slot: Some(3),
             selected_city_active: false,
             city_management_disabled: false,
             action_stack: vec![8, 9],
@@ -1458,6 +1460,7 @@ mod tests {
                 figure_capacity_limit: Some(12),
                 city_management_profile_present: true,
                 active_city_owner: Some(2),
+                active_city_slot: Some(3),
                 selected_city_active: false,
                 city_management_disabled: false,
                 action_stack: vec![8, 9],

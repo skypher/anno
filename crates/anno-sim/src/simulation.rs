@@ -192,6 +192,10 @@ pub struct SourcePlayerController {
     pub city_management_profile_present: bool,
     /// Owner byte of the controller's `+0x3e7c` active city, when present.
     pub active_city_owner: Option<u8>,
+    /// Physical source-city slot of controller `+0x3e7c`. Source controller
+    /// initialization scans cities in physical pool order, so this remains
+    /// distinct from the owner byte when a player owns multiple cities.
+    pub active_city_slot: Option<usize>,
     /// Whether `FUN_0040fcb0` accepts the selected map city.
     pub selected_city_active: bool,
     /// Source `PLAYER4 + 0x70` bit six, which bypasses `FUN_00424bf0`.
@@ -222,6 +226,7 @@ impl Default for SourcePlayerController {
             figure_capacity_limit: None,
             city_management_profile_present: false,
             active_city_owner: None,
+            active_city_slot: None,
             selected_city_active: false,
             city_management_disabled: false,
             action_stack: Vec::new(),
@@ -1640,6 +1645,22 @@ impl Simulation {
         }
     }
 
+    /// Seed the direct populated-city arm of `FUN_0040f580` for every
+    /// controller. The source's map-suitability fallback applies only when
+    /// this returns no physical city slot.
+    pub fn configure_source_controller_populated_cities(&mut self) {
+        for player_slot in 0..combat::SOURCE_KIND4_PLAYER_SLOT_COUNT {
+            let city_slot = self
+                .source_cities
+                .source_controller_populated_city_slot(player_slot as u8);
+            let city_owner = city_slot
+                .and_then(|slot| self.source_cities.record(slot).map(|city| city.owner_slot));
+            let controller = &mut self.source_player_controllers[player_slot];
+            controller.active_city_slot = city_slot;
+            controller.active_city_owner = city_owner;
+        }
+    }
+
     fn source_controller_figure_capacity_from_inputs(
         desired_figure_count: u32,
         owned_figure_count: u32,
@@ -1777,6 +1798,18 @@ impl Simulation {
         controller.figure_roster_dirty = false;
     }
 
+    fn source_controller_active_city_owned_by(&self, player_slot: usize) -> bool {
+        let controller = &self.source_player_controllers[player_slot];
+        controller
+            .active_city_slot
+            .map(|slot| {
+                self.source_cities
+                    .record(slot)
+                    .is_some_and(|city| city.owner_slot == player_slot as u8)
+            })
+            .unwrap_or(controller.active_city_owner == Some(player_slot as u8))
+    }
+
     fn tick_source_player_controller_city_management(
         &mut self,
         player_slot: usize,
@@ -1785,7 +1818,7 @@ impl Simulation {
         if controller.city_management_disabled
             || !controller.city_management_profile_present
             || controller.desired_figure_count == 0
-            || controller.active_city_owner != Some(player_slot as u8)
+            || !self.source_controller_active_city_owned_by(player_slot)
             || controller.selected_city_active
         {
             return None;
@@ -7685,6 +7718,7 @@ mod tests {
             figure_capacity_limit: None,
             city_management_profile_present: true,
             active_city_owner: Some(0),
+            active_city_slot: None,
             selected_city_active: false,
             city_management_disabled: false,
             action_stack: vec![9],
@@ -7732,6 +7766,7 @@ mod tests {
             figure_capacity_limit: None,
             city_management_profile_present: true,
             active_city_owner: Some(0),
+            active_city_slot: None,
             selected_city_active: false,
             city_management_disabled: false,
             action_stack: vec![9],
@@ -7784,6 +7819,32 @@ mod tests {
 
         sim.refresh_source_player_controller_figure_capacity(0);
         assert_eq!(sim.source_player_controllers[0].figure_capacity, 3);
+    }
+
+    #[test]
+    fn source_controller_populated_city_initialization_keeps_physical_slot() {
+        let mut sim = Simulation::new();
+        assert!(sim.source_cities.set_record(
+            2,
+            Some(SourceCityRecord {
+                owner_slot: 1,
+                tier_population: [0, 0, 12, 0, 0],
+                ..Default::default()
+            })
+        ));
+        assert!(sim.source_cities.set_record(
+            5,
+            Some(SourceCityRecord {
+                owner_slot: 1,
+                tier_population: [0, 0, 0, 5, 5],
+                ..Default::default()
+            })
+        ));
+
+        sim.configure_source_controller_populated_cities();
+
+        assert_eq!(sim.source_player_controllers[1].active_city_slot, Some(5));
+        assert_eq!(sim.source_player_controllers[1].active_city_owner, Some(1));
     }
 
     #[test]
