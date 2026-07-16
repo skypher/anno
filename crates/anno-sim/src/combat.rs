@@ -48,6 +48,67 @@ pub const SOURCE_SHIP_CARGO_SLOT_QUANTITY_CAPACITY: u16 = 0x640;
 /// its `+0x08` cargo-metadata word, which `FUN_00458000` forwards to `0x849`.
 pub const SOURCE_KIND4_BOARDING_CARGO_METADATA: u16 = 0;
 
+/// One source city row read by `FUN_00475c60`. This is a score-specific view
+/// of the fixed `DAT_005dbae0` record, keeping the score kernel independent
+/// of scenario and simulation storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceDiplomacyCity {
+    pub island_id: u8,
+    pub owner_slot: u8,
+    pub resident_amount: u32,
+    pub tier_population: [u32; 5],
+}
+
+impl SourceDiplomacyCity {
+    fn resident_total(self) -> u32 {
+        self.tier_population
+            .into_iter()
+            .fold(self.resident_amount, u32::wrapping_add)
+    }
+
+    fn tier_population_total(self) -> u32 {
+        self.tier_population.into_iter().fold(0, u32::wrapping_add)
+    }
+
+    fn strength(self) -> i32 {
+        let quarter = (0x80_i32 + ((0x80_i32 >> 31) & 3)) >> 2;
+        let mut total = 0_u32;
+        let mut highest = 0_usize;
+        for (tier, population) in self.tier_population.into_iter().enumerate() {
+            if population != 0 {
+                highest = tier;
+            }
+            total = total.wrapping_add(population);
+        }
+        if total == 0 {
+            return 0;
+        }
+        let top = self.tier_population[highest];
+        let remainder = (top.wrapping_mul(quarter as u32) / total) as i32;
+        let fraction = if (quarter * 2) / 3 <= remainder {
+            quarter - 1
+        } else {
+            remainder
+        };
+        quarter * highest as i32 + fraction
+    }
+}
+
+/// One active source kind-4 land figure, contributing to the island's
+/// `+0x4a + owner` presence counter through `FUN_00453da0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceDiplomacyKind4Occupant {
+    pub island_id: u8,
+    pub owner: u8,
+}
+
+/// One live entry in the eight-slot island map-object table at `island + 0xac`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceDiplomacyDynamicObject {
+    pub island_id: u8,
+    pub owner: u8,
+}
+
 /// A source cargo entry packs its ware in bits `0..=7`, its exact quantity in
 /// bits `8..=21`, and the source entry metadata in bits `22..=31`.
 pub const fn source_ship_cargo_slot_ware(slot: u32) -> u8 {
@@ -1614,6 +1675,28 @@ impl SourceRelationshipEvent {
     }
 }
 
+/// `DAT_005b77f0` contains 32 eight-byte diplomacy notifications per player.
+pub const SOURCE_DIPLOMACY_EVENT_QUEUE_CAPACITY: usize = 0x20;
+
+/// One `DAT_005b77f0` queue record. The source layout is a type byte, a peer
+/// byte, two unused bytes, and the `DAT_005b6040` timestamp at offset `+4`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceDiplomacyEvent {
+    pub event_type: u8,
+    pub peer: u8,
+    pub timestamp: u32,
+}
+
+impl Default for SourceDiplomacyEvent {
+    fn default() -> Self {
+        Self {
+            event_type: 0,
+            peer: 0,
+            timestamp: 0,
+        }
+    }
+}
+
 /// Nation interaction matrix (who can fight whom).
 /// `source_relation_codes` preserves the directed `DAT_005b7770` bytes,
 /// indexed by `(attacker_nation * 0x50 + defender_nation) * 8`; the
@@ -1633,6 +1716,43 @@ pub struct DiplomacyMatrix {
     /// is distinct from the `DAT_005b7770` relation event `0x2f`.
     #[serde(default = "default_source_attitude_codes")]
     source_attitude_codes: [[u8; 7]; 7],
+    /// Runtime `DAT_005b77f0` notification queues, one 32-record ringless
+    /// replacement array per player.
+    #[serde(default = "default_source_diplomacy_event_queues")]
+    source_diplomacy_event_queues:
+        [[SourceDiplomacyEvent; SOURCE_DIPLOMACY_EVENT_QUEUE_CAPACITY]; 7],
+    /// Directed `DAT_005b7750` counters used by `FUN_00477390` for event
+    /// types 6, 7, and 11.
+    #[serde(default = "default_source_diplomacy_activity")]
+    source_diplomacy_activity: [[u32; 7]; 7],
+    /// Directed `DAT_005b7730` values, loaded from PLAYER4 offset `+0x40`.
+    #[serde(default = "default_source_diplomacy_pair_weights")]
+    source_diplomacy_pair_base: [[u16; 7]; 7],
+    /// Directed `DAT_005b7740` values, loaded from PLAYER4 offset `+0x60`.
+    #[serde(default = "default_source_diplomacy_pair_weights")]
+    source_diplomacy_pair_scale: [[u16; 7]; 7],
+    /// Runtime `DAT_005b76f0`, serialized at PLAYER4 offset `+0x1c`.
+    #[serde(default = "default_source_diplomacy_policy_flags")]
+    source_diplomacy_policy_flags: [u32; 7],
+    /// `DAT_005b7720`, serialized at PLAYER4 offset `+0x20`.
+    #[serde(default = "default_source_diplomacy_policy_u16")]
+    source_diplomacy_peer_population_threshold: [u16; 7],
+    /// `DAT_005b7722`, serialized at PLAYER4 offset `+0x22`.
+    #[serde(default = "default_source_diplomacy_policy_u16")]
+    source_diplomacy_own_population_threshold: [u16; 7],
+    /// `DAT_005b76ff`, serialized at PLAYER4 offset `+0x24`.
+    #[serde(default = "default_source_diplomacy_policy_u8")]
+    source_diplomacy_own_city_strength: [u8; 7],
+    /// `DAT_005b7700`, serialized at PLAYER4 offset `+0x25`.
+    #[serde(default = "default_source_diplomacy_policy_u8")]
+    source_diplomacy_peer_city_strength: [u8; 7],
+    /// Runtime player state at `DAT_005b7680` used by `FUN_00475c60`.
+    #[serde(default = "default_source_diplomacy_player_states")]
+    source_diplomacy_player_states: [u8; 7],
+    /// Byte at player offset `+0x83`; every successful queue insertion sets
+    /// it to 6 in `FUN_00477390`.
+    #[serde(default = "default_source_diplomacy_queue_state")]
+    source_diplomacy_queue_state: [u8; 7],
     /// Trade-agreement matrix (manual sec. 7.2). Symmetric: a trade
     /// agreement between players a and b is bilateral. Once
     /// concluded, each side can inspect the other's warehouses.
@@ -1663,6 +1783,198 @@ fn default_source_attitude_codes() -> [[u8; 7]; 7] {
     [[0; 7]; 7]
 }
 
+fn default_source_diplomacy_event_queues(
+) -> [[SourceDiplomacyEvent; SOURCE_DIPLOMACY_EVENT_QUEUE_CAPACITY]; 7] {
+    [[SourceDiplomacyEvent::default(); SOURCE_DIPLOMACY_EVENT_QUEUE_CAPACITY]; 7]
+}
+
+fn default_source_diplomacy_activity() -> [[u32; 7]; 7] {
+    [[0; 7]; 7]
+}
+
+fn default_source_diplomacy_pair_weights() -> [[u16; 7]; 7] {
+    [[0; 7]; 7]
+}
+
+fn default_source_diplomacy_policy_flags() -> [u32; 7] {
+    [0; 7]
+}
+
+fn default_source_diplomacy_policy_u16() -> [u16; 7] {
+    [0; 7]
+}
+
+fn default_source_diplomacy_policy_u8() -> [u8; 7] {
+    [0; 7]
+}
+
+fn default_source_diplomacy_player_states() -> [u8; 7] {
+    [0xff; 7]
+}
+
+fn default_source_diplomacy_queue_state() -> [u8; 7] {
+    [0; 7]
+}
+
+fn source_diplomacy_curve(age: u8, segments: &[(u8, u8, u8, u8)]) -> i32 {
+    for &(start, end, initial, terminal) in segments {
+        if age < start || age > end {
+            continue;
+        }
+        if age == end {
+            return i32::from(terminal);
+        }
+        let span = i32::from(end) - i32::from(start);
+        let increment = (i32::from(terminal) * 0x100 - i32::from(initial) * 0x100) / span;
+        return (i32::from(initial) * 0x100 + (i32::from(age) - i32::from(start)) * increment) >> 8;
+    }
+    0
+}
+
+fn source_diplomacy_population_curve(index: u8) -> i32 {
+    source_diplomacy_curve(
+        index,
+        &[
+            (0, 1, 0xfe, 0xd5),
+            (1, 4, 0xd5, 0x80),
+            (4, 8, 0x80, 0x60),
+            (8, 0x0c, 0x60, 0x40),
+            (0x0c, 0x14, 0x40, 0x33),
+            (0x14, 0x28, 0x33, 0x26),
+            (0x28, 0x46, 0x26, 0x19),
+            (0x46, 0x7f, 0x19, 0x0c),
+        ],
+    )
+}
+
+fn source_diplomacy_own_population_penalty(index: u8) -> i32 {
+    source_diplomacy_curve(
+        index,
+        &[(0, 0x40, 0xaa, 0x82), (0x40, 0x66, 0x82, 0x50), (0x66, 0x80, 0x50, 0)],
+    )
+}
+
+fn source_diplomacy_peer_population_penalty(index: u8) -> i32 {
+    source_diplomacy_curve(
+        index,
+        &[(0, 0x19, 0, 0x46), (0x19, 0x40, 0x46, 0x82), (0x40, 0x80, 0x82, 0xaa)],
+    )
+}
+
+fn source_diplomacy_city_strength_penalty(index: u8) -> i32 {
+    source_diplomacy_curve(
+        index,
+        &[(0, 0x19, 0, 0x46), (0x19, 0x2a, 0x46, 0x82), (0x2a, 0x80, 0x82, 0xaa)],
+    )
+}
+
+fn source_signed_fixed_div_4096(value: i32) -> i32 {
+    value.wrapping_add((value >> 31) & 0x0fff) >> 12
+}
+
+/// Replays `FUN_00475fe0` for one queued record. The source forms the age by
+/// unsigned subtraction before shifting, so a future timestamp saturates at
+/// the same 255 bucket as an old timestamp after wraparound.
+pub fn source_diplomacy_event_age_score(
+    event: SourceDiplomacyEvent,
+    source_time_ticks: u32,
+) -> i32 {
+    if event.event_type == 0 {
+        return 0;
+    }
+    let age = ((source_time_ticks.wrapping_sub(event.timestamp) >> 7).min(0xff)) as u8;
+    let magnitude = match event.event_type {
+        1 => source_diplomacy_curve(
+            age,
+            &[
+                (0, 0x32, 0x1e, 0x12),
+                (0x32, 0x4b, 0x12, 0),
+                (0x4b, 0xff, 0, 0),
+            ],
+        ),
+        3 => source_diplomacy_curve(
+            age,
+            &[
+                (0, 0x4b, 0x1e, 0x12),
+                (0x4b, 0x96, 0x12, 8),
+                (0x96, 200, 8, 0),
+                (200, 0xff, 0, 0),
+            ],
+        ),
+        5 => source_diplomacy_curve(
+            age,
+            &[
+                (0, 0x32, 0x32, 0x19),
+                (0x32, 0x4b, 0x19, 0),
+                (0x4b, 0xff, 0, 0),
+            ],
+        ),
+        6 => source_diplomacy_curve(
+            age,
+            &[(0, 0x1e, 0x0c, 7), (0x1e, 0x32, 7, 0), (0x32, 0xff, 0, 0)],
+        ),
+        7 => source_diplomacy_curve(
+            age,
+            &[
+                (0, 100, 0x46, 0x23),
+                (100, 0xfa, 0x23, 0),
+                (0xfa, 0xff, 0, 0),
+            ],
+        ),
+        8 => -source_diplomacy_curve(
+            age,
+            &[
+                (0, 0x50, 0x3c, 0x1e),
+                (0x50, 200, 0x1e, 0),
+                (200, 0xff, 0, 0),
+            ],
+        ),
+        9 => source_diplomacy_curve(
+            age,
+            &[
+                (0, 0x1e, 0x19, 0x0d),
+                (0x1e, 0x2d, 0x0d, 0),
+                (0x2d, 0xff, 0, 0),
+            ],
+        ),
+        10 => -source_diplomacy_curve(
+            age,
+            &[
+                (0, 0x32, 100, 0x32),
+                (0x32, 0x46, 0x32, 10),
+                (0x46, 100, 10, 0),
+                (100, 0xff, 0, 0),
+            ],
+        ),
+        11 => source_diplomacy_curve(
+            age,
+            &[
+                (0, 0x50, 0x28, 0x14),
+                (0x50, 200, 0x14, 0),
+                (200, 0xff, 0, 0),
+            ],
+        ),
+        12 => source_diplomacy_curve(
+            age,
+            &[
+                (0, 0x50, 0x1e, 0x0f),
+                (0x50, 200, 0x0f, 0),
+                (200, 0xff, 0, 0),
+            ],
+        ),
+        13 => -source_diplomacy_curve(
+            age,
+            &[
+                (0, 0x50, 0x1e, 0x0f),
+                (0x50, 200, 0x0f, 0),
+                (200, 0xff, 0, 0),
+            ],
+        ),
+        _ => 0,
+    };
+    magnitude
+}
+
 impl DiplomacyMatrix {
     pub fn new() -> Self {
         let mut relations = [[Diplomacy::Neutral; 7]; 7];
@@ -1674,6 +1986,17 @@ impl DiplomacyMatrix {
             relations,
             source_relation_codes: default_source_relation_codes(),
             source_attitude_codes: default_source_attitude_codes(),
+            source_diplomacy_event_queues: default_source_diplomacy_event_queues(),
+            source_diplomacy_activity: default_source_diplomacy_activity(),
+            source_diplomacy_pair_base: default_source_diplomacy_pair_weights(),
+            source_diplomacy_pair_scale: default_source_diplomacy_pair_weights(),
+            source_diplomacy_policy_flags: default_source_diplomacy_policy_flags(),
+            source_diplomacy_peer_population_threshold: default_source_diplomacy_policy_u16(),
+            source_diplomacy_own_population_threshold: default_source_diplomacy_policy_u16(),
+            source_diplomacy_own_city_strength: default_source_diplomacy_policy_u8(),
+            source_diplomacy_peer_city_strength: default_source_diplomacy_policy_u8(),
+            source_diplomacy_player_states: default_source_diplomacy_player_states(),
+            source_diplomacy_queue_state: default_source_diplomacy_queue_state(),
             trade_agreement: [[false; 7]; 7],
             trade_agreement_broken: [[false; 7]; 7],
         }
@@ -1769,9 +2092,10 @@ impl DiplomacyMatrix {
     }
 
     /// Execute the directed `FUN_004760e0` / `0x2f` relation transition.
-    /// The constructor allocates a source event only when the requested raw
-    /// value differs from the current entry, so this returns false for an
-    /// out-of-range or duplicate transition.
+    /// The constructor compares `DAT_005b7770` directly against the raw
+    /// payload before it allocates event `0x2f`. Payload 1 therefore remains
+    /// repeatable after its handler stores code 2; only payloads 0 and 3
+    /// become duplicate-suppressed by their resulting source byte.
     pub fn apply_source_relationship_event(
         &mut self,
         source: u8,
@@ -1781,11 +2105,10 @@ impl DiplomacyMatrix {
         if source as usize >= 7 || target as usize >= 7 {
             return false;
         }
-        let code = event.relationship_code();
-        if self.source_relationship_code(source, target) == code {
+        if self.source_relationship_code(source, target) == event as u8 as u32 {
             return false;
         }
-        self.set_source_relationship_code(source, target, code);
+        self.set_source_relationship_code(source, target, event.relationship_code());
         true
     }
 
@@ -1824,6 +2147,347 @@ impl DiplomacyMatrix {
         };
         self.source_attitude_codes[source as usize][target as usize] = forward;
         self.source_attitude_codes[target as usize][source as usize] = reverse;
+        true
+    }
+
+    /// Return one player's fixed 32-slot `DAT_005b77f0` notification queue.
+    pub fn source_diplomacy_event_queue(
+        &self,
+        player: u8,
+    ) -> Option<&[SourceDiplomacyEvent; SOURCE_DIPLOMACY_EVENT_QUEUE_CAPACITY]> {
+        self.source_diplomacy_event_queues.get(player as usize)
+    }
+
+    /// Return the directed `DAT_005b7750` activity counter maintained by
+    /// `FUN_00477390`.
+    pub fn source_diplomacy_activity(&self, player: u8, peer: u8) -> u32 {
+        self.source_diplomacy_activity
+            .get(player as usize)
+            .and_then(|row| row.get(peer as usize))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Preserve the three directed inputs read by `FUN_00475c60` from one
+    /// PLAYER4 row: `DAT_005b7750`, `DAT_005b7730`, and `DAT_005b7740`.
+    pub fn set_source_diplomacy_score_inputs(
+        &mut self,
+        player: u8,
+        peer: u8,
+        activity: u32,
+        base: u16,
+        scale: u16,
+    ) {
+        if player as usize >= 7 || peer as usize >= 7 {
+            return;
+        }
+        self.source_diplomacy_activity[player as usize][peer as usize] = activity;
+        self.source_diplomacy_pair_base[player as usize][peer as usize] = base;
+        self.source_diplomacy_pair_scale[player as usize][peer as usize] = scale;
+    }
+
+    /// Return the directed `DAT_005b7730` / `DAT_005b7740` score inputs.
+    pub fn source_diplomacy_pair_weights(&self, player: u8, peer: u8) -> (u16, u16) {
+        if player as usize >= 7 || peer as usize >= 7 {
+            return (0, 0);
+        }
+        (
+            self.source_diplomacy_pair_base[player as usize][peer as usize],
+            self.source_diplomacy_pair_scale[player as usize][peer as usize],
+        )
+    }
+
+    /// Preserve the PLAYER4 controls that select the policy deductions in
+    /// `FUN_00475c60`, together with the source runtime player-state byte.
+    pub fn set_source_diplomacy_policy_inputs(
+        &mut self,
+        player: u8,
+        player_state: u8,
+        flags: u32,
+        peer_population_threshold: u16,
+        own_population_threshold: u16,
+        own_city_strength: u8,
+        peer_city_strength: u8,
+    ) {
+        let index = player as usize;
+        if index >= 7 {
+            return;
+        }
+        self.source_diplomacy_player_states[index] = player_state;
+        self.source_diplomacy_policy_flags[index] = flags;
+        self.source_diplomacy_peer_population_threshold[index] = peer_population_threshold;
+        self.source_diplomacy_own_population_threshold[index] = own_population_threshold;
+        self.source_diplomacy_own_city_strength[index] = own_city_strength;
+        self.source_diplomacy_peer_city_strength[index] = peer_city_strength;
+    }
+
+    /// Full `FUN_00475c60` score. `island_development` supplies the live
+    /// island-record u16 at `+0x18`; it is deliberately an explicit argument
+    /// until that mutable island field has a source-backed storage owner.
+    pub fn source_diplomacy_score(
+        &self,
+        player: u8,
+        peer: u8,
+        caller_term: i32,
+        source_time_ticks: u32,
+        cities: &[SourceDiplomacyCity],
+        kind4_occupants: &[SourceDiplomacyKind4Occupant],
+        dynamic_objects: &[SourceDiplomacyDynamicObject],
+        island_development: impl Fn(u8) -> u16,
+    ) -> i32 {
+        let (player_index, peer_index) = (player as usize, peer as usize);
+        if player_index >= 7 || peer_index >= 7 {
+            return 0;
+        }
+
+        let mut player_residents = 0_u32;
+        let mut peer_residents = 0_u32;
+        let mut player_city_strength = 0_i32;
+        let mut peer_city_strength = 0_i32;
+        let player_city_count = cities
+            .iter()
+            .filter(|city| city.owner_slot == player)
+            .count();
+        let mut island_presence_penalty = 0_i32;
+        let mut map_object_penalty = 0_i32;
+
+        for city in cities {
+            if city.owner_slot == player {
+                if matches!(self.source_diplomacy_player_states[player_index], 0x0c | 0x0e) {
+                    let peer_has_object = dynamic_objects
+                        .iter()
+                        .any(|object| object.island_id == city.island_id && object.owner == peer);
+                    if peer_has_object {
+                        if island_development(city.island_id) < 4
+                            && (player_city_count < 3 || city.tier_population_total() != 0)
+                        {
+                            map_object_penalty = 200;
+                        }
+                    }
+
+                    let peer_presence = kind4_occupants.iter().any(|occupant| {
+                        occupant.island_id == city.island_id && occupant.owner == peer
+                    });
+                    if peer_presence {
+                        let player_presence = kind4_occupants.iter().any(|occupant| {
+                            occupant.island_id == city.island_id && occupant.owner == player
+                        });
+                        island_presence_penalty = island_presence_penalty.max(if player_presence
+                            && peer_has_object
+                        {
+                            60
+                        } else {
+                            200
+                        });
+                    }
+                }
+
+                let residents = city.resident_total();
+                player_residents = player_residents.wrapping_add(residents);
+                if self.source_diplomacy_policy_flags[player_index] & 0x100 != 0 {
+                    player_city_strength = player_city_strength.max(city.strength());
+                }
+            } else if city.owner_slot == peer {
+                let residents = city.resident_total();
+                peer_residents = peer_residents.wrapping_add(residents);
+                if self.source_diplomacy_policy_flags[player_index] & 0x200 != 0 {
+                    peer_city_strength = peer_city_strength.max(city.strength());
+                }
+            }
+        }
+
+        let mut policy_penalty = island_presence_penalty + map_object_penalty;
+        let flags = self.source_diplomacy_policy_flags[player_index];
+        if flags & 0x10 != 0
+            && peer_residents
+                > u32::from(self.source_diplomacy_peer_population_threshold[player_index])
+            && self.source_diplomacy_player_states[peer_index] == 0
+        {
+            // The executable computes the quotient, then assigns 0x80 unless
+            // it already equals 0x80. Every defined input therefore indexes
+            // the terminal point of DAT_00548fc0.
+            policy_penalty += source_diplomacy_peer_population_penalty(0x80);
+        }
+        if flags & 0x80 != 0
+            && player_residents
+                <= u32::from(self.source_diplomacy_own_population_threshold[player_index])
+            && self.source_diplomacy_player_states[peer_index] == 0
+        {
+            let threshold = u32::from(self.source_diplomacy_own_population_threshold[player_index]);
+            if threshold != 0 {
+                policy_penalty += source_diplomacy_own_population_penalty(
+                    (player_residents.wrapping_shl(7) / threshold) as u8,
+                );
+            }
+        }
+        if flags & 0x200 != 0
+            && peer_city_strength
+                > i32::from(self.source_diplomacy_peer_city_strength[player_index])
+            && self.source_diplomacy_player_states[peer_index] == 0
+        {
+            policy_penalty += source_diplomacy_city_strength_penalty(
+                (peer_city_strength - i32::from(self.source_diplomacy_peer_city_strength[player_index]))
+                    as u8,
+            );
+        }
+        if flags & 0x100 != 0
+            && player_city_strength
+                < i32::from(self.source_diplomacy_own_city_strength[player_index])
+        {
+            policy_penalty += source_diplomacy_city_strength_penalty(
+                (i32::from(self.source_diplomacy_own_city_strength[player_index]) - player_city_strength)
+                    as u8,
+            );
+        }
+
+        self.source_diplomacy_score_without_policy(
+            player,
+            peer,
+            caller_term,
+            player_residents,
+            peer_residents,
+            source_time_ticks,
+        ) - policy_penalty
+    }
+
+    /// Return the player byte at offset `+0x83` that source queue insertion
+    /// sets to 6.
+    pub fn source_diplomacy_queue_state(&self, player: u8) -> u8 {
+        self.source_diplomacy_queue_state
+            .get(player as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The queue and activity contribution at the head of
+    /// `FUN_00475c60(player, peer, param_3)`, before that routine adds the
+    /// city, settlement, and caller-supplied terms.
+    pub fn source_diplomacy_queue_score(
+        &self,
+        player: u8,
+        peer: u8,
+        source_time_ticks: u32,
+    ) -> i32 {
+        let Some(queue) = self.source_diplomacy_event_queue(player) else {
+            return 0;
+        };
+        if peer as usize >= 7 {
+            return 0;
+        }
+        let notification_score = queue
+            .iter()
+            .filter(|event| event.event_type != 0 && event.peer == peer)
+            .map(|event| source_diplomacy_event_age_score(*event, source_time_ticks))
+            .sum::<i32>();
+        let activity_penalty =
+            (self.source_diplomacy_activity[player as usize][peer as usize].wrapping_shl(3) >> 5)
+                .min(100) as i32;
+        notification_score - activity_penalty
+    }
+
+    /// The score portion at the tail of `FUN_00475c60` that is determined by
+    /// the notification queue, `FUN_0047f790` owner totals, and PLAYER4
+    /// `DAT_005b7730`/`DAT_005b7740` rows. The source's preceding policy and
+    /// island-occupancy modifiers are intentionally excluded from this named
+    /// component.
+    pub fn source_diplomacy_score_without_policy(
+        &self,
+        player: u8,
+        peer: u8,
+        caller_term: i32,
+        player_residents: u32,
+        peer_residents: u32,
+        source_time_ticks: u32,
+    ) -> i32 {
+        if player as usize >= 7 || peer as usize >= 7 {
+            return 0;
+        }
+        let population_mix = (player_residents as i64 * 0x33 + peer_residents as i64 * 0x4c)
+            .div_euclid(0x4000)
+            .min(0x7f) as u8;
+        let curve = source_diplomacy_population_curve(population_mix);
+        let (base, scale) = self.source_diplomacy_pair_weights(player, peer);
+        let base_term = source_signed_fixed_div_4096(
+            (i32::from(base).wrapping_add(caller_term)).wrapping_mul(curve),
+        )
+        .min(0x6e);
+        let scale_term = ((u32::from(scale) * curve as u32) >> 12).min(0x46) as i32;
+        self.source_diplomacy_queue_score(player, peer, source_time_ticks) + base_term + scale_term
+    }
+
+    fn clear_source_diplomacy_events(&mut self, player: usize, peer: u8, event_type: u8) {
+        for event in &mut self.source_diplomacy_event_queues[player] {
+            if event.event_type == event_type && event.peer == peer {
+                event.event_type = 0;
+            }
+        }
+    }
+
+    /// Replay `FUN_00477390` against a player's 32-entry notification array.
+    /// The source chooses a same-type/peer entry for duplicate classes, or
+    /// otherwise overwrites the entry having the smallest absolute
+    /// `FUN_00475fe0` score. A non-duplicate insertion stops at the first
+    /// zero-score entry, which gives empty slots first priority.
+    pub fn enqueue_source_diplomacy_event(
+        &mut self,
+        player: u8,
+        peer: u8,
+        event_type: u8,
+        source_time_ticks: u32,
+    ) -> bool {
+        let player = player as usize;
+        let peer_index = peer as usize;
+        if player >= 7 || peer_index >= 7 {
+            return false;
+        }
+
+        let duplicate_class = match event_type {
+            6 => {
+                self.source_diplomacy_activity[player][peer_index] >>= 3;
+                true
+            }
+            7 | 11 => {
+                self.clear_source_diplomacy_events(player, peer, 8);
+                self.source_diplomacy_activity[player][peer_index] = 0;
+                true
+            }
+            8 => {
+                self.clear_source_diplomacy_events(player, peer, 7);
+                self.clear_source_diplomacy_events(player, peer, 11);
+                true
+            }
+            9 | 10 => true,
+            _ => false,
+        };
+
+        let queue = &mut self.source_diplomacy_event_queues[player];
+        let mut selected = None;
+        let mut best_absolute_score = i32::MAX;
+        for (index, event) in queue.iter().copied().enumerate() {
+            if duplicate_class && event.event_type == event_type && event.peer == peer {
+                selected = Some(index);
+                break;
+            }
+
+            let absolute_score = source_diplomacy_event_age_score(event, source_time_ticks).abs();
+            if absolute_score < best_absolute_score {
+                selected = Some(index);
+                best_absolute_score = absolute_score;
+                if !duplicate_class && absolute_score == 0 {
+                    break;
+                }
+            }
+        }
+
+        let Some(index) = selected else {
+            return false;
+        };
+        queue[index] = SourceDiplomacyEvent {
+            event_type,
+            peer,
+            timestamp: source_time_ticks,
+        };
+        self.source_diplomacy_queue_state[player] = 6;
         true
     }
 
@@ -5117,6 +5781,8 @@ mod tests {
 
         assert!(dm.apply_source_relationship_event(0, 1, SourceRelationshipEvent::SetCode2));
         assert_eq!(dm.source_relationship_code(0, 1), 2);
+        assert!(dm.apply_source_relationship_event(0, 1, SourceRelationshipEvent::SetCode2));
+        assert_eq!(dm.source_relationship_code(0, 1), 2);
         assert!(dm.apply_source_relationship_event(0, 1, SourceRelationshipEvent::SetCode3));
         assert_eq!(dm.source_relationship_code(0, 1), 3);
         assert!(!dm.apply_source_relationship_event(7, 1, SourceRelationshipEvent::SetCode0));
@@ -5138,6 +5804,192 @@ mod tests {
         assert_eq!(dm.source_attitude_code(0, 1), 0);
         assert_eq!(dm.source_attitude_code(1, 0), 0);
         assert!(!dm.apply_source_attitude_payload(0, 1, 2));
+    }
+
+    #[test]
+    fn source_diplomacy_event_scores_match_fun_00475fe0_curves() {
+        let event = SourceDiplomacyEvent {
+            event_type: 1,
+            peer: 2,
+            timestamp: 0,
+        };
+        assert_eq!(source_diplomacy_event_age_score(event, 0), -30);
+        assert_eq!(source_diplomacy_event_age_score(event, 0x32 << 7), -18);
+        assert_eq!(source_diplomacy_event_age_score(event, 0x4b << 7), 0);
+
+        let type_seven = SourceDiplomacyEvent {
+            event_type: 7,
+            ..event
+        };
+        assert_eq!(source_diplomacy_event_age_score(type_seven, 0), 70);
+        assert_eq!(source_diplomacy_event_age_score(type_seven, 100 << 7), 35);
+
+        let type_ten = SourceDiplomacyEvent {
+            event_type: 10,
+            ..event
+        };
+        assert_eq!(source_diplomacy_event_age_score(type_ten, 0), -100);
+        assert_eq!(source_diplomacy_event_age_score(type_ten, 100 << 7), 0);
+
+        let future = SourceDiplomacyEvent {
+            timestamp: 1,
+            ..event
+        };
+        assert_eq!(source_diplomacy_event_age_score(future, 0), 0);
+    }
+
+    #[test]
+    fn source_diplomacy_queue_replays_fun_00477390_replacement_and_cancellation() {
+        let mut dm = DiplomacyMatrix::new();
+        assert!(dm.enqueue_source_diplomacy_event(0, 1, 4, 17));
+        assert_eq!(dm.source_diplomacy_event_queue(0).unwrap()[0].event_type, 4);
+        assert_eq!(dm.source_diplomacy_event_queue(0).unwrap()[0].timestamp, 17);
+        assert_eq!(dm.source_diplomacy_queue_state(0), 6);
+
+        dm.source_diplomacy_activity[0][1] = 72;
+        assert!(dm.enqueue_source_diplomacy_event(0, 1, 6, 20));
+        assert_eq!(dm.source_diplomacy_activity(0, 1), 9);
+        let six_slot = dm
+            .source_diplomacy_event_queue(0)
+            .unwrap()
+            .iter()
+            .position(|event| event.event_type == 6 && event.peer == 1)
+            .unwrap();
+        assert!(dm.enqueue_source_diplomacy_event(0, 1, 6, 23));
+        assert_eq!(
+            dm.source_diplomacy_event_queue(0).unwrap()[six_slot].timestamp,
+            23
+        );
+
+        assert!(dm.enqueue_source_diplomacy_event(0, 1, 8, 24));
+        assert!(dm.enqueue_source_diplomacy_event(0, 1, 7, 25));
+        assert_eq!(dm.source_diplomacy_activity(0, 1), 0);
+        assert!(!dm
+            .source_diplomacy_event_queue(0)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == 8 && event.peer == 1));
+
+        let now = 200 << 7;
+        dm.source_diplomacy_event_queues[2] = [SourceDiplomacyEvent {
+            event_type: 6,
+            peer: 0,
+            timestamp: now,
+        }; SOURCE_DIPLOMACY_EVENT_QUEUE_CAPACITY];
+        dm.source_diplomacy_event_queues[2][13] = SourceDiplomacyEvent {
+            event_type: 3,
+            peer: 0,
+            timestamp: 0,
+        };
+        assert!(dm.enqueue_source_diplomacy_event(2, 4, 4, now));
+        assert_eq!(
+            dm.source_diplomacy_event_queue(2).unwrap()[13].event_type,
+            4
+        );
+        assert_eq!(dm.source_diplomacy_event_queue(2).unwrap()[13].peer, 4);
+    }
+
+    #[test]
+    fn source_diplomacy_queue_score_matches_fun_00475c60_prefix() {
+        let mut dm = DiplomacyMatrix::new();
+        dm.source_diplomacy_event_queues[0][0] = SourceDiplomacyEvent {
+            event_type: 1,
+            peer: 1,
+            timestamp: 0,
+        };
+        dm.source_diplomacy_event_queues[0][1] = SourceDiplomacyEvent {
+            event_type: 7,
+            peer: 1,
+            timestamp: 0,
+        };
+        dm.source_diplomacy_event_queues[0][2] = SourceDiplomacyEvent {
+            event_type: 7,
+            peer: 2,
+            timestamp: 0,
+        };
+        dm.source_diplomacy_activity[0][1] = 72;
+
+        assert_eq!(dm.source_diplomacy_queue_score(0, 1, 0), 22);
+        assert_eq!(dm.source_diplomacy_queue_score(0, 1, 0x4b << 7), 25);
+        assert_eq!(dm.source_diplomacy_queue_score(0, 7, 0), 0);
+    }
+
+    #[test]
+    fn source_diplomacy_score_inputs_preserve_directed_player4_rows() {
+        let mut dm = DiplomacyMatrix::new();
+        dm.set_source_diplomacy_score_inputs(2, 4, 72, 0x1234, 0x5678);
+
+        assert_eq!(dm.source_diplomacy_activity(2, 4), 72);
+        assert_eq!(dm.source_diplomacy_pair_weights(2, 4), (0x1234, 0x5678));
+        assert_eq!(dm.source_diplomacy_pair_weights(4, 2), (0, 0));
+    }
+
+    #[test]
+    fn source_diplomacy_score_without_policy_matches_fun_00475c60_weighted_tail() {
+        let mut dm = DiplomacyMatrix::new();
+        dm.set_source_diplomacy_score_inputs(0, 1, 0, 0x1000, 0x1000);
+
+        assert_eq!(
+            dm.source_diplomacy_score_without_policy(0, 1, 0, 0, 0, 0),
+            180
+        );
+        assert_eq!(
+            dm.source_diplomacy_score_without_policy(0, 1, 0, 40_800, 0, 0),
+            24
+        );
+
+        assert!(dm.enqueue_source_diplomacy_event(0, 1, 7, 0));
+        assert_eq!(
+            dm.source_diplomacy_score_without_policy(0, 1, 0, 0, 0, 0),
+            250
+        );
+    }
+
+    #[test]
+    fn source_diplomacy_policy_curves_and_island_deductions_match_fun_00475c60() {
+        assert_eq!(source_diplomacy_own_population_penalty(0), 0xaa);
+        assert_eq!(source_diplomacy_own_population_penalty(0x80), 0);
+        assert_eq!(source_diplomacy_peer_population_penalty(0x80), 0xaa);
+        assert_eq!(source_diplomacy_city_strength_penalty(0), 0);
+        assert_eq!(source_diplomacy_city_strength_penalty(0x80), 0xaa);
+
+        let mut dm = DiplomacyMatrix::new();
+        dm.set_source_diplomacy_policy_inputs(0, 0x0c, 0, 0, 0, 0, 0);
+        dm.set_source_diplomacy_policy_inputs(1, 0, 0, 0, 0, 0, 0);
+        let cities = [SourceDiplomacyCity {
+            island_id: 9,
+            owner_slot: 0,
+            resident_amount: 0,
+            tier_population: [1, 0, 0, 0, 0],
+        }];
+        let dynamic_objects = [SourceDiplomacyDynamicObject {
+            island_id: 9,
+            owner: 1,
+        }];
+        let peer_only = [SourceDiplomacyKind4Occupant {
+            island_id: 9,
+            owner: 1,
+        }];
+
+        assert_eq!(
+            dm.source_diplomacy_score(0, 1, 0, 0, &cities, &peer_only, &dynamic_objects, |_| 3,),
+            -400
+        );
+
+        let contested = [
+            SourceDiplomacyKind4Occupant {
+                island_id: 9,
+                owner: 1,
+            },
+            SourceDiplomacyKind4Occupant {
+                island_id: 9,
+                owner: 0,
+            },
+        ];
+        assert_eq!(
+            dm.source_diplomacy_score(0, 1, 0, 0, &cities, &contested, &dynamic_objects, |_| 3,),
+            -260
+        );
     }
 
     #[test]

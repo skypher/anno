@@ -1119,6 +1119,57 @@ impl Simulation {
         table
     }
 
+    /// Evaluate `FUN_00475c60` against the simulation's live source city,
+    /// kind-4, and dynamic-object state. The mutable island-record value at
+    /// `+0x18` is supplied by the caller because it has not yet acquired a
+    /// source-backed storage owner in `IslandMap`.
+    pub fn source_diplomacy_score(
+        &self,
+        player: u8,
+        peer: u8,
+        caller_term: i32,
+        island_development: impl Fn(u8) -> u16,
+    ) -> i32 {
+        let cities = self
+            .source_cities
+            .active_records()
+            .into_iter()
+            .map(|city| combat::SourceDiplomacyCity {
+                island_id: city.island_id,
+                owner_slot: city.owner_slot,
+                resident_amount: city.resident_amount,
+                tier_population: city.tier_population,
+            })
+            .collect::<Vec<_>>();
+        let kind4_occupants = self
+            .source_kind4_occupants
+            .iter()
+            .filter(|occupant| occupant.active)
+            .map(|occupant| combat::SourceDiplomacyKind4Occupant {
+                island_id: occupant.island_id,
+                owner: occupant.owner,
+            })
+            .collect::<Vec<_>>();
+        let dynamic_objects = self
+            .source_dynamic_map_objects
+            .iter()
+            .map(|object| combat::SourceDiplomacyDynamicObject {
+                island_id: object.island,
+                owner: object.owner,
+            })
+            .collect::<Vec<_>>();
+        self.diplomacy.source_diplomacy_score(
+            player,
+            peer,
+            caller_term,
+            self.source_time_ticks,
+            &cities,
+            &kind4_occupants,
+            &dynamic_objects,
+            island_development,
+        )
+    }
+
     /// Resolve a `0x35` or `0x36` descriptor against the live HQ objects
     /// currently represented by this simulation's building state.
     pub fn resolve_source_dynamic_map_object_target(
@@ -6177,16 +6228,72 @@ impl Simulation {
                 source,
                 target,
                 payload,
-            } => self
-                .diplomacy
-                .apply_source_relationship_payload(source, target, payload),
+            } => {
+                let queue_type_one =
+                    matches!(self.diplomacy.source_attitude_code(source, target), 2 | 3);
+                let applied = self
+                    .diplomacy
+                    .apply_source_relationship_payload(source, target, payload);
+                if !applied {
+                    return false;
+                }
+                match payload {
+                    0 => {
+                        if queue_type_one {
+                            self.diplomacy.enqueue_source_diplomacy_event(
+                                target,
+                                source,
+                                1,
+                                self.source_time_ticks,
+                            );
+                        }
+                        self.diplomacy.enqueue_source_diplomacy_event(
+                            target,
+                            source,
+                            3,
+                            self.source_time_ticks,
+                        );
+                    }
+                    1 => {
+                        self.diplomacy.enqueue_source_diplomacy_event(
+                            target,
+                            source,
+                            4,
+                            self.source_time_ticks,
+                        );
+                    }
+                    3 => {}
+                    _ => return false,
+                }
+                true
+            }
             Command::ApplySourceAttitudeEvent {
                 source,
                 target,
                 payload,
-            } => self
-                .diplomacy
-                .apply_source_attitude_payload(source, target, payload),
+            } => {
+                let applied = self
+                    .diplomacy
+                    .apply_source_attitude_payload(source, target, payload);
+                if !applied {
+                    return false;
+                }
+                let event_type = match payload {
+                    0 => Some(1),
+                    1 => Some(2),
+                    3 => None,
+                    _ => return false,
+                };
+                if let Some(event_type) = event_type {
+                    self.diplomacy.enqueue_source_diplomacy_event(
+                        target,
+                        source,
+                        event_type,
+                        self.source_time_ticks,
+                    );
+                }
+                true
+            }
             Command::Buy { player, good, qty } => {
                 let pi = player as usize;
                 if pi >= self.players.len() {
@@ -11273,10 +11380,11 @@ mod tests {
     }
 
     #[test]
-    fn source_relationship_event_command_updates_only_the_directed_source_byte() {
+    fn source_relationship_event_command_updates_the_directed_byte_and_target_queue() {
         use crate::commands::Command;
 
         let mut sim = Simulation::new();
+        sim.source_time_ticks = 73;
         sim.diplomacy.set_source_relationship_code(0, 1, 3);
         assert!(sim.apply_command(&Command::ApplySourceRelationshipEvent {
             source: 0,
@@ -11285,11 +11393,36 @@ mod tests {
         }));
         assert_eq!(sim.diplomacy.source_relationship_code(0, 1), 2);
         assert_eq!(sim.diplomacy.source_relationship_code(1, 0), 0);
-        assert!(!sim.apply_command(&Command::ApplySourceRelationshipEvent {
+        assert_eq!(
+            sim.diplomacy.source_diplomacy_event_queue(1).unwrap()[0].event_type,
+            4
+        );
+        assert_eq!(
+            sim.diplomacy.source_diplomacy_event_queue(1).unwrap()[0].peer,
+            0
+        );
+        assert_eq!(
+            sim.diplomacy.source_diplomacy_event_queue(1).unwrap()[0].timestamp,
+            73
+        );
+        assert!(sim.apply_command(&Command::ApplySourceRelationshipEvent {
             source: 0,
             target: 1,
             payload: 1,
         }));
+
+        sim.diplomacy.set_source_relationship_code(0, 1, 3);
+        sim.diplomacy.set_source_attitude_code(0, 1, 2);
+        assert!(sim.apply_command(&Command::ApplySourceRelationshipEvent {
+            source: 0,
+            target: 1,
+            payload: 0,
+        }));
+        let queue = sim.diplomacy.source_diplomacy_event_queue(1).unwrap();
+        assert_eq!(queue[0].event_type, 1);
+        assert_eq!(queue[0].peer, 0);
+        assert_eq!(queue[1].event_type, 3);
+        assert_eq!(queue[1].peer, 0);
     }
 
     #[test]
@@ -11297,6 +11430,7 @@ mod tests {
         use crate::commands::Command;
 
         let mut sim = Simulation::new();
+        sim.source_time_ticks = 91;
         assert!(sim.apply_command(&Command::ApplySourceAttitudeEvent {
             source: 0,
             target: 1,
@@ -11304,6 +11438,18 @@ mod tests {
         }));
         assert_eq!(sim.diplomacy.source_attitude_code(0, 1), 1);
         assert_eq!(sim.diplomacy.source_attitude_code(1, 0), 2);
+        assert_eq!(
+            sim.diplomacy.source_diplomacy_event_queue(1).unwrap()[0].event_type,
+            2
+        );
+        assert_eq!(
+            sim.diplomacy.source_diplomacy_event_queue(1).unwrap()[0].peer,
+            0
+        );
+        assert_eq!(
+            sim.diplomacy.source_diplomacy_event_queue(1).unwrap()[0].timestamp,
+            91
+        );
         assert!(!sim.apply_command(&Command::ApplySourceAttitudeEvent {
             source: 0,
             target: 1,

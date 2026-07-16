@@ -224,7 +224,15 @@ use std::path::Path;
 ///       source combat candidate filtering.
 /// v119: diplomacy retains directed `DAT_005b77b0` attitude codes for the
 ///       source `FUN_00476130` event path.
-pub const SAVE_VERSION: u32 = 119;
+/// v120: diplomacy retains each player's 32-slot `DAT_005b77f0` notification
+///       queue plus the `DAT_005b7750` activity counters and queue-state byte.
+/// v121: source cities retain the live `+0x218` resident amount used by
+///       `FUN_0047f790` and diplomacy score aggregation.
+/// v122: diplomacy retains PLAYER4's `DAT_005b7730`, `DAT_005b7740`, and
+///       `DAT_005b7750` score-input arrays.
+/// v123: diplomacy retains PLAYER4's `FUN_00475c60` policy flags, thresholds,
+///       city-strength targets, and source player-state bytes.
+pub const SAVE_VERSION: u32 = 123;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -238,7 +246,7 @@ pub const SAVE_VERSION: u32 = 119;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 119;
+pub const MIN_LOADABLE_VERSION: u32 = 123;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -611,7 +619,16 @@ mod tests {
         sim.paused = true;
         sim.diplomacy.set_source_relationship_code(0, 1, 1);
         sim.diplomacy.set_source_relationship_code(1, 0, 3);
-        assert!(sim.diplomacy.apply_source_attitude_payload(0, 1, 1));
+        sim.diplomacy
+            .set_source_diplomacy_score_inputs(0, 1, 72, 0x1234, 0x5678);
+        sim.source_time_ticks = 321;
+        assert!(
+            sim.apply_command(&crate::commands::Command::ApplySourceAttitudeEvent {
+                source: 0,
+                target: 1,
+                payload: 1,
+            })
+        );
         sim.seed_source_rand(1);
         let _ = sim.next_source_rand();
 
@@ -633,6 +650,23 @@ mod tests {
         assert_eq!(sim2.diplomacy.source_relationship_code(1, 0), 3);
         assert_eq!(sim2.diplomacy.source_attitude_code(0, 1), 1);
         assert_eq!(sim2.diplomacy.source_attitude_code(1, 0), 2);
+        assert_eq!(sim2.diplomacy.source_diplomacy_activity(0, 1), 72);
+        assert_eq!(
+            sim2.diplomacy.source_diplomacy_pair_weights(0, 1),
+            (0x1234, 0x5678)
+        );
+        assert_eq!(
+            sim2.diplomacy.source_diplomacy_event_queue(1).unwrap()[0].event_type,
+            2
+        );
+        assert_eq!(
+            sim2.diplomacy.source_diplomacy_event_queue(1).unwrap()[0].peer,
+            0
+        );
+        assert_eq!(
+            sim2.diplomacy.source_diplomacy_event_queue(1).unwrap()[0].timestamp,
+            321
+        );
         assert_eq!(sim2.next_source_rand(), expected_next_rand);
     }
 
@@ -760,6 +794,7 @@ mod tests {
                 owner_slot: 4,
                 phase: 6,
                 tier_population: [10, 20, 30, 40, 50],
+                resident_amount: 77,
                 ..Default::default()
             }),
         ));
@@ -1170,6 +1205,7 @@ mod tests {
                 owner_slot: 4,
                 phase: 6,
                 tier_population: [10, 20, 30, 40, 50],
+                resident_amount: 77,
                 ..Default::default()
             })
         );

@@ -1320,6 +1320,36 @@ pub struct PlayerSlotInit {
     /// pinned to a binary function yet, so the raw u16 is
     /// exposed for downstream callers.
     pub slot_u16_0x18: u16,
+    /// Runtime player dword `DAT_005b76f0`, saved at PLAYER4 offset `0x1c`.
+    /// `FUN_00475c60` enables its four population and city-strength policy
+    /// deductions through bits `0x10`, `0x80`, `0x100`, and `0x200`.
+    pub diplomacy_policy_flags_0x1c: u32,
+    /// PLAYER4 u16 `+0x20`, copied from `DAT_005b7720` by
+    /// `FUN_00478160`. The population policy at `FUN_00475c60` compares it
+    /// with the peer's total residents.
+    pub diplomacy_peer_population_threshold_0x20: u16,
+    /// PLAYER4 u16 `+0x22`, copied from `DAT_005b7722`. The corresponding
+    /// policy compares it with this player's total residents.
+    pub diplomacy_own_population_threshold_0x22: u16,
+    /// PLAYER4 byte `+0x24`, copied from `DAT_005b76ff`. This is the
+    /// player-city strength target used by policy bit `0x100`.
+    pub diplomacy_own_city_strength_0x24: u8,
+    /// PLAYER4 byte `+0x25`, copied from `DAT_005b7700`. This is the
+    /// peer-city strength target used by policy bit `0x200`.
+    pub diplomacy_peer_city_strength_0x25: u8,
+    /// Seven u16 values at slot offsets `0x40, 0x42, ..., 0x4c`.
+    /// `FUN_00478160` copies these from runtime `DAT_005b7730`; the
+    /// `FUN_00475c60` diplomacy score adds the directed value to its caller
+    /// contribution before applying the population curve.
+    pub diplomacy_base_0x40: [u16; 7],
+    /// Seven u16 values at slot offsets `0x60, 0x62, ..., 0x6c`.
+    /// `FUN_00478160` copies these from `DAT_005b7740`; `FUN_00475c60`
+    /// applies the same population curve to this directed scale term.
+    pub diplomacy_scale_0x60: [u16; 7],
+    /// Seven u32 values at slot offsets `0x80, 0x88, ..., 0xb0`.
+    /// These are the directed runtime `DAT_005b7750` activity counters used
+    /// by `FUN_00477390` and deducted by `FUN_00475c60`.
+    pub diplomacy_activity_0x80: [u32; 7],
     /// Seven u32 values at slot offsets 0xC0, 0xC8, … 0xF0
     /// (stride 8; padding +4 uniformly zero). `FUN_00478160`
     /// copies these from the directed `DAT_005b7770` table, which
@@ -1720,6 +1750,22 @@ impl SzsFile {
             } else {
                 0
             };
+            let read_u16 = |start: usize| -> u16 {
+                let o = off + start;
+                if o + 2 <= data.len() {
+                    u16::from_le_bytes([data[o], data[o + 1]])
+                } else {
+                    0
+                }
+            };
+            let read_u32 = |start: usize| -> u32 {
+                let o = off + start;
+                if o + 4 <= data.len() {
+                    u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
+                } else {
+                    0
+                }
+            };
             let read_array = |start: usize| -> [u32; 7] {
                 let mut arr = [0u32; 7];
                 for (i, slot_val) in arr.iter_mut().enumerate() {
@@ -1731,6 +1777,19 @@ impl SzsFile {
                 }
                 arr
             };
+            let read_u16_array = |start: usize| -> [u16; 7] {
+                let mut arr = [0u16; 7];
+                for (i, slot_val) in arr.iter_mut().enumerate() {
+                    let o = off + start + i * 2;
+                    if o + 2 <= data.len() {
+                        *slot_val = u16::from_le_bytes([data[o], data[o + 1]]);
+                    }
+                }
+                arr
+            };
+            let diplomacy_base_0x40 = read_u16_array(0x40);
+            let diplomacy_scale_0x60 = read_u16_array(0x60);
+            let diplomacy_activity_0x80 = read_array(0x80);
             let relations_0xc0 = read_array(0xC0);
             let relationships = read_array(0x140);
             let events_0x1c0 = read_array(0x1C0);
@@ -1757,6 +1816,14 @@ impl SzsFile {
                 relationships,
                 events_0x1c0,
                 slot_u16_0x18,
+                diplomacy_policy_flags_0x1c: read_u32(0x1c),
+                diplomacy_peer_population_threshold_0x20: read_u16(0x20),
+                diplomacy_own_population_threshold_0x22: read_u16(0x22),
+                diplomacy_own_city_strength_0x24: data.get(off + 0x24).copied().unwrap_or(0),
+                diplomacy_peer_city_strength_0x25: data.get(off + 0x25).copied().unwrap_or(0),
+                diplomacy_base_0x40,
+                diplomacy_scale_0x60,
+                diplomacy_activity_0x80,
             });
         }
         out

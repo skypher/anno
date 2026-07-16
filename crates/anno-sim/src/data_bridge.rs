@@ -303,6 +303,11 @@ pub struct SourceCityRecord {
     /// The five BGRUPPE populations; `FUN_0047f1f0(city, 1)` sums entries
     /// one through four for the kind-12 city-dispatch threshold.
     pub tier_population: [u32; 5],
+    /// Source city dword `+0x218`. `FUN_0047f790` adds this live resident
+    /// amount to the five dwords at `+0x220..+0x230`; it changes when the
+    /// source city-figure transfer handlers move residents between cities.
+    #[serde(default)]
+    pub resident_amount: u32,
     /// Source city bytes `+0x164 + 0x0c * i` sampled by `FUN_0047f0c0` for
     /// luxury ware slots `0x0f + i`.
     #[serde(default)]
@@ -352,6 +357,7 @@ impl Default for SourceCityRecord {
             owner_slot: 0,
             phase: 0,
             tier_population: [0; 5],
+            resident_amount: 0,
             luxury_satisfaction: [0; 7],
             satisfaction_weights: source_city_initial_satisfaction_weights(),
             satisfaction_pressure: 0,
@@ -366,6 +372,14 @@ impl Default for SourceCityRecord {
 }
 
 impl SourceCityRecord {
+    /// `FUN_0047f790(city)`: the five `+0x220` BGRUPPE totals plus the live
+    /// `+0x218` resident amount, with the executable's wrapping u32 sum.
+    pub fn source_resident_total(self) -> u32 {
+        self.tier_population
+            .into_iter()
+            .fold(self.resident_amount, u32::wrapping_add)
+    }
+
     /// Replay `FUN_0047f0c0`, `FUN_0047f400`, and `FUN_0047f850` for the
     /// five population groups. The caller supplies the live city demand
     /// bytes; the BGRUPPE selectors and targets are fixed source data.
@@ -569,6 +583,19 @@ impl SourceCityTable {
     /// Active city records in source pool order, for source-audit tests.
     pub fn active_records(&self) -> Vec<SourceCityRecord> {
         self.slots.iter().flatten().copied().collect()
+    }
+
+    /// Sum `FUN_0047f790` across every active source-city record owned by one
+    /// player. This is the `local_14` / `local_18` accumulation in
+    /// `FUN_00475c60` before its policy-specific modifiers.
+    pub fn source_resident_total_for_owner(&self, owner_slot: u8) -> u32 {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|city| city.owner_slot == owner_slot)
+            .fold(0_u32, |total, city| {
+                total.wrapping_add(city.source_resident_total())
+            })
     }
 }
 
@@ -2414,7 +2441,23 @@ pub fn diplomacy_from_player4_relationships(
         for j in 0..n {
             dm.set_source_relationship_code(i as u8, j as u8, players[i].relations_0xc0[j]);
             dm.set_source_attitude_code(i as u8, j as u8, players[i].relationships[j] as u8);
+            dm.set_source_diplomacy_score_inputs(
+                i as u8,
+                j as u8,
+                players[i].diplomacy_activity_0x80[j],
+                players[i].diplomacy_base_0x40[j],
+                players[i].diplomacy_scale_0x60[j],
+            );
         }
+        dm.set_source_diplomacy_policy_inputs(
+            i as u8,
+            players[i].state_byte,
+            players[i].diplomacy_policy_flags_0x1c,
+            players[i].diplomacy_peer_population_threshold_0x20,
+            players[i].diplomacy_own_population_threshold_0x22,
+            players[i].diplomacy_own_city_strength_0x24,
+            players[i].diplomacy_peer_city_strength_0x25,
+        );
     }
     dm
 }
@@ -3936,6 +3979,39 @@ mod tests {
         city.luxury_satisfaction = [17, 18, 18, 18, 0, 18, 18];
         city.refresh_group_satisfaction();
         assert_eq!(city.satisfaction_by_group[4], 128);
+    }
+
+    #[test]
+    fn city_resident_totals_match_fun_0047f790_and_owner_accumulation() {
+        let city = SourceCityRecord {
+            owner_slot: 2,
+            tier_population: [10, 20, 30, 40, 50],
+            resident_amount: 7,
+            ..Default::default()
+        };
+        assert_eq!(city.source_resident_total(), 157);
+
+        let mut cities = SourceCityTable::default();
+        assert!(cities.set_record(0, Some(city)));
+        assert!(cities.set_record(
+            1,
+            Some(SourceCityRecord {
+                owner_slot: 2,
+                resident_amount: u32::MAX,
+                ..Default::default()
+            })
+        ));
+        assert!(cities.set_record(
+            2,
+            Some(SourceCityRecord {
+                owner_slot: 3,
+                resident_amount: 90,
+                ..Default::default()
+            })
+        ));
+
+        assert_eq!(cities.source_resident_total_for_owner(2), 156);
+        assert_eq!(cities.source_resident_total_for_owner(3), 90);
     }
 
     #[test]
