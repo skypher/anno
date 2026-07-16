@@ -1553,6 +1553,41 @@ impl Simulation {
         true
     }
 
+    fn source_shared_figure_position(
+        &self,
+        entity: SourceSharedFigureEntity,
+    ) -> Option<(i32, i32)> {
+        fn source_position_component(value: f32) -> Option<i32> {
+            (value.is_finite() && value >= i32::MIN as f32 && value < i32::MAX as f32)
+                .then_some(value as i32)
+        }
+
+        match entity {
+            SourceSharedFigureEntity::MilitaryUnit(index) => {
+                let unit = &self.military_units[index];
+                if unit.source_position_initialized {
+                    Some((
+                        source_position_component(unit.source_position_x)?,
+                        source_position_component(unit.source_position_y)?,
+                    ))
+                } else {
+                    Some((unit.tile_x, unit.tile_y))
+                }
+            }
+            SourceSharedFigureEntity::TradeShip(index) => {
+                let ship = &self.trade_ships[index];
+                Some((ship.world_x, ship.world_y))
+            }
+            SourceSharedFigureEntity::DynamicFigure(index) => {
+                let figure = &self.source_dynamic_combat_figures[index];
+                Some((
+                    source_position_component(figure.position.0)?,
+                    source_position_component(figure.position.1)?,
+                ))
+            }
+        }
+    }
+
     fn source_shared_figure_purchase_fields(
         &self,
         entity: SourceSharedFigureEntity,
@@ -2317,8 +2352,83 @@ impl Simulation {
         true
     }
 
-    /// Recovered action cases from `FUN_00429aa0` that have complete local
-    /// suppliers. State four remains figure-motion driven by `FUN_00417690`.
+    /// Replay the arrival/retry branch of `FUN_00417690`. State four first
+    /// resolves its kind-`0x34` candidate against the selected figure's live
+    /// position. An approaching figure retains the target descriptor,
+    /// consumes one `+0x1da8` retry, and requeues state four;
+    /// allocation is reachable only after the source proximity predicate
+    /// succeeds.
+    pub fn advance_source_controller_city_arrival(&mut self, player_slot: usize) -> bool {
+        let Some(controller) = self.source_player_controllers.get(player_slot) else {
+            return false;
+        };
+        if controller.action_stack.last().copied() != Some(4) {
+            return false;
+        }
+        let (Some(figure_handle), Some(island_id), Some((candidate_x, candidate_y))) = (
+            controller.action_figure_handle,
+            controller.action_target_island_id,
+            controller.action_source_candidate_tile,
+        ) else {
+            self.clear_source_controller_city_arrival(player_slot);
+            return false;
+        };
+        let descriptor = SourceTargetDescriptor::from_source_kind34_island_cell(
+            controller.island_search_cursor,
+            candidate_x as u8,
+            candidate_y as u8,
+        );
+        let Some(entity) = self.source_shared_figure_entity(figure_handle) else {
+            self.clear_source_controller_city_arrival(player_slot);
+            return false;
+        };
+        let Some(position) = self.source_shared_figure_position(entity) else {
+            self.clear_source_controller_city_arrival(player_slot);
+            return false;
+        };
+        let reached = self
+            .island_maps
+            .iter()
+            .find(|map| map.island_id == island_id)
+            .is_some_and(|map| map.source_controller_city_target_reached(descriptor, position));
+        if reached {
+            return self.complete_source_controller_city_arrival(player_slot);
+        }
+
+        let retries = self.source_player_controllers[player_slot].action_arrival_retries;
+        if retries == 0 {
+            self.clear_source_controller_city_arrival(player_slot);
+            return false;
+        }
+
+        self.source_player_controllers[player_slot]
+            .action_stack
+            .pop();
+        self.source_player_controllers[player_slot].action_arrival_retries = retries - 1;
+        if !self.set_source_shared_figure_target_descriptor(figure_handle, descriptor) {
+            self.clear_source_controller_city_arrival(player_slot);
+            return false;
+        }
+        self.source_player_controllers[player_slot]
+            .action_stack
+            .push(4);
+        true
+    }
+
+    fn clear_source_controller_city_arrival(&mut self, player_slot: usize) {
+        let controller = &mut self.source_player_controllers[player_slot];
+        if controller.action_stack.last().copied() == Some(4) {
+            controller.action_stack.pop();
+        }
+        controller.action_figure_handle = None;
+        controller.action_target_island_id = None;
+        controller.action_target_tile = None;
+        controller.action_source_candidate_tile = None;
+        controller.action_target_direction = None;
+        controller.action_arrival_retries = 0;
+    }
+
+    /// Recovered action cases from `FUN_00429aa0` with local source inputs.
     fn dispatch_source_controller_action(&mut self, player_slot: usize) {
         match self.source_player_controllers[player_slot]
             .action_stack
@@ -2330,6 +2440,9 @@ impl Simulation {
             }
             Some(3) => {
                 let _ = self.advance_source_controller_city_candidate_search(player_slot);
+            }
+            Some(4) => {
+                let _ = self.advance_source_controller_city_arrival(player_slot);
             }
             _ => {}
         }
@@ -2426,7 +2539,7 @@ impl Simulation {
     /// Replay the scheduling portion of `FUN_0042b4b0`. The source decrements
     /// all active-controller timers first, then advances its physical player
     /// cursor until a pass performs no controller work. Only the recovered
-    /// `FUN_00429aa0` action-two/action-three cases and the
+    /// `FUN_00429aa0` action-two/action-three/action-four cases and the
     /// `FUN_00424bf0` -> `FUN_00422150` -> `FUN_00422030` purchase branch are
     /// executed here; other action-stack handlers retain their own paths.
     fn tick_source_player_controllers(&mut self, dt_ms: u32) {
@@ -8675,6 +8788,37 @@ mod tests {
         assert_eq!(
             sim.military_units[0].source_target_descriptor,
             Some(descriptor)
+        );
+    }
+
+    #[test]
+    fn source_controller_state_four_requeues_an_approaching_figure_with_one_less_retry() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(4, 16, 16));
+        let mut unit = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 0, 0);
+        unit.source_figure_kind = Some(1);
+        unit.source_live_runtime_slot = Some(7);
+        sim.military_units.push(unit);
+        sim.source_player_controllers[0] = SourcePlayerController {
+            action_figure_handle: Some(7),
+            action_target_island_id: Some(4),
+            action_target_tile: Some((4, 4)),
+            action_source_candidate_tile: Some((3, 4)),
+            action_arrival_retries: 4,
+            island_search_cursor: 4,
+            action_stack: vec![4],
+            ..Default::default()
+        };
+
+        assert!(sim.advance_source_controller_city_arrival(0));
+        let controller = &sim.source_player_controllers[0];
+        assert_eq!(controller.action_stack, vec![4]);
+        assert_eq!(controller.action_arrival_retries, 3);
+        assert_eq!(
+            sim.military_units[0].source_target_descriptor,
+            Some(SourceTargetDescriptor::from_source_kind34_island_cell(
+                4, 3, 4
+            ))
         );
     }
 
