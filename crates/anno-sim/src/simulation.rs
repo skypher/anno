@@ -213,6 +213,28 @@ pub struct SourcePlayerController {
     /// Controller `+0x1db4` / `+0x1db8`, the state-three target tile passed
     /// to the `FUN_004084d0` construction command in state four.
     pub action_target_tile: Option<(u8, u8)>,
+    /// Controller `+0x1dc8`, advanced before every state-two island probe and
+    /// wrapped through the source's fifty physical island slots.
+    pub island_search_cursor: u8,
+    /// Controller `+0x1dcc`. `None` represents the raw zero sentinel;
+    /// otherwise `FUN_00416370` requires `FUN_0046aff0(island, selector)` to
+    /// return `0x80` before the island is eligible.
+    pub island_search_requirement: Option<u8>,
+    /// Controller `+0x1dd4`, the island selected by `FUN_00416370` and
+    /// consumed by the action-two rectangle producer.
+    pub island_search_selected_island_id: Option<u8>,
+    /// Controller `+0x4e4`, initialized to 1800 and reduced by fifty after a
+    /// full unsuccessful island sweep while it remains above the minimum.
+    pub island_search_area_threshold: i32,
+    /// Controller `+0x4e8`, the state-two minimum area threshold, initialized
+    /// to 300 by the requester and compared against candidate area totals.
+    pub island_search_minimum_area: i32,
+    /// Controller `+0x1dd0`, retaining a nonzero requirement when a complete
+    /// sweep clears `+0x1dcc` for the next source action.
+    pub island_search_deferred_requirement: Option<u8>,
+    /// Controller `+0x28` / `+0x30` retry gate set by a complete exhausted
+    /// unconstrained sweep. The supplier re-enters after 600 source ticks.
+    pub island_search_retry_at_ticks: Option<u32>,
     /// Owner byte of the controller's `+0x3e7c` active city, when present.
     pub active_city_owner: Option<u8>,
     /// Physical source-city slot of controller `+0x3e7c`. Source controller
@@ -255,6 +277,13 @@ impl Default for SourcePlayerController {
             action_figure_handle: None,
             action_target_island_id: None,
             action_target_tile: None,
+            island_search_cursor: 0,
+            island_search_requirement: None,
+            island_search_selected_island_id: None,
+            island_search_area_threshold: 0,
+            island_search_minimum_area: 0,
+            island_search_deferred_requirement: None,
+            island_search_retry_at_ticks: None,
             active_city_owner: None,
             active_city_slot: None,
             selected_city_active: false,
@@ -1830,6 +1859,13 @@ impl Simulation {
         controller.action_figure_handle = None;
         controller.action_target_island_id = None;
         controller.action_target_tile = None;
+        controller.island_search_cursor = 0;
+        controller.island_search_requirement = None;
+        controller.island_search_selected_island_id = None;
+        controller.island_search_area_threshold = 0;
+        controller.island_search_minimum_area = 0;
+        controller.island_search_deferred_requirement = None;
+        controller.island_search_retry_at_ticks = None;
         controller.selected_city_active = false;
         controller.action_stack.clear();
         controller.action_budget = 0;
@@ -1911,6 +1947,152 @@ impl Simulation {
                     .source_city_count_for_owner(city.owner_slot)
                     >= 3
         })
+    }
+
+    /// Begin the `FUN_00416370` supplier used by the source controller before
+    /// it queues action two. `requirement` is the raw `+0x1dcc` selector from
+    /// `FUN_00416ca0`; the island map provides the exact `FUN_0046aff0`
+    /// strength through its retained `INSEL5` resource state.
+    pub fn request_source_controller_island_search(
+        &mut self,
+        player_slot: usize,
+        requirement: Option<u8>,
+    ) -> bool {
+        let Some(controller) = self.source_player_controllers.get_mut(player_slot) else {
+            return false;
+        };
+        controller.island_search_requirement = requirement;
+        controller.island_search_selected_island_id = None;
+        controller.island_search_area_threshold = 0x708;
+        controller.island_search_minimum_area = 300;
+        controller.island_search_deferred_requirement = None;
+        controller.island_search_retry_at_ticks = None;
+        self.advance_source_controller_island_search(player_slot)
+    }
+
+    fn source_controller_island_is_active(&self, island_id: u8) -> bool {
+        self.island_maps.iter().any(|map| map.island_id == island_id)
+    }
+
+    fn source_controller_island_satisfies_requirement(
+        &self,
+        island_id: u8,
+        requirement: Option<u8>,
+    ) -> bool {
+        match requirement {
+            None => true,
+            Some(selector) => self
+                .island_maps
+                .iter()
+                .find(|map| map.island_id == island_id)
+                .is_some_and(|map| map.source_resource_strength(selector) == 0x80),
+        }
+    }
+
+    /// Advance the full fifty-slot `FUN_00416370` island cursor once. The
+    /// source assumes a populated world and therefore has unbounded loops;
+    /// the model bounds its equivalent traversal at eight complete sweeps,
+    /// matching the maximum island-local city-pointer count.
+    fn advance_source_controller_island_search(&mut self, player_slot: usize) -> bool {
+        let Some(controller) = self.source_player_controllers.get(player_slot) else {
+            return false;
+        };
+        if controller
+            .island_search_retry_at_ticks
+            .is_some_and(|retry_at| self.source_time_ticks.wrapping_sub(retry_at) > u32::MAX - 600)
+        {
+            return false;
+        }
+        let faction_state = self
+            .source_kind4_dispatch
+            .faction_states
+            .get(player_slot)
+            .copied()
+            .unwrap_or(u8::MAX);
+
+        if faction_state == 0x0e {
+            let mut completed_sweeps = 1_u8;
+            for _ in 0..SOURCE_VISIBLE_ISLAND_SLOTS * 8 {
+                let island_id = {
+                    let controller = &mut self.source_player_controllers[player_slot];
+                    controller.island_search_cursor =
+                        (controller.island_search_cursor + 1) % SOURCE_VISIBLE_ISLAND_SLOTS as u8;
+                    if controller.island_search_cursor == 0 {
+                        completed_sweeps = completed_sweeps.saturating_add(1);
+                    }
+                    controller.island_search_cursor
+                };
+                if self.source_controller_island_is_active(island_id)
+                    && completed_sweeps >= self.source_cities.source_city_count_on_island(island_id)
+                {
+                    let controller = &mut self.source_player_controllers[player_slot];
+                    controller.island_search_selected_island_id = Some(island_id);
+                    if !controller.action_stack.contains(&2) {
+                        controller.action_stack.push(2);
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        for _ in 0..SOURCE_VISIBLE_ISLAND_SLOTS {
+            let (island_id, wrapped, requirement, desired_figure_count) = {
+                let controller = &mut self.source_player_controllers[player_slot];
+                controller.island_search_cursor =
+                    (controller.island_search_cursor + 1) % SOURCE_VISIBLE_ISLAND_SLOTS as u8;
+                (
+                    controller.island_search_cursor,
+                    controller.island_search_cursor == 0,
+                    controller.island_search_requirement,
+                    controller.desired_figure_count,
+                )
+            };
+            if wrapped {
+                let controller = &mut self.source_player_controllers[player_slot];
+                if controller.island_search_area_threshold <= controller.island_search_minimum_area
+                {
+                    if requirement.is_none() && desired_figure_count > 2 {
+                        controller.island_search_deferred_requirement = None;
+                        controller.island_search_retry_at_ticks =
+                            Some(self.source_time_ticks.wrapping_add(600));
+                        return false;
+                    }
+                    controller.island_search_area_threshold = 0x708;
+                    controller.island_search_minimum_area = 300;
+                    if let Some(requirement) = controller.island_search_requirement.take() {
+                        controller.island_search_deferred_requirement = Some(requirement);
+                        return false;
+                    }
+                    controller.island_search_deferred_requirement = None;
+                    controller.island_search_retry_at_ticks =
+                        Some(self.source_time_ticks.wrapping_add(600));
+                    return false;
+                }
+                controller.island_search_area_threshold -= 0x32;
+            }
+
+            if !self.source_controller_island_is_active(island_id)
+                || !self.source_controller_target_island_is_eligible(player_slot, island_id)
+                || !self.source_controller_island_satisfies_requirement(island_id, requirement)
+            {
+                continue;
+            }
+            let island_city_count = self.source_cities.source_city_count_on_island(island_id);
+            if desired_figure_count <= 1 && island_city_count == 0 {
+                continue;
+            }
+            let controller = &mut self.source_player_controllers[player_slot];
+            if controller.island_search_minimum_area <= controller.island_search_area_threshold {
+                controller.island_search_selected_island_id = Some(island_id);
+                if !controller.action_stack.contains(&2) {
+                    controller.action_stack.push(2);
+                }
+                return true;
+            }
+            return false;
+        }
+        false
     }
 
     /// Complete the successful `FUN_00417690` state-four arrival. State three
@@ -7899,6 +8081,7 @@ mod tests {
             purchase_predecessor_issued: false,
             owned_figure_handles: vec![],
             figure_roster_dirty: false,
+            ..Default::default()
         };
 
         sim.tick_source_player_controllers(1);
@@ -7955,6 +8138,7 @@ mod tests {
             purchase_predecessor_issued: true,
             owned_figure_handles: vec![],
             figure_roster_dirty: false,
+            ..Default::default()
         };
 
         sim.tick_source_player_controllers(1);
@@ -8088,6 +8272,78 @@ mod tests {
     }
 
     #[test]
+    fn source_controller_state_two_cursor_selects_source_island_order_and_requirement() {
+        let mut sim = Simulation::new();
+        sim.source_kind4_dispatch.faction_states = [0x0c, 0x0e, 7, 7, 7, 7, 7];
+        sim.island_maps.push(IslandMap::new_open(1, 8, 8));
+        sim.island_maps.push(IslandMap::new_open(3, 8, 8));
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 1,
+                owner_slot: 0,
+                ..Default::default()
+            })
+        ));
+        assert!(sim.source_cities.set_record(
+            1,
+            Some(SourceCityRecord {
+                island_id: 3,
+                owner_slot: 1,
+                ..Default::default()
+            })
+        ));
+
+        assert!(sim.request_source_controller_island_search(0, None));
+        let controller = &sim.source_player_controllers[0];
+        assert_eq!(controller.island_search_cursor, 3);
+        assert_eq!(controller.island_search_selected_island_id, Some(3));
+        assert_eq!(controller.action_stack, vec![2]);
+
+        let mut constrained = Simulation::new();
+        constrained.source_kind4_dispatch.faction_states[0] = 0x0c;
+        constrained.source_player_controllers[0].desired_figure_count = 2;
+        constrained.island_maps.push(IslandMap::new_open(1, 8, 8));
+        constrained.island_maps.push(
+            IslandMap::new_open(2, 8, 8).with_source_resource_state(
+                anno_formats::szs::IslandSourceResourceState {
+                    crop_flags: 1,
+                    ..Default::default()
+                },
+            ));
+
+        assert!(constrained.request_source_controller_island_search(0, Some(0x2d)));
+        let controller = &constrained.source_player_controllers[0];
+        assert_eq!(controller.island_search_cursor, 2);
+        assert_eq!(controller.island_search_requirement, Some(0x2d));
+        assert_eq!(controller.island_search_selected_island_id, Some(2));
+        assert_eq!(controller.action_stack, vec![2]);
+    }
+
+    #[test]
+    fn source_controller_state_two_native_cursor_repeats_until_city_count() {
+        let mut sim = Simulation::new();
+        sim.source_kind4_dispatch.faction_states[0] = 0x0e;
+        sim.island_maps.push(IslandMap::new_open(1, 8, 8));
+        for slot in 0..2 {
+            assert!(sim.source_cities.set_record(
+                slot,
+                Some(SourceCityRecord {
+                    island_id: 1,
+                    owner_slot: 5,
+                    ..Default::default()
+                })
+            ));
+        }
+
+        assert!(sim.request_source_controller_island_search(0, None));
+        let controller = &sim.source_player_controllers[0];
+        assert_eq!(controller.island_search_cursor, 1);
+        assert_eq!(controller.island_search_selected_island_id, Some(1));
+        assert_eq!(controller.action_stack, vec![2]);
+    }
+
+    #[test]
     fn source_controller_city_arrival_installs_the_physical_city_profile() {
         let mut sim = Simulation::new();
         sim.source_time_ticks = 4_321;
@@ -8194,6 +8450,7 @@ mod tests {
             purchase_predecessor_issued: true,
             owned_figure_handles: vec![7],
             figure_roster_dirty: false,
+            ..Default::default()
         };
 
         sim.tick_source_player_controllers(0);

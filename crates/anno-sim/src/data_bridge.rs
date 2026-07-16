@@ -721,6 +721,19 @@ impl SourceCityTable {
             .unwrap_or(u8::MAX)
     }
 
+    /// Count active island-local city pointers. `FUN_00416370` uses the
+    /// corresponding `+0xac..+0xc8` pointer table when its controller has at
+    /// most one desired figure.
+    pub fn source_city_count_on_island(&self, island_id: u8) -> u8 {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|city| city.island_id == island_id)
+            .count()
+            .try_into()
+            .unwrap_or(u8::MAX)
+    }
+
     /// Sum `FUN_0047f790` across every active source-city record owned by one
     /// player. This is the `local_14` / `local_18` accumulation in
     /// `FUN_00475c60` before its policy-specific modifiers.

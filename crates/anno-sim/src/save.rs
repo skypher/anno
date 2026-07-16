@@ -249,7 +249,9 @@ use std::path::Path;
 ///       tick; controller arrivals retain the state-three target tile.
 /// v133: scenario city `+0x19` stores its island-local city-pointer slot,
 ///       separately from city owner `+0x1a`.
-pub const SAVE_VERSION: u32 = 133;
+/// v134: source controller state-two island cursor, capability selector,
+///       selected island, and area thresholds persist across saves.
+pub const SAVE_VERSION: u32 = 134;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -263,7 +265,7 @@ pub const SAVE_VERSION: u32 = 133;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 133;
+pub const MIN_LOADABLE_VERSION: u32 = 134;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -894,6 +896,13 @@ mod tests {
             action_figure_handle: Some(4),
             action_target_island_id: Some(1),
             action_target_tile: Some((12, 13)),
+            island_search_cursor: 17,
+            island_search_requirement: Some(0x2d),
+            island_search_selected_island_id: Some(3),
+            island_search_area_threshold: 1_450,
+            island_search_minimum_area: 300,
+            island_search_deferred_requirement: Some(0x31),
+            island_search_retry_at_ticks: Some(6_000),
             active_city_owner: Some(2),
             active_city_slot: Some(3),
             selected_city_active: false,
@@ -1481,6 +1490,13 @@ mod tests {
                 action_figure_handle: Some(4),
                 action_target_island_id: Some(1),
                 action_target_tile: Some((12, 13)),
+                island_search_cursor: 17,
+                island_search_requirement: Some(0x2d),
+                island_search_selected_island_id: Some(3),
+                island_search_area_threshold: 1_450,
+                island_search_minimum_area: 300,
+                island_search_deferred_requirement: Some(0x31),
+                island_search_retry_at_ticks: Some(6_000),
                 active_city_owner: Some(2),
                 active_city_slot: Some(3),
                 selected_city_active: false,
