@@ -237,9 +237,11 @@ use std::path::Path;
 /// v125: source player-controller timers, action stacks, city gates, and
 ///       category-1/2/3 roster state retain `FUN_0042b4b0` scheduling.
 /// v126: the `FUN_00423710` global controller difficulty mode persists.
-/// v127: controller city-management and figure-capacity profile predicates
-///       retain their distinct source offsets.
-pub const SAVE_VERSION: u32 = 127;
+/// v127: controller city-management profile predicate retains source offset
+///       `+0x10638`.
+/// v128: removes the synthetic controller `+0x106f8` profile field after an
+///       executable instruction census found its sole read and no writes.
+pub const SAVE_VERSION: u32 = 128;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -253,7 +255,7 @@ pub const SAVE_VERSION: u32 = 127;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 127;
+pub const MIN_LOADABLE_VERSION: u32 = 128;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -876,7 +878,6 @@ mod tests {
             figure_roster_ratio: 1,
             figure_capacity: 4,
             figure_capacity_limit: Some(12),
-            figure_capacity_profile_present: true,
             city_management_profile_present: true,
             active_city_owner: Some(2),
             selected_city_active: false,
@@ -1455,7 +1456,6 @@ mod tests {
                 figure_roster_ratio: 1,
                 figure_capacity: 4,
                 figure_capacity_limit: Some(12),
-                figure_capacity_profile_present: true,
                 city_management_profile_present: true,
                 active_city_owner: Some(2),
                 selected_city_active: false,

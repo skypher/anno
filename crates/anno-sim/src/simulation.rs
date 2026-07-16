@@ -187,9 +187,6 @@ pub struct SourcePlayerController {
     /// `FUN_00423710`. `None` denotes an unconfigured controller outside a
     /// loaded PLAYER4 record.
     pub figure_capacity_limit: Option<u16>,
-    /// Controller `+0x106f8`, which independently enables the weighted
-    /// roster adjustment inside `FUN_00423710`.
-    pub figure_capacity_profile_present: bool,
     /// Controller `+0x10638`: a non-null city-management profile enables the
     /// ten-second `FUN_00424bf0` branch.
     pub city_management_profile_present: bool,
@@ -223,7 +220,6 @@ impl Default for SourcePlayerController {
             figure_roster_ratio: 0,
             figure_capacity: 0,
             figure_capacity_limit: None,
-            figure_capacity_profile_present: false,
             city_management_profile_present: false,
             active_city_owner: None,
             selected_city_active: false,
@@ -1487,20 +1483,6 @@ impl Simulation {
         }
     }
 
-    fn source_shared_figure_score_state(&self, entity: SourceSharedFigureEntity) -> u8 {
-        match entity {
-            SourceSharedFigureEntity::MilitaryUnit(index) => {
-                self.military_units[index].source_score_state
-            }
-            SourceSharedFigureEntity::TradeShip(index) => {
-                self.trade_ships[index].source_score_state
-            }
-            SourceSharedFigureEntity::DynamicFigure(index) => {
-                self.source_dynamic_combat_figures[index].source_score_state
-            }
-        }
-    }
-
     fn transfer_source_shared_figure(&mut self, entity: SourceSharedFigureEntity, buyer: u8) {
         let replacement_kind = self
             .source_kind4_dispatch
@@ -1658,43 +1640,6 @@ impl Simulation {
         }
     }
 
-    fn source_controller_figure_score_totals(
-        &self,
-    ) -> [u32; combat::SOURCE_KIND4_PLAYER_SLOT_COUNT] {
-        let mut totals = [0; combat::SOURCE_KIND4_PLAYER_SLOT_COUNT];
-        for handle in 0..combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY {
-            let Some(entity) = self.source_shared_figure_entity(handle) else {
-                continue;
-            };
-            let Some((figure_kind, owner, _, _)) =
-                self.source_shared_figure_purchase_fields(entity)
-            else {
-                continue;
-            };
-            if !(1..=3).contains(&figure_kind) {
-                continue;
-            }
-            if let Some(total) = totals.get_mut(usize::from(owner)) {
-                *total =
-                    total.wrapping_add(u32::from(self.source_shared_figure_score_state(entity)));
-            }
-        }
-        totals
-    }
-
-    fn source_controller_active_city_figure_metric(&self, player_slot: usize) -> u16 {
-        let active_city_owner = self.source_player_controllers[player_slot].active_city_owner;
-        active_city_owner
-            .and_then(|owner| {
-                self.source_cities
-                    .active_records()
-                    .into_iter()
-                    .find(|city| city.owner_slot == owner)
-            })
-            .map(|city| city.controller_figure_capacity_metric)
-            .unwrap_or(0)
-    }
-
     fn source_controller_figure_capacity_from_inputs(
         desired_figure_count: u32,
         owned_figure_count: u32,
@@ -1759,27 +1704,27 @@ impl Simulation {
         else {
             return;
         };
-        let (desired_figure_count, owned_figure_count, profile_present) = {
+        let (desired_figure_count, owned_figure_count) = {
             let controller = &self.source_player_controllers[player_slot];
             (
                 controller.desired_figure_count,
                 controller.owned_figure_handles.len() as u32,
-                controller.figure_capacity_profile_present,
             )
         };
-        let score_totals = self.source_controller_figure_score_totals();
-        let active_city_figure_metric =
-            self.source_controller_active_city_figure_metric(player_slot);
         let (figure_roster_ratio, figure_capacity) =
             Self::source_controller_figure_capacity_from_inputs(
                 desired_figure_count,
                 owned_figure_count,
-                profile_present,
+                // `FUN_0040f580` clears the complete controller record,
+                // including `+0x106f8`; the executable contains no later
+                // instruction that writes that displacement. Its weighted
+                // `FUN_00423710` branch is therefore inactive at runtime.
+                false,
                 player_slot,
-                score_totals,
+                [0; combat::SOURCE_KIND4_PLAYER_SLOT_COUNT],
                 self.source_kind4_dispatch.faction_states,
                 self.source_controller_difficulty_mode,
-                active_city_figure_metric,
+                0,
                 figure_capacity_limit,
             );
         let controller = &mut self.source_player_controllers[player_slot];
@@ -7738,7 +7683,6 @@ mod tests {
             figure_roster_ratio: 0,
             figure_capacity: 1,
             figure_capacity_limit: None,
-            figure_capacity_profile_present: false,
             city_management_profile_present: true,
             active_city_owner: Some(0),
             selected_city_active: false,
@@ -7786,7 +7730,6 @@ mod tests {
             figure_roster_ratio: 0,
             figure_capacity: 1,
             figure_capacity_limit: None,
-            figure_capacity_profile_present: false,
             city_management_profile_present: true,
             active_city_owner: Some(0),
             selected_city_active: false,
@@ -7831,7 +7774,7 @@ mod tests {
     }
 
     #[test]
-    fn source_controller_city_management_and_capacity_profiles_are_independent() {
+    fn source_controller_loader_keeps_weighted_capacity_profile_inactive() {
         let mut sim = Simulation::new();
         let controller = &mut sim.source_player_controllers[0];
         controller.desired_figure_count = 3;
@@ -7841,10 +7784,6 @@ mod tests {
 
         sim.refresh_source_player_controller_figure_capacity(0);
         assert_eq!(sim.source_player_controllers[0].figure_capacity, 3);
-
-        sim.source_player_controllers[0].figure_capacity_profile_present = true;
-        sim.refresh_source_player_controller_figure_capacity(0);
-        assert_eq!(sim.source_player_controllers[0].figure_capacity, 6);
     }
 
     #[test]
