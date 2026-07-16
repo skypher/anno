@@ -1519,6 +1519,21 @@ impl Simulation {
             })
     }
 
+    /// `FUN_0044f000`, `FUN_0044f110`, and `FUN_004489e0` address only the
+    /// shared `DAT_004cf358` figure table. The controller's raw handle is
+    /// therefore not interchangeable with the compatibility unit or ship
+    /// handles accepted by the wider event resolver above.
+    fn source_controller_dynamic_figure_index(&self, handle: u16) -> Option<usize> {
+        (handle < combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY).then_some(())?;
+        self.source_dynamic_combat_figures
+            .iter()
+            .rposition(|figure| {
+                figure.active
+                    && (1..=3).contains(&figure.figure_kind)
+                    && figure.runtime_slot == handle
+            })
+    }
+
     fn source_shared_figure_owner(&self, entity: SourceSharedFigureEntity) -> u8 {
         match entity {
             SourceSharedFigureEntity::MilitaryUnit(index) => self.military_units[index].owner,
@@ -1529,63 +1544,18 @@ impl Simulation {
         }
     }
 
-    /// Write the live `FUN_004458f0` target descriptor used by the controller
-    /// before it calls `FUN_004489e0` for a selected shared figure.
-    fn set_source_shared_figure_target_descriptor(
+    /// Store `FUN_004489e0`'s persistent target on the shared dynamic record
+    /// selected by a player controller.
+    fn set_source_controller_figure_target_descriptor(
         &mut self,
         handle: u16,
         descriptor: SourceTargetDescriptor,
     ) -> bool {
-        let Some(entity) = self.source_shared_figure_entity(handle) else {
+        let Some(index) = self.source_controller_dynamic_figure_index(handle) else {
             return false;
         };
-        match entity {
-            SourceSharedFigureEntity::MilitaryUnit(index) => {
-                self.military_units[index].source_target_descriptor = Some(descriptor);
-            }
-            SourceSharedFigureEntity::TradeShip(index) => {
-                self.trade_ships[index].source_target_descriptor = Some(descriptor);
-            }
-            SourceSharedFigureEntity::DynamicFigure(index) => {
-                self.source_dynamic_combat_figures[index].target_descriptor = descriptor;
-            }
-        }
+        self.source_dynamic_combat_figures[index].target_descriptor = descriptor;
         true
-    }
-
-    fn source_shared_figure_position(
-        &self,
-        entity: SourceSharedFigureEntity,
-    ) -> Option<(i32, i32)> {
-        fn source_position_component(value: f32) -> Option<i32> {
-            (value.is_finite() && value >= i32::MIN as f32 && value < i32::MAX as f32)
-                .then_some(value as i32)
-        }
-
-        match entity {
-            SourceSharedFigureEntity::MilitaryUnit(index) => {
-                let unit = &self.military_units[index];
-                if unit.source_position_initialized {
-                    Some((
-                        source_position_component(unit.source_position_x)?,
-                        source_position_component(unit.source_position_y)?,
-                    ))
-                } else {
-                    Some((unit.tile_x, unit.tile_y))
-                }
-            }
-            SourceSharedFigureEntity::TradeShip(index) => {
-                let ship = &self.trade_ships[index];
-                Some((ship.world_x, ship.world_y))
-            }
-            SourceSharedFigureEntity::DynamicFigure(index) => {
-                let figure = &self.source_dynamic_combat_figures[index];
-                Some((
-                    source_position_component(figure.position.0)?,
-                    source_position_component(figure.position.1)?,
-                ))
-            }
-        }
     }
 
     fn source_shared_figure_purchase_fields(
@@ -1972,13 +1942,10 @@ impl Simulation {
         let owner = player_slot as u8;
         let handles = (0..combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY)
             .filter(|&handle| {
-                let Some(entity) = self.source_shared_figure_entity(handle) else {
+                let Some(index) = self.source_controller_dynamic_figure_index(handle) else {
                     return false;
                 };
-                self.source_shared_figure_purchase_fields(entity)
-                    .is_some_and(|(kind, figure_owner, _, _)| {
-                        (1..=3).contains(&kind) && figure_owner == owner
-                    })
+                self.source_dynamic_combat_figures[index].owner == owner
             })
             .collect();
         let controller = &mut self.source_player_controllers[player_slot];
@@ -2336,7 +2303,7 @@ impl Simulation {
             source_x as u8,
             source_y as u8,
         );
-        if !self.set_source_shared_figure_target_descriptor(figure_handle, figure_target) {
+        if !self.set_source_controller_figure_target_descriptor(figure_handle, figure_target) {
             return false;
         }
         let controller = &mut self.source_player_controllers[player_slot];
@@ -2378,11 +2345,19 @@ impl Simulation {
             candidate_x as u8,
             candidate_y as u8,
         );
-        let Some(entity) = self.source_shared_figure_entity(figure_handle) else {
+        let Some(figure_index) = self.source_controller_dynamic_figure_index(figure_handle) else {
             self.clear_source_controller_city_arrival(player_slot);
             return false;
         };
-        let Some(position) = self.source_shared_figure_position(entity) else {
+        let figure = &self.source_dynamic_combat_figures[figure_index];
+        let Some(position) = (figure.position.0.is_finite()
+            && figure.position.0 >= i32::MIN as f32
+            && figure.position.0 < i32::MAX as f32
+            && figure.position.1.is_finite()
+            && figure.position.1 >= i32::MIN as f32
+            && figure.position.1 < i32::MAX as f32)
+            .then_some((figure.position.0 as i32, figure.position.1 as i32))
+        else {
             self.clear_source_controller_city_arrival(player_slot);
             return false;
         };
@@ -2405,7 +2380,7 @@ impl Simulation {
             .action_stack
             .pop();
         self.source_player_controllers[player_slot].action_arrival_retries = retries - 1;
-        if !self.set_source_shared_figure_target_descriptor(figure_handle, descriptor) {
+        if !self.set_source_controller_figure_target_descriptor(figure_handle, descriptor) {
             self.clear_source_controller_city_arrival(player_slot);
             return false;
         }
@@ -8776,18 +8751,39 @@ mod tests {
     }
 
     #[test]
-    fn source_controller_writes_kind34_target_to_selected_shared_figure() {
+    fn source_controller_writes_kind34_target_to_selected_dynamic_figure() {
         let mut sim = Simulation::new();
-        let mut unit = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 0, 0);
-        unit.source_figure_kind = Some(1);
-        unit.source_live_runtime_slot = Some(7);
-        sim.military_units.push(unit);
+        sim.source_dynamic_combat_figures
+            .push(SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 1,
+                candidate_list_key: 4,
+                figure_definition_id: 0x19,
+                direction: 0,
+                source_payload: 0,
+                position: (0.5, 0.5),
+                position_z: 0.0,
+                source_energy: 0,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 0,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 7,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion::default(),
+            });
 
         let descriptor = SourceTargetDescriptor::from_source_kind34_island_cell(4, 12, 13);
-        assert!(sim.set_source_shared_figure_target_descriptor(7, descriptor));
+        assert!(sim.set_source_controller_figure_target_descriptor(7, descriptor));
         assert_eq!(
-            sim.military_units[0].source_target_descriptor,
-            Some(descriptor)
+            sim.source_dynamic_combat_figures[0].target_descriptor,
+            descriptor
         );
     }
 
@@ -8795,10 +8791,31 @@ mod tests {
     fn source_controller_state_four_requeues_an_approaching_figure_with_one_less_retry() {
         let mut sim = Simulation::new();
         sim.island_maps.push(IslandMap::new_open(4, 16, 16));
-        let mut unit = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 0, 0);
-        unit.source_figure_kind = Some(1);
-        unit.source_live_runtime_slot = Some(7);
-        sim.military_units.push(unit);
+        sim.source_dynamic_combat_figures
+            .push(SourceDynamicCombatFigure {
+                active: true,
+                figure_kind: 1,
+                candidate_list_key: 4,
+                figure_definition_id: 0x19,
+                direction: 0,
+                source_payload: 0,
+                position: (0.5, 0.5),
+                position_z: 0.0,
+                source_energy: 0,
+                source_score_state: 0,
+                source_action_ready_at: 0,
+                source_cargo_slots: [0; crate::combat::SOURCE_SHIP_CARGO_SLOT_COUNT],
+                target_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                state_descriptor: SourceTargetDescriptor::from_bytes([0; 4]),
+                owner: 0,
+                state: 0,
+                flags: 0,
+                notification: 0,
+                runtime_slot: 7,
+                auxiliary_kind: 0,
+                name_index: 0,
+                source_motion: combat::SourceGenericMotion::default(),
+            });
         sim.source_player_controllers[0] = SourcePlayerController {
             action_figure_handle: Some(7),
             action_target_island_id: Some(4),
@@ -8815,10 +8832,8 @@ mod tests {
         assert_eq!(controller.action_stack, vec![4]);
         assert_eq!(controller.action_arrival_retries, 3);
         assert_eq!(
-            sim.military_units[0].source_target_descriptor,
-            Some(SourceTargetDescriptor::from_source_kind34_island_cell(
-                4, 3, 4
-            ))
+            sim.source_dynamic_combat_figures[0].target_descriptor,
+            SourceTargetDescriptor::from_source_kind34_island_cell(4, 3, 4)
         );
     }
 
