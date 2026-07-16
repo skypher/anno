@@ -2650,6 +2650,55 @@ impl Simulation {
         controller.action_arrival_retries = 0;
     }
 
+    /// Replay `FUN_00417c80`: consume state seven, rebuild the controller's
+    /// construction-work queue from its newly allocated city, and request
+    /// source action six only when no work record survives `FUN_00417aa0`.
+    pub fn advance_source_controller_city_construction(&mut self, player_slot: usize) -> bool {
+        let Some(controller) = self.source_player_controllers.get(player_slot) else {
+            return false;
+        };
+        if controller.action_stack.last().copied() != Some(7) {
+            return false;
+        }
+
+        let city_slot = controller
+            .city_management_profile
+            .map(|profile| profile.city_slot);
+        self.source_player_controllers[player_slot]
+            .action_stack
+            .pop();
+        self.source_player_controllers[player_slot].source_city_construction_queue =
+            SourceControllerCityConstructionQueue::default();
+
+        let calls = city_slot
+            .and_then(|slot| self.source_cities.record(slot))
+            .and_then(|city| {
+                self.island_maps
+                    .iter()
+                    .find(|map| map.island_id == city.island_id)
+                    .map(|map| {
+                        map.source_controller_city_construction_work_calls(city.source_owner)
+                    })
+            })
+            .unwrap_or_default();
+        let controller = &mut self.source_player_controllers[player_slot];
+        for bytes in calls {
+            let _ = controller
+                .source_city_construction_queue
+                .insert(SourceControllerCityConstructionWork::from_bytes(bytes));
+        }
+        if controller
+            .source_city_construction_queue
+            .entries()
+            .is_empty()
+            && controller.action_budget > 0
+            && !controller.action_stack.contains(&6)
+        {
+            controller.action_stack.push(6);
+        }
+        true
+    }
+
     /// Recovered action cases from `FUN_00429aa0` with local source inputs.
     fn dispatch_source_controller_action(&mut self, player_slot: usize) {
         match self.source_player_controllers[player_slot]
@@ -2665,6 +2714,9 @@ impl Simulation {
             }
             Some(4) => {
                 let _ = self.advance_source_controller_city_arrival(player_slot);
+            }
+            Some(7) => {
+                let _ = self.advance_source_controller_city_construction(player_slot);
             }
             _ => {}
         }
@@ -9231,6 +9283,43 @@ mod tests {
         assert_eq!(controller.action_source_candidate_tile, None);
         assert_eq!(controller.action_target_direction, None);
         assert_eq!(controller.action_arrival_retries, 0);
+    }
+
+    #[test]
+    fn source_controller_state_seven_clears_work_and_queues_six_when_empty() {
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(2, 8, 8));
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 2,
+                source_owner: 0,
+                owner_slot: 0,
+                ..Default::default()
+            }),
+        ));
+        let mut retained = [0_u8; 32];
+        retained[0x1c..0x1e].copy_from_slice(&2_i16.to_le_bytes());
+        let mut queue = SourceControllerCityConstructionQueue::default();
+        assert!(queue.insert(SourceControllerCityConstructionWork::from_bytes(retained,)));
+        sim.source_player_controllers[0] = SourcePlayerController {
+            city_management_profile: Some(SourceCityManagementProfile {
+                city_slot: 0,
+                initialized_at_ticks: 0,
+            }),
+            source_city_construction_queue: queue,
+            action_stack: vec![8, 7],
+            action_budget: 14,
+            ..Default::default()
+        };
+
+        assert!(sim.advance_source_controller_city_construction(0));
+        let controller = &sim.source_player_controllers[0];
+        assert!(controller
+            .source_city_construction_queue
+            .entries()
+            .is_empty());
+        assert_eq!(controller.action_stack, vec![8, 6]);
     }
 
     #[test]

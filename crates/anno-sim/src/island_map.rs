@@ -635,6 +635,154 @@ impl IslandMap {
         })
     }
 
+    /// Replay the two map scans in `FUN_00417c80`. Each returned value is the
+    /// zero-initialized 32-byte argument record written by `FUN_00417aa0`;
+    /// its caller applies the source queue's priority admission rule.
+    pub fn source_controller_city_construction_work_calls(
+        &self,
+        source_owner: u8,
+    ) -> Vec<[u8; 32]> {
+        let mut calls = Vec::new();
+
+        // The first pass visits each row left-to-right. The executable uses
+        // the two zero coordinates themselves as its no-span sentinel.
+        for y in 0..i32::from(self.height) {
+            let mut start_x = 0;
+            let mut start_y = 0;
+            let mut mode = 1;
+            for x in 0..i32::from(self.width) {
+                let cell = self.source_map_kind_cell((x, y));
+                let valid = cell.is_some_and(|cell| {
+                    cell.map_owner == source_owner && matches!(cell.kind_code, 1 | 18)
+                });
+                let direction = cell.map(|cell| cell.map_direction).unwrap_or(u8::MAX);
+                let edge_clear = matches!(direction, 2 | 3)
+                    && self.source_controller_city_construction_edge_clear(x, y, 0);
+
+                if valid && (direction <= 1 || edge_clear) {
+                    if direction == 0 {
+                        if start_x == 0 && start_y == 0 {
+                            start_x = x;
+                            start_y = y;
+                        }
+                        continue;
+                    }
+                    if mode == 0 && direction == 1 {
+                        mode = 1;
+                    }
+                    if start_x != 0 || start_y != 0 {
+                        calls.push(source_controller_city_construction_record(
+                            start_x,
+                            x - 1,
+                            start_y,
+                            y,
+                            x - start_x - 1,
+                            0,
+                            1,
+                            1,
+                            0,
+                            mode,
+                        ));
+                        start_x = 0;
+                        start_y = 0;
+                    }
+                    if direction > 1 {
+                        mode = 0;
+                    }
+                    continue;
+                }
+
+                if start_x != 0 || start_y != 0 {
+                    calls.push(source_controller_city_construction_record(
+                        x - 1,
+                        start_x,
+                        y,
+                        start_y,
+                        x - start_x - 1,
+                        2,
+                        -1,
+                        -1,
+                        0,
+                        1,
+                    ));
+                    start_x = 0;
+                    start_y = 0;
+                    mode = 1;
+                }
+            }
+        }
+
+        // The second pass visits each column top-to-bottom. Its interrupted
+        // record carries the negated signed map width in the arg-eight slot.
+        for x in 0..i32::from(self.width) {
+            let mut start_x = 0;
+            let mut start_y = 0;
+            let mut mode = 1;
+            for y in 0..i32::from(self.height) {
+                let cell = self.source_map_kind_cell((x, y));
+                let valid = cell.is_some_and(|cell| {
+                    cell.map_owner == source_owner && matches!(cell.kind_code, 1 | 18)
+                });
+                let direction = cell.map(|cell| cell.map_direction).unwrap_or(u8::MAX);
+                let edge_clear = matches!(direction, 2 | 3)
+                    && self.source_controller_city_construction_edge_clear(x, y, 1);
+
+                if valid && (direction <= 1 || edge_clear) {
+                    if direction == 0 {
+                        if start_x == 0 && start_y == 0 {
+                            start_x = x;
+                            start_y = y;
+                        }
+                        continue;
+                    }
+                    if mode == 0 && direction == 1 {
+                        mode = 1;
+                    }
+                    if start_x != 0 || start_y != 0 {
+                        calls.push(source_controller_city_construction_record(
+                            x,
+                            i32::from(source_owner),
+                            start_y,
+                            y - 1,
+                            y - start_y - 1,
+                            1,
+                            i32::from(self.width),
+                            0,
+                            1,
+                            mode,
+                        ));
+                        start_x = 0;
+                        start_y = 0;
+                    }
+                    if direction > 1 {
+                        mode = 0;
+                    }
+                    continue;
+                }
+
+                if start_x != 0 || start_y != 0 {
+                    calls.push(source_controller_city_construction_record(
+                        i32::from(source_owner),
+                        y - 1,
+                        start_x,
+                        start_y,
+                        y - start_y - 1,
+                        3,
+                        -i32::from(self.width),
+                        0,
+                        -1,
+                        1,
+                    ));
+                    start_x = 0;
+                    start_y = 0;
+                    mode = 1;
+                }
+            }
+        }
+
+        calls
+    }
+
     /// `FUN_0040fe80` from one local map cell and a two-bit direction. The
     /// return is the source's one-based line distance, including its special
     /// single-kind-16 run handling.
@@ -1644,6 +1792,36 @@ fn source_controller_city_candidate_kind(kind_code: u8) -> bool {
     matches!(kind_code, 23 | 26 | 27 | 29 | 30)
 }
 
+/// Pack the `FUN_00417aa0` values in their destination-record order. The
+/// first argument to that function is the controller and is not recorded.
+fn source_controller_city_construction_record(
+    word_0: i32,
+    word_4: i32,
+    word_8: i32,
+    word_c: i32,
+    priority: i32,
+    word_1a: i32,
+    word_18: i32,
+    word_10: i32,
+    word_14: i32,
+    bit_1e: i32,
+) -> [u8; 32] {
+    let mut record = [0_u8; 32];
+    record[0..4].copy_from_slice(&word_0.to_le_bytes());
+    record[4..8].copy_from_slice(&word_4.to_le_bytes());
+    record[8..12].copy_from_slice(&word_8.to_le_bytes());
+    record[12..16].copy_from_slice(&word_c.to_le_bytes());
+    record[16..20].copy_from_slice(&word_10.to_le_bytes());
+    record[20..24].copy_from_slice(&word_14.to_le_bytes());
+    record[24..26].copy_from_slice(&(word_18 as i16).to_le_bytes());
+    record[26..28].copy_from_slice(&(word_1a as i16).to_le_bytes());
+    record[28..30].copy_from_slice(&(priority as i16).to_le_bytes());
+    if bit_1e != 0 {
+        record[30] |= 1;
+    }
+    record
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2289,6 +2467,58 @@ mod tests {
         map.source_map_kind_cells[index(5, 3)] = cell(11);
         assert!(!map.source_controller_city_construction_edge_clear(3, 3, 1));
         assert!(!map.source_controller_city_construction_edge_clear(3, 3, 4));
+    }
+
+    #[test]
+    fn controller_city_construction_calls_replay_both_fun_00417c80_passes() {
+        let mut map = IslandMap::new_open(1, 8, 8);
+        let index = |x, y| y * 8 + x;
+        let cell = |direction| {
+            Some(SourceMapKindCell {
+                kind_code: 1,
+                kind3_center_cell: false,
+                map_owner: 3,
+                ware_slot: 0,
+                map_direction: direction,
+            })
+        };
+
+        // A row span emits the first pass's ordinary record.
+        map.source_map_kind_cells[index(2, 2)] = cell(0);
+        map.source_map_kind_cells[index(5, 2)] = cell(1);
+        // A column span emits the second pass's distinct argument layout.
+        map.source_map_kind_cells[index(6, 2)] = cell(0);
+        map.source_map_kind_cells[index(6, 5)] = cell(1);
+
+        let calls = map.source_controller_city_construction_work_calls(3);
+        let word = |record: &[u8; 32], offset| {
+            i32::from_le_bytes(record[offset..offset + 4].try_into().unwrap())
+        };
+        let row = calls
+            .iter()
+            .find(|record| word(record, 0) == 2 && word(record, 4) == 4)
+            .unwrap();
+        assert_eq!(word(row, 8), 2);
+        assert_eq!(word(row, 12), 2);
+        assert_eq!(word(row, 16), 1);
+        assert_eq!(word(row, 20), 0);
+        assert_eq!(i16::from_le_bytes(row[24..26].try_into().unwrap()), 1);
+        assert_eq!(i16::from_le_bytes(row[26..28].try_into().unwrap()), 0);
+        assert_eq!(i16::from_le_bytes(row[28..30].try_into().unwrap()), 2);
+        assert_eq!(row[30] & 1, 1);
+
+        let column = calls
+            .iter()
+            .find(|record| word(record, 0) == 6 && word(record, 4) == 3)
+            .unwrap();
+        assert_eq!(word(column, 8), 2);
+        assert_eq!(word(column, 12), 4);
+        assert_eq!(word(column, 16), 0);
+        assert_eq!(word(column, 20), 1);
+        assert_eq!(i16::from_le_bytes(column[24..26].try_into().unwrap()), 8);
+        assert_eq!(i16::from_le_bytes(column[26..28].try_into().unwrap()), 1);
+        assert_eq!(i16::from_le_bytes(column[28..30].try_into().unwrap()), 2);
+        assert_eq!(column[30] & 1, 1);
     }
 
     #[test]
