@@ -237,14 +237,15 @@ use std::path::Path;
 /// v125: source player-controller timers, action stacks, city gates, and
 ///       category-1/2/3 roster state retain `FUN_0042b4b0` scheduling.
 /// v126: the `FUN_00423710` global controller difficulty mode persists.
-/// v127: controller city-management profile predicate retains source offset
-///       `+0x10638`.
+/// v127: controller city-management profile retains source offset `+0x10638`.
 /// v128: removes the synthetic controller `+0x106f8` profile field after an
 ///       executable instruction census found its sole read and no writes.
 /// v129: controller `+0x3e7c` retains its physical source-city slot.
 /// v130: controller `+0x08` initialization ticks retain the strict
 ///       `FUN_00429070` 36,000-tick reset cadence.
-pub const SAVE_VERSION: u32 = 130;
+/// v131: controller city-management profiles retain their physical city slot,
+///       arrival figure, target island, and action budget.
+pub const SAVE_VERSION: u32 = 131;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -258,7 +259,7 @@ pub const SAVE_VERSION: u32 = 130;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 130;
+pub const MIN_LOADABLE_VERSION: u32 = 131;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -882,12 +883,18 @@ mod tests {
             figure_roster_ratio: 1,
             figure_capacity: 4,
             figure_capacity_limit: Some(12),
-            city_management_profile_present: true,
+            city_management_profile: Some(crate::simulation::SourceCityManagementProfile {
+                city_slot: 3,
+                initialized_at_ticks: 0,
+            }),
+            action_figure_handle: Some(4),
+            action_target_island_id: Some(1),
             active_city_owner: Some(2),
             active_city_slot: Some(3),
             selected_city_active: false,
             city_management_disabled: false,
             action_stack: vec![8, 9],
+            action_budget: 14,
             purchase_predecessor_issued: false,
             owned_figure_handles: vec![4, 7],
             figure_roster_dirty: true,
@@ -1462,12 +1469,18 @@ mod tests {
                 figure_roster_ratio: 1,
                 figure_capacity: 4,
                 figure_capacity_limit: Some(12),
-                city_management_profile_present: true,
+                city_management_profile: Some(crate::simulation::SourceCityManagementProfile {
+                    city_slot: 3,
+                    initialized_at_ticks: 0,
+                }),
+                action_figure_handle: Some(4),
+                action_target_island_id: Some(1),
                 active_city_owner: Some(2),
                 active_city_slot: Some(3),
                 selected_city_active: false,
                 city_management_disabled: false,
                 action_stack: vec![8, 9],
+                action_budget: 14,
                 purchase_predecessor_issued: false,
                 owned_figure_handles: vec![4, 7],
                 figure_roster_dirty: true,

@@ -634,6 +634,20 @@ impl SourceCityTable {
         selected
     }
 
+    /// Resolve the physical city slot installed into controller `+0x10638`
+    /// by the successful branch of `FUN_00417690`. The source walks the city
+    /// pointers attached to its selected island and retains the first city
+    /// whose owner byte matches the controller's player slot.
+    pub fn source_controller_city_management_profile_slot(
+        &self,
+        island_id: u8,
+        owner_slot: u8,
+    ) -> Option<usize> {
+        self.slots.iter().position(|record| {
+            record.is_some_and(|city| city.island_id == island_id && city.owner_slot == owner_slot)
+        })
+    }
+
     /// Restore one physical source city slot. Runtime scenario loading fills
     /// records in order; save replay and focused source audits may restore a
     /// specific slot directly.

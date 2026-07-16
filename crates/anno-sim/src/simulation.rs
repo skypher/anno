@@ -160,6 +160,15 @@ pub struct SourceFigurePurchaseEvent {
     pub amount: u16,
 }
 
+/// Controller `+0x10638` after `FUN_00417690` completes a city arrival.
+/// The source addresses this per-city profile as `controller + 0x3e80 +
+/// city_slot * 0x298` and writes its `+0x14` source-clock timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceCityManagementProfile {
+    pub city_slot: usize,
+    pub initialized_at_ticks: u32,
+}
+
 /// Controller bytes consumed by the `FUN_0042b4b0` city-management branch.
 ///
 /// The complete controller occupies `0x11e88` bytes in the executable. This
@@ -191,9 +200,16 @@ pub struct SourcePlayerController {
     /// `FUN_00423710`. `None` denotes an unconfigured controller outside a
     /// loaded PLAYER4 record.
     pub figure_capacity_limit: Option<u16>,
-    /// Controller `+0x10638`: a non-null city-management profile enables the
-    /// ten-second `FUN_00424bf0` branch.
-    pub city_management_profile_present: bool,
+    /// Controller `+0x10638`: the city profile installed by a successful
+    /// `FUN_00417690` arrival. Its presence enables the ten-second
+    /// `FUN_00424bf0` branch.
+    pub city_management_profile: Option<SourceCityManagementProfile>,
+    /// Controller `+0x1dac`, the category-1/2/3 figure selected by
+    /// `FUN_004172e0` for action state four.
+    pub action_figure_handle: Option<u16>,
+    /// Controller `+0x1db0`, the selected island index consumed by
+    /// `FUN_00417690` to locate its managed city.
+    pub action_target_island_id: Option<u8>,
     /// Owner byte of the controller's `+0x3e7c` active city, when present.
     pub active_city_owner: Option<u8>,
     /// Physical source-city slot of controller `+0x3e7c`. Source controller
@@ -207,6 +223,9 @@ pub struct SourcePlayerController {
     /// Controller `+0x24` / `+0x34` action stack. The city purchase path only
     /// runs while its top action is greater than eight.
     pub action_stack: Vec<u8>,
+    /// Controller `+0x3e78`, replenished to fourteen by the successful
+    /// `FUN_00417690` city-arrival branch.
+    pub action_budget: i32,
     /// Result of the preceding `FUN_00421d30` priority branch. A true value
     /// means that function issued a city action and therefore suppresses a
     /// purchase on this city-management pass.
@@ -229,12 +248,15 @@ impl Default for SourcePlayerController {
             figure_roster_ratio: 0,
             figure_capacity: 0,
             figure_capacity_limit: None,
-            city_management_profile_present: false,
+            city_management_profile: None,
+            action_figure_handle: None,
+            action_target_island_id: None,
             active_city_owner: None,
             active_city_slot: None,
             selected_city_active: false,
             city_management_disabled: false,
             action_stack: Vec::new(),
+            action_budget: 0,
             purchase_predecessor_issued: false,
             owned_figure_handles: Vec::new(),
             figure_roster_dirty: false,
@@ -1800,9 +1822,12 @@ impl Simulation {
         controller.desired_figure_count = u32::from(faction_state == 0x0c) * 3;
         controller.figure_roster_ratio = 0;
         controller.figure_capacity = 0;
-        controller.city_management_profile_present = false;
+        controller.city_management_profile = None;
+        controller.action_figure_handle = None;
+        controller.action_target_island_id = None;
         controller.selected_city_active = false;
         controller.action_stack.clear();
+        controller.action_budget = 0;
         controller.purchase_predecessor_issued = false;
         controller.owned_figure_handles.clear();
         controller.figure_roster_dirty = matches!(faction_state, 0x0c | 0x0e);
@@ -1853,13 +1878,65 @@ impl Simulation {
             .unwrap_or(controller.active_city_owner == Some(player_slot as u8))
     }
 
+    /// Complete the successful `FUN_00417690` state-four arrival. State three
+    /// has already selected the owned figure and target island; this routine
+    /// records the per-city `+0x10638` profile, raises `+0x18`, restores the
+    /// action budget, and appends the source's state-eight then state-seven
+    /// follow-up actions without duplicating an existing stack entry.
+    pub fn complete_source_controller_city_arrival(&mut self, player_slot: usize) -> bool {
+        let Some(controller) = self.source_player_controllers.get(player_slot) else {
+            return false;
+        };
+        if controller.action_stack.last().copied() != Some(4) {
+            return false;
+        }
+        let (Some(figure_handle), Some(island_id)) = (
+            controller.action_figure_handle,
+            controller.action_target_island_id,
+        ) else {
+            return false;
+        };
+        let Some(entity) = self.source_shared_figure_entity(figure_handle) else {
+            return false;
+        };
+        if self.source_shared_figure_owner(entity) != player_slot as u8 {
+            return false;
+        }
+
+        // `FUN_00417690` first consumes state four once its selected figure
+        // is live, even when a later city lookup rejects the arrival.
+        self.source_player_controllers[player_slot]
+            .action_stack
+            .pop();
+        let Some(city_slot) = self
+            .source_cities
+            .source_controller_city_management_profile_slot(island_id, player_slot as u8)
+        else {
+            return false;
+        };
+
+        let controller = &mut self.source_player_controllers[player_slot];
+        controller.desired_figure_count = controller.desired_figure_count.wrapping_add(1);
+        controller.city_management_profile = Some(SourceCityManagementProfile {
+            city_slot,
+            initialized_at_ticks: self.source_time_ticks,
+        });
+        controller.action_budget = 14;
+        for action in [8, 7] {
+            if !controller.action_stack.contains(&action) {
+                controller.action_stack.push(action);
+            }
+        }
+        true
+    }
+
     fn tick_source_player_controller_city_management(
         &mut self,
         player_slot: usize,
     ) -> Option<SourceFigurePurchaseEvent> {
         let controller = &self.source_player_controllers[player_slot];
         if controller.city_management_disabled
-            || !controller.city_management_profile_present
+            || controller.city_management_profile.is_none()
             || controller.desired_figure_count == 0
             || !self.source_controller_active_city_owned_by(player_slot)
             || controller.selected_city_active
@@ -1929,7 +2006,9 @@ impl Simulation {
                         .saturating_add(50);
                     no_controller_work = false;
                 }
-                if self.source_player_controllers[player_slot].city_management_profile_present
+                if self.source_player_controllers[player_slot]
+                    .city_management_profile
+                    .is_some()
                     && self.source_player_controllers[player_slot].city_management_timer_ms < 0
                 {
                     let _ = self.tick_source_player_controller_city_management(player_slot);
@@ -7760,12 +7839,18 @@ mod tests {
             figure_roster_ratio: 0,
             figure_capacity: 1,
             figure_capacity_limit: None,
-            city_management_profile_present: true,
+            city_management_profile: Some(SourceCityManagementProfile {
+                city_slot: 0,
+                initialized_at_ticks: 0,
+            }),
+            action_figure_handle: None,
+            action_target_island_id: None,
             active_city_owner: Some(0),
             active_city_slot: None,
             selected_city_active: false,
             city_management_disabled: false,
             action_stack: vec![9],
+            action_budget: 0,
             purchase_predecessor_issued: false,
             owned_figure_handles: vec![],
             figure_roster_dirty: false,
@@ -7809,12 +7894,18 @@ mod tests {
             figure_roster_ratio: 0,
             figure_capacity: 1,
             figure_capacity_limit: None,
-            city_management_profile_present: true,
+            city_management_profile: Some(SourceCityManagementProfile {
+                city_slot: 0,
+                initialized_at_ticks: 0,
+            }),
+            action_figure_handle: None,
+            action_target_island_id: None,
             active_city_owner: Some(0),
             active_city_slot: None,
             selected_city_active: false,
             city_management_disabled: false,
             action_stack: vec![9],
+            action_budget: 0,
             purchase_predecessor_issued: true,
             owned_figure_handles: vec![],
             figure_roster_dirty: false,
@@ -7860,7 +7951,10 @@ mod tests {
         controller.desired_figure_count = 3;
         controller.owned_figure_handles = vec![0; 10];
         controller.figure_capacity_limit = Some(100);
-        controller.city_management_profile_present = true;
+        controller.city_management_profile = Some(SourceCityManagementProfile {
+            city_slot: 0,
+            initialized_at_ticks: 0,
+        });
 
         sim.refresh_source_player_controller_figure_capacity(0);
         assert_eq!(sim.source_player_controllers[0].figure_capacity, 3);
@@ -7893,6 +7987,53 @@ mod tests {
     }
 
     #[test]
+    fn source_controller_city_arrival_installs_the_physical_city_profile() {
+        let mut sim = Simulation::new();
+        sim.source_time_ticks = 4_321;
+        assert!(sim.source_cities.set_record(
+            2,
+            Some(SourceCityRecord {
+                island_id: 7,
+                owner_slot: 0,
+                ..Default::default()
+            })
+        ));
+        assert!(sim.source_cities.set_record(
+            5,
+            Some(SourceCityRecord {
+                island_id: 7,
+                owner_slot: 0,
+                ..Default::default()
+            })
+        ));
+
+        let mut ship = TradeShip::new(0, 0, 0, 0);
+        ship.source_figure_kind = Some(1);
+        ship.source_runtime_slot = Some(7);
+        sim.trade_ships.push(ship);
+        sim.source_player_controllers[0] = SourcePlayerController {
+            desired_figure_count: 3,
+            action_figure_handle: Some(7),
+            action_target_island_id: Some(7),
+            action_stack: vec![8, 4],
+            ..Default::default()
+        };
+
+        assert!(sim.complete_source_controller_city_arrival(0));
+        let controller = &sim.source_player_controllers[0];
+        assert_eq!(controller.desired_figure_count, 4);
+        assert_eq!(
+            controller.city_management_profile,
+            Some(SourceCityManagementProfile {
+                city_slot: 2,
+                initialized_at_ticks: 4_321,
+            })
+        );
+        assert_eq!(controller.action_budget, 14);
+        assert_eq!(controller.action_stack, vec![8, 7]);
+    }
+
+    #[test]
     fn source_controller_reinitializes_after_strict_36000_tick_age() {
         let mut sim = Simulation::new();
         sim.source_kind4_dispatch.remote_owner_dispatch_enabled = true;
@@ -7908,12 +8049,18 @@ mod tests {
             figure_roster_ratio: 8,
             figure_capacity: 9,
             figure_capacity_limit: Some(12),
-            city_management_profile_present: true,
+            city_management_profile: Some(SourceCityManagementProfile {
+                city_slot: 0,
+                initialized_at_ticks: 0,
+            }),
+            action_figure_handle: Some(7),
+            action_target_island_id: Some(0),
             active_city_owner: None,
             active_city_slot: None,
             selected_city_active: true,
             city_management_disabled: false,
             action_stack: vec![9],
+            action_budget: 0,
             purchase_predecessor_issued: true,
             owned_figure_handles: vec![7],
             figure_roster_dirty: false,
@@ -7926,9 +8073,12 @@ mod tests {
         assert_eq!(controller.desired_figure_count, 3);
         assert_eq!(controller.figure_roster_ratio, 1);
         assert_eq!(controller.figure_capacity, 0);
-        assert!(!controller.city_management_profile_present);
+        assert!(controller.city_management_profile.is_none());
+        assert_eq!(controller.action_figure_handle, None);
+        assert_eq!(controller.action_target_island_id, None);
         assert!(!controller.selected_city_active);
         assert!(controller.action_stack.is_empty());
+        assert_eq!(controller.action_budget, 0);
         assert!(!controller.purchase_predecessor_issued);
         assert!(controller.owned_figure_handles.is_empty());
         assert!(!controller.figure_roster_dirty);
