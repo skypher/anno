@@ -187,6 +187,9 @@ pub struct SourcePlayerController {
     /// `FUN_00423710`. `None` denotes an unconfigured controller outside a
     /// loaded PLAYER4 record.
     pub figure_capacity_limit: Option<u16>,
+    /// Controller `+0x106f8`, which independently enables the weighted
+    /// roster adjustment inside `FUN_00423710`.
+    pub figure_capacity_profile_present: bool,
     /// Controller `+0x10638`: a non-null city-management profile enables the
     /// ten-second `FUN_00424bf0` branch.
     pub city_management_profile_present: bool,
@@ -220,6 +223,7 @@ impl Default for SourcePlayerController {
             figure_roster_ratio: 0,
             figure_capacity: 0,
             figure_capacity_limit: None,
+            figure_capacity_profile_present: false,
             city_management_profile_present: false,
             active_city_owner: None,
             selected_city_active: false,
@@ -1760,7 +1764,7 @@ impl Simulation {
             (
                 controller.desired_figure_count,
                 controller.owned_figure_handles.len() as u32,
-                controller.city_management_profile_present,
+                controller.figure_capacity_profile_present,
             )
         };
         let score_totals = self.source_controller_figure_score_totals();
@@ -7734,6 +7738,7 @@ mod tests {
             figure_roster_ratio: 0,
             figure_capacity: 1,
             figure_capacity_limit: None,
+            figure_capacity_profile_present: false,
             city_management_profile_present: true,
             active_city_owner: Some(0),
             selected_city_active: false,
@@ -7781,6 +7786,7 @@ mod tests {
             figure_roster_ratio: 0,
             figure_capacity: 1,
             figure_capacity_limit: None,
+            figure_capacity_profile_present: false,
             city_management_profile_present: true,
             active_city_owner: Some(0),
             selected_city_active: false,
@@ -7822,6 +7828,23 @@ mod tests {
         );
         assert_eq!(roster_ratio, 3);
         assert_eq!(capacity, 2);
+    }
+
+    #[test]
+    fn source_controller_city_management_and_capacity_profiles_are_independent() {
+        let mut sim = Simulation::new();
+        let controller = &mut sim.source_player_controllers[0];
+        controller.desired_figure_count = 3;
+        controller.owned_figure_handles = vec![0; 10];
+        controller.figure_capacity_limit = Some(100);
+        controller.city_management_profile_present = true;
+
+        sim.refresh_source_player_controller_figure_capacity(0);
+        assert_eq!(sim.source_player_controllers[0].figure_capacity, 3);
+
+        sim.source_player_controllers[0].figure_capacity_profile_present = true;
+        sim.refresh_source_player_controller_figure_capacity(0);
+        assert_eq!(sim.source_player_controllers[0].figure_capacity, 6);
     }
 
     #[test]
