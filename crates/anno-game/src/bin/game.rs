@@ -1221,7 +1221,9 @@ fn refresh_simulation_island_map(
         return;
     };
     let source_resource_state = map.source_resource_state();
+    let source_runtime_classification = map.source_runtime_classification();
     *map = IslandMap::from_island(island, &cod.buildings)
+        .with_source_runtime_classification(source_runtime_classification)
         .with_source_resource_state(source_resource_state);
 }
 
@@ -8166,6 +8168,7 @@ fn init_simulation(
         .enumerate()
         .map(|(index, island)| {
             IslandMap::from_island(island, &cod.buildings)
+                .with_source_runtime_classification(szs.island_source_runtime_classification(index))
                 .with_source_resource_state(szs.island_source_resource_state(index))
         })
         .collect();

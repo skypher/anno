@@ -1415,6 +1415,28 @@ fn write_chunk(out: &mut Vec<u8>, name: &str, body: &[u8]) {
 }
 
 impl SzsFile {
+    /// Return the u16 installed at island-runtime offset `+0x18` by the
+    /// `INSEL5` loader at `0x00469d60`. The loader overwrites the serialized
+    /// word at `0x61` for source island numbers through `0x6e` before copying
+    /// it into the runtime record.
+    pub fn island_source_runtime_classification(&self, island_index: usize) -> u16 {
+        let Some(data) = self
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.name == "INSEL5" && chunk.data.len() >= 8)
+            .nth(island_index)
+            .map(|chunk| chunk.data.as_slice())
+        else {
+            return 0;
+        };
+
+        let serialized = data
+            .get(0x61..0x63)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .unwrap_or(0);
+        source_runtime_island_classification(data[0], serialized)
+    }
+
     /// Decode the resource inputs paired with the `island_index`th parsed
     /// `INSEL5` island. Short editor-generated records carry the zero state.
     pub fn island_source_resource_state(&self, island_index: usize) -> IslandSourceResourceState {
@@ -1938,6 +1960,18 @@ impl SzsFile {
         }
 
         tiles
+    }
+}
+
+/// Exact `INSEL5` classification rewrite at `0x00469e50`.
+pub const fn source_runtime_island_classification(island_number: u8, serialized: u16) -> u16 {
+    match island_number {
+        0..=0x20 => 0,
+        0x21..=0x2a => 1,
+        0x2b..=0x37 => 2,
+        0x38..=0x4b => 3,
+        0x4c..=0x6e => 4,
+        _ => serialized,
     }
 }
 
@@ -3663,6 +3697,28 @@ mod tests {
         assert_eq!(state.resource_strength(0x37), 0);
         assert_eq!(state.resource_strength(0x2f), 0x80);
         assert_eq!(state.resource_strength(0x2e), 0);
+    }
+
+    #[test]
+    fn insel5_runtime_classification_matches_00469e50() {
+        assert_eq!(source_runtime_island_classification(0x20, 9), 0);
+        assert_eq!(source_runtime_island_classification(0x21, 9), 1);
+        assert_eq!(source_runtime_island_classification(0x2a, 9), 1);
+        assert_eq!(source_runtime_island_classification(0x2b, 9), 2);
+        assert_eq!(source_runtime_island_classification(0x37, 9), 2);
+        assert_eq!(source_runtime_island_classification(0x38, 9), 3);
+        assert_eq!(source_runtime_island_classification(0x4b, 9), 3);
+        assert_eq!(source_runtime_island_classification(0x4c, 9), 4);
+        assert_eq!(source_runtime_island_classification(0x6e, 9), 4);
+        assert_eq!(source_runtime_island_classification(0x6f, 9), 9);
+
+        let mut body = vec![0_u8; 0x74];
+        body[0] = 0x71;
+        body[0x61..0x63].copy_from_slice(&9_u16.to_le_bytes());
+        let mut encoded = Vec::new();
+        write_chunk(&mut encoded, "INSEL5", &body);
+        let parsed = SzsFile::parse(&encoded).expect("parse INSEL5 classification");
+        assert_eq!(parsed.island_source_runtime_classification(0), 9);
     }
 
     #[test]

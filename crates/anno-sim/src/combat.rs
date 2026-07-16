@@ -2221,9 +2221,9 @@ impl DiplomacyMatrix {
         self.source_diplomacy_peer_city_strength[index] = peer_city_strength;
     }
 
-    /// Full `FUN_00475c60` score. `island_development` supplies the live
-    /// island-record u16 at `+0x18`; it is deliberately an explicit argument
-    /// until that mutable island field has a source-backed storage owner.
+    /// Full `FUN_00475c60` score. `island_runtime_classification` supplies the
+    /// island-record u16 at `+0x18` so this map-independent score kernel can
+    /// be used without depending on simulation storage.
     pub fn source_diplomacy_score(
         &self,
         player: u8,
@@ -2233,7 +2233,7 @@ impl DiplomacyMatrix {
         cities: &[SourceDiplomacyCity],
         kind4_occupants: &[SourceDiplomacyKind4Occupant],
         dynamic_objects: &[SourceDiplomacyDynamicObject],
-        island_development: impl Fn(u8) -> u16,
+        island_runtime_classification: impl Fn(u8) -> u16,
     ) -> i32 {
         let (player_index, peer_index) = (player as usize, peer as usize);
         if player_index >= 7 || peer_index >= 7 {
@@ -2258,7 +2258,7 @@ impl DiplomacyMatrix {
                         .iter()
                         .any(|object| object.island_id == city.island_id && object.owner == peer);
                     if peer_has_object {
-                        if island_development(city.island_id) < 4
+                        if island_runtime_classification(city.island_id) < 4
                             && (player_city_count < 3 || city.tier_population_total() != 0)
                         {
                             map_object_penalty = 200;

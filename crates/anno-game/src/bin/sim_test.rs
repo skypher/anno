@@ -125,6 +125,7 @@ fn main() {
         .enumerate()
         .map(|(index, island)| {
             IslandMap::from_island(island, &cod.buildings)
+                .with_source_runtime_classification(szs.island_source_runtime_classification(index))
                 .with_source_resource_state(szs.island_source_resource_state(index))
         })
         .collect();

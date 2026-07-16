@@ -1120,16 +1120,8 @@ impl Simulation {
     }
 
     /// Evaluate `FUN_00475c60` against the simulation's live source city,
-    /// kind-4, and dynamic-object state. The mutable island-record value at
-    /// `+0x18` is supplied by the caller because it has not yet acquired a
-    /// source-backed storage owner in `IslandMap`.
-    pub fn source_diplomacy_score(
-        &self,
-        player: u8,
-        peer: u8,
-        caller_term: i32,
-        island_development: impl Fn(u8) -> u16,
-    ) -> i32 {
+    /// kind-4, dynamic-object, and island-runtime state.
+    pub fn source_diplomacy_score(&self, player: u8, peer: u8, caller_term: i32) -> i32 {
         let cities = self
             .source_cities
             .active_records()
@@ -1166,7 +1158,13 @@ impl Simulation {
             &cities,
             &kind4_occupants,
             &dynamic_objects,
-            island_development,
+            |island_id| {
+                self.island_maps
+                    .iter()
+                    .find(|map| map.island_id == island_id)
+                    .map(|map| map.source_runtime_classification())
+                    .unwrap_or(0)
+            },
         )
     }
 

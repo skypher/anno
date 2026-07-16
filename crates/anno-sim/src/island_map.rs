@@ -11,7 +11,7 @@
 //! - Warehouse tiles are walkable (carriers need to reach them)
 
 use anno_formats::cod::BuildingDef as CodBuilding;
-use anno_formats::szs::{Island, IslandSourceResourceState};
+use anno_formats::szs::{source_runtime_island_classification, Island, IslandSourceResourceState};
 use std::collections::HashSet;
 
 use crate::source_cell::{source_plantation_path_kind_always_walkable, SourceMapCellState};
@@ -95,6 +95,9 @@ pub struct IslandMap {
     /// scenario file. Use `active_fertilities()` to iterate the
     /// non-sentinel typed values.
     pub fertilities: [u8; 8],
+    /// Source island-runtime u16 at offset `+0x18`, initialized from the
+    /// `INSEL5` loader's classification rewrite.
+    source_runtime_classification: u16,
     /// Source raw-resource availability and attenuation copied from the
     /// matching `INSEL5` runtime record.
     source_resource_state: IslandSourceResourceState,
@@ -265,8 +268,20 @@ impl IslandMap {
             source_land_target_sizes,
             source_kind4_line_of_fire_template,
             fertilities: island.fertilities,
+            source_runtime_classification: source_runtime_island_classification(island.number, 0),
             source_resource_state: IslandSourceResourceState::default(),
         }
+    }
+
+    /// Attach the `INSEL5` loader's initialized runtime classification.
+    pub fn with_source_runtime_classification(mut self, classification: u16) -> Self {
+        self.source_runtime_classification = classification;
+        self
+    }
+
+    /// Return the source island-runtime u16 at offset `+0x18`.
+    pub const fn source_runtime_classification(&self) -> u16 {
+        self.source_runtime_classification
     }
 
     /// Attach the matching `INSEL5` resource inputs after the static map has
@@ -1086,6 +1101,7 @@ impl IslandMap {
                 usize::from(height) * 2,
             ),
             fertilities: [7; 8],
+            source_runtime_classification: source_runtime_island_classification(island_id, 0),
             source_resource_state: IslandSourceResourceState::default(),
         }
     }
