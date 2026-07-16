@@ -605,6 +605,35 @@ impl SourceCityTable {
             .last()
     }
 
+    /// Replay the physical-city selection loop in `FUN_0040f580`. A city
+    /// with at least ten tier-2-through-4 residents always replaces the
+    /// current selection; otherwise its island's raw `FUN_0040e8b0` score
+    /// replaces the selection only when strictly greater.
+    pub fn source_controller_city_slot(
+        &self,
+        owner_slot: u8,
+        mut island_score: impl FnMut(u8, u8) -> i32,
+    ) -> Option<usize> {
+        let mut selected = None;
+        let mut selected_score = 0;
+        for (slot, record) in self.slots.iter().enumerate() {
+            let Some(city) = record else {
+                continue;
+            };
+            if city.owner_slot != owner_slot {
+                continue;
+            }
+            let score = island_score(city.island_id, city.source_owner);
+            if city.tier_population[2..].iter().copied().sum::<u32>() >= 10
+                || selected_score < score
+            {
+                selected = Some(slot);
+                selected_score = score;
+            }
+        }
+        selected
+    }
+
     /// Restore one physical source city slot. Runtime scenario loading fills
     /// records in order; save replay and focused source audits may restore a
     /// specific slot directly.
@@ -4088,6 +4117,41 @@ mod tests {
 
         assert_eq!(cities.source_controller_populated_city_slot(2), Some(4));
         assert_eq!(cities.source_controller_populated_city_slot(3), None);
+    }
+
+    #[test]
+    fn controller_city_selection_replaces_a_populated_city_with_later_higher_score() {
+        let mut cities = SourceCityTable::default();
+        assert!(cities.set_record(
+            1,
+            Some(SourceCityRecord {
+                island_id: 4,
+                source_owner: 2,
+                owner_slot: 2,
+                tier_population: [0, 0, 10, 0, 0],
+                ..Default::default()
+            })
+        ));
+        assert!(cities.set_record(
+            3,
+            Some(SourceCityRecord {
+                island_id: 9,
+                source_owner: 5,
+                owner_slot: 2,
+                ..Default::default()
+            })
+        ));
+
+        assert_eq!(
+            cities.source_controller_city_slot(2, |island, source_owner| {
+                if (island, source_owner) == (9, 5) {
+                    80
+                } else {
+                    20
+                }
+            }),
+            Some(3)
+        );
     }
 
     #[test]

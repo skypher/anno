@@ -40,6 +40,7 @@ struct SourceCivilianPathCell {
 struct SourceMapKindCell {
     kind_code: u8,
     kind3_center_cell: bool,
+    map_owner: u8,
 }
 
 /// Walkability grid for a single island.
@@ -194,6 +195,7 @@ impl IslandMap {
                             kind_code: def.source_kind_code().unwrap_or(u8::MAX),
                             kind3_center_cell: def.source_kind_code() == Some(3)
                                 && source_cell_index == def.size.0.saturating_mul(def.size.1) / 2,
+                            map_owner: tile.source_owner(),
                         });
                         walkable[idx] = is_walkable;
                         road[idx] = is_road;
@@ -305,6 +307,27 @@ impl IslandMap {
 
     pub const fn source_resource_transition_deadline_ticks(&self) -> u32 {
         self.source_resource_state.transition_deadline_ticks
+    }
+
+    /// `FUN_0040e8b0`'s raw suitability score for one map-owner selector.
+    /// The controller initializer compares these unnormalised scores when no
+    /// owned city has at least ten inhabitants in BGRUPPE tiers 2 through 4.
+    pub fn source_controller_city_suitability_score(&self, owner: u8) -> i32 {
+        let mut score = i32::from(self.width) * i32::from(self.height);
+        for cell in &self.source_map_kind_cells {
+            let penalty = match cell {
+                Some(cell) if cell.map_owner == 7 || cell.map_owner == owner => {
+                    match cell.kind_code {
+                        10..=12 => 4,
+                        25 | 26 => 2,
+                        _ => 1,
+                    }
+                }
+                _ => 1,
+            };
+            score -= penalty;
+        }
+        score
     }
 
     /// The attenuation write in the latter branch of `FUN_0046b3e0`.
@@ -1086,6 +1109,7 @@ impl IslandMap {
                 Some(SourceMapKindCell {
                     kind_code: 11,
                     kind3_center_cell: false,
+                    map_owner: 0,
                 });
                 size
             ],
@@ -1575,6 +1599,7 @@ mod tests {
             Some(SourceMapKindCell {
                 kind_code,
                 kind3_center_cell,
+                map_owner: 0,
             })
         };
         let index = |x, y| y * 6 + x;
@@ -1610,6 +1635,31 @@ mod tests {
             map.source_kind13_replacement_orientation((2, 2), 3, (2, 2)),
             3
         );
+    }
+
+    #[test]
+    fn controller_city_suitability_score_uses_source_kind_penalties() {
+        let mut map = IslandMap::new_open(1, 3, 1);
+        map.source_map_kind_cells = vec![
+            Some(SourceMapKindCell {
+                kind_code: 10,
+                kind3_center_cell: false,
+                map_owner: 2,
+            }),
+            Some(SourceMapKindCell {
+                kind_code: 25,
+                kind3_center_cell: false,
+                map_owner: 2,
+            }),
+            Some(SourceMapKindCell {
+                kind_code: 11,
+                kind3_center_cell: false,
+                map_owner: 1,
+            }),
+        ];
+
+        assert_eq!(map.source_controller_city_suitability_score(2), -4);
+        assert_eq!(map.source_controller_city_suitability_score(1), 0);
     }
 
     #[test]

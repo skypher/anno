@@ -1645,20 +1645,30 @@ impl Simulation {
         }
     }
 
-    /// Seed the direct populated-city arm of `FUN_0040f580` for every
-    /// controller. The source's map-suitability fallback applies only when
-    /// this returns no physical city slot.
-    pub fn configure_source_controller_populated_cities(&mut self) {
+    /// Seed controller `+0x3e7c` from `FUN_0040f580`'s physical city scan.
+    /// The map score uses each city's retained source map-owner selector.
+    pub fn configure_source_controller_active_cities(&mut self) {
         for player_slot in 0..combat::SOURCE_KIND4_PLAYER_SLOT_COUNT {
-            let city_slot = self
-                .source_cities
-                .source_controller_populated_city_slot(player_slot as u8);
-            let city_owner = city_slot
-                .and_then(|slot| self.source_cities.record(slot).map(|city| city.owner_slot));
-            let controller = &mut self.source_player_controllers[player_slot];
-            controller.active_city_slot = city_slot;
-            controller.active_city_owner = city_owner;
+            self.configure_source_controller_active_city(player_slot);
         }
+    }
+
+    fn configure_source_controller_active_city(&mut self, player_slot: usize) {
+        let city_slot = self.source_cities.source_controller_city_slot(
+            player_slot as u8,
+            |island_id, source_owner| {
+                self.island_maps
+                    .iter()
+                    .find(|map| map.island_id == island_id)
+                    .map(|map| map.source_controller_city_suitability_score(source_owner))
+                    .unwrap_or(0)
+            },
+        );
+        let city_owner =
+            city_slot.and_then(|slot| self.source_cities.record(slot).map(|city| city.owner_slot));
+        let controller = &mut self.source_player_controllers[player_slot];
+        controller.active_city_slot = city_slot;
+        controller.active_city_owner = city_owner;
     }
 
     fn source_controller_figure_capacity_from_inputs(
@@ -1762,6 +1772,7 @@ impl Simulation {
             return;
         }
 
+        self.configure_source_controller_active_city(player_slot);
         let faction_state = self
             .source_kind4_dispatch
             .faction_states
@@ -7822,7 +7833,7 @@ mod tests {
     }
 
     #[test]
-    fn source_controller_populated_city_initialization_keeps_physical_slot() {
+    fn source_controller_city_initialization_keeps_physical_slot() {
         let mut sim = Simulation::new();
         assert!(sim.source_cities.set_record(
             2,
@@ -7841,7 +7852,7 @@ mod tests {
             })
         ));
 
-        sim.configure_source_controller_populated_cities();
+        sim.configure_source_controller_active_cities();
 
         assert_eq!(sim.source_player_controllers[1].active_city_slot, Some(5));
         assert_eq!(sim.source_player_controllers[1].active_city_owner, Some(1));
