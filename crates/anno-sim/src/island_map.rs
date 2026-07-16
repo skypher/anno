@@ -43,6 +43,18 @@ struct SourceMapKindCell {
     map_owner: u8,
 }
 
+/// One six-word candidate record produced by `FUN_00415af0` for the source
+/// controller's state-two city search. Bounds are local-cell half-open
+/// intervals; `area` is the source record's accumulated horizontal length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceControllerCityRectangle {
+    pub x0: u16,
+    pub y0: u16,
+    pub x1: u16,
+    pub y1: u16,
+    pub area: u32,
+}
+
 /// Walkability grid for a single island.
 #[derive(Debug, Clone)]
 pub struct IslandMap {
@@ -328,6 +340,107 @@ impl IslandMap {
             score -= penalty;
         }
         score
+    }
+
+    /// Replay `FUN_00415af0` over this island's live source kind and owner
+    /// grid. The executable scans its half-open `(0, 0)` through
+    /// `(width - 1, height - 1)` bounds, first marking vertical runs and then
+    /// merging horizontal runs from consecutive rows into six-word records.
+    pub fn source_controller_city_rectangles(
+        &self,
+        owner: u8,
+        minimum_width: u16,
+        minimum_height: u16,
+    ) -> Vec<SourceControllerCityRectangle> {
+        let x_limit = usize::from(self.width.saturating_sub(1));
+        let y_limit = usize::from(self.height.saturating_sub(1));
+        let minimum_width = usize::from(minimum_width);
+        let minimum_height = usize::from(minimum_height);
+        if x_limit == 0 || y_limit == 0 || minimum_width == 0 || minimum_height == 0 {
+            return Vec::new();
+        }
+
+        let mut marked = vec![false; usize::from(self.width) * usize::from(self.height)];
+        let eligible = |x: usize, y: usize| {
+            self.source_map_kind_cells[y * usize::from(self.width) + x].is_some_and(|cell| {
+                cell.map_owner == owner && matches!(cell.kind_code, 10..=12 | 31 | 32)
+            })
+        };
+
+        for x in 0..x_limit {
+            let mut run_start = 0;
+            let mut run_length = 0;
+            for y in 0..y_limit {
+                if eligible(x, y) {
+                    if run_length == 0 {
+                        run_start = y;
+                    }
+                    run_length += 1;
+                    continue;
+                }
+                if run_length >= minimum_height {
+                    for marked_y in run_start..run_start + run_length {
+                        marked[marked_y * usize::from(self.width) + x] = true;
+                    }
+                }
+                run_length = 0;
+            }
+        }
+
+        let mut rectangles = Vec::new();
+        let mut previous_lines: Vec<(usize, usize, usize)> = Vec::new();
+        for y in 0..y_limit {
+            let mut current_lines = Vec::new();
+            let mut run_start = 0;
+            let mut run_length = 0;
+            for x in 0..x_limit {
+                if marked[y * usize::from(self.width) + x] {
+                    if run_length == 0 {
+                        run_start = x;
+                    }
+                    run_length += 1;
+                    continue;
+                }
+                if run_length != 0 {
+                    for marked_x in run_start..run_start + run_length {
+                        marked[y * usize::from(self.width) + marked_x] = false;
+                    }
+                    if run_length >= minimum_width {
+                        let run_end = run_start + run_length;
+                        let rectangle = previous_lines
+                            .iter()
+                            .find(|(previous_start, previous_end, _)| {
+                                run_start <= *previous_end && *previous_start <= run_end
+                            })
+                            .map(|(_, _, rectangle)| *rectangle)
+                            .unwrap_or_else(|| {
+                                if rectangles.len() == 256 {
+                                    return usize::MAX;
+                                }
+                                rectangles.push(SourceControllerCityRectangle {
+                                    x0: run_start as u16,
+                                    y0: y as u16,
+                                    x1: run_end as u16,
+                                    y1: y as u16 + 1,
+                                    area: 0,
+                                });
+                                rectangles.len() - 1
+                            });
+                        if rectangle != usize::MAX {
+                            let entry = &mut rectangles[rectangle];
+                            entry.x0 = entry.x0.min(run_start as u16);
+                            entry.x1 = entry.x1.max(run_end as u16);
+                            entry.y1 = y as u16 + 1;
+                            entry.area = entry.area.saturating_add(run_length as u32);
+                            current_lines.push((run_start, run_end, rectangle));
+                        }
+                    }
+                }
+                run_length = 0;
+            }
+            previous_lines = current_lines;
+        }
+        rectangles
     }
 
     /// The attenuation write in the latter branch of `FUN_0046b3e0`.
@@ -1660,6 +1773,31 @@ mod tests {
 
         assert_eq!(map.source_controller_city_suitability_score(2), -4);
         assert_eq!(map.source_controller_city_suitability_score(1), 0);
+    }
+
+    #[test]
+    fn controller_city_rectangles_replay_vertical_marks_and_row_merges() {
+        let mut map = IslandMap::new_open(1, 8, 8);
+        for y in 0..6 {
+            for x in 0..6 {
+                map.source_map_kind_cells[y * 8 + x] = Some(SourceMapKindCell {
+                    kind_code: 10,
+                    kind3_center_cell: false,
+                    map_owner: 7,
+                });
+            }
+        }
+
+        assert_eq!(
+            map.source_controller_city_rectangles(7, 5, 5),
+            vec![SourceControllerCityRectangle {
+                x0: 0,
+                y0: 0,
+                x1: 6,
+                y1: 6,
+                area: 36,
+            }]
+        );
     }
 
     #[test]
