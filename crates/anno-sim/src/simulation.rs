@@ -219,6 +219,9 @@ pub struct SourcePlayerController {
     /// Controller `+0x1dbc`, the source map-word direction retained with the
     /// selected state-three construction target.
     pub action_target_direction: Option<u8>,
+    /// Controller `+0x1da8`, seeded to four by state three and decremented by
+    /// `FUN_00417690` when the selected figure must re-approach its candidate.
+    pub action_arrival_retries: u8,
     /// Controller `+0x1dc8`, advanced before every state-two island probe and
     /// wrapped through the source's fifty physical island slots.
     pub island_search_cursor: u8,
@@ -288,6 +291,7 @@ impl Default for SourcePlayerController {
             action_target_tile: None,
             action_source_candidate_tile: None,
             action_target_direction: None,
+            action_arrival_retries: 0,
             island_search_cursor: 0,
             island_search_requirement: None,
             island_search_selected_island_id: None,
@@ -1897,6 +1901,7 @@ impl Simulation {
         controller.action_target_tile = None;
         controller.action_source_candidate_tile = None;
         controller.action_target_direction = None;
+        controller.action_arrival_retries = 0;
         controller.island_search_cursor = 0;
         controller.island_search_requirement = None;
         controller.island_search_selected_island_id = None;
@@ -2303,6 +2308,7 @@ impl Simulation {
         controller.action_figure_handle = Some(figure_handle);
         controller.action_source_candidate_tile = Some((source_x, source_y));
         controller.action_target_direction = Some(direction);
+        controller.action_arrival_retries = 4;
         controller.action_target_tile = Some((target_x as u8, target_y as u8));
         controller.action_target_island_id = Some(target_island_id);
         if !controller.action_stack.contains(&4) {
@@ -8793,6 +8799,7 @@ mod tests {
         assert_eq!(controller.action_figure_handle, None);
         assert_eq!(controller.action_target_island_id, None);
         assert_eq!(controller.action_target_tile, None);
+        assert_eq!(controller.action_arrival_retries, 0);
         assert!(!controller.selected_city_active);
         assert!(controller.action_stack.is_empty());
         assert_eq!(controller.action_budget, 0);
