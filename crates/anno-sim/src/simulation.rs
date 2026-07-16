@@ -2605,7 +2605,9 @@ impl Simulation {
     /// replays the resulting `FUN_004084d0` city allocation, records the
     /// per-city `+0x10638` profile, raises `+0x18`, restores the action budget,
     /// and appends the source's state-eight then state-seven follow-up actions
-    /// without duplicating an existing stack entry.
+    /// without duplicating an existing stack entry. Its common cleanup clears
+    /// the completed state-four target fields after those follow-up actions
+    /// are queued.
     pub fn complete_source_controller_city_arrival(&mut self, player_slot: usize) -> bool {
         let Some(controller) = self.source_player_controllers.get(player_slot) else {
             return false;
@@ -2658,6 +2660,7 @@ impl Simulation {
                 controller.action_stack.push(action);
             }
         }
+        self.clear_source_controller_city_arrival(player_slot);
         true
     }
 
@@ -9114,6 +9117,12 @@ mod tests {
         );
         assert_eq!(controller.action_budget, 14);
         assert_eq!(controller.action_stack, vec![8, 7]);
+        assert_eq!(controller.action_figure_handle, None);
+        assert_eq!(controller.action_target_island_id, None);
+        assert_eq!(controller.action_target_tile, None);
+        assert_eq!(controller.action_source_candidate_tile, None);
+        assert_eq!(controller.action_target_direction, None);
+        assert_eq!(controller.action_arrival_retries, 0);
     }
 
     #[test]
