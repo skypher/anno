@@ -202,6 +202,23 @@ impl SourceControllerCityConstructionWork {
     pub const fn priority(self) -> i16 {
         i16::from_le_bytes([self.bytes[0x1c], self.bytes[0x1d]])
     }
+
+    const fn word(self, offset: usize) -> i32 {
+        i32::from_le_bytes([
+            self.bytes[offset],
+            self.bytes[offset + 1],
+            self.bytes[offset + 2],
+            self.bytes[offset + 3],
+        ])
+    }
+
+    const fn word_4(self) -> i32 {
+        self.word(4)
+    }
+
+    const fn word_c(self) -> i32 {
+        self.word(0x0c)
+    }
 }
 
 /// The `FUN_00417aa0` construction-work queue. The source retains at most
@@ -241,6 +258,43 @@ impl SourceControllerCityConstructionQueue {
         };
         self.entries[index] = work;
         true
+    }
+}
+
+/// Controller state at `+0x1d14` through `+0x1d28` shared by the
+/// construction consumers. `FUN_00412b20` and `FUN_00412de0` advance this
+/// state with the same tail after a work record completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct SourceControllerCityConstructionCursor {
+    /// Controller `+0x1d14`, indexing the active `+0x1df4` work record.
+    pub work_index: i32,
+    /// Controller `+0x1d18` / `+0x1d1c`, current construction scan origin.
+    pub scan_x: i32,
+    pub scan_y: i32,
+    /// Controller `+0x1d20`, the current record's signed retry/span count.
+    pub remaining: i32,
+    /// Controller `+0x1d24` / `+0x1d28`, source baseline coordinates.
+    pub baseline_x: i32,
+    pub baseline_y: i32,
+}
+
+impl SourceControllerCityConstructionCursor {
+    /// Replay the common completion tail in `FUN_00412b20` and
+    /// `FUN_00412de0`. A true return is the source's terminal return value.
+    pub fn advance_after_record(&mut self, queue: &SourceControllerCityConstructionQueue) -> bool {
+        self.work_index = self.work_index.wrapping_add(1);
+        let Some(work) = usize::try_from(self.work_index)
+            .ok()
+            .and_then(|index| queue.entries.get(index).copied())
+        else {
+            return true;
+        };
+        self.scan_x = work.word_4();
+        self.scan_y = work.word_c();
+        self.baseline_x = work.word_4();
+        self.baseline_y = work.word_c();
+        self.remaining = i32::from(work.priority());
+        false
     }
 }
 
@@ -325,6 +379,9 @@ pub struct SourcePlayerController {
     /// Controller `+0x1df0/+0x1df4`: state-seven construction work emitted
     /// by `FUN_00417c80` through `FUN_00417aa0`.
     pub source_city_construction_queue: SourceControllerCityConstructionQueue,
+    /// Controller `+0x1d14` through `+0x1d28`, preserved between action-ten
+    /// and action-eleven construction consumer updates.
+    pub source_city_construction_cursor: SourceControllerCityConstructionCursor,
     /// Owner byte of the controller's `+0x3e7c` active city, when present.
     pub active_city_owner: Option<u8>,
     /// Physical source-city slot of controller `+0x3e7c`. Source controller
@@ -379,6 +436,7 @@ impl Default for SourcePlayerController {
             island_search_retry_at_ticks: None,
             source_city_rectangles: Vec::new(),
             source_city_construction_queue: SourceControllerCityConstructionQueue::default(),
+            source_city_construction_cursor: SourceControllerCityConstructionCursor::default(),
             active_city_owner: None,
             active_city_slot: None,
             selected_city_active: false,
@@ -8390,6 +8448,44 @@ mod tests {
         assert!(ordered.insert(work(5, 5)));
         assert_eq!(ordered.entries()[1].bytes()[0], 5);
         assert_eq!(ordered.entries()[2].bytes()[0], 2);
+    }
+
+    #[test]
+    fn source_controller_construction_cursor_replays_common_consumer_tail() {
+        let work = |x: i32, y: i32, priority: i16| {
+            let mut bytes = [0_u8; 32];
+            bytes[4..8].copy_from_slice(&x.to_le_bytes());
+            bytes[0x0c..0x10].copy_from_slice(&y.to_le_bytes());
+            bytes[0x1c..0x1e].copy_from_slice(&priority.to_le_bytes());
+            SourceControllerCityConstructionWork::from_bytes(bytes)
+        };
+        let mut queue = SourceControllerCityConstructionQueue::default();
+        assert!(queue.insert(work(10, 20, 2)));
+        assert!(queue.insert(work(-4, 7, 5)));
+
+        let mut cursor = SourceControllerCityConstructionCursor {
+            work_index: 0,
+            scan_x: 99,
+            scan_y: 98,
+            remaining: 97,
+            baseline_x: 96,
+            baseline_y: 95,
+        };
+        assert!(!cursor.advance_after_record(&queue));
+        assert_eq!(
+            cursor,
+            SourceControllerCityConstructionCursor {
+                work_index: 1,
+                scan_x: -4,
+                scan_y: 7,
+                remaining: 5,
+                baseline_x: -4,
+                baseline_y: 7,
+            }
+        );
+
+        assert!(cursor.advance_after_record(&queue));
+        assert_eq!(cursor.work_index, 2);
     }
 
     #[test]

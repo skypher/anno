@@ -255,7 +255,9 @@ use std::path::Path;
 ///       `FUN_00455a20` route program and cursor.
 /// v136: player controllers retain `FUN_00417aa0` state-seven construction
 ///       work queues.
-pub const SAVE_VERSION: u32 = 136;
+/// v137: player controllers retain the `+0x1d14` construction-consumer
+///       cursor and its live scan state.
+pub const SAVE_VERSION: u32 = 137;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -269,7 +271,7 @@ pub const SAVE_VERSION: u32 = 136;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 136;
+pub const MIN_LOADABLE_VERSION: u32 = 137;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -911,6 +913,15 @@ mod tests {
             island_search_minimum_area: 300,
             island_search_deferred_requirement: Some(0x31),
             island_search_retry_at_ticks: Some(6_000),
+            source_city_construction_cursor:
+                crate::simulation::SourceControllerCityConstructionCursor {
+                    work_index: 3,
+                    scan_x: -4,
+                    scan_y: 7,
+                    remaining: 5,
+                    baseline_x: -4,
+                    baseline_y: 7,
+                },
             active_city_owner: Some(2),
             active_city_slot: Some(3),
             selected_city_active: false,
@@ -1505,6 +1516,15 @@ mod tests {
                 island_search_minimum_area: 300,
                 island_search_deferred_requirement: Some(0x31),
                 island_search_retry_at_ticks: Some(6_000),
+                source_city_construction_cursor:
+                    crate::simulation::SourceControllerCityConstructionCursor {
+                        work_index: 3,
+                        scan_x: -4,
+                        scan_y: 7,
+                        remaining: 5,
+                        baseline_x: -4,
+                        baseline_y: 7,
+                    },
                 active_city_owner: Some(2),
                 active_city_slot: Some(3),
                 selected_city_active: false,
