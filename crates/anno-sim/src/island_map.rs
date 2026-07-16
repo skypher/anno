@@ -48,7 +48,7 @@ struct SourceMapKindCell {
 /// One six-word candidate record produced by `FUN_00415af0` for the source
 /// controller's state-two city search. Bounds are local-cell half-open
 /// intervals; `area` is the source record's accumulated horizontal length.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceControllerCityRectangle {
     pub x0: u16,
     pub y0: u16,
