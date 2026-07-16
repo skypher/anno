@@ -247,7 +247,9 @@ use std::path::Path;
 ///       arrival figure, target island, and action budget.
 /// v132: source cities retain their allocation tile and `+0x1e0` readiness
 ///       tick; controller arrivals retain the state-three target tile.
-pub const SAVE_VERSION: u32 = 132;
+/// v133: scenario city `+0x19` stores its island-local city-pointer slot,
+///       separately from city owner `+0x1a`.
+pub const SAVE_VERSION: u32 = 133;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -261,7 +263,7 @@ pub const SAVE_VERSION: u32 = 132;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 132;
+pub const MIN_LOADABLE_VERSION: u32 = 133;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";

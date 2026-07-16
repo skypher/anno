@@ -723,9 +723,9 @@ impl SourceCityTable {
 
 /// Build the source fixed city-record pool from scenario STADT4 records.
 /// `FUN_00480370` indexes live island map cells using the record's island
-/// table id, so this retains `Island::number`; STADT4's owner slot supplies
-/// both its city owner and the scenario map-owner encoding used for the
-/// kind-13 anchor predicate.
+/// table id, so this retains `Island::number`. Each parsed island has one
+/// STADT4 city, which occupies local city-pointer slot zero at `+0x19`;
+/// STADT4's owner slot belongs only in the city `+0x1a` player field.
 pub fn source_cities_from_scenario(szs: &SzsFile) -> SourceCityTable {
     let mut cities = SourceCityTable::default();
     for island in &szs.islands {
@@ -734,7 +734,7 @@ pub fn source_cities_from_scenario(szs: &SzsFile) -> SourceCityTable {
         };
         if !cities.insert_next(SourceCityRecord {
             island_id: island.number,
-            source_owner: city.owner_slot,
+            source_owner: 0,
             owner_slot: city.owner_slot,
             phase: 0,
             tier_population: city.tier_population,
