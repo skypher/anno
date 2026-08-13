@@ -95,7 +95,9 @@ impl SourceKind13Location {
         let state = self.state_byte();
         let flags = self.lifecycle_flags;
         match target_group {
-            0 => flags & 4 != 0 || state & 0x80 != 0,
+            // `FUN_0047bfa0` case 0 reads byte `+0x09 & 4`, i.e. the u16's
+            // bit 0x400 (a neighbouring kind-8 object), not byte `+0x08 & 4`.
+            0 => flags & 0x0400 != 0 || state & 0x80 != 0,
             1 => state & 0x80 != 0 && flags & 0x000c != 0,
             2 => {
                 state & 0x80 != 0
@@ -151,20 +153,25 @@ impl SourceKind13Location {
         let lifecycle_low = self.lifecycle_flags as u8;
         let aggregate_satisfaction = inputs.overall_satisfaction;
 
+        // `FUN_0047b410`: when the record is not yet matured (`state & 0x80 == 0`)
+        // and byte `+0x09` bit 2 (`lifecycle_flags & 0x400`, set only by a
+        // neighbouring kind-8 object) is clear, the source `goto`s the decay
+        // path with a zero source-satisfaction, bypassing the growth gate.
+        let mut skip_growth = false;
         let (current_satisfaction, source_satisfaction) = if state & 0x80 == 0 {
-            (
-                if group == 0 { group_satisfaction } else { 0 },
-                if lifecycle_low & 4 == 0 {
-                    0
-                } else {
-                    aggregate_satisfaction
-                },
-            )
+            let current = if group == 0 { group_satisfaction } else { 0 };
+            if self.lifecycle_flags & 0x0400 == 0 {
+                skip_growth = true;
+                (current, 0)
+            } else {
+                (current, aggregate_satisfaction)
+            }
         } else {
             (group_satisfaction, aggregate_satisfaction)
         };
 
-        if aggregate_satisfaction > 0x57
+        if !skip_growth
+            && aggregate_satisfaction > 0x57
             && current_satisfaction > 0x6b
             && state & 0x40 != 0
             && lifecycle_low & 3 == 0
@@ -209,14 +216,26 @@ impl SourceKind13Location {
 }
 
 fn source_kind13_linear_curve(index: u8, pieces: &[(u8, u8, i32, i32)]) -> u8 {
+    // `FUN_00403370` fills each segment's half-open ramp `[start, end)` and then
+    // writes index `end` with the exact terminal. Because the segments run in
+    // source order, a shared boundary (one segment's `end` == the next
+    // segment's `start`) is overwritten by the later segment's exact initial
+    // value, not the earlier segment's truncated ramp. Select the segment whose
+    // half-open ramp covers `index`; the final endpoint falls through to the
+    // last segment's terminal.
     for &(start, end, initial, terminal) in pieces {
-        if index > end {
+        if index < start || index >= end {
             continue;
         }
         let span = i32::from(end) - i32::from(start);
         let step = (terminal - initial) * 0x100 / span;
         let fixed = initial * 0x100 + (i32::from(index) - i32::from(start)) * step;
         return (fixed >> 8).clamp(0, 0xff) as u8;
+    }
+    if let Some(&(_, end, _, terminal)) = pieces.last() {
+        if index == end {
+            return terminal.clamp(0, 0xff) as u8;
+        }
     }
     0
 }
@@ -3912,7 +3931,7 @@ mod tests {
             lifecycle_flags: 0,
         };
         assert!(SourceKind13Location {
-            lifecycle_flags: 4,
+            lifecycle_flags: 0x0400,
             ..base
         }
         .source_transition_active_for_group(0));
