@@ -819,10 +819,19 @@ impl Ship {
         self.heading_byte / 2
     }
 
-    /// Eight raw SHIP4 slots at `0x132 + 8i` consumed by the loader loop at
-    /// `FUN_0045f9b2`. It expands these records into the category-1 shared
-    /// state at `+0x1f4`; `FUN_00458e60` later tests the resulting low-byte
-    /// item IDs while deciding whether a category-6 figure may target it.
+    /// Eight raw SHIP4 slots at `0x132 + 8i` (spanning `0x132..0x172`, before
+    /// the cargo block at `0x175`). These feed the category-6 combat-selection
+    /// path resolved by `resolve_ship_kind6_policy_slots`; the runtime consumer
+    /// is `FUN_00458e60`, which tests the low-byte item IDs while deciding
+    /// whether a category-6 figure may target the ship.
+    ///
+    /// The exact disk offset is NOT independently confirmed against a SHIP4
+    /// disk-record loader in the decompiled dump (the load path that expands
+    /// these into runtime state is not present in `1602_exe.c`), and the field
+    /// is all-zero in every shipped scenario, so it has no observable effect
+    /// today. `0x132` is retained because it is the only pre-cargo placement:
+    /// `0x174` (an earlier speculative alternative) would span `0x174..0x1b4`
+    /// and collide byte-for-byte with the cargo slots at `0x175`.
     pub fn source_kind6_policy_raw_slots(&self) -> [u64; 8] {
         std::array::from_fn(|index| {
             let offset = 0x132 + index * 8;
