@@ -250,12 +250,36 @@ Original read at clock 255 (correct stride), vs the same scenario run headless:
   native (50k), pirate (5k) match **exactly**, and the runtime state bytes
   match the scenario faction types. The human matches (10008 vs 10000; the
   on-screen counter agreed, confirming the read).
-- **The only divergence is the AI players** (slots 1, 3): the original's AI is
-  actively building and paying upkeep (gold already drawn down to 6831 / 6115
-  by clock 255), while the Rust AI controller is an acknowledged
-  work-in-progress and its decisions are RNG-gated, so its spending differs.
-  This is expected, not a scenario/economy bug.
+- **AI players diverge** (slots 1, 3): the original's AI is actively building
+  and paying upkeep (gold already drawn down to 6831 / 6115 by clock 255),
+  while the Rust AI controller is an acknowledged work-in-progress and its
+  decisions are RNG-gated. Expected.
 
 The initial wrong-stride read (which showed non-human slots at 0 / the trader
 at a spurious 10979) was a reader bug, not an engine difference — corrected in
 `econ_snapshot.py` / `winedbg_snapshot.py`.
+
+#### Confirmed finding: the human economy *trajectory* diverges
+
+The **initial** human economy matches, but the trajectory does not:
+
+| clock | original human gold | Rust headless human gold |
+|--|--|--|
+| 0 | 10000 | 10000 |
+| 255 | **10008** | ~9850 (interp.) |
+| 640 | **10024** | (declining) |
+
+The original's human city is net-flat/slightly-positive (two snapshots, both
+~10000+), while the Rust city runs a **deficit** and declines (10000 → 9928 →
+9855 → 9827 over clocks 0–300). Root cause is **not** the cost side:
+`FUN_0047f6b0` gates military upkeep on `state==0`, which for the human adds it
+in both engines (the gate only spares AI). It is the **income** side, driven by
+**population**: the Rust city loses population fast (Exile total 570 → 483 in
+30 s) because `population.rs` uses the documented consumption/satisfaction
+*approximation* (empirical `CONSUMPTION_PER_100` + average satisfaction) instead
+of the source's weight-accumulator + weighted-sum satisfaction (`FUN_0047f8a0`,
+see the economy audit). Unsatisfied citizens emigrate, income falls, gold
+declines. **Next fidelity step:** port the exact consumption/satisfaction model
+so the stable city stays stable — validated directionally against the
+original's flat human gold. (Exact population parity still needs RNG-seed
+pinning; the *sign* of the trajectory is the checkable signal today.)
