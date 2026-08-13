@@ -2816,9 +2816,11 @@ fn source_kind4_candidate_score(
         attacker_ratio.min(0x100) as usize,
     ));
     if candidate_metric <= target_shot_radius {
-        let retaliation_ratio = target_strength * 128 / attacker_max_energy;
-        let retaliation_index = retaliation_ratio * retaliation_ratio
-            / u32::from(attacker_definition.source_runtime_hit_points());
+        // `FUN_00454250` (decompiled/1602_exe.c:58463-58471): the retaliation
+        // curve is indexed by the plain linear ratio `(target_strength << 7) /
+        // attacker_energy_cap`, clamped at 0x100. The source neither squares
+        // this ratio nor divides by the attacker's hit points.
+        let retaliation_index = target_strength * 128 / attacker_max_energy;
         score += u32::from(source_kind4_curve_retaliation(
             retaliation_index.min(0x100) as usize,
         ));
@@ -2956,9 +2958,11 @@ fn source_common_candidate_score(
         attacker_ratio.min(0x100) as usize,
     ));
     if candidate_metric <= target_shot_radius {
-        let retaliation_ratio = target_strength * 128 / attacker_max_energy;
-        let retaliation_index = retaliation_ratio * retaliation_ratio
-            / u32::from(attacker_definition.runtime_hit_points);
+        // `FUN_00454250` (decompiled/1602_exe.c:58463-58471): the retaliation
+        // curve is indexed by the plain linear ratio `(target_strength << 7) /
+        // attacker_energy_cap`, clamped at 0x100. The source neither squares
+        // this ratio nor divides by the attacker's hit points.
+        let retaliation_index = target_strength * 128 / attacker_max_energy;
         score += u32::from(source_kind4_curve_retaliation(
             retaliation_index.min(0x100) as usize,
         ));
@@ -3338,17 +3342,15 @@ pub fn advance_source_kind15_figure(
     if !figure.active {
         return true;
     }
-
-    let available_time = dt_ms as f32 * SOURCE_GENERIC_FIGURE_TIME_SCALE;
-    let remaining_time = figure.remaining_work_time / figure.source_step_amount;
-    if available_time < remaining_time {
-        figure.remaining_work_time -= available_time * figure.source_step_amount;
-        return false;
+    if advance_source_generic_work_time(
+        &mut figure.remaining_work_time,
+        figure.source_step_amount,
+        dt_ms,
+    ) {
+        figure.active = false;
+        return true;
     }
-
-    figure.remaining_work_time = 0.0;
-    figure.active = false;
-    true
+    false
 }
 
 /// Advance a kind-14 visual through the same generic work-time consumption
@@ -3360,15 +3362,47 @@ pub fn advance_source_kind14_figure(
     if !figure.active {
         return true;
     }
-    let available_time = dt_ms as f32 * SOURCE_GENERIC_FIGURE_TIME_SCALE;
-    let remaining_time = figure.remaining_work_time / figure.source_step_amount;
-    if available_time < remaining_time {
-        figure.remaining_work_time -= available_time * figure.source_step_amount;
-        return false;
+    if advance_source_generic_work_time(
+        &mut figure.remaining_work_time,
+        figure.source_step_amount,
+        dt_ms,
+    ) {
+        figure.active = false;
+        return true;
     }
-    figure.remaining_work_time = 0.0;
-    figure.active = false;
-    true
+    false
+}
+
+/// Consume one generic figure's authored work time exactly as
+/// `FUN_00451890` does (decompiled/1602_exe.c:56624-56712). The source
+/// subtracts `available_time * step` from the record's remaining `Worktime`,
+/// clamped to what remains, and removes the live record only once that amount
+/// reaches zero. Returns `true` when the record reaches expiry this update.
+///
+/// The subtraction is truncating, not a `remaining / step` comparison: at an
+/// exact-boundary update the residue `remaining - available_time * step` can
+/// round to a positive sub-ULP value, so the source keeps the figure alive for
+/// one more update rather than removing it early. Reproducing the two source
+/// branches keeps that ULP behavior bit-faithful.
+fn advance_source_generic_work_time(
+    remaining_work_time: &mut f32,
+    step_amount: f32,
+    dt_ms: u32,
+) -> bool {
+    let available_time = dt_ms as f32 * SOURCE_GENERIC_FIGURE_TIME_SCALE;
+    let consumed = available_time * step_amount;
+    if *remaining_work_time < consumed {
+        // `*pfVar15 < fVar10`: the frame would over-consume the remaining work,
+        // so the source subtracts all of it and the record reaches zero.
+        *remaining_work_time = 0.0;
+        return true;
+    }
+    *remaining_work_time -= consumed;
+    if *remaining_work_time <= 0.0 {
+        *remaining_work_time = 0.0;
+        return true;
+    }
+    false
 }
 
 /// Apply `FUN_00458ac0`'s `metric < 0x61` row filter and rank the resulting
@@ -5006,15 +5040,17 @@ mod tests {
         let engaged_warship = source_candidate(1, 0x19, 195, 17);
 
         // The raw category-6 caller strength is 6. At range 14, the shared
-        // score body yields the approach term alone for state zero and adds
-        // the source retaliation curve for the state-17 target.
+        // score body yields the approach term alone (40) for state zero. For
+        // the state-17 target the target strength is 36, so `FUN_00454250`
+        // indexes its retaliation curve at `36 * 128 / 285 = 16`, adding
+        // `curve_retaliation(16) = 30` for a total of 70.
         assert_eq!(
             source_kind6_candidate_score(&attacker, &dormant_warship, 14),
             Some(40)
         );
         assert_eq!(
             source_kind6_candidate_score(&attacker, &engaged_warship, 14),
-            Some(87)
+            Some(70)
         );
     }
 
@@ -5401,7 +5437,17 @@ mod tests {
 
         assert!(!advance_source_kind15_figure(&mut figure, 100));
         assert!((figure.remaining_work_time - 0.86).abs() < f32::EPSILON);
-        assert!(advance_source_kind15_figure(&mut figure, 860));
+
+        // `FUN_00451890` subtracts `available_time * step` (0.86) from the
+        // remaining 0.86 rather than comparing `remaining / step`. In float32
+        // that leaves a positive sub-ULP residue, so the source keeps the
+        // record alive for one more update instead of removing it here.
+        assert!(!advance_source_kind15_figure(&mut figure, 860));
+        assert!(figure.active);
+        assert!(figure.remaining_work_time > 0.0 && figure.remaining_work_time < 0.02);
+
+        // The following update over-consumes the residue and removes the record.
+        assert!(advance_source_kind15_figure(&mut figure, 100));
         assert!(!figure.active);
         assert_eq!(figure.remaining_work_time, 0.0);
     }
@@ -5493,7 +5539,7 @@ mod tests {
                 SourceKind6RankedCandidate {
                     target: engaged_warship,
                     metric: 8,
-                    score: 87,
+                    score: 70,
                 },
                 SourceKind6RankedCandidate {
                     target: dormant_warship,
