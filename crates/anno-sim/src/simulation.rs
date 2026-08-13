@@ -3160,7 +3160,15 @@ impl Simulation {
         self.autosave_timer_ms += real_dt_ms;
     }
 
-    /// Single simulation step (max 200ms).
+    /// Single simulation step (max 200ms), matching one `FUN_00489670` slice.
+    ///
+    /// NOTE: the dispatch order below does not yet reproduce `FUN_00489670`'s
+    /// order for the shared-RNG subsystems — resource/deferred-combat currently
+    /// run ahead of city/kind13, and several source RNG draws are unported — so
+    /// the `rand()` stream is not bit-exact against the original. This is a
+    /// known, documented gap; see `docs/rng-dispatch-order.md` for the full
+    /// slot-by-slot map and the roadmap. Do not reorder piecemeal: the fix is
+    /// to port the missing draws first, then dispatch in strict source order.
     fn step(&mut self, dt_ms: u32) {
         self.advance_source_clock(dt_ms);
         self.tick_source_resource_environment(dt_ms);

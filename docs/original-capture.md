@@ -171,3 +171,21 @@ Two constraints, both real:
    RNG-dependent state diverges from a headless Rust run. Compare the
    deterministic early-game economy/population instead, where both sides
    evolve from the same fixed scenario start.
+
+### First cross-engine agreement
+
+Running the Rust headless on the *same* scenario the original's tutorial loads:
+
+```sh
+cargo run -q -p anno-game --bin headless -- \
+    --scenario "extracted/Szenes/Tutorial0.szs" --ticks 30 --dump-every 10
+```
+
+reports player 0 **gold = 50000** at tick 0 — identical to the value winedbg
+read out of the original's live `DAT_005b7680+4`. Both engines start from the
+same economy state. The gold then stays flat through tick 30 (no buildings, no
+population yet), which confirms the deterministic early-game economy is quiet
+until something is built — so a *discriminating* dynamic comparison needs
+automated building placement in both engines, not just an idle idle-start diff.
+(Full RNG-word parity is a separate, longer road — see
+`docs/rng-dispatch-order.md`.)
