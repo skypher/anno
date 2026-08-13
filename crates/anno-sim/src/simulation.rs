@@ -3431,25 +3431,33 @@ impl Simulation {
         let mut advances = Vec::new();
         self.source_combat_terminal_slices.retain_mut(|slice| {
             let elapsed = dt_ms as f32 * combat::SOURCE_GENERIC_FIGURE_TIME_SCALE;
-            let motion_time = if slice.scalar_speed > 0.0 {
-                elapsed.min(slice.remaining_distance / slice.scalar_speed)
+            // `FUN_00451890` motion prefix: `fVar10 = elapsed * speed` is the
+            // distance step; when the remaining distance is smaller the clamp
+            // takes `fVar10 = *pfVar15` exactly (the remaining distance itself),
+            // so `*pfVar15 - fVar10` reaches exactly `0.0` on the tick that
+            // exhausts it. The record is freed only when that difference is
+            // `<= 0` (`*pfVar15 <= _DAT_00496318`), never a tick early: a
+            // sub-ULP residue left after a non-clamped step keeps the record
+            // alive for the extra tick the source spends draining it.
+            let (motion_time, consumed) = if slice.scalar_speed > 0.0 {
+                let step = elapsed * slice.scalar_speed;
+                if slice.remaining_distance < step {
+                    (slice.remaining_distance / slice.scalar_speed, slice.remaining_distance)
+                } else {
+                    (elapsed, step)
+                }
             } else {
-                0.0
+                (0.0, 0.0)
             };
-            let consumed = motion_time * slice.scalar_speed;
             advances.push((
                 slice.target,
                 motion_time,
+                consumed,
                 slice.velocity_x,
                 slice.velocity_y,
                 slice.velocity_z,
             ));
-            // The record is freed once its remaining amount is exhausted.
-            // Consuming the distance across successive ticks accumulates a
-            // sub-ULP residue (the per-tick `elapsed` clamp falls a hair short
-            // of `remaining / scalar_speed`), so admit an effectively-exhausted
-            // remainder rather than carrying the record for one extra tick.
-            if slice.remaining_distance <= consumed + f32::EPSILON {
+            if slice.remaining_distance <= consumed {
                 completed.push(slice.target);
                 false
             } else {
@@ -3457,16 +3465,17 @@ impl Simulation {
                 true
             }
         });
-        for (target, motion_time, velocity_x, velocity_y, velocity_z) in advances {
+        for (target, motion_time, consumed, velocity_x, velocity_y, velocity_z) in advances {
             if let SourceCombatTerminalSliceTarget::DynamicFigure(index) = target {
                 if let Some(figure) = self.source_dynamic_combat_figures.get_mut(index) {
                     figure.position.0 += motion_time * velocity_x;
                     figure.position.1 += motion_time * velocity_y;
                     figure.position_z += motion_time * velocity_z;
+                    // The figure's `+0x14` remaining distance is the same
+                    // `*pfVar15` field the slice mirrors; decrement it by the
+                    // identical clamped `fVar10` so the two stay bit-synced.
                     figure.source_motion.remaining_distance =
-                        (figure.source_motion.remaining_distance
-                            - motion_time * figure.source_motion.scalar_speed)
-                            .max(0.0);
+                        (figure.source_motion.remaining_distance - consumed).max(0.0);
                 }
             }
         }
@@ -13832,6 +13841,16 @@ mod tests {
         sim.tick_source_combat_terminal_slices(19);
         assert!(sim.source_dynamic_combat_figures[0].active);
         assert!((sim.source_dynamic_combat_figures[0].position.0 - 1.2375).abs() < f32::EPSILON);
+        // Tick two consumes a full `elapsed * speed` step (0.0125) without
+        // clamping, because the remaining distance (0.012500003) is a hair
+        // larger. Per `FUN_00451890` the record survives with that sub-ULP
+        // residue even though the figure has reached its destination cell;
+        // `*pfVar15 <= _DAT_00496318` is not yet satisfied.
+        sim.tick_source_combat_terminal_slices(1);
+        assert!(sim.source_dynamic_combat_figures[0].active);
+        assert!((sim.source_dynamic_combat_figures[0].position.0 - 1.25).abs() < f32::EPSILON);
+        assert!(!sim.source_combat_terminal_slices.is_empty());
+        // Tick three clamps the remaining residue to zero and frees the record.
         sim.tick_source_combat_terminal_slices(1);
         assert!(!sim.source_dynamic_combat_figures[0].active);
         assert!((sim.source_dynamic_combat_figures[0].position.0 - 1.25).abs() < f32::EPSILON);
