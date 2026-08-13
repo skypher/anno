@@ -573,8 +573,12 @@ impl SourceMapCellState {
 
     /// Complete one executed `FUN_0047daf0` root branch. Idle and
     /// storage-blocked roots receive its fixed 11-phase retry; an active root
-    /// reloads `ceil(Interval × activity / 128)` from definition offset
-    /// `+0x3a`. The root records that interval in source u16 `+0x12`; once
+    /// reloads `(Interval × activity) / 128` from definition offset `+0x3a`.
+    /// The executable computes this with the MSVC signed-divide-by-128
+    /// idiom `(x + (x >> 0x1f & 0x7f)) >> 7` (`1602_exe.c:89930`), which
+    /// truncates toward zero, i.e. floors for the always-nonnegative
+    /// `Interval × activity`. The root records that interval in source u16
+    /// `+0x12`; once
     /// the accumulator exceeds 239, both it and the produced-stock `+0x10`
     /// are halved.
     pub fn complete_source_scheduler_run(&mut self) {
@@ -587,8 +591,7 @@ impl SourceMapCellState {
         self.scheduler_cooldown = if self.activity < 64 {
             11
         } else {
-            ((u32::from(self.source_scheduler_interval) * u32::from(self.activity) + 127) >> 7)
-                as u16
+            ((u32::from(self.source_scheduler_interval) * u32::from(self.activity)) >> 7) as u16
         };
         self.source_production_time = self
             .source_production_time
@@ -1018,8 +1021,10 @@ mod tests {
         state.source_scheduler_interval = 5;
         state.activity = 64;
         state.complete_source_scheduler_run();
-        assert_eq!(state.scheduler_cooldown, 3);
-        assert_eq!(state.source_production_time, 14);
+        // floor(Interval * activity / 128) = floor(5 * 64 / 128) = floor(2.5) = 2
+        // (`FUN_0047daf0` truncates toward zero at `1602_exe.c:89930`).
+        assert_eq!(state.scheduler_cooldown, 2);
+        assert_eq!(state.source_production_time, 13);
 
         state.activity = 128;
         state.block_source_scheduler();

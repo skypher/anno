@@ -90,8 +90,13 @@ pub fn tick_building(building: &mut BuildingInstance, def: &BuildingDef, dt_ms: 
 
 /// Calculate production efficiency (0-128 scale).
 ///
-/// Efficiency = min(input1_stock / input1_capacity, input2_stock / input2_capacity) * 128
-/// If a building has no inputs, efficiency is always 128 (100%).
+/// `FUN_0047daf0` derives the activity ratio from each input's *per-cycle
+/// consumption amount*, not from the output storage cap: raw material divides
+/// by `Rohmenge` (definition offset `0x26`, loaded as `input_1_rate`) at
+/// `1602_exe.c:89915`, and work material divides by `Workmenge` (offset
+/// `0x28`, loaded as `input_2_rate`) at `1602_exe.c:89921`. Each ratio is
+/// `input_stock * 128 / consumption_amount`, individually capped at 128, then
+/// combined with `min`. A building with no inputs is always 128 (100%).
 fn calculate_efficiency(building: &BuildingInstance, def: &BuildingDef) -> u8 {
     if def.input_1_rate == 0 && def.input_2_rate == 0 {
         return 128; // No inputs needed (raw resource)
@@ -99,13 +104,13 @@ fn calculate_efficiency(building: &BuildingInstance, def: &BuildingDef) -> u8 {
 
     let mut eff = 128u32;
 
-    if def.input_1_rate > 0 && def.storage_capacity > 0 {
-        let ratio = (building.input_1_stock as u32 * 128) / def.storage_capacity as u32;
+    if def.input_1_rate > 0 {
+        let ratio = (building.input_1_stock as u32 * 128) / def.input_1_rate as u32;
         eff = eff.min(ratio);
     }
 
-    if def.input_2_rate > 0 && def.storage_capacity > 0 {
-        let ratio = (building.input_2_stock as u32 * 128) / def.storage_capacity as u32;
+    if def.input_2_rate > 0 {
+        let ratio = (building.input_2_stock as u32 * 128) / def.input_2_rate as u32;
         eff = eff.min(ratio);
     }
 
