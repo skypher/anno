@@ -229,25 +229,33 @@ Even so, treat each attach as one-shot; relaunch if a read returns
 
 #### First populated-scenario result (Exile)
 
-| slot | state | scenario gold | Rust headless | original @clock 640 |
-|--|--|--|--|--|
-| 0 human | 0x00 | 10000 | 10000 | **10024** |
-| 1 AI (inactive) | 0x0c | 10000 | 10000 | 0 |
-| 2 AI | 0x0c | 10000 | 10000 | 0 |
-| 3 AI (inactive) | 0x0c | 10000 | 10000 | 0 |
-| 4 trader | 0x0d | 1000000 | 1000000 | **10979** |
-| 5 native | 0x0e | 50000 | 50000 | 0 |
-| 6 pirate | 0x0b | 5000 | 5000 | 0 |
+> The player record byte stride is **0x280**, not 0xA0: the binary indexes
+> `(int*)&DAT_005b7680 + slot*0xa0`, so the byte stride is `0xa0*4`. The
+> trader's `1000000` gold write lands at `005b7680 + 4*0x280 + 4`. Slot 0 reads
+> right at any stride (offset 0); slots 1..6 need 0x280.
 
-- **The human player's economy is faithful** — original 10024 vs Rust's 10000
-  start (both ~10000; the +24 is 640 clocks of the audited income/upkeep). The
-  on-screen gold counter read 10024 too, confirming the winedbg read is real.
-- **Open finding (non-human slots).** The original's *runtime* player table
-  funds only the human (and a distinct 10979 for the trader, not its 1M
-  scenario value); AI/native/pirate read 0. The Rust headless reports the raw
-  scenario `starting_gold` for every slot (`scenario.rs:227` funds
-  unconditionally, and trader/native/pirate map to `PlayerState::Empty`). This
-  is either deferred runtime activation of non-human players in the original or
-  a Rust funding difference — it needs more RE than one snapshot supports, so
-  it is recorded here rather than "fixed" speculatively. It does **not** affect
-  the human economy comparison, which is the fidelity signal that matters.
+Original read at clock 255 (correct stride), vs the same scenario run headless:
+
+| slot | state | scenario gold | Rust headless | original @clock 255 |
+|--|--|--|--|--|
+| 0 human | 0x00 | 10000 | 10000 | **10008** ✓ |
+| 1 AI | 0x0c | 10000 | 10000 | 6831 (AI spending) |
+| 2 AI | 0x0c | 10000 | 10000 | **10000** ✓ |
+| 3 AI | 0x0c | 10000 | 10000 | 6115 (AI spending) |
+| 4 trader | 0x0d | 1000000 | 1000000 | **1000000** ✓ |
+| 5 native | 0x0e | 50000 | 50000 | **50000** ✓ |
+| 6 pirate | 0x0b | 5000 | 5000 | **5000** ✓ |
+
+- **Scenario loading + fixed-faction economy are faithful.** The trader (1M),
+  native (50k), pirate (5k) match **exactly**, and the runtime state bytes
+  match the scenario faction types. The human matches (10008 vs 10000; the
+  on-screen counter agreed, confirming the read).
+- **The only divergence is the AI players** (slots 1, 3): the original's AI is
+  actively building and paying upkeep (gold already drawn down to 6831 / 6115
+  by clock 255), while the Rust AI controller is an acknowledged
+  work-in-progress and its decisions are RNG-gated, so its spending differs.
+  This is expected, not a scenario/economy bug.
+
+The initial wrong-stride read (which showed non-human slots at 0 / the trader
+at a spurious 10979) was a reader bug, not an engine difference — corrected in
+`econ_snapshot.py` / `winedbg_snapshot.py`.

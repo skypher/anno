@@ -4,7 +4,7 @@
 Frida cannot instrument this wow64 Wine (see docs/original-capture.md), but
 Wine's own debugger `winedbg` talks through wineserver rather than
 ptrace/dlopen, so it CAN attach to the 32-bit PE and read its memory without
-crashing it. This snapshots the player-data table `DAT_005b7680` (160 B × 7
+crashing it. This snapshots the player-data table `DAT_005b7680` (0x280 B × 7
 players; the module loads at its preferred base 0x400000, no ASLR under Wine)
 and prints each player's gold (record offset +4, verified live == the on-screen
 50000 at tutorial start) and name (+8).
@@ -33,7 +33,11 @@ import sys
 import time
 
 PLAYER_TABLE = 0x005B7680
-PLAYER_STRIDE = 0xA0
+# BYTE stride is 0x280: the binary indexes `(int*)&DAT_005b7680 + slot*0xa0`,
+# i.e. 0xa0*4 bytes. (Slot 0 reads correctly at any stride since it is at
+# offset 0; slots 1..6 need 0x280 — the trader's 1M gold write _DAT_005b8084
+# is at 005b7680 + 4*0x280 + 4.)
+PLAYER_STRIDE = 0x280
 PLAYER_COUNT = 7
 GOLD_OFFSET = 0x04
 WINE = os.environ.get("WINE", os.path.expanduser("~/wine/bin/wine"))

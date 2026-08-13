@@ -25,8 +25,13 @@ WINE = os.environ.get("WINE", os.path.expanduser("~/wine/bin/wine"))
 PREFIX = os.environ.get("WINEPREFIX", os.path.expanduser("~/.wine-anno"))
 CLOCK = 0x005B6040
 PLAYER_TABLE = 0x005B7680
-STRIDE = 0xA0
+# The table is indexed in the binary as `(int*)&DAT_005b7680 + slot*0xa0`, so
+# the BYTE stride is 0xa0*4 = 0x280 (verified: the trader's gold write
+# _DAT_005b8084 = 1000000 lands at 005b7680 + 4*0x280 + 4). state at byte +0,
+# gold at byte +4, name at byte +8.
+STRIDE = 0x280
 COUNT = 7
+STATE_OFF = 0
 GOLD_OFF = 4
 
 
@@ -70,15 +75,19 @@ def main():
     if not pid:
         print("1602.exe not attachable")
         return 1
-    words = COUNT * STRIDE // 4
-    out = winedbg(
-        f"attach 0x{pid}\nx/4x 0x{CLOCK:08x}\n"
-        f"x/{words}x 0x{PLAYER_TABLE:08x}\ndetach\nquit\n"
-    )
+    # Read the clock plus each slot's state+gold word individually (2 words per
+    # slot) rather than the whole 0x1180-byte table.
+    reads = [f"x/4x 0x{CLOCK:08x}"]
+    for p in range(COUNT):
+        reads.append(f"x/2x 0x{PLAYER_TABLE + p * STRIDE:08x}")
+    out = winedbg(f"attach 0x{pid}\n" + "\n".join(reads) + "\ndetach\nquit\n")
     mem = parse_words(out)
     clock = mem.get(CLOCK)
     golds = [sgold(mem.get(PLAYER_TABLE + p * STRIDE + GOLD_OFF)) for p in range(COUNT)]
+    states = [mem.get(PLAYER_TABLE + p * STRIDE + STATE_OFF) for p in range(COUNT)]
+    states = [s & 0xFF if s is not None else None for s in states]
     print(f"clock={clock}  gold={golds}")
+    print(f"          states={['0x%02x' % s if s is not None else None for s in states]}")
     return 0
 
 
