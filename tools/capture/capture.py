@@ -6,10 +6,13 @@ pins the RNG seed, and writes the emitted JSON lines to a JSONL file whose
 schema matches the headless Rust driver
 (crates/anno-game/src/bin/headless.rs). tools/compare then diffs the two.
 
-This requires the copyrighted 1602.exe (not in this repo) and a Windows or
-Wine environment with Frida installed (`pip install frida-tools`). It is a
-scaffold: the address map in capture.js is from static analysis and the
-player-record field offsets are placeholders to be calibrated (see README).
+This requires the copyrighted 1602.exe (not in this repo) and a Windows
+Frida session (or Frida's winealbin / Windows-Python-under-Wine bridge).
+Linux frida.attach on the wow64 Wine used in docs/original-capture.md
+kills wine-preloader and never sees the PE — see tools/capture/README.md.
+It is a scaffold: the address map in capture.js is from static analysis
+and the player-record field offsets are placeholders to be calibrated
+(see README).
 
 Usage:
     # Launch the game under instrumentation and capture 3000 ticks:

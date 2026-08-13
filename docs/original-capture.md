@@ -1,12 +1,13 @@
 # Running & driving the original 1602.exe headless
 
 This documents how to run the shipping `extracted/1602.exe` headless under
-Wine, drive its menus programmatically, and where the path to a fully
-automated, instrumented run is currently blocked. It complements
+Wine and drive its menus with XTEST. Menu automation is userspace and
+unblocked. Per-tick Frida capture is still blocked on this wow64 Wine: the
+Linux Frida agent cannot inject into `wine-preloader`. It complements
 `docs/lockstep.md` (the Rust side) and `tools/capture/` (the Frida harness).
 
-Everything below runs **entirely as a normal user — no root** — except the
-two blockers noted at the end, which need root on this kind of box.
+Everything below runs as a normal user — no root. `ptrace_scope` is already
+`0` here; the Frida failure is architectural, not a permissions problem.
 
 ## Prerequisites (userspace)
 
@@ -66,37 +67,73 @@ the 800×600 window (Tutorial → Explore path):
 | Scenario tree | click **Tutorial** | 430, 316 |
 | Left column | click **New Game** | 220, 305 |
 | Tutorial submenu | click **Start Game** | 200, 487 |
-| → "Enter your name" screen | *(blocked, see below)* | — |
+| Name hall | click a **player colour flag** | red 140, 250 |
+| → in-game tutorial | | |
 
 ```sh
+# One-shot (title screen already up):
+python tools/capture/xinput.py :140 start-tutorial
+
+# Or the same clicks by hand:
 python tools/capture/xinput.py :140 click 215 315 && sleep 2
 python tools/capture/xinput.py :140 click 430 316 && sleep 2
 python tools/capture/xinput.py :140 click 220 305 && sleep 2
 python tools/capture/xinput.py :140 click 200 487 && sleep 12
+python tools/capture/xinput.py :140 flag 0
 ```
 
-Mouse navigation is reliable. Character typing into the name field also works
-(click the field first to give it focus, then `xinput.py … key <char>`).
+The name hall is `gaddata/farbwahl.gad` (`FUN_0048b590` case 7). There is no
+OK button. Clicking flag IDs `0x88CD`–`0x88D0` posts event `0x4E/0x39` with
+the colour index and starts the scenario. Synthesized Return only commits the
+name text gadget (`FUN_00409630` mode 5): it copies the buffer into
+`DAT_005b6fa0` and clears `DAT_006c304c`, then the hall stays up. Clicking
+the name field first is optional (default is "Anonymous") and actually
+*delays* flag enable, because flags stay `Nosel` while `DAT_005b1bf4 != 0`
+and that latch is cleared only when `DAT_006c304c == 0`.
 
-## Blockers (need root / deeper work)
+Mouse navigation is reliable. Character typing into the name field works
+once the field is clicked (`xinput.py … key <char>`), then `flag` to start.
 
-1. **Name-entry confirm.** The "Enter your name" dialog (field defaults to
-   "Anonymous") has **no OK button** — Enter is the only confirm. Synthesized
-   Return does **not** confirm it through any XTEST variant (main/keypad,
-   tap/hold, focused/unfocused, with/without a WM), even though Return maps
-   correctly to VK_RETURN (keycode 36, not in Wine's layout-mismatch set) and
-   the game reads keyboard via ordinary window messages (no DirectInput in the
-   decompiled source). The likely unblock is **kernel-level input**
-   (`ydotool`/uinput) — but `/dev/uinput` is root-only here — or a Wine
-   message trace (which currently breaks rendering, see above).
+Flag clicks in the 800×600 window (1024×768 GAD × 800/1024):
 
-2. **Instrumentation.** Frida injection into the wow64 Wine PE process
-   crashes it ("terminated during injection"); attach-on-spawn reaches the
-   Wine loader but the real PE runs in a separate child process. `winedbg`
-   (Wine's native debugger) does **not** crash the game and is the viable
-   non-destructive path, but needs the Wine internal PID and is clunky for
-   high-frequency per-tick capture. See `tools/capture/README.md`.
+| Colour | Coord |
+|---|---|
+| 0 red | 140, 250 |
+| 1 blue | 273, 357 |
+| 2 white | 541, 359 |
+| 3 yellow | 700, 313 |
 
-Both blockers are tractable with root access (uinput input + unrestricted
-Wine tracing / a true 32-bit Wine for cleaner Frida). Until then, the Rust
-side of the lockstep harness is fully usable on its own (`docs/lockstep.md`).
+## Frida on this Wine (still blocked)
+
+`tools/capture/capture.py` is written for a Windows Frida session (or Frida's
+Wine/`winealbin` bridge). Linux `pip install frida-tools` against this
+Kron4ek `amd64-wow64` prefix does **not** instrument `1602.exe`. Verified
+with Frida 17.17.0, Wine 11.15, `ptrace_scope=0`:
+
+| Attempt | Result |
+|---|---|
+| `frida.attach(<wine-preloader pid>)` on `explorer.exe` / `start.exe` | `ProcessNotRespondingError: refused to load frida-agent, or terminated during injection`. The target PID is gone afterwards. |
+| `frida.spawn(['./1602.exe'])` | `ExecutableNotSupportedError: unable to parse executable` — Linux spawn only understands ELF. |
+| `frida.spawn([wine, './1602.exe'])` | Attach succeeds, but `Process.arch` is `x64 linux` and the module list is `wine`, `libc.so.6`, `ld-linux-x86-64.so.2`, … The 32-bit PE then starts as a **separate** `wine-preloader` child. Hooks never land on `FUN_00489670`. |
+
+Why: `1602.exe` is PE32. This Wine has `x86_64-unix` + `i386-windows` and
+**no** `i386-unix`, so the game runs as 32-bit PE code inside a 64-bit
+`wine-preloader`. Linux Frida injects a 64-bit ELF `frida-agent.so` via
+ptrace/`dlopen`. That is the wrong injector: wine-preloader owns the
+address space, syscalls, and signals, so the agent kills the process
+(same class as [frida#3339](https://github.com/frida/frida/issues/3339)).
+Root would not change that. A classic multiarch 32-bit Wine is a different
+process shape and still often fatal for the Linux agent.
+
+Paths that do not crash the game:
+
+- **`winedbg`** — Wine's own debugger talks through wineserver, not
+  ptrace+`dlopen`. Viable but clunky for per-tick dumps; needs the Wine
+  internal PID.
+- **Windows-side Frida** — `frida-server.exe` / gadget DLL injected as a
+  PE (the README's "Windows Python + Frida / winealbin" path). That is a
+  different tool than Linux `frida.attach(pid)`.
+
+Until one of those is wired into `capture.py`, the Rust side of the
+lockstep harness is fully usable on its own (`docs/lockstep.md`). See
+`tools/capture/README.md`.

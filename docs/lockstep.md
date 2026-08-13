@@ -45,7 +45,9 @@ cargo run -p anno-game --bin headless -- \
     --scenario extracted/szenes/game00.szs \
     --seed 1 --dt 100 --ticks 3000 --dump-every 10 --out rust.jsonl
 
-# 2. Original side (needs 1602.exe + Frida; see tools/capture/README.md):
+# 2. Original side (needs 1602.exe + a Windows-side Frida; Linux
+#    frida.attach on wow64 Wine kills wine-preloader — see
+#    tools/capture/README.md and docs/original-capture.md):
 python tools/capture/capture.py --exe 'C:/Anno1602/1602.exe' \
     --seed 1 --ticks 3000 --dump-every 10 --out original.jsonl
 

@@ -20,9 +20,15 @@ workflow described in `docs/lockstep.md`.
 ## Requirements
 
 - The copyrighted `1602.exe` (not in this repo).
-- Windows, or Linux + Wine with a Windows Python + Frida, or Frida's
-  Wine/`winealbin` bridge.
-- `pip install frida-tools`.
+- **Windows Frida**, or Linux + Wine with a **Windows** Python + Frida, or
+  Frida's Wine/`winealbin` gadget (a PE agent). Linux `frida.attach` on
+  this wow64 Wine kills `wine-preloader` — see below.
+- `pip install frida-tools` (on the Windows side, or for the winealbin
+  bridge).
+
+Menu driving under Wine+Xvfb does **not** need Frida:
+`python tools/capture/xinput.py :140 start-tutorial`. That path is
+documented in `docs/original-capture.md`.
 
 ## Usage
 
@@ -80,6 +86,28 @@ The **RNG word** (`holdrand`) is CRT-build-specific and not in the address
 map. If you locate it (scan for the LCG state after a known number of
 `rand()` calls), pass `--holdrand 0x...`; otherwise the RNG column is
 reported as `-1` and only tick-count and scheduler-trace comparison apply.
+
+## Linux Frida + wow64 Wine
+
+`capture.py` calls `frida.spawn` / `frida.attach` as a **Linux** session.
+That does not reach the 32-bit PE on the Kron4ek `amd64-wow64` Wine used
+in `docs/original-capture.md` (Wine 11.15, Frida 17.17.0, `ptrace_scope=0`):
+
+- Attach to a live `wine-preloader` (`explorer.exe`, `start.exe`,
+  `1602.exe`) raises `ProcessNotRespondingError` ("terminated during
+  injection") and **kills** the target. wine-preloader is not a normal
+  ELF process; ptrace+`dlopen` of 64-bit `frida-agent.so` is fatal
+  ([frida#3339](https://github.com/frida/frida/issues/3339)).
+- `frida.spawn(['1602.exe'])` fails: Linux Frida cannot parse a PE
+  (`ExecutableNotSupportedError`).
+- `frida.spawn([wine, '1602.exe'])` attaches to the Unix `wine` stub
+  (`Process.arch == x64 linux`, modules are `wine`/`libc`). The real PE
+  is a later `wine-preloader` child, so `FUN_00489670` is never hooked.
+
+This Wine has `x86_64-unix` + `i386-windows` and no `i386-unix`. Root
+does not fix the injector. Use a Windows Frida / winealbin gadget, or
+`winedbg` through wineserver. Menu automation is independent and already
+works via `xinput.py`.
 
 ## Trust boundary
 
