@@ -291,3 +291,60 @@ satisfaction to full still bled gold, while excluding terrain maintenance fixed
 it even with population unchanged. Population *does* still decline in Exile — a
 separate production→warehouse food-delivery gap — but that is RNG-gated and does
 not drive the gold trajectory.)
+
+### Static config tables read live (no scenario needed)
+
+The `.cod`-compiled tables populate during startup, so a winedbg read **at the
+title screen** recovers them bit-exactly — no menu driving, no timing. Read
+2026-08-14 (`BGRUPPE` table at `DAT_0061fa40`, 0x48-byte records ×5):
+
+| field | values | meaning |
+|--|--|--|
+| `+0x00` | 0, 60, 90, 99, 107 | `Prozent × 128/100` fulfillment target |
+| `+0x04` | 0, 2, 4, 5, 6 | demanded-ware count (post-pass `FUN_00462d50`) |
+| `+0x08` | 0, 120, 360, 495, 642 | target × count — `FUN_0047f3b0` scale |
+| `+0x0c` | 128, 384, 960, 1600, 2560 | `Maxwohn << 6` |
+| `+0x10` | 7, 8, 11, 12, 13 | `Steuer` per-capita income (confirms Rust) |
+| `+0x18..` | see below | 8 ware demand weights (NAHRUNG..SCHMUCK) |
+
+Ware weights (`Ware:` floats stored ×8192 by the parser, `/600` at load; so
+`0.2/0.5/0.6/0.7/0.8 → 2/6/8/9/10`): settler `[ALKOHOL 6, STOFFE 8]`; citizen
+`[TABAKW 6, GEWUERZE 6, ALKOHOL 8, STOFFE 9]`; merchant `[8, 8, KAKAO 9, 9,
+10]`; aristocrat `[8, 8, 8, ALKOHOL 10, KLEIDUNG 6, SCHMUCK 2]`. The global
+food rate `DAT_0049af2c = ftol(1.3 × 8192)/600 = 17` per resident per cycle —
+at the 15/16-decay equilibrium that pulls 1.3 t per 100 residents per minute,
+matching the cod comment "Verbrauch je 100 Einwohner". The satisfaction curve
+`DAT_0055e780` matched the Rust port at every sampled entry (including
+interpolated ones: `[0x20]=81`, `[0x40]=86`, `[0x60]=99`, `[0xd0]=426`).
+
+### Exact consumption engine: bit-exact cross-engine agreement
+
+With the `FUN_0047f8a0` demand cycle ported
+(`SourceCityRecord::source_ware_economy_cycle`), the original's live Exile city
+records (read via winedbg at clock 0, one cycle in) match the Rust engine's
+hand-computed accumulators **bit-exactly**: the human city (156 settlers) shows
+`demand = [2486, 0, 0, 0, 877, 1170, 0, 0]` = `⌊17·156·15/16⌋ /
+⌊6·156·15/16⌋ / ⌊8·156·15/16⌋` in exactly the ported slot layout
+(NAHRUNG/ALKOHOL/STOFFE), supplies 0, fulfillment bytes 0x80, tax bytes 0x80.
+
+### Remaining divergence: initial city stores (KONTOR2)
+
+The original's Exile cities **start stocked**: the human city holds NAHRUNG
+800, TABAKW 800, ALKOHOL 509, STOFFE 509, WERKZEUG 1127, HOLZ 982, ZIEGEL 982
+(1/32-t units) at clock 0, while the Rust loader creates every Kontor empty —
+so the exact engine correctly starves the Rust city (settler satisfaction 0)
+and the population approximation drains it. The authored stocks live in the
+scenario's `KONTOR2` chunks (1004 B = 4-byte header + 50 × 0x14 records;
+loader at `0x484230`, in a decompiled-dump gap, recovered by disassembly):
+record `+0x0c` u16 = initial stock, `+0x10` u16 = def number (+20000) whose
+def byte `+0x21` selects the ware slot, `+0x00`/`+0x08` merge into the runtime
+ware entry's trade-slider fields. `cargo run -p anno-formats --example
+audit_kontor2_bytes <szs>` dumps them (Exile: 800/800/509/509/1127 confirmed
+authored). Parsing KONTOR2 stock into the scenario loader is the open next
+step; after that the Exile population trajectory comparison
+(`docs/original-capture.md` capture flow + `tools/capture/read_city`-style
+snapshots) becomes discriminating.
+
+Caveat for long captures: each winedbg attach is one-shot-ish — after a few
+attach/detach cycles this Wine build sometimes takes the game down. Space
+snapshots minutes apart and expect to relaunch between measurement campaigns.

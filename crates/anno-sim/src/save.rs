@@ -260,7 +260,11 @@ use std::path::Path;
 /// v138: subsystem timer accumulators and the fractional game-clock
 ///       accumulator persist, so save→load is phase-exact (required for
 ///       tick-lockstep replay and state-hash comparison).
-pub const SAVE_VERSION: u32 = 138;
+/// v139: source city records retain the `FUN_0047f8a0` ware
+///       demand/supply accumulators, per-slot fulfillment bytes and
+///       histories, and the worst-slot byte — the exact per-city
+///       consumption cycle's state.
+pub const SAVE_VERSION: u32 = 139;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant

@@ -302,6 +302,53 @@ pub const SOURCE_CITY_GROUP_LUXURY_REQUIREMENTS: [[bool; 7]; 5] = [
     [true, true, true, true, false, true, true],
 ];
 
+/// The eight demand-slot goods at city record `+0x150 + 0x0c*slot`.
+/// `FUN_0047f8a0` maps slot to source ware `slot + 0x0e`
+/// (`1602_exe.c:91331`), i.e. NAHRUNG through SCHMUCK in ware-table
+/// order; `FUN_0047f7b0` (`:91215-91230`) confirms the same mapping for
+/// the per-ware demand display.
+pub const SOURCE_CITY_DEMAND_WARE_GOODS: [crate::types::Good; 8] = [
+    crate::types::Good::Food,
+    crate::types::Good::TobaccoProducts,
+    crate::types::Good::Spices,
+    crate::types::Good::Cocoa,
+    crate::types::Good::Alcohol,
+    crate::types::Good::Cloth,
+    crate::types::Good::Clothing,
+    crate::types::Good::Jewelry,
+];
+
+/// Per-group, per-slot demand weights at `DAT_0061fa58 + BGruppe*0x48`
+/// (columns follow [`SOURCE_CITY_DEMAND_WARE_GOODS`]; column zero is the
+/// NAHRUNG slot, which no BGRUPPE_WARE entry populates). The haeuser
+/// loader stores `ftol(Ware_float * 8192) / 600` (`1602_exe.c:66650`,
+/// with the parser's 19.13 fixed-point float encoding), so the shipped
+/// `0.2/0.5/0.6/0.7/0.8` coefficients compile to `2/6/8/9/10`. Verified
+/// bit-exact against the running original's table with a winedbg read of
+/// `DAT_0061fa40..+0x168` (2026-08-14).
+pub const SOURCE_CITY_WARE_DEMAND_WEIGHTS: [[i32; 8]; 5] = [
+    [0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 6, 8, 0, 0],
+    [0, 6, 6, 0, 8, 9, 0, 0],
+    [0, 8, 8, 9, 9, 10, 0, 0],
+    [0, 8, 8, 8, 10, 0, 6, 2],
+];
+
+/// `DAT_0049af2c`: the global NAHRUNG demand rate added per effective
+/// resident per city cycle (`1602_exe.c:91422`). Compiled from
+/// haeuser.cod `Nahrung: 1.3` ("Verbrauch je 100 Einwohner") as
+/// `ftol(1.3 * 8192) / 600 = 17`; read live as 17. At the `15/16` decay
+/// equilibrium this pulls `17*pop/256` store units (1/32 t) per 10 s
+/// cycle — 1.3 t per 100 residents per minute, matching the cod comment.
+pub const SOURCE_CITY_FOOD_DEMAND_RATE: i32 = 17;
+
+/// `DAT_0061fa48 + BGruppe*0x48`: the `FUN_0047f3b0` satisfaction scale.
+/// `FUN_00462d50` (`1602_exe.c:68796-68813`) compiles it after loading as
+/// `fulfillment_target * demanded_ware_count`, counting nonzero weights
+/// across all eight demand slots. Read live as `[0, 120, 360, 495, 642]`
+/// (counts `[0, 2, 4, 5, 6]`).
+pub const SOURCE_CITY_GROUP_SATISFACTION_SCALES: [u32; 5] = [0, 120, 360, 495, 642];
+
 /// Fixed count of city records at `DAT_005dbae0`.
 pub const SOURCE_CITY_RECORD_SLOTS: usize = 0x4b;
 
@@ -350,9 +397,35 @@ pub struct SourceCityRecord {
     #[serde(default)]
     pub controller_figure_capacity_metric: u16,
     /// Source city bytes `+0x164 + 0x0c * i` sampled by `FUN_0047f0c0` for
-    /// luxury ware slots `0x0f + i`.
+    /// luxury ware slots `0x0f + i`. `FUN_0047f8a0` recomputes each byte
+    /// every city cycle as the slot's supply/demand fulfillment ratio.
     #[serde(default)]
     pub luxury_satisfaction: [u8; 7],
+    /// Source city byte `+0x158`: the NAHRUNG (slot zero) fulfillment
+    /// ratio, the only demand-slot byte outside `luxury_satisfaction`.
+    /// `FUN_0047f8a0` copies it to `+0x255` every cycle (`:91375`).
+    #[serde(default)]
+    pub food_fulfillment: u8,
+    /// Source city dwords `+0x150 + 0x0c*slot`: smoothed ware-demand
+    /// accumulators in 1/256 store units, grown by `weight * residents`
+    /// each cycle and decayed by `15/16` (`FUN_0047f8a0` `:91411-91434`).
+    #[serde(default)]
+    pub ware_demand: [i32; 8],
+    /// Source city dwords `+0x154 + 0x0c*slot`: the matching supply
+    /// accumulators, credited `pull << 8` per withdrawn store unit and
+    /// decayed alongside the demand accumulators.
+    #[serde(default)]
+    pub ware_supply: [i32; 8],
+    /// Source city bytes `+0x159..+0x15b` per slot: the three-deep
+    /// fulfillment history produced by the cycle's `memmove` (`:91349`),
+    /// newest first.
+    #[serde(default)]
+    pub ware_fulfillment_history: [[u8; 3]; 8],
+    /// Source city byte `+0x256`: the ware index (`0x0e..=0x15`) of the
+    /// worst declining demand slot this cycle, zero when none declined
+    /// (`:91355-91376`).
+    #[serde(default)]
+    pub worst_ware_slot: u8,
     /// Source city bytes `+0x24d..+0x251`. `FUN_00468ce0` initializes all
     /// five to `0x80`, and `FUN_0047f400` applies each to its group target.
     #[serde(default = "source_city_initial_satisfaction_weights")]
@@ -404,6 +477,11 @@ impl Default for SourceCityRecord {
             resident_amount: 0,
             controller_figure_capacity_metric: 0,
             luxury_satisfaction: [0; 7],
+            food_fulfillment: 0,
+            ware_demand: [0; 8],
+            ware_supply: [0; 8],
+            ware_fulfillment_history: [[0; 3]; 8],
+            worst_ware_slot: 0,
             satisfaction_weights: source_city_initial_satisfaction_weights(),
             satisfaction_pressure: 0,
             satisfaction_by_group: [0; 5],
@@ -466,6 +544,136 @@ impl SourceCityRecord {
         });
     }
 
+    /// The current fulfillment byte for one demand slot: `+0x158` for
+    /// NAHRUNG, `+0x158 + 0x0c*slot` (`luxury_satisfaction`) otherwise.
+    pub fn ware_fulfillment_current(&self, slot: usize) -> u8 {
+        if slot == 0 {
+            self.food_fulfillment
+        } else {
+            self.luxury_satisfaction[slot - 1]
+        }
+    }
+
+    fn set_ware_fulfillment_current(&mut self, slot: usize, value: u8) {
+        if slot == 0 {
+            self.food_fulfillment = value;
+        } else {
+            self.luxury_satisfaction[slot - 1] = value;
+        }
+    }
+
+    /// One `FUN_0047f8a0` demand/consumption cycle (`1602_exe.c:91321-91437`)
+    /// for a city whose owner passes the local-player satisfaction gate.
+    ///
+    /// `pull(slot, want)` must withdraw up to `want` whole store units
+    /// (1/32 good) of [`SOURCE_CITY_DEMAND_WARE_GOODS`]`[slot]` from the
+    /// city's store and return the withdrawn amount; the source computes
+    /// `want` itself from `stock - reserved` before calling
+    /// `FUN_0047a9b0`, so the callback applies the same clamp.
+    ///
+    /// The trailing fulfillment-warning messages (`FUN_00430d50`) and the
+    /// population/satisfaction UI events are presentation-only and not
+    /// replayed; the `+0x1f0`/`+0x1f4` `89/90` decays touch counters this
+    /// record does not yet model.
+    pub fn source_ware_economy_cycle(&mut self, mut pull: impl FnMut(usize, u16) -> u16) {
+        // Per-slot pull, history shift, and fulfillment ratio
+        // (`:91325-91374`). `local_2c` tracks the declining slot with the
+        // lowest fresh ratio as a ware index (slot + 0x0e).
+        let mut worst_ware_slot = 0u8;
+        for slot in 0..8 {
+            let demand = self.ware_demand[slot];
+            let mut supply = self.ware_supply[slot];
+            let deficit = demand - supply;
+            if deficit > 0 {
+                // `((deficit + carry) >> 8) + 1`: floor division of the
+                // positive deficit by the 256 accumulator scale, plus one.
+                let want = ((deficit >> 8) + 1).min(i32::from(u16::MAX)) as u16;
+                let got = pull(slot, want);
+                supply += i32::from(got) << 8;
+            }
+            // `memmove(+0x159, +0x158, 3)`: history becomes
+            // [current, old newest, old middle]; the oldest byte drops.
+            let current = self.ware_fulfillment_current(slot);
+            let history = self.ware_fulfillment_history[slot];
+            self.ware_fulfillment_history[slot] = [current, history[0], history[1]];
+            // `(supply << 7) / demand` in 32-bit int arithmetic; the
+            // result is compared unsigned against 0x80, so a negative
+            // quotient also clamps to full.
+            let fulfillment = if demand == 0 {
+                0x80
+            } else {
+                let ratio = supply.wrapping_shl(7).wrapping_div(demand);
+                if ratio as u32 > 0x80 {
+                    0x80
+                } else {
+                    ratio as u8
+                }
+            };
+            self.ware_supply[slot] = supply;
+            self.set_ware_fulfillment_current(slot, fulfillment);
+            // Declining-trend tracking (`:91355-91372`): fresh ratio below
+            // last cycle's, which itself was below the cycle before.
+            let history = self.ware_fulfillment_history[slot];
+            if fulfillment < history[0] && history[0] < history[1] {
+                let tracked = usize::from(worst_ware_slot).checked_sub(0x0e);
+                if tracked.is_none_or(|t| fulfillment < self.ware_fulfillment_current(t)) {
+                    worst_ware_slot = (slot + 0x0e) as u8;
+                }
+            }
+        }
+        self.overall_satisfaction = self.food_fulfillment;
+        self.worst_ware_slot = worst_ware_slot;
+
+        // Per-group satisfaction and demand accumulation, group four down
+        // to zero (`:91377-91426`).
+        for group in (0..5).rev() {
+            let fulfilled: u32 = (1..8)
+                .filter(|&slot| SOURCE_CITY_WARE_DEMAND_WEIGHTS[group][slot] != 0)
+                .map(|slot| u32::from(self.ware_fulfillment_current(slot)))
+                .sum();
+            let denominator = source_city_group_satisfaction_denominator_scaled(
+                self.satisfaction_pressure,
+                self.satisfaction_weights[group],
+                SOURCE_CITY_GROUP_SATISFACTION_SCALES[group],
+            );
+            self.satisfaction_by_group[group] = if denominator == 0 {
+                0x80
+            } else {
+                ((fulfilled << 7) / denominator).min(0x80) as u8
+            };
+            let population = self.tier_population[group];
+            if population == 0 {
+                // `:91404-91406`: an empty group's tax weight resets to
+                // the 0x80 default, effective from the next cycle.
+                self.satisfaction_weights[group] = 0x80;
+            }
+            // Effective consumers (`:91407-91410`): residents reserved to
+            // promote into this group consume at its weights already;
+            // those reserved to leave for the next group stop counting.
+            let mut effective = population as i32;
+            if group < 4 {
+                effective -= i32::from(self.promotion_reservations[group + 1]);
+            }
+            effective += i32::from(self.promotion_reservations[group]);
+            if effective != 0 {
+                for slot in 1..8 {
+                    self.ware_demand[slot] +=
+                        SOURCE_CITY_WARE_DEMAND_WEIGHTS[group][slot] * effective;
+                }
+                self.ware_demand[0] += SOURCE_CITY_FOOD_DEMAND_RATE * effective;
+            }
+        }
+
+        // `15/16` accumulator decay for every slot (`:91427-91434`,
+        // unsigned in the source) and the `255/256` satisfaction-pressure
+        // decay (`:91437`).
+        for slot in 0..8 {
+            self.ware_demand[slot] = ((self.ware_demand[slot] as u32).wrapping_mul(15) >> 4) as i32;
+            self.ware_supply[slot] = ((self.ware_supply[slot] as u32).wrapping_mul(15) >> 4) as i32;
+        }
+        self.satisfaction_pressure = (u32::from(self.satisfaction_pressure) * 0xff >> 8) as u16;
+    }
+
     /// Assemble the source city operands consumed by `FUN_0047b410`.
     pub const fn source_kind13_transfer_inputs(self) -> SourceKind13TransferInputs {
         SourceKind13TransferInputs {
@@ -482,10 +690,27 @@ fn source_city_group_satisfaction_denominator(
     weight: u8,
     fulfillment_target: u8,
 ) -> u32 {
+    source_city_group_satisfaction_denominator_scaled(
+        pressure,
+        weight,
+        u32::from(fulfillment_target),
+    )
+}
+
+/// `FUN_0047f3b0` (`1602_exe.c:90939`): identical to `FUN_0047f400` but
+/// scaled by the compiled `DAT_0061fa48` target-times-ware-count field.
+/// The regular `FUN_0047f8a0` cycle divides the *sum* of the group's
+/// fulfillment bytes by this, where the tax-change path (`FUN_0047f850`)
+/// divides their *average* by the plain target.
+fn source_city_group_satisfaction_denominator_scaled(
+    pressure: u16,
+    weight: u8,
+    scale: u32,
+) -> u32 {
     let pressure_steps = u32::from(pressure >> 5);
     let curve_input = 0x80_u32.saturating_sub(pressure_steps) * u32::from(weight);
     let curve = source_city_satisfaction_curve((curve_input >> 7) as u8);
-    (curve * u32::from(fulfillment_target)) >> 7
+    (curve * scale) >> 7
 }
 
 /// Runtime `DAT_0055e780` initialized by the nine `FUN_004033d0` calls in
@@ -4171,6 +4396,127 @@ mod tests {
         city.luxury_satisfaction = [17, 18, 18, 18, 0, 18, 18];
         city.refresh_group_satisfaction();
         assert_eq!(city.satisfaction_by_group[4], 128);
+    }
+
+    #[test]
+    fn ware_economy_cycle_accumulates_pulls_and_decays_like_fun_0047f8a0() {
+        // Pioneers only: NAHRUNG demand grows by rate 17 per resident and
+        // decays 15/16; slot pulls are `(deficit >> 8) + 1` whole units.
+        let mut city = SourceCityRecord {
+            tier_population: [300, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let mut pulls: Vec<(usize, u16)> = Vec::new();
+        city.source_ware_economy_cycle(|slot, want| {
+            pulls.push((slot, want));
+            want
+        });
+        // First cycle: every accumulator starts at zero, so no slot pulls
+        // and every fulfillment byte reports full (demand == 0 -> 0x80).
+        assert!(pulls.is_empty());
+        assert_eq!(city.food_fulfillment, 0x80);
+        assert_eq!(city.luxury_satisfaction, [0x80; 7]);
+        assert_eq!(city.overall_satisfaction, 0x80);
+        assert_eq!(city.satisfaction_by_group, [0x80; 5]);
+        // 300 residents accumulate 17*300 = 5100 food demand, decayed
+        // 15/16 to 4781 (`:91422`, `:91430`).
+        assert_eq!(city.ware_demand[0], 4781);
+        assert_eq!(city.ware_demand[1..], [0; 7]);
+
+        city.source_ware_economy_cycle(|slot, want| {
+            pulls.push((slot, want));
+            want
+        });
+        // Second cycle: deficit 4781 pulls (4781 >> 8) + 1 = 19 units,
+        // crediting supply 19 << 8 = 4864 -> fulfillment clamps at 0x80.
+        assert_eq!(pulls, [(0, 19)]);
+        assert_eq!(city.food_fulfillment, 0x80);
+        // History captured the pre-cycle byte.
+        assert_eq!(city.ware_fulfillment_history[0], [0x80, 0, 0]);
+        // demand (4781 + 5100) * 15 / 16 = 9263; supply 4864 * 15 / 16 = 4560.
+        assert_eq!(city.ware_demand[0], 9263);
+        assert_eq!(city.ware_supply[0], 4560);
+    }
+
+    #[test]
+    fn ware_economy_cycle_starves_settlers_on_an_empty_store() {
+        let mut city = SourceCityRecord {
+            tier_population: [0, 100, 0, 0, 0],
+            ..Default::default()
+        };
+        // Cycle one seeds settler demand: ALKOHOL 6*100, STOFFE 8*100,
+        // NAHRUNG 17*100, each decayed 15/16.
+        city.source_ware_economy_cycle(|_, _| 0);
+        assert_eq!(city.ware_demand[0], 1593);
+        assert_eq!(city.ware_demand[4], 562);
+        assert_eq!(city.ware_demand[5], 750);
+        // Cycle two: the empty store fails every pull, so the demanded
+        // slots report zero fulfillment while undemanded slots stay full.
+        city.source_ware_economy_cycle(|_, _| 0);
+        assert_eq!(city.food_fulfillment, 0);
+        assert_eq!(city.overall_satisfaction, 0);
+        assert_eq!(city.luxury_satisfaction, [0x80, 0x80, 0x80, 0, 0, 0x80, 0x80]);
+        // Settlers (both demanded slots empty) collapse to zero; higher
+        // groups retain the undemanded slots' full bytes over their
+        // scales: g2 (128+128)*128/360, g3 (3*128)*128/495,
+        // g4 (5*128)*128/642. Pioneers have scale zero -> always full.
+        assert_eq!(city.satisfaction_by_group, [128, 0, 91, 99, 127]);
+    }
+
+    #[test]
+    fn ware_economy_cycle_resets_empty_group_tax_and_counts_reservations() {
+        let mut city = SourceCityRecord {
+            tier_population: [100, 0, 0, 0, 0],
+            satisfaction_weights: [0x40; 5],
+            promotion_reservations: [0, 20, 0, 0, 0],
+            ..Default::default()
+        };
+        city.source_ware_economy_cycle(|_, _| 0);
+        // `:91404`: only groups without residents reset their tax weight
+        // to the 0x80 default; group zero keeps the player's setting.
+        assert_eq!(city.satisfaction_weights, [0x40, 0x80, 0x80, 0x80, 0x80]);
+        // `:91407-91410`: the 20 residents reserved to promote into group
+        // one consume at settler weights already (ALKOHOL 6*20 -> 112
+        // after decay, STOFFE 8*20 -> 150) while group zero's food
+        // consumers drop to 80: total NAHRUNG (17*80 + 17*20) * 15 / 16.
+        assert_eq!(city.ware_demand[4], 112);
+        assert_eq!(city.ware_demand[5], 150);
+        assert_eq!(city.ware_demand[0], 1593);
+    }
+
+    #[test]
+    fn ware_economy_cycle_tracks_declining_worst_slot() {
+        // A slot whose fresh ratio undercuts a two-cycle decline is
+        // reported as `slot + 0x0e` in `worst_ware_slot` (`:91355-91376`).
+        let mut city = SourceCityRecord {
+            tier_population: [0, 100, 0, 0, 0],
+            ..Default::default()
+        };
+        let mut supply_units = [0u16; 8];
+        supply_units[4] = 400; // plentiful ALKOHOL at first
+        supply_units[5] = 400; // plentiful STOFFE
+        for _ in 0..3 {
+            city.source_ware_economy_cycle(|slot, want| {
+                let take = want.min(supply_units[slot]);
+                supply_units[slot] -= take;
+                take
+            });
+        }
+        assert_eq!(city.worst_ware_slot, 0);
+        // The store runs dry. NAHRUNG never had stock, so its byte
+        // flatlines at zero without the strict three-sample decline the
+        // tracker requires; STOFFE — stocked, then starved, and with the
+        // larger demand weight than ALKOHOL — is the slot whose monotone
+        // decline trips first, reported as ware index 0x13.
+        let mut tripped = None;
+        for _ in 0..6 {
+            city.source_ware_economy_cycle(|_, _| 0);
+            if city.worst_ware_slot != 0 {
+                tripped = Some(city.worst_ware_slot);
+                break;
+            }
+        }
+        assert_eq!(tripped, Some(0x13));
     }
 
     #[test]

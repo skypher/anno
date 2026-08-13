@@ -58,9 +58,16 @@ pub const TIER_DEMANDS: &[&[Good]] = &[
 /// Higher tiers consume more per capita because they demand more
 /// distinct goods.
 ///
-/// REPORT-GAP (consumption mechanism is config-driven and only
-/// partially reproduced here). The original does NOT use a single
-/// per-tier consumption scalar. Instead (`FUN_0047f8a0`,
+/// LEGACY APPROXIMATION — the exact `FUN_0047f8a0` accumulator model
+/// is now ported as
+/// `data_bridge::SourceCityRecord::source_ware_economy_cycle` and runs
+/// per city inside the kind-12 city dispatcher for owners passing the
+/// local-player satisfaction gate; those owners' players mirror the
+/// exact results via [`mirror_city_demands`] and never enter this
+/// scalar path. This function remains only for owners outside that
+/// gate (see `Simulation::source_city_demand_mirror`).
+///
+/// For reference, the exact model this approximates (`FUN_0047f8a0`,
 /// `1602_exe.c:91379-91434`):
 ///   * Per tier, per good, a smoothed *demand accumulator* at struct
 ///     `0x150` (food) / `0x15c+` (goods 1..7) is grown by
@@ -82,13 +89,9 @@ pub const TIER_DEMANDS: &[&[Good]] = &[
 ///   Aristocrat: ALKOHOL 0.8, KAKAO 0.6, TABAKWAREN 0.6, GEWUERZE 0.6, KLEIDUNG 0.5, SCHMUCK 0.2
 /// (Pioneer consumes food only, via the `Nahrung` rate.)
 ///
-/// Faithfully reproducing the accumulator EMA + whole-unit pull
-/// dynamics is a larger, higher-risk change that would ripple through
-/// warehouse withdrawal and every economy/population test, so it is
-/// intentionally left as a gap. The scalar below is the prior
-/// empirical approximation (community population-per-industry table,
-/// scaled to per-100-pop-per-economy-tick), retained pending a full
-/// port of the accumulator model.
+/// The scalar below is the prior empirical approximation (community
+/// population-per-industry table, scaled to
+/// per-100-pop-per-economy-tick), retained for the legacy path only.
 const CONSUMPTION_PER_100: [u16; NUM_POP_TIERS] = [
     2, // Pioneer
     4, // Settler
@@ -228,6 +231,48 @@ pub fn update_population_demands(player: &mut Player, warehouses: &mut [Warehous
 /// Map a Good to its demand slot index.
 fn demand_slot_for_good(good: Good) -> Option<usize> {
     DEMAND_GOODS.iter().position(|&g| g == good)
+}
+
+/// Aggregated results of the exact per-city `FUN_0047f8a0` demand cycle
+/// (`data_bridge::SourceCityRecord::source_ware_economy_cycle`) for one
+/// player, bridged into this per-player approximation layer. Arrays
+/// follow the source demand-slot order
+/// [`crate::data_bridge::SOURCE_CITY_DEMAND_WARE_GOODS`].
+#[derive(Debug, Clone, Default)]
+pub struct CityDemandMirror {
+    /// Population-weighted per-group satisfaction across the player's
+    /// cities (`+0x248` bytes); a plain average when no group residents
+    /// exist anywhere. Exact for single-city players.
+    pub satisfaction: [u8; 5],
+    /// Per-slot current fulfillment bytes, max across cities.
+    pub fulfillment: [u8; 8],
+    /// Per-slot demand accumulators summed across cities, floored to
+    /// whole store units.
+    pub demand: [u32; 8],
+    /// Matching supply accumulator sums.
+    pub supply: [u32; 8],
+}
+
+/// Replace the invented per-player consumption with the exact per-city
+/// results. The city cycle already withdrew the goods from the city
+/// stores, so this only projects satisfaction and the demand-slot view;
+/// it never touches warehouses. Runs after `economy::tick_economy` so
+/// the exact fulfillment byte lands in `fulfillment_history[0]` (the
+/// promotion gate's sample) uneclipsed.
+pub fn mirror_city_demands(player: &mut Player, mirror: &CityDemandMirror) {
+    player.satisfaction = mirror.satisfaction;
+    for (idx, &good) in DEMAND_GOODS.iter().enumerate() {
+        let Some(source_slot) = crate::data_bridge::SOURCE_CITY_DEMAND_WARE_GOODS
+            .iter()
+            .position(|&g| g == good)
+        else {
+            continue;
+        };
+        let slot = &mut player.demands[idx];
+        slot.demand = mirror.demand[source_slot];
+        slot.supply = mirror.supply[source_slot];
+        slot.fulfillment_history[0] = mirror.fulfillment[source_slot];
+    }
 }
 
 /// Net per-tier population growth per economy tick, expressed in

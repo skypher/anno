@@ -16,6 +16,7 @@ use crate::coverage::CoverageMap;
 use crate::data_bridge::{
     SourceCityRecord, SourceCityTable, SourceKind13DispatchState, SourceKind13Location,
     SourceKind13LocationTable, SourceKind13PromotionDefinition, SourceKind4Occupant,
+    SOURCE_CITY_DEMAND_WARE_GOODS,
 };
 use crate::economy;
 use crate::entity::{ActionType, CargoRoute, Figure, SourceFigureRecordLayout, SourceWorkerRoute};
@@ -4056,12 +4057,39 @@ impl Simulation {
                 continue;
             };
             city.phase = self.source_city_dispatch_phase;
+            let mut city = *city;
             if city_satisfaction_allowed {
-                city.satisfaction_pressure =
-                    (u32::from(city.satisfaction_pressure) * 0xff >> 8) as u16;
-                city.refresh_group_satisfaction();
+                // The exact `FUN_0047f8a0` demand cycle: whole-unit pulls
+                // from the city store, fulfillment ratios, group
+                // satisfaction, weighted demand accumulation, and the
+                // accumulator/pressure decays. The store is the island
+                // Kontor inventory this city's owner holds.
+                let warehouse = self.warehouses.iter_mut().find(|warehouse| {
+                    warehouse.active
+                        && warehouse.island_id == city.island_id
+                        && warehouse.owner == city.owner_slot
+                });
+                match warehouse {
+                    Some(warehouse) => {
+                        city.source_ware_economy_cycle(|ware_slot, want| {
+                            let good = SOURCE_CITY_DEMAND_WARE_GOODS[ware_slot];
+                            let available = warehouse
+                                .city_stock_fixed(good)
+                                .saturating_sub(warehouse.city_reserved_fixed(good));
+                            let take = want.min(available);
+                            if take == 0 {
+                                0
+                            } else {
+                                warehouse.withdraw_city_good_fixed(good, take)
+                            }
+                        });
+                    }
+                    None => city.source_ware_economy_cycle(|_, _| 0),
+                }
+                if let Some(record) = self.source_cities.record_mut(slot) {
+                    *record = city;
+                }
             }
-            let city = *city;
             if self.source_city_kind12_dispatch_allows(city) {
                 self.spawn_source_kind12_figures(city);
             }
@@ -4738,6 +4766,58 @@ impl Simulation {
                         PlayerState::HumanActive | PlayerState::AiActive
                     )
                 })
+    }
+
+    /// Aggregate the exact per-city `FUN_0047f8a0` results for one owner
+    /// into the per-player approximation layer's mirror. `None` for
+    /// owners whose cities do not run the exact cycle (the
+    /// `source_city_satisfaction_allows` gate) or who own no city yet —
+    /// they keep the legacy per-player consumption.
+    fn source_city_demand_mirror(&self, owner_slot: u8) -> Option<population::CityDemandMirror> {
+        if !self.source_city_satisfaction_allows(owner_slot) {
+            return None;
+        }
+        let cities: Vec<SourceCityRecord> = self
+            .source_cities
+            .active_records()
+            .into_iter()
+            .filter(|city| city.owner_slot == owner_slot)
+            .collect();
+        if cities.is_empty() {
+            return None;
+        }
+        let mut mirror = population::CityDemandMirror::default();
+        for group in 0..5 {
+            let residents: u64 = cities
+                .iter()
+                .map(|city| u64::from(city.tier_population[group]))
+                .sum();
+            mirror.satisfaction[group] = if residents == 0 {
+                (cities
+                    .iter()
+                    .map(|city| u32::from(city.satisfaction_by_group[group]))
+                    .sum::<u32>()
+                    / cities.len() as u32) as u8
+            } else {
+                (cities
+                    .iter()
+                    .map(|city| {
+                        u64::from(city.satisfaction_by_group[group])
+                            * u64::from(city.tier_population[group])
+                    })
+                    .sum::<u64>()
+                    / residents) as u8
+            };
+        }
+        for city in &cities {
+            for slot in 0..8 {
+                mirror.fulfillment[slot] =
+                    mirror.fulfillment[slot].max(city.ware_fulfillment_current(slot));
+                mirror.demand[slot] += (city.ware_demand[slot].max(0) as u32) >> 8;
+                mirror.supply[slot] += (city.ware_supply[slot].max(0) as u32) >> 8;
+            }
+        }
+        Some(mirror)
     }
 
     /// Delete one live source kind-4 figure by its `SOLDAT3` runtime slot.
@@ -5759,14 +5839,28 @@ impl Simulation {
                 }
             }
         }
+        let city_mirrors: Vec<Option<population::CityDemandMirror>> = (0..self.players.len())
+            .map(|i| self.source_city_demand_mirror(i as u8))
+            .collect();
         for (i, player) in self.players.iter_mut().enumerate() {
             player.building_maintenance = maintenance[i];
-            // Update demands and consume goods from warehouses
-            population::update_population_demands(player, &mut self.warehouses, i as u8);
+            if city_mirrors[i].is_none() {
+                // Legacy approximation for owners whose cities do not run
+                // the exact `FUN_0047f8a0` cycle (see
+                // `source_city_satisfaction_allows`): update demands and
+                // consume goods from warehouses.
+                population::update_population_demands(player, &mut self.warehouses, i as u8);
+            }
             // Apply economy (gold balance, bankruptcy). Satisfaction is
-            // set fresh in update_population_demands above; tick_economy
-            // must not decay it.
+            // set fresh above or mirrored below; tick_economy must not
+            // decay it.
             economy::tick_economy(player);
+            if let Some(mirror) = &city_mirrors[i] {
+                // The exact per-city cycle already consumed the goods;
+                // project its satisfaction and fulfillment into the
+                // per-player layer that growth and house upgrades read.
+                population::mirror_city_demands(player, mirror);
+            }
             // Grow / shrink population by tier and promote satisfied tiers up,
             // clamped to current housing capacity.
             population::update_population_growth(player, housing[i]);
