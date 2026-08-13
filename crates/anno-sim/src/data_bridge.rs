@@ -1807,6 +1807,20 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         _ => ProductionType::Craft,
     };
 
+    // Natural terrain / nature (category 0: WALD forests, FELS ore rocks,
+    // beaches, water, pasture animals) are auto-placed map features, not
+    // player-constructed buildings, and accrue NO operating cost in the
+    // original: the source adds a building's operating cost to the city cost
+    // accumulator only when the instance's flag 0x10 is set (FUN_0047f6b0 /
+    // FUN_00463140 reading def+0x2a); terrain has no such flag. The per-type
+    // maintenance table above is an approximation that wrongly charged forests
+    // (WALD -> Wood -> 5) and ore rocks (FELS -> Ore -> 60), making the Rust
+    // economy run a deficit the original does not (validated against the live
+    // original on Exile: excluding terrain flips the human city from a per-tick
+    // loss to the flat/positive trajectory the original shows — see
+    // docs/original-capture.md). Zero it for terrain to match.
+    let maintenance = if category == 0 { 0 } else { maintenance };
+
     BuildingDef {
         id: cod_building.nummer as u16,
         category,

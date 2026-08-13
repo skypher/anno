@@ -270,16 +270,24 @@ The **initial** human economy matches, but the trajectory does not:
 | 640 | **10024** | (declining) |
 
 The original's human city is net-flat/slightly-positive (two snapshots, both
-~10000+), while the Rust city runs a **deficit** and declines (10000 → 9928 →
-9855 → 9827 over clocks 0–300). Root cause is **not** the cost side:
-`FUN_0047f6b0` gates military upkeep on `state==0`, which for the human adds it
-in both engines (the gate only spares AI). It is the **income** side, driven by
-**population**: the Rust city loses population fast (Exile total 570 → 483 in
-30 s) because `population.rs` uses the documented consumption/satisfaction
-*approximation* (empirical `CONSUMPTION_PER_100` + average satisfaction) instead
-of the source's weight-accumulator + weighted-sum satisfaction (`FUN_0047f8a0`,
-see the economy audit). Unsatisfied citizens emigrate, income falls, gold
-declines. **Next fidelity step:** port the exact consumption/satisfaction model
-so the stable city stays stable — validated directionally against the
-original's flat human gold. (Exact population parity still needs RNG-seed
-pinning; the *sign* of the trajectory is the checkable signal today.)
+~10000+), while the Rust city *was* running a **deficit** and declining (10000
+→ 9928 → 9855 → 9827 over clocks 0–300).
+
+**Root cause (found by instrumented diagnosis, FIXED):** the Rust charged
+building **maintenance on natural terrain**. The invented per-type maintenance
+table gave forests `WALD → Wood → 5` and ore rocks `FELS → Ore → 60`, so
+player 0's 66 forest tiles + 3 ore rocks alone contributed 510 of 667
+maintenance/tick — a net −72/tick regardless of population. The original
+charges operating cost only for *constructed* buildings (instance flag `0x10`
+in `FUN_0047f6b0`/`FUN_00463140` reading `def+0x2a`); terrain has no such flag.
+Gating maintenance on `category != 0` (terrain/nature) in `data_bridge.rs`
+removes the invented charge. After the fix the Rust human gold reads
+`10000 → 10014 → 10026 → 10052` over clocks 0–300 — flat/positive, matching the
+original's `10008 @255` / `10024 @640` in both sign and magnitude.
+
+(My first hypothesis — that the `population.rs` consumption/satisfaction
+approximation drove emigration — was **refuted** by experiment: forcing
+satisfaction to full still bled gold, while excluding terrain maintenance fixed
+it even with population unchanged. Population *does* still decline in Exile — a
+separate production→warehouse food-delivery gap — but that is RNG-gated and does
+not drive the gold trajectory.)
