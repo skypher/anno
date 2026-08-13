@@ -222,9 +222,11 @@ impl SourceControllerCityConstructionWork {
 }
 
 /// The `FUN_00417aa0` construction-work queue. The source retains at most
-/// 256 records, rejects priorities at most one, and, when full, replaces the
-/// first stored entry whose priority is at most three only for an incoming
-/// priority above three.
+/// 256 records and rejects priorities at most one. When full it accepts only
+/// an incoming priority above three, evicting the running-minimum-priority
+/// record (scanning from the front and stopping once the minimum reaches
+/// three or below); a saturated queue whose records all outrank three still
+/// evicts its first global minimum rather than rejecting the insert.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct SourceControllerCityConstructionQueue {
     entries: Vec<SourceControllerCityConstructionWork>,
@@ -248,12 +250,24 @@ impl SourceControllerCityConstructionQueue {
         if work.priority() <= 3 {
             return false;
         }
-        let Some(index) = self
-            .entries
-            .iter()
-            .enumerate()
-            .find_map(|(index, entry)| (entry.priority() <= 3).then_some(index))
-        else {
+        // `FUN_00417aa0` evicts the running-minimum-priority record, scanning
+        // from the front and stopping as soon as the minimum drops to three or
+        // below (`while (iVar2 < 0x100 && 3 < sVar5)`, with `sVar5` seeded to
+        // 1000). When every stored record outranks three it still evicts the
+        // first global minimum, so a priority-above-three insert into a
+        // saturated queue always succeeds.
+        let mut victim: Option<usize> = None;
+        let mut min_priority: i16 = 1000;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry.priority() < min_priority {
+                min_priority = entry.priority();
+                victim = Some(index);
+            }
+            if min_priority <= 3 {
+                break;
+            }
+        }
+        let Some(index) = victim else {
             return false;
         };
         self.entries[index] = work;
@@ -3025,10 +3039,13 @@ impl Simulation {
 
     /// Replay the scheduling portion of `FUN_0042b4b0`. The source decrements
     /// all active-controller timers first, then advances its physical player
-    /// cursor until a pass performs no controller work. Only the recovered
-    /// `FUN_00429aa0` action-two/action-three/action-four cases and the
-    /// `FUN_00424bf0` -> `FUN_00422150` -> `FUN_00422030` purchase branch are
-    /// executed here; other action-stack handlers retain their own paths.
+    /// cursor, skipping idle slots and stopping after the first slot that
+    /// performs controller work (`bVar2` starts true and is cleared the first
+    /// time any branch does work, so `while (bVar2)` services at most one
+    /// working controller per call). Only the recovered `FUN_00429aa0`
+    /// action-two/action-three/action-four cases and the `FUN_00424bf0` ->
+    /// `FUN_00422150` -> `FUN_00422030` purchase branch are executed here;
+    /// other action-stack handlers retain their own paths.
     fn tick_source_player_controllers(&mut self, dt_ms: u32) {
         if !self.source_kind4_dispatch.remote_owner_dispatch_enabled {
             return;
@@ -3056,11 +3073,10 @@ impl Simulation {
             }
         }
 
-        let mut continue_scheduler = true;
-        while continue_scheduler {
+        let mut no_work_yet = true;
+        loop {
             let player_slot = usize::from(self.source_player_controller_cursor);
             let faction_state = self.source_kind4_dispatch.faction_states[player_slot];
-            let mut no_controller_work = true;
 
             if faction_state == 0x0c {
                 if self.source_player_controllers[player_slot].figure_roster_dirty {
@@ -3072,7 +3088,7 @@ impl Simulation {
                         .action_timer_ms
                         .saturating_add(50);
                     self.dispatch_source_controller_action(player_slot);
-                    no_controller_work = false;
+                    no_work_yet = false;
                 }
                 if self.source_player_controllers[player_slot]
                     .city_management_profile
@@ -3084,7 +3100,7 @@ impl Simulation {
                         .source_player_controllers[player_slot]
                         .city_management_timer_ms
                         .saturating_add(10_000);
-                    no_controller_work = false;
+                    no_work_yet = false;
                 }
             }
 
@@ -3096,7 +3112,12 @@ impl Simulation {
                 self.source_player_controller_cursor = 0;
                 return;
             }
-            continue_scheduler = !no_controller_work;
+            // `while (bVar2)`: once any slot has done work `no_work_yet` is
+            // false and the source loop terminates instead of continuing on to
+            // the next physical controller.
+            if !no_work_yet {
+                return;
+            }
         }
     }
 
@@ -8716,7 +8737,12 @@ mod tests {
         assert!(queue.insert(work(4, 0)));
         assert_eq!(queue.entries()[0].priority(), 4);
         assert!(!queue.insert(work(3, 0)));
-        assert!(!queue.insert(work(5, 0)));
+        // The queue is saturated with priority-four records and holds nothing
+        // at or below three, yet `FUN_00417aa0` still evicts the first global
+        // minimum (index zero) for an incoming priority above three rather than
+        // rejecting it.
+        assert!(queue.insert(work(5, 0)));
+        assert_eq!(queue.entries()[0].priority(), 5);
 
         let mut ordered = SourceControllerCityConstructionQueue::default();
         assert!(ordered.insert(work(4, 0)));
