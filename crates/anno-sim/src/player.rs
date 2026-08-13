@@ -27,9 +27,20 @@ pub const TAX_TIER_MULTIPLIER_16: [u8; NUM_POP_TIERS] = [
 ];
 
 /// Bankruptcy threshold (gold balance).
+///
+/// RE: `1602_exe.c:84682` (settlement collapse in `FUN_00476...`),
+/// where the "still solvent" test is `-0x3e9 < gold`
+/// (`-0x3e9 == -1001`). Gold at or below -1001 makes the player
+/// eligible for the bankruptcy game-over counter, so -1001 is the
+/// highest balance that already counts as bankrupt (hence the `<=`
+/// comparison in `is_bankrupt`).
 pub const BANKRUPTCY_THRESHOLD: i32 = -1001;
 
 /// Consecutive bankruptcy ticks before game over.
+///
+/// RE: `1602_exe.c:84685` — the per-player counter at struct
+/// offset 0x9e is pre-incremented and compared `< 0x28`, so the
+/// game-over path is taken once it reaches 0x28 == 40.
 pub const BANKRUPTCY_GAME_OVER_TICKS: u32 = 40;
 
 /// Player state.
@@ -153,8 +164,13 @@ impl Player {
     }
 
     /// Check if player is bankrupt.
+    ///
+    /// Source (`1602_exe.c:84682`) treats the player as solvent
+    /// while `-1001 < gold`; the bankruptcy counter advances once
+    /// `gold <= -1001`. Use `<=` so the boundary value -1001 counts
+    /// as bankrupt, matching the decompiled comparison.
     pub fn is_bankrupt(&self) -> bool {
-        self.gold < BANKRUPTCY_THRESHOLD
+        self.gold <= BANKRUPTCY_THRESHOLD
     }
 
     /// Check if game over due to sustained bankruptcy.

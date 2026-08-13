@@ -12,10 +12,13 @@
 use crate::player::Player;
 use crate::types::NUM_POP_TIERS;
 
-/// Economy tick interval in milliseconds. Aligned to the
-/// binary's `-1000` ms game-tick decrement at `1602_exe.c:16110`
-/// — there is no half-ms cadence in the original, so a 9999 ms
-/// approximation has no RE basis.
+/// Economy tick interval in milliseconds. The population/economy
+/// ticker `FUN_0047f8a0` accumulates elapsed ms into `DAT_0054a3b4`
+/// and fires when `9999 < DAT_0054a3b4` (`1602_exe.c:91300`), i.e.
+/// once the accumulator passes 9999 — an effective ~10 000 ms
+/// period. (Note: this constant is currently informational; the
+/// live tick cadence is driven by the caller's timer, not read from
+/// here.)
 pub const ECONOMY_TICK_MS: u32 = 10_000;
 
 /// Satisfaction threshold below which citizens leave (60%).

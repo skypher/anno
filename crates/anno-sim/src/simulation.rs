@@ -5763,9 +5763,11 @@ impl Simulation {
             // `bankruptcy_ticks` toward game-over (40 ticks). Edge-
             // triggered against the previous sample so the line
             // doesn't flood every tick the player is in the red.
+            // Window is `gold <= -1001` (see `Player::is_bankrupt`,
+            // RE `1602_exe.c:84682`); fire on the tick that crosses in.
             let p0_gold = p0.gold;
-            if p0_gold < crate::player::BANKRUPTCY_THRESHOLD
-                && self.last_treasury_warn_gold >= crate::player::BANKRUPTCY_THRESHOLD
+            if p0_gold <= crate::player::BANKRUPTCY_THRESHOLD
+                && self.last_treasury_warn_gold > crate::player::BANKRUPTCY_THRESHOLD
             {
                 self.event_log
                     .push("[treasury] our treasury is running dangerously low".to_string());
