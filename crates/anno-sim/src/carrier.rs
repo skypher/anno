@@ -360,8 +360,9 @@ struct CarrierRequest {
 }
 
 /// Choose the input whose stock is closest to exhaustion. The source scheduler
-/// starts a generic carrier below two production batches, which corresponds to
-/// its 256/128 stock-ratio threshold.
+/// starts a generic carrier at or below two production batches: `FUN_0047daf0`
+/// dispatches when `stock * 128 / rate <= 256`, i.e. `stock <= 2 * rate`
+/// inclusive, mirroring `carrier_request_for_source_input`.
 fn carrier_request(
     building: &BuildingInstance,
     def: &BuildingDef,
@@ -378,7 +379,7 @@ fn carrier_request(
         }
         let batch = rate.max(1);
         let target = batch.saturating_mul(2);
-        (stock < target).then_some((good, stock, batch, target))
+        (stock <= target).then_some((good, stock, batch, target))
     })
     .min_by_key(|(_, stock, batch, _)| (u32::from(*stock) << 16) / u32::from(*batch))
     .map(|(good, stock, _, target)| CarrierRequest {
@@ -430,7 +431,11 @@ fn select_carrier_source_wave(
     max_load: u16,
 ) -> Option<(usize, CarrierSupplier, (i32, i32), Vec<(i32, i32)>, u16)> {
     let max_fixed = max_load.checked_mul(SOURCE_STORAGE_UNIT)?;
-    let minimum_fixed = max_fixed / 2;
+    // `FUN_00471380` derives the reservation floor as `param_9 / 2` clamped to
+    // `0x40`: `local_24 = param_9 / 2; if (0x3f < local_24) local_24 = 0x40;`.
+    // For the stock TRAEGER (`Maxtrag: 4`, `max_fixed == 128`) the clamp is
+    // inert (64 == max_fixed / 2); it only bites a modded `Maxtrag > 4`.
+    let minimum_fixed = (max_fixed / 2).min(0x40);
     let mut grid = map.carrier_path_grid();
 
     for candidate in source_cells.iter().copied() {
