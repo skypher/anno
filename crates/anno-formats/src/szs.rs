@@ -140,11 +140,20 @@ pub struct IslandSourceResourceState {
     pub record_count: u8,
     /// `INSEL5[0x1C..0x5C]`, eight records with stride eight.
     pub records: [IslandSourceResourceRecord; 8],
-    /// `INSEL5[0x5C..0x60]`, the crop-resource bitmask.
+    /// `INSEL5[0x5C..0x60]`, the crop-resource bitmask. The loader
+    /// (`0x00469f96..0x0046a001`) reloads this word into runtime `+0x5c` with
+    /// `|= 0x1181` forced on, so wares `0x2d`/`0x34`/`0x35`/`0x39` (grain and
+    /// the attenuation-exempt grass/tree/fish) always read available; the OR
+    /// is applied by [`resource_strength`], not stored here.
     pub crop_flags: u32,
-    /// `INSEL5[0x39..0x3d]`, compared with `DAT_005b6040` by
-    /// `FUN_0046b3e0` to choose its raw-to-dry scan before the source begins
-    /// the attenuation-decay and dry-to-raw branch.
+    /// `INSEL5[0x64]`, the season/parity byte the loader copies to runtime
+    /// `+0x1c`. `FUN_0046aff0` compares it against 0 and 1 to pick which crop
+    /// triple is fertile; `FUN_0046b3e0` reads the same byte for the
+    /// `FRAU`/`ADEL` terrain-event definition.
+    pub parity: u8,
+    /// `INSEL5[0x6c..0x70]`, copied to runtime `+0x60` and compared with
+    /// `DAT_005b6040` by `FUN_0046b3e0` to choose its raw-to-dry scan before
+    /// the source begins the attenuation-decay and dry-to-raw branch.
     pub transition_deadline_ticks: u32,
     /// `INSEL5[0x66]`, the mutable factor subtracted by `FUN_004684a0` for
     /// non-grass, non-tree, and non-fish resources.
@@ -154,7 +163,7 @@ pub struct IslandSourceResourceState {
 impl IslandSourceResourceState {
     /// Exact 0/64/128 result of `FUN_0046aff0` for one raw ware.
     pub fn resource_strength(self, ware: u8) -> u8 {
-        if !(0x2d..=0x34).contains(&ware) {
+        if !(0x2d..=0x3a).contains(&ware) {
             let mut partial_strength = 0;
             for record in self
                 .records
@@ -173,17 +182,18 @@ impl IslandSourceResourceState {
             return partial_strength;
         }
 
-        if self.crop_flags & (1_u32 << u32::from(ware - 0x2d)) != 0 {
+        // The loader forces `0x1181` on before `FUN_0046aff0` reads the mask.
+        if (self.crop_flags | 0x1181) & (1_u32 << u32::from(ware - 0x2d)) != 0 {
             return 0x80;
         }
-        if self.records[0].ware() == 0 {
+        if self.parity == 0 {
             return if matches!(ware, 0x2e | 0x30 | 0x32) {
                 0x40
             } else {
                 0
             };
         }
-        if self.records[0].ware() == 1 && matches!(ware, 0x2f | 0x31 | 0x33) {
+        if self.parity == 1 && matches!(ware, 0x2f | 0x31 | 0x33) {
             0x40
         } else {
             0
@@ -1479,21 +1489,32 @@ impl SzsFile {
             state.record_count = data[0x1a].min(8);
         }
         for (index, record) in state.records.iter_mut().enumerate() {
-            let offset = 0x1c + index * 8;
-            let len = record.raw.len();
-            if data.len() >= offset + len {
-                record.raw.copy_from_slice(&data[offset..offset + len]);
+            // The loader (`0x0046a004`) assembles each runtime record from two
+            // four-byte serialized halves: the selector word at `0x1c + 8r`
+            // (runtime `+0x20`) and the availability word at `0x28 + 8r`
+            // (runtime `+0x24`). The two halves overlap adjacent records in the
+            // packed chunk, so they cannot be read as one contiguous slice.
+            let selector_offset = 0x1c + index * 8;
+            let availability_offset = 0x28 + index * 8;
+            if data.len() >= selector_offset + 4 {
+                record.raw[0..4].copy_from_slice(&data[selector_offset..selector_offset + 4]);
+            }
+            if data.len() >= availability_offset + 4 {
+                record.raw[4..8].copy_from_slice(&data[availability_offset..availability_offset + 4]);
             }
         }
         if data.len() >= 0x60 {
             state.crop_flags = u32::from_le_bytes(data[0x5c..0x60].try_into().expect("slice size"));
         }
-        if data.len() >= 0x3d {
-            state.transition_deadline_ticks =
-                u32::from_le_bytes(data[0x39..0x3d].try_into().expect("slice size"));
+        if data.len() > 0x64 {
+            state.parity = data[0x64];
         }
         if data.len() > 0x66 {
             state.attenuation = data[0x66];
+        }
+        if data.len() >= 0x70 {
+            state.transition_deadline_ticks =
+                u32::from_le_bytes(data[0x6c..0x70].try_into().expect("slice size"));
         }
         state
     }
@@ -3726,11 +3747,22 @@ mod tests {
         body[1] = 12;
         body[2] = 10;
         body[0x1a] = 2;
-        body[0x1c..0x24].copy_from_slice(&[0x35, 0xaa, 0xbb, 0xcc, 1, 0xdd, 0x20, 0x00]);
-        body[0x24..0x2c].copy_from_slice(&[0x36, 0, 0, 0, 0, 0, 0x40, 0x00]);
+        // Record selectors are the word at `0x1c + 8r`; the availability word
+        // lives separately at `0x28 + 8r`. Record 0 is an available (state 0)
+        // sub-crop `0x02` with remaining `0x20`; record 1 a partial (state 1)
+        // sub-crop `0x03`.
+        body[0x1c] = 0x02;
+        body[0x28] = 0;
+        body[0x2a] = 0x20;
+        body[0x24] = 0x03;
+        body[0x30] = 1;
+        // Authored crop bit 2 (ware 0x2f); the loader still forces 0x1181 on.
         body[0x5c..0x60].copy_from_slice(&(1_u32 << 2).to_le_bytes());
-        body[0x39..0x3d].copy_from_slice(&12_345_u32.to_le_bytes());
+        // Season/parity byte at 0x64 selects the odd fertile triple.
+        body[0x64] = 1;
         body[0x66] = 0x40;
+        // Transition deadline at 0x6c (the loader's runtime `+0x60`).
+        body[0x6c..0x70].copy_from_slice(&12_345_u32.to_le_bytes());
 
         let mut encoded = Vec::new();
         write_chunk(&mut encoded, "INSEL5", &body);
@@ -3738,17 +3770,30 @@ mod tests {
         let state = parsed.island_source_resource_state(0);
 
         assert_eq!(state.record_count, 2);
-        assert_eq!(state.records[0].ware(), 0x35);
-        assert_eq!(state.records[0].availability_state(), 1);
+        assert_eq!(state.records[0].ware(), 0x02);
+        assert_eq!(state.records[0].availability_state(), 0);
         assert_eq!(state.records[0].remaining_amount(), 0x20);
-        assert_eq!(state.records[1].ware(), 0x36);
+        assert_eq!(state.records[1].ware(), 0x03);
+        assert_eq!(state.records[1].availability_state(), 1);
+        assert_eq!(state.parity, 1);
         assert_eq!(state.attenuation, 0x40);
         assert_eq!(state.transition_deadline_ticks, 12_345);
-        assert_eq!(state.resource_strength(0x35), 0x40);
-        assert_eq!(state.resource_strength(0x36), 0x80);
-        assert_eq!(state.resource_strength(0x37), 0);
+        // Sub-crop wares (< 0x2d) go through the record search.
+        assert_eq!(state.resource_strength(0x02), 0x80);
+        assert_eq!(state.resource_strength(0x03), 0x40);
+        assert_eq!(state.resource_strength(0x04), 0);
+        // Grain and the attenuation-exempt grass/tree/fish are forced on.
+        assert_eq!(state.resource_strength(0x2d), 0x80);
+        assert_eq!(state.resource_strength(0x35), 0x80);
+        assert_eq!(state.resource_strength(0x39), 0x80);
+        // The authored crop bit 2 pins ware 0x2f to full strength directly.
         assert_eq!(state.resource_strength(0x2f), 0x80);
+        // Parity 1 makes the rest of the odd triple fertile (0x40) and the
+        // even triple barren (0) through the season fallback.
+        assert_eq!(state.resource_strength(0x31), 0x40);
+        assert_eq!(state.resource_strength(0x33), 0x40);
         assert_eq!(state.resource_strength(0x2e), 0);
+        assert_eq!(state.resource_strength(0x30), 0);
     }
 
     #[test]

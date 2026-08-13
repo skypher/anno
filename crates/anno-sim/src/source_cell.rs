@@ -954,7 +954,8 @@ pub const fn source_resource_harvest_transition(
     } else {
         4
     };
-    let mask_index = (((x & 3) as u32 + (y as u32) * 4 + island as u32) & 31) as usize;
+    let mask_index =
+        (((x & 3) as u32 + (y as u32) * 4 + island as u32 + ware as u32) & 31) as usize;
     if SOURCE_RESOURCE_GROWTH_MASKS[band][mask_index] {
         SourceResourceHarvestTransition::Regrowth
     } else {

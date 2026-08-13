@@ -4329,8 +4329,9 @@ impl Simulation {
 
     /// `FUN_0044bd00`: allocate a generic type-17 figure for one due terrain
     /// row after the shared source-event table and generic figure pool both
-    /// admit it. The first INSEL5 resource selector chooses `FRAU` (`0x5b`)
-    /// only when it equals one; all other islands use `ADEL` (`0x59`).
+    /// admit it. `FUN_0046b3e0` reads the island season/parity byte
+    /// (runtime `+0x1c`) and chooses `FRAU` (`0x5b`) only when it equals one;
+    /// all other islands use `ADEL` (`0x59`).
     fn allocate_source_terrain_event(
         &mut self,
         map_index: usize,
@@ -4360,7 +4361,7 @@ impl Simulation {
         let (Ok(event_x), Ok(event_y)) = (i16::try_from(world.0), i16::try_from(world.1)) else {
             return None;
         };
-        let definition = if map.source_resource_state().records[0].ware() == 1 {
+        let definition = if map.source_resource_state().parity == 1 {
             0x5b
         } else {
             0x59
@@ -9605,15 +9606,18 @@ mod tests {
         constrained.island_maps.push(
             IslandMap::new_open(2, 8, 8).with_source_resource_state(
                 anno_formats::szs::IslandSourceResourceState {
-                    crop_flags: 1,
+                    // Grain (0x2d) is forced available everywhere by the
+                    // loader's `crop_flags |= 0x1181`, so discriminate with a
+                    // non-forced special crop: bit 2 == ware 0x2f.
+                    crop_flags: 1 << 2,
                     ..Default::default()
                 },
             ));
 
-        assert!(constrained.request_source_controller_island_search(0, Some(0x2d)));
+        assert!(constrained.request_source_controller_island_search(0, Some(0x2f)));
         let controller = &constrained.source_player_controllers[0];
         assert_eq!(controller.island_search_cursor, 2);
-        assert_eq!(controller.island_search_requirement, Some(0x2d));
+        assert_eq!(controller.island_search_requirement, Some(0x2f));
         assert_eq!(controller.island_search_selected_island_id, Some(2));
         assert_eq!(controller.action_stack, vec![2]);
     }
@@ -12116,8 +12120,12 @@ mod tests {
         use anno_formats::szs::IslandSourceResourceState;
 
         let mut sim = Simulation::new();
+        // `FUN_004684a0` indexes its growth mask by `(x&3)+y*4+island+ware`.
+        // GETREIDE's `0x2d` selector puts the `(0,0)` mask bit on a band-3
+        // drought cell, so place the dry cell at `y == 1` (mask index 17),
+        // where the same band's bit is a regrowth to exercise the restore.
         sim.island_maps
-            .push(IslandMap::new_open(0, 1, 1).with_source_resource_state(
+            .push(IslandMap::new_open(0, 1, 2).with_source_resource_state(
                 IslandSourceResourceState {
                     attenuation: 64,
                     crop_flags: 1,
@@ -12130,7 +12138,7 @@ mod tests {
             properties: [("Ware".into(), "GETREIDE".into())].into(),
             ..Default::default()
         };
-        let mut dry = SourceMapCellState::new_static(0, 0, 0, &raw, 0).unwrap();
+        let mut dry = SourceMapCellState::new_static(0, 0, 1, &raw, 0).unwrap();
         dry.source_resource_growth_factor = 128;
         assert!(dry.replace_harvested_raw_resource(SourceResourceHarvestTransition::Drought));
         sim.source_static_map_roots.push(dry);
