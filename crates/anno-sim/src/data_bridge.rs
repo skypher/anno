@@ -1775,6 +1775,83 @@ fn parse_good(name: &str) -> Good {
     }
 }
 
+/// Map a source ware-registration index (the executable's compiled
+/// `def+0x21` byte; see `anno_formats::cod::source_ware_slot` for the
+/// token table) to this simulator's [`Good`]. Slot `0x07` covers both
+/// `FLEISCH` and `RIND` in the source; the processed good is returned.
+pub fn good_for_source_ware_slot(slot: u8) -> Good {
+    match slot {
+        0x02 => Good::Ore,
+        0x03 => Good::Gold,
+        0x04 => Good::Wool,
+        0x05 => Good::Sugar,
+        0x06 => Good::Tobacco,
+        0x07 => Good::Meat,
+        0x08 => Good::Grain,
+        0x09 => Good::Flour,
+        0x0a => Good::Iron,
+        0x0b => Good::Swords,
+        0x0c => Good::Muskets,
+        0x0d => Good::Cannons,
+        0x0e => Good::Food,
+        0x0f => Good::TobaccoProducts,
+        0x10 => Good::Spices,
+        0x11 => Good::Cocoa,
+        0x12 => Good::Alcohol,
+        0x13 => Good::Cloth,
+        0x14 => Good::Clothing,
+        0x15 => Good::Jewelry,
+        0x16 => Good::Tools,
+        0x17 => Good::Wood,
+        0x18 => Good::Bricks,
+        _ => Good::None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn good_for_source_ware_slot_roundtrips_the_registration_table() {
+    // Every token the executable registers with a Good-mapped slot must
+    // resolve back to the same Good through the slot index. RIND shares
+    // slot 0x07 with FLEISCH; the slot mapping returns the processed
+    // good, so the raw-cattle alias is the one accepted exception.
+    for token in [
+        "EISENERZ",
+        "GOLD",
+        "WOLLE",
+        "ZUCKER",
+        "TABAK",
+        "FLEISCH",
+        "KORN",
+        "MEHL",
+        "EISEN",
+        "SCHWERTER",
+        "MUSKETEN",
+        "KANONEN",
+        "NAHRUNG",
+        "TABAKWAREN",
+        "GEWUERZE",
+        "KAKAO",
+        "ALKOHOL",
+        "STOFFE",
+        "KLEIDUNG",
+        "SCHMUCK",
+        "WERKZEUG",
+        "HOLZ",
+        "ZIEGEL",
+    ] {
+        let slot = anno_formats::cod::source_ware_slot(token)
+            .unwrap_or_else(|| panic!("{token} must be in the registration table"));
+        assert_eq!(
+            good_for_source_ware_slot(slot),
+            parse_good(token),
+            "slot round-trip mismatch for {token}"
+        );
+    }
+    assert_eq!(good_for_source_ware_slot(0x00), Good::None);
+    assert_eq!(good_for_source_ware_slot(0x3a), Good::None);
+}
+
 #[cfg(test)]
 #[test]
 fn parse_good_covers_all_haeuser_cod_tokens() {
@@ -3285,6 +3362,7 @@ mod tests {
                     state_payload: [0; 8],
                 },
             ],
+            kontors: Vec::new(),
         };
 
         let occupants = source_kind4_occupants_from_scenario(&scenario);
@@ -3397,6 +3475,7 @@ mod tests {
             scenario: ScenarioMeta::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
 
         assert_eq!(
@@ -3490,6 +3569,7 @@ mod tests {
             scenario: ScenarioMeta::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
 
         let states = source_map_cell_states_from_scenario(&szs, &cod);
@@ -3552,6 +3632,7 @@ mod tests {
             scenario: ScenarioMeta::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
 
         let states = source_map_cell_states_from_scenario(&szs, &cod);
@@ -3642,6 +3723,7 @@ mod tests {
             scenario: ScenarioMeta::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
 
         let backing = source_static_map_backing_cells_from_scenario(&szs, &cod);
@@ -3821,6 +3903,7 @@ mod tests {
             scenario: ScenarioMeta::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
 
         let states = source_map_cell_states_from_scenario(&szs, &cod);
@@ -3903,6 +3986,7 @@ mod tests {
             scenario: ScenarioMeta::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
 
         assert_eq!(
@@ -4770,6 +4854,7 @@ mod tests {
             scenario: ScenarioMeta::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
 
         let defs = load_building_defs(&cod);
@@ -5008,6 +5093,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
 
         let dispatch = source_kind4_dispatch_state_from_scenario(&scenario);

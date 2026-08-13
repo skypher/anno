@@ -340,10 +340,19 @@ record `+0x0c` u16 = initial stock, `+0x10` u16 = def number (+20000) whose
 def byte `+0x21` selects the ware slot, `+0x00`/`+0x08` merge into the runtime
 ware entry's trade-slider fields. `cargo run -p anno-formats --example
 audit_kontor2_bytes <szs>` dumps them (Exile: 800/800/509/509/1127 confirmed
-authored). Parsing KONTOR2 stock into the scenario loader is the open next
-step; after that the Exile population trajectory comparison
-(`docs/original-capture.md` capture flow + `tools/capture/read_city`-style
-snapshots) becomes discriminating.
+authored). **Now parsed and seeded** (`SzsFile::kontors` →
+`Warehouse::seed_city_stock_fixed` in the scenario loader): the Rust t0 city
+store matches the original bit-exactly, settler satisfaction holds at 128, and
+the food drain follows the exact 1.3 t/min/100-residents rate.
+
+With consumption exact and stores seeded, the dominant remaining divergence is
+the **population growth approximation**: `update_population_growth` grows a
+satisfied tier ~5 %/economy-tick and the house-tier gate upgrades every
+satisfied house each tick, so the Rust Exile population explodes (156 → 844
+settlers+ in 400 s) where the original is bounded by houses and immigrant
+figures (26 houses × Maxwohn 6 ≈ the starting 156 — likely near-flat; the
+kind-13/`FUN_0047b540` house subsystem is the exact model to port next). The
+trajectory measurement against the live original quantifies this.
 
 Caveat for long captures: each winedbg attach is one-shot-ish — after a few
 attach/detach cycles this Wine build sometimes takes the game down. Space

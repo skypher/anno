@@ -10488,6 +10488,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.ocean_map = Some(OceanMap::from_source_scenario(&scenario, &[]));
@@ -15083,6 +15084,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let ocean = OceanMap::from_scenario(&szs);
 
@@ -15134,6 +15136,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -15174,6 +15177,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -15218,6 +15222,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.ocean_map = Some(OceanMap::from_scenario(&szs));
@@ -15260,6 +15265,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));

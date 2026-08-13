@@ -989,6 +989,47 @@ pub struct SzsFile {
     /// Initial land figures parsed from the SOLDAT3 chunk. Source shipping
     /// scenarios use kind-4 entries for their authored land soldiers.
     pub land_figures: Vec<LandFigure>,
+    /// Authored city-store contents parsed from the `KONTOR2` chunks,
+    /// one per settlement Kontor. Empty when the scenario has none.
+    pub kontors: Vec<Kontor>,
+}
+
+/// One `KONTOR2` chunk: the authored city-store state for a settlement.
+///
+/// Layout (loader at `0x484230`, a decompiled-dump gap recovered by
+/// disassembly; 1004 bytes = 4-byte header + 50 records × 0x14):
+/// header byte 0 is the island index, bytes 1/2 the Kontor tile. Each
+/// record targets the runtime city ware entry selected by its
+/// definition's compiled ware byte (`def + 0x21`).
+#[derive(Debug, Clone)]
+pub struct Kontor {
+    /// Island index (same space as [`City::island_index`]).
+    pub island_index: u8,
+    /// Kontor tile coordinates from header bytes 1/2.
+    pub tile_x: u8,
+    pub tile_y: u8,
+    /// The fifty per-ware records, empty entries included.
+    pub stocks: Vec<KontorStock>,
+}
+
+/// One 0x14-byte `KONTOR2` record.
+#[derive(Debug, Clone, Copy)]
+pub struct KontorStock {
+    /// Record `+0x00`: bitfields merged into the runtime ware entry's
+    /// `+8` dword (ten-bit trade-slider fields and their enable flags).
+    pub trade_flags: u32,
+    /// Record `+0x04`: semantics not yet pinned.
+    pub field_4: u32,
+    /// Record `+0x08`: split into the runtime entry's `+2`/`+4` u16s
+    /// (trade-slider amounts).
+    pub slider_amounts: u32,
+    /// Record `+0x0c`: initial stock written to the runtime entry's
+    /// `+6` u16, in the city store's 1/32-good fixed-point units.
+    pub stock_fixed: u16,
+    /// Record `+0x10`: haeuser definition id; the loader resolves
+    /// `0x4e20 + id` and reads the definition's compiled ware byte to
+    /// pick the ware slot. Zero marks an unused record.
+    pub definition_raw_id: u16,
 }
 
 /// Scenario-level metadata (mission #, player range, difficulty
@@ -1642,6 +1683,12 @@ impl SzsFile {
             .map(|c| Self::parse_soldat3(&c.data))
             .unwrap_or_default();
 
+        let kontors = chunks
+            .iter()
+            .filter(|c| c.name == "KONTOR2")
+            .filter_map(|c| Self::parse_kontor2(&c.data))
+            .collect();
+
         Ok(SzsFile {
             chunks,
             islands,
@@ -1650,6 +1697,27 @@ impl SzsFile {
             scenario,
             ships,
             land_figures,
+            kontors,
+        })
+    }
+
+    fn parse_kontor2(data: &[u8]) -> Option<Kontor> {
+        let (header, records) = data.split_at_checked(4)?;
+        let stocks = records
+            .chunks_exact(0x14)
+            .map(|rec| KontorStock {
+                trade_flags: u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]),
+                field_4: u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]),
+                slider_amounts: u32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]),
+                stock_fixed: u16::from_le_bytes([rec[0x0c], rec[0x0d]]),
+                definition_raw_id: u16::from_le_bytes([rec[0x10], rec[0x11]]),
+            })
+            .collect();
+        Some(Kontor {
+            island_index: header[0],
+            tile_x: header[1],
+            tile_y: header[2],
+            stocks,
         })
     }
 
@@ -2559,6 +2627,74 @@ mod tests {
         let i1 = &parsed.islands[1];
         assert_eq!(i1.number, 4);
         assert!(i1.tiles.is_empty());
+    }
+
+    #[test]
+    fn kontor2_carries_exiles_authored_city_stocks() {
+        // Live-verified against the running original (winedbg read of
+        // the runtime city table at clock 0, 2026-08-14): Exile's human
+        // city opens with NAHRUNG 800, TABAKWAREN 800, ALKOHOL 509,
+        // STOFFE 509, WERKZEUG 1127 in 1/32-good units. Those authored
+        // amounts live in the island-0 KONTOR2 records keyed by
+        // definition id (`+0x4e20` -> compiled ware byte).
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let szs_data = match std::fs::read(root.join("extracted/Szenes/Exile.szs")) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping test: Exile.szs not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&szs_data).expect("failed to parse Exile.szs");
+        assert_eq!(szs.kontors.len(), 7, "Exile ships seven KONTOR2 chunks");
+        let human = szs
+            .kontors
+            .iter()
+            .find(|k| k.island_index == 0)
+            .expect("island 0 kontor");
+        assert_eq!((human.tile_x, human.tile_y), (5, 29));
+        assert_eq!(human.stocks.len(), 50);
+        let stock_of = |raw_id: u16| {
+            human
+                .stocks
+                .iter()
+                .find(|s| s.definition_raw_id == raw_id)
+                .map(|s| s.stock_fixed)
+        };
+        assert_eq!(stock_of(1075), Some(800)); // NAHRUNG
+        assert_eq!(stock_of(525), Some(800)); // TABAKWAREN
+        assert_eq!(stock_of(519), Some(509));
+        assert_eq!(stock_of(507), Some(509));
+        assert_eq!(stock_of(515), Some(1127)); // WERKZEUG
+
+        // With haeuser.cod available, resolve the definition ids the
+        // way the loader does and confirm the ware selection.
+        let cod_data = match std::fs::read(root.join("extracted/haeuser.cod")) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping ware resolution: haeuser.cod not found");
+                return;
+            }
+        };
+        let cod = crate::cod::CodFile::parse(&cod_data).expect("parse haeuser.cod");
+        let ware_of = |raw_id: u16| {
+            cod.building_by_source_id(crate::cod::SOURCE_DEFINITION_ID_BASE + i32::from(raw_id))
+                .and_then(crate::cod::BuildingDef::source_ware_slot)
+        };
+        assert_eq!(ware_of(1075), Some(0x0e), "def 1075 sells NAHRUNG");
+        assert_eq!(ware_of(525), Some(0x0f), "def 525 sells TABAKWAREN");
+        assert_eq!(ware_of(515), Some(0x16), "def 515 sells WERKZEUG");
+        // 519/507: one is ALKOHOL (0x12), the other STOFFE (0x13).
+        let pair = [ware_of(519), ware_of(507)];
+        assert!(
+            pair.contains(&Some(0x12)) && pair.contains(&Some(0x13)),
+            "defs 519/507 must cover ALKOHOL and STOFFE, got {pair:?}"
+        );
     }
 
     #[test]

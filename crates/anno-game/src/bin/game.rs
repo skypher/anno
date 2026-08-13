@@ -6709,6 +6709,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -6744,6 +6745,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -6775,6 +6777,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -6979,6 +6982,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -7042,6 +7046,7 @@ mod tests {
                 cargo_slots: [0; 7],
             }],
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -7089,6 +7094,7 @@ mod tests {
                 cargo_slots: [0; 7],
             }],
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -7119,6 +7125,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),
@@ -7159,6 +7166,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let cod = CodFile {
             constants: Default::default(),

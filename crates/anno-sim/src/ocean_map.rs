@@ -701,6 +701,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let definitions = [CodBuilding {
             source_id: 0x4e20,
@@ -735,6 +736,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let ocean = OceanMap::from_source_scenario(&scenario, &[]);
         let target = SourceResolvedStaticTarget {
@@ -776,6 +778,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let ocean = OceanMap::from_source_scenario(&scenario, &[]);
         let target = crate::source_route::SourceResolvedDynamicTarget {
@@ -833,6 +836,7 @@ mod tests {
             scenario: Default::default(),
             ships: Vec::new(),
             land_figures: Vec::new(),
+            kontors: Vec::new(),
         };
         let definitions = [
             CodBuilding {

@@ -126,6 +126,44 @@ pub fn init_simulation(
         ));
     }
 
+    // Seed authored city-store stocks from the scenario's KONTOR2
+    // chunks. The source loader (`0x484230`) writes each record's
+    // `+0x0c` u16 straight into the runtime city ware entry selected by
+    // the record definition's compiled ware byte; without this the Rust
+    // Kontors start empty and the exact `FUN_0047f8a0` demand cycle
+    // correctly starves the city (live Exile check: the original's
+    // human city opens with NAHRUNG 800, ALKOHOL/STOFFE 509, ...).
+    for kontor in &szs.kontors {
+        let Some(warehouse) = warehouses
+            .iter_mut()
+            .filter(|warehouse| warehouse.island_id == kontor.island_index)
+            .min_by_key(|warehouse| {
+                let dx = i32::from(warehouse.tile_x) - i32::from(kontor.tile_x);
+                let dy = i32::from(warehouse.tile_y) - i32::from(kontor.tile_y);
+                dx * dx + dy * dy
+            })
+        else {
+            continue;
+        };
+        for stock in &kontor.stocks {
+            if stock.definition_raw_id == 0 || stock.stock_fixed == 0 {
+                continue;
+            }
+            let source_id = anno_formats::cod::SOURCE_DEFINITION_ID_BASE
+                + i32::from(stock.definition_raw_id);
+            let Some(good) = cod
+                .building_by_source_id(source_id)
+                .and_then(|def| def.source_ware_slot())
+                .map(anno_sim::data_bridge::good_for_source_ware_slot)
+            else {
+                continue;
+            };
+            if good != anno_sim::types::Good::None {
+                warehouse.seed_city_stock_fixed(good, stock.stock_fixed);
+            }
+        }
+    }
+
     // Build island walkability maps
     let island_maps: Vec<IslandMap> = szs
         .islands

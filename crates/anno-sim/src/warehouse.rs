@@ -325,6 +325,20 @@ impl Warehouse {
         }
     }
 
+    /// Seed an authored scenario stock in 1/32-good units. The `KONTOR2`
+    /// loader (`0x484230`) writes each record's `+0x0c` u16 directly into
+    /// the runtime city ware entry's stock (`+6`) with no capacity clamp;
+    /// the integral view keeps its floor. Raises the integral capacity to
+    /// hold the seeded amount so display/deposit logic stays consistent.
+    pub fn seed_city_stock_fixed(&mut self, good: Good, stock_fixed: u16) {
+        self.city_fixed_inventory.insert(good, stock_fixed);
+        let integral = stock_fixed / 32;
+        let capacity = self.capacity(good).max(integral);
+        let entry = self.inventory.entry(good).or_insert((0, capacity));
+        entry.1 = entry.1.max(capacity);
+        entry.0 = integral;
+    }
+
     /// Withdraw an exact source city-store amount in 1/32-good units.
     /// `FUN_0047b160` uses this scale for kind-13 housing replacements after
     /// its caller has checked the city record's stock-minus-reserved balance.
