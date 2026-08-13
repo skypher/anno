@@ -300,8 +300,17 @@ impl TickScheduler {
 }
 
 pub fn scaled_sim_ms(real_dt_ms: u32, speed_multiplier: u32) -> u32 {
+    // FUN_00489670: `if (2999 < DAT_0049af74 * param_1) param_1 = 0x32;` then the
+    // loop initializes `param_1 = DAT_0049af74 * param_1`. So a runaway frame is
+    // clamped to 50 *ticks* and then re-scaled by the speed multiplier — the
+    // processed total is `speed * 50`, not a flat 50. They coincide only at
+    // speed 1 (the previous code dropped the multiplier on the clamp branch).
     let scaled = real_dt_ms.saturating_mul(speed_multiplier);
-    if scaled > MAX_TOTAL_MS { 50 } else { scaled }
+    if scaled > MAX_TOTAL_MS {
+        50u32.saturating_mul(speed_multiplier)
+    } else {
+        scaled
+    }
 }
 
 pub fn unresolved_timing_specs() -> Vec<&'static TimingSpec> {
@@ -500,5 +509,11 @@ mod tests {
     fn runaway_frame_clamp_matches_simulation_policy() {
         assert_eq!(scaled_sim_ms(2_999, 1), 2_999);
         assert_eq!(scaled_sim_ms(3_000, 1), 50);
+        // FUN_00489670 clamps to 50 ticks then re-scales by the speed
+        // multiplier, so a runaway frame processes speed*50, not a flat 50.
+        assert_eq!(scaled_sim_ms(1_500, 2), 50 * 2); // scaled 3000 > 2999 -> 2*50
+        assert_eq!(scaled_sim_ms(1_000, 3), 50 * 3); // scaled 3000 > 2999 -> 3*50
+        assert_eq!(scaled_sim_ms(1_000, 4), 50 * 4); // scaled 4000 > 2999 -> 4*50
+        assert_eq!(scaled_sim_ms(700, 4), 2_800); // scaled 2800 <= 2999 -> unclamped
     }
 }
