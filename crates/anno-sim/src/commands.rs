@@ -136,6 +136,41 @@ pub enum Command {
         good: Good,
         qty: u16,
     },
+    /// Place building definition `def_index` (haeuser.cod compile order ==
+    /// `sim.building_defs` order) at a tile, mirroring the game's
+    /// click-place flow: fertility gate, fishery coast gate, walkability,
+    /// gold cost. Applied by the game layer
+    /// (`anno_game::game_commands::apply_game_command`), which owns the
+    /// compiled COD table needed to synthesize the source placement
+    /// command; `Simulation::apply_command` alone refuses it.
+    PlaceBuilding {
+        player: u8,
+        island: u8,
+        tile_x: u16,
+        tile_y: u16,
+        def_index: u16,
+        orientation: u8,
+    },
+    /// Demolish the `player`-owned building whose footprint covers the
+    /// tile, refunding half its gold cost. Applied by the game layer, like
+    /// [`Command::PlaceBuilding`].
+    DemolishBuilding {
+        player: u8,
+        island: u8,
+        tile_x: u16,
+        tile_y: u16,
+    },
+    /// Issue a move order to one military unit, mirroring the right-click
+    /// order flow: source-backed units route through their island's
+    /// source-world coordinates and kind-4 occupant record; plain units
+    /// take the tile target directly.
+    MoveUnit {
+        player: u8,
+        unit_index: u32,
+        island: u8,
+        tile_x: i32,
+        tile_y: i32,
+    },
 }
 
 impl Command {

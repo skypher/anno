@@ -21,7 +21,7 @@ pub const SOURCE_DEFINITION_ID_BASE: i32 = 0x4e20;
 /// Translate one `Ware` token through the executable's registration table.
 /// The values `0x19..=0x2c` are the sixteen soldier, cavalry, musketeer,
 /// cannonier, and pioneer policy items tested by `FUN_00458e60`.
-pub const fn source_ware_slot(token: &str) -> Option<u8> {
+pub fn source_ware_slot(token: &str) -> Option<u8> {
     Some(match token {
         "NOWARE" => 0x00,
         "ALLWARE" => 0x01,
@@ -406,6 +406,13 @@ impl CodFile {
 
     fn parse_text(text: &str) -> Result<CodFile, CodError> {
         let mut constants: HashMap<String, i32> = HashMap::new();
+        // Builtin constants the executable's constant table supplies before it
+        // parses haeuser.cod. The shipped file references `RADIUS_MARKT` and
+        // `RADIUS_HQ` (marketplace and warehouse service radius) but never
+        // defines them; the original engine seeds them from the binary. Values
+        // are the same ones `anno_sim::data_bridge` recovered.
+        constants.insert("RADIUS_MARKT".to_string(), 30);
+        constants.insert("RADIUS_HQ".to_string(), 22);
         let mut buildings: Vec<BuildingDef> = Vec::new();
         let mut building_by_nummer: HashMap<i32, BuildingDef> = HashMap::new();
         // `@field: +/-value` is evaluated by the executable parser against

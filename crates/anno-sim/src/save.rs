@@ -257,7 +257,10 @@ use std::path::Path;
 ///       work queues.
 /// v137: player controllers retain the `+0x1d14` construction-consumer
 ///       cursor and its live scan state.
-pub const SAVE_VERSION: u32 = 137;
+/// v138: subsystem timer accumulators and the fractional game-clock
+///       accumulator persist, so save→load is phase-exact (required for
+///       tick-lockstep replay and state-hash comparison).
+pub const SAVE_VERSION: u32 = 138;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -271,7 +274,7 @@ pub const SAVE_VERSION: u32 = 137;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 137;
+pub const MIN_LOADABLE_VERSION: u32 = 138;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -280,9 +283,20 @@ pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
 pub struct SaveState {
     pub version: u32,
     pub game_clock: u32,
+    /// Milliseconds not yet promoted into `game_clock`.
+    pub clock_frac_ms: u32,
     pub speed_multiplier: u32,
     pub paused: bool,
     pub autosave_timer_ms: u32,
+    /// Subsystem cadence accumulators, in `step()` dispatch order. Restored
+    /// on load so the next fire of each subsystem lands on the same tick it
+    /// would have without the save/load roundtrip.
+    pub timer_production_accumulator_ms: u32,
+    pub timer_population_accumulator_ms: u32,
+    pub timer_diplomacy_accumulator_ms: u32,
+    pub timer_market_accumulator_ms: u32,
+    pub timer_ships_accumulator_ms: u32,
+    pub timer_events_accumulator_ms: u32,
     pub players: Vec<Player>,
     pub buildings: Vec<BuildingInstance>,
     pub source_dynamic_map_objects: Vec<SourceDynamicMapObject>,
@@ -311,6 +325,7 @@ pub struct SaveState {
     pub source_combat_terminal_slices: Vec<crate::simulation::SourceCombatTerminalSlice>,
     pub tile_clears: Vec<crate::simulation::TileClear>,
     pub source_kind4_dispatch: crate::combat::SourceKind4DispatchState,
+    #[serde(with = "crate::serde_util::byte_array")]
     pub source_shared_figure_control_flags:
         [u8; crate::combat::SOURCE_DYNAMIC_SHARED_SLOT_CAPACITY as usize],
     pub source_player_controllers:
@@ -376,9 +391,16 @@ impl Simulation {
         SaveState {
             version: SAVE_VERSION,
             game_clock: self.game_clock,
+            clock_frac_ms: self.clock_frac_ms,
             speed_multiplier: self.speed_multiplier,
             paused: self.paused,
             autosave_timer_ms: self.autosave_timer_ms,
+            timer_production_accumulator_ms: self.timer_production.accumulator_ms,
+            timer_population_accumulator_ms: self.timer_population.accumulator_ms,
+            timer_diplomacy_accumulator_ms: self.timer_diplomacy.accumulator_ms,
+            timer_market_accumulator_ms: self.timer_market.accumulator_ms,
+            timer_ships_accumulator_ms: self.timer_ships.accumulator_ms,
+            timer_events_accumulator_ms: self.timer_events.accumulator_ms,
             players: self.players.clone(),
             buildings: self.buildings.clone(),
             source_dynamic_map_objects: self.source_dynamic_map_objects.clone(),
@@ -439,14 +461,30 @@ impl Simulation {
         }
     }
 
+    /// Deterministic digest of the current mutable game state. Two sims
+    /// seeded identically and driven with the same fixed timestep and
+    /// command stream produce the same hash on every tick; the first
+    /// differing tick localizes a divergence.
+    pub fn state_hash(&self) -> u64 {
+        state_hash(&self.snapshot())
+    }
+
     /// Apply a previously captured snapshot. Preserves immutable scenario
-    /// data (building_defs, island_maps, ocean_map). Coverage maps and
-    /// timers are reset and will be recomputed by the next tick.
+    /// data (building_defs, island_maps, ocean_map). Coverage maps are
+    /// reset and will be recomputed by the next tick; subsystem timer
+    /// accumulators are restored, so the tick phase survives the roundtrip.
     pub fn apply_snapshot(&mut self, s: SaveState) {
         self.game_clock = s.game_clock;
+        self.clock_frac_ms = s.clock_frac_ms;
         self.speed_multiplier = s.speed_multiplier;
         self.paused = s.paused;
         self.autosave_timer_ms = s.autosave_timer_ms;
+        self.timer_production.accumulator_ms = s.timer_production_accumulator_ms;
+        self.timer_population.accumulator_ms = s.timer_population_accumulator_ms;
+        self.timer_diplomacy.accumulator_ms = s.timer_diplomacy_accumulator_ms;
+        self.timer_market.accumulator_ms = s.timer_market_accumulator_ms;
+        self.timer_ships.accumulator_ms = s.timer_ships_accumulator_ms;
+        self.timer_events.accumulator_ms = s.timer_events_accumulator_ms;
         self.players = s.players;
         self.buildings = s.buildings;
         self.source_dynamic_map_objects = s.source_dynamic_map_objects;
@@ -501,6 +539,28 @@ impl Simulation {
         self.trade_ships = s.trade_ships;
         self.objectives = s.objectives;
     }
+}
+
+/// FNV-1a 64-bit hash of the bincode encoding of a save snapshot.
+///
+/// Stable across processes and platforms (bincode encodes fixed-width
+/// little-endian integers), so two simulations driven with the same seed,
+/// timestep, and commands can be compared tick by tick by hash alone.
+pub fn state_hash(state: &SaveState) -> u64 {
+    let payload = bincode::serialize(state).expect("SaveState must serialize");
+    fnv1a_64(&payload)
+}
+
+const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = FNV1A_OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV1A_PRIME);
+    }
+    hash
 }
 
 pub fn save_to_file(path: &Path, state: &SaveState) -> Result<(), SaveError> {
@@ -566,9 +626,16 @@ mod tests {
         let mut state = SaveState {
             version: MIN_LOADABLE_VERSION,
             game_clock: 0,
+            clock_frac_ms: 0,
             speed_multiplier: 1,
             paused: false,
             autosave_timer_ms: 0,
+            timer_production_accumulator_ms: 0,
+            timer_population_accumulator_ms: 0,
+            timer_diplomacy_accumulator_ms: 0,
+            timer_market_accumulator_ms: 0,
+            timer_ships_accumulator_ms: 0,
+            timer_events_accumulator_ms: 0,
             players: vec![Player::new_human(0)],
             buildings: vec![],
             source_dynamic_map_objects: vec![],
@@ -718,6 +785,90 @@ mod tests {
             321
         );
         assert_eq!(sim2.next_source_rand(), expected_next_rand);
+    }
+
+    #[test]
+    fn save_load_is_phase_exact() {
+        // A sim saved mid-interval and restored into a fresh instance must
+        // fire every subsystem on the same future tick as an uninterrupted
+        // run: the timer accumulators and clock_frac_ms must survive the
+        // roundtrip, not reset to zero.
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.seed_source_rand(42);
+        // 7 × 130 ms leaves every accumulator mid-interval (910 ms elapsed).
+        for _ in 0..7 {
+            sim.tick(130);
+        }
+
+        let snap = sim.snapshot();
+        assert_eq!(snap.clock_frac_ms, sim.clock_frac_ms);
+        assert_ne!(
+            snap.timer_production_accumulator_ms, 0,
+            "test precondition: production timer should be mid-interval"
+        );
+
+        let mut restored = Simulation::new();
+        restored.apply_snapshot(snap);
+        assert_eq!(
+            restored.timer_production.accumulator_ms,
+            sim.timer_production.accumulator_ms
+        );
+        assert_eq!(
+            restored.timer_population.accumulator_ms,
+            sim.timer_population.accumulator_ms
+        );
+        assert_eq!(
+            restored.timer_diplomacy.accumulator_ms,
+            sim.timer_diplomacy.accumulator_ms
+        );
+        assert_eq!(
+            restored.timer_market.accumulator_ms,
+            sim.timer_market.accumulator_ms
+        );
+        assert_eq!(
+            restored.timer_ships.accumulator_ms,
+            sim.timer_ships.accumulator_ms
+        );
+        assert_eq!(
+            restored.timer_events.accumulator_ms,
+            sim.timer_events.accumulator_ms
+        );
+        assert_eq!(restored.clock_frac_ms, sim.clock_frac_ms);
+
+        // Continue both sims in lockstep; their states must stay identical.
+        for _ in 0..40 {
+            sim.tick(130);
+            restored.tick(130);
+        }
+        assert_eq!(sim.game_clock, restored.game_clock);
+        assert_eq!(
+            bincode::serialize(&sim.snapshot()).unwrap(),
+            bincode::serialize(&restored.snapshot()).unwrap()
+        );
+    }
+
+    #[test]
+    fn state_hash_matches_lockstep_twins_and_flags_divergence() {
+        let build = || {
+            let mut sim = Simulation::new();
+            sim.players.push(Player::new_human(0));
+            sim.players[0].gold = 500;
+            sim.seed_source_rand(1234);
+            sim
+        };
+        let mut a = build();
+        let mut b = build();
+        for _ in 0..50 {
+            a.tick(130);
+            b.tick(130);
+            assert_eq!(a.state_hash(), b.state_hash());
+        }
+
+        // A single extra RNG draw must change the digest.
+        let before = a.state_hash();
+        let _ = a.next_source_rand();
+        assert_ne!(a.state_hash(), before);
     }
 
     #[test]
@@ -906,6 +1057,9 @@ mod tests {
             action_figure_handle: Some(4),
             action_target_island_id: Some(1),
             action_target_tile: Some((12, 13)),
+            action_source_candidate_tile: Some((21, -6)),
+            action_target_direction: Some(2),
+            action_arrival_retries: 3,
             island_search_cursor: 17,
             island_search_requirement: Some(0x2d),
             island_search_selected_island_id: Some(3),
@@ -931,6 +1085,8 @@ mod tests {
             purchase_predecessor_issued: false,
             owned_figure_handles: vec![4, 7],
             figure_roster_dirty: true,
+            source_city_rectangles: Vec::new(),
+            source_city_construction_queue: Default::default(),
         };
         let mut source_route_program = crate::combat::default_source_kind4_route_program();
         source_route_program[0] = 0x31;
@@ -1471,7 +1627,9 @@ mod tests {
                 source_kind6_policy_raw_slots: [0; 8],
                 source_kind6_policy_ware_slots: [0; 8],
                 source_kind6_target_descriptor_payload: None,
-                kind6_target_descriptor: None,
+                kind6_target_descriptor: Some(
+                    crate::source_route::SourceTargetDescriptor::from_bytes([0x37, 0, 9, 10]),
+                ),
                 candidate_list_key: Some(1),
                 owner: 4,
                 position: (18.5, 21.25),
@@ -1509,6 +1667,9 @@ mod tests {
                 action_figure_handle: Some(4),
                 action_target_island_id: Some(1),
                 action_target_tile: Some((12, 13)),
+                action_source_candidate_tile: Some((21, -6)),
+                action_target_direction: Some(2),
+                action_arrival_retries: 3,
                 island_search_cursor: 17,
                 island_search_requirement: Some(0x2d),
                 island_search_selected_island_id: Some(3),
@@ -1534,6 +1695,8 @@ mod tests {
                 purchase_predecessor_issued: false,
                 owned_figure_handles: vec![4, 7],
                 figure_roster_dirty: true,
+                source_city_rectangles: Vec::new(),
+                source_city_construction_queue: Default::default(),
             }
         );
         assert_eq!(

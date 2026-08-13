@@ -60,9 +60,9 @@ pub(crate) struct SourceDynamicRouteProgram {
 
 /// Timer state for each subsystem.
 #[derive(Debug, Clone)]
-struct SubsystemTimer {
-    accumulator_ms: u32,
-    interval_ms: u32,
+pub(crate) struct SubsystemTimer {
+    pub(crate) accumulator_ms: u32,
+    pub(crate) interval_ms: u32,
 }
 
 impl SubsystemTimer {
@@ -644,7 +644,7 @@ pub struct SourceKind4DeferredRelocation {
     pub target_descriptor: SourceTargetDescriptor,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SourceTransferEventCandidate {
     slot: u16,
     x: i16,
@@ -686,7 +686,7 @@ pub struct Simulation {
     /// Game clock in centiseconds (600 = 1 displayed minute).
     pub game_clock: u32,
     /// Fractional tick accumulator.
-    clock_frac_ms: u32,
+    pub(crate) clock_frac_ms: u32,
 
     /// Game speed multiplier (1 = normal).
     pub speed_multiplier: u32,
@@ -695,12 +695,12 @@ pub struct Simulation {
     pub paused: bool,
 
     // Subsystem cadences (1000-ms tick aligned).
-    timer_production: SubsystemTimer, // PRODUCTION_TICK_MS (1000)
-    timer_population: SubsystemTimer, // 10_000
-    timer_events: SubsystemTimer,     // 10_000
-    timer_ships: SubsystemTimer,      // 1_000
-    timer_market: SubsystemTimer,     // 1_000
-    timer_diplomacy: SubsystemTimer,  // 5_000
+    pub(crate) timer_production: SubsystemTimer, // PRODUCTION_TICK_MS (1000)
+    pub(crate) timer_population: SubsystemTimer, // 10_000
+    pub(crate) timer_events: SubsystemTimer,     // 10_000
+    pub(crate) timer_ships: SubsystemTimer,      // 1_000
+    pub(crate) timer_market: SubsystemTimer,     // 1_000
+    pub(crate) timer_diplomacy: SubsystemTimer,  // 5_000
 
     // Game state
     pub players: Vec<Player>,
@@ -1265,10 +1265,7 @@ impl Simulation {
                 let island = descriptor.bytes()[1];
                 let slot = descriptor.bytes()[2];
                 let table = self.source_dynamic_map_object_table(island);
-                let object = table
-                    .objects()
-                    .find(|object| object.slot == slot)
-                    .copied()?;
+                let object = table.objects().find(|object| object.slot == slot)?;
                 let map = self
                     .island_maps
                     .iter()
@@ -1761,6 +1758,11 @@ impl Simulation {
 
     pub fn next_source_rand(&mut self) -> u16 {
         self.rng_state.next()
+    }
+
+    /// Raw MSVC LCG state, comparable to the original process's `holdrand`.
+    pub fn source_rand_state(&self) -> u32 {
+        self.rng_state.state()
     }
 
     fn next_rand(&mut self) -> u64 {
@@ -3193,8 +3195,15 @@ impl Simulation {
     /// `FUN_00447f00`. The source removal path clears their live slot, so a
     /// completed record is removed from this live-only collection.
     fn tick_source_kind15_combat_figures(&mut self, dt_ms: u32) {
-        self.source_kind15_combat_figures
-            .retain_mut(|figure| !combat::advance_source_kind15_figure(figure, dt_ms));
+        self.source_kind15_combat_figures.retain_mut(|figure| {
+            let expired = combat::advance_source_kind15_figure(figure, dt_ms);
+            // The source consumes the authored work time in one per-frame
+            // update; splitting a frame into `MAX_STEP_MS` chunks leaves a
+            // sub-ULP residue that keeps the record alive one extra step. Treat
+            // an effectively-exhausted work time as expiry so the figure is
+            // removed on the frame its authored worktime elapses.
+            !expired && figure.remaining_work_time > f32::EPSILON
+        });
     }
 
     /// Advance generic kind-14 launch records created by `FUN_00447e90`.
@@ -3414,7 +3423,12 @@ impl Simulation {
                 slice.velocity_y,
                 slice.velocity_z,
             ));
-            if slice.remaining_distance <= consumed {
+            // The record is freed once its remaining amount is exhausted.
+            // Consuming the distance across successive ticks accumulates a
+            // sub-ULP residue (the per-tick `elapsed` clamp falls a hair short
+            // of `remaining / scalar_speed`), so admit an effectively-exhausted
+            // remainder rather than carrying the record for one extra tick.
+            if slice.remaining_distance <= consumed + f32::EPSILON {
                 completed.push(slice.target);
                 false
             } else {
@@ -4805,7 +4819,7 @@ impl Simulation {
             event_y,
             location.source_owner,
         )?;
-        let mut definition = civilian::source_kind12_initial_definition(self.next_source_rand());
+        let mut definition = civilian::source_kind12_initial_definition(self.rng_state.next());
         if !self.source_figure_pool_has_capacity() {
             return None;
         }
@@ -4815,7 +4829,7 @@ impl Simulation {
         {
             return None;
         }
-        let threshold = (u32::from(self.next_source_rand() & 7) + 5) * 0x40;
+        let threshold = (u32::from(self.rng_state.next() & 7) + 5) * 0x40;
         let mut grid = map.civilian_path_grid(start, location.source_owner, permission_branch);
         let route = grid
             .search_with_blocked_cell_callback(start, |_, elapsed_cost| {
@@ -4843,7 +4857,7 @@ impl Simulation {
             let target = path.last().copied().unwrap_or(start);
             if let Some(target_kind) = map.civilian_path_kind(route.position) {
                 definition =
-                    civilian::source_kind12_definition(target_kind, self.next_source_rand());
+                    civilian::source_kind12_definition(target_kind, self.rng_state.next());
             }
             (target, path)
         } else {
@@ -4918,10 +4932,13 @@ impl Simulation {
         }) {
             return None;
         }
-        let map = self
+        if !self
             .island_maps
             .iter()
-            .find(|map| map.island_id == root.island)?;
+            .any(|map| map.island_id == root.island)
+        {
+            return None;
+        }
         let start = (
             i32::from(root.x) + (i32::from(root.footprint_width.max(1)) - 1) / 2,
             i32::from(root.y) + (i32::from(root.footprint_height.max(1)) - 1) / 2,
@@ -4961,7 +4978,12 @@ impl Simulation {
             .movement_speed_for_definition(definition);
         figure.sprite_set = definition;
         figure.base_sprite = self.civilian_config.sprite_base_for_definition(definition);
-        figure.source_position_z = map.source_terrain_height(start).unwrap_or(0.0);
+        figure.source_position_z = self
+            .island_maps
+            .iter()
+            .find(|map| map.island_id == root.island)
+            .and_then(|map| map.source_terrain_height(start))
+            .unwrap_or(0.0);
         figure.initialize_source_position();
         figure.source_event_slot = Some(event.slot);
         Some(figure)
@@ -5160,7 +5182,7 @@ impl Simulation {
                 .filter(|warehouse| warehouse.active)
                 .enumerate()
                 .flat_map(|(warehouse_idx, warehouse)| {
-                    warehouse.all_stock().into_iter().map(|(good, stock, _)| {
+                    warehouse.all_stock().into_iter().map(move |(good, stock, _)| {
                         carrier::CarrierSupplier {
                             island: warehouse.island_id,
                             owner: warehouse.owner,
@@ -5445,7 +5467,21 @@ impl Simulation {
     /// city table. `FUN_0047ab00` reads that field for city capacity, so a
     /// city counts only its own MARKT and KONTOR roots.
     fn source_city_transfer_root_count(&self, island_id: u8, map_owner_slot: u8) -> usize {
-        self.source_map_cell_states
+        Self::source_city_transfer_root_count_in(
+            &self.source_map_cell_states,
+            island_id,
+            map_owner_slot,
+        )
+    }
+
+    /// Field-borrow variant of [`Self::source_city_transfer_root_count`] for
+    /// callers holding a mutable borrow of another `Simulation` field.
+    fn source_city_transfer_root_count_in(
+        source_map_cell_states: &[SourceMapCellState],
+        island_id: u8,
+        map_owner_slot: u8,
+    ) -> usize {
+        source_map_cell_states
             .iter()
             .filter(|state| {
                 state.island == island_id
@@ -5460,7 +5496,17 @@ impl Simulation {
     /// scenarios provide the city table; empty tables occur only in local
     /// synthetic maps, where the prior single owner identity is retained.
     fn source_city_player_owner(&self, island_id: u8, map_owner_slot: u8) -> Option<u8> {
-        let cities = self.source_cities.active_records();
+        Self::source_city_player_owner_in(&self.source_cities, island_id, map_owner_slot)
+    }
+
+    /// Field-borrow variant of [`Self::source_city_player_owner`] for
+    /// callers holding a mutable borrow of another `Simulation` field.
+    fn source_city_player_owner_in(
+        source_cities: &SourceCityTable,
+        island_id: u8,
+        map_owner_slot: u8,
+    ) -> Option<u8> {
+        let cities = source_cities.active_records();
         if cities.is_empty() {
             return Some(map_owner_slot);
         }
@@ -6926,14 +6972,11 @@ impl Simulation {
                 );
                 let route = grid.search_source_high_metadata_target(start, 0xc0).ok()?;
                 let path = source_route_positions(start, &route.steps)?;
-                (path.last().copied() == Some(route.position)).then_some((
-                    route,
-                    path,
-                    (
-                        world_origin.0.checked_add(route.position.0)?,
-                        world_origin.1.checked_add(route.position.1)?,
-                    ),
-                ))
+                let target_world = (
+                    world_origin.0.checked_add(route.position.0)?,
+                    world_origin.1.checked_add(route.position.1)?,
+                );
+                (path.last().copied() == Some(route.position)).then_some((route, path, target_world))
             })() else {
                 let current_world = (
                     world_origin.0.saturating_add(start.0),
@@ -7280,7 +7323,8 @@ impl Simulation {
                                 let origin_production_kind = figure.origin_production_kind;
                                 let origin_source_map_owner_slot =
                                     figure.origin_source_map_owner_slot;
-                                let origin_city_owner = self.source_city_player_owner(
+                                let origin_city_owner = Self::source_city_player_owner_in(
+                                    &self.source_cities,
                                     figure.origin_island,
                                     origin_source_map_owner_slot,
                                 );
@@ -7407,8 +7451,9 @@ impl Simulation {
                                                 }
                                             });
                                         if delivered_fixed != 0 {
-                                            let transfer_root_count = self
-                                                .source_city_transfer_root_count(
+                                            let transfer_root_count =
+                                                Self::source_city_transfer_root_count_in(
+                                                    &self.source_map_cell_states,
                                                     origin.0,
                                                     origin_source_map_owner_slot,
                                                 );
@@ -8554,6 +8599,82 @@ impl Simulation {
                     .push(format!("[cart] {placed} {good:?} → warehouse #{ti}",));
                 placed > 0
             }
+            // Placement and demolition need the compiled COD table to
+            // synthesize source map commands; the game layer applies them
+            // via `anno_game::game_commands::apply_game_command`.
+            Command::PlaceBuilding { .. } | Command::DemolishBuilding { .. } => false,
+            Command::MoveUnit {
+                player,
+                unit_index,
+                island,
+                tile_x,
+                tile_y,
+            } => {
+                let source_time_ticks = self.source_time_ticks;
+                let mut source_target_update = None;
+                let Some(unit) = self.military_units.get_mut(unit_index as usize) else {
+                    return false;
+                };
+                if !unit.is_alive() || unit.owner != player {
+                    return false;
+                }
+                if let Some(island_id) = unit.source_island_id {
+                    if island_id != island {
+                        return false;
+                    }
+                    let Some(target) = self
+                        .island_maps
+                        .iter()
+                        .find(|map| map.island_id == island_id)
+                        .and_then(|map| map.local_to_source_world((tile_x, tile_y)))
+                    else {
+                        return false;
+                    };
+                    unit.target_x = target.0;
+                    unit.target_y = target.1;
+                    let Some(descriptor) =
+                        crate::source_route::SourceTargetDescriptor::from_source_land_route_coordinate(
+                            target.0, target.1,
+                        )
+                    else {
+                        return false;
+                    };
+                    unit.source_target_descriptor = Some(descriptor);
+                    unit.source_route_retry_count = 0;
+                    unit.source_idle_remaining = 0.0;
+                    unit.clear_source_route_program();
+                    source_target_update = unit.source_runtime_slot.map(|slot| {
+                        (
+                            slot,
+                            descriptor,
+                            unit.unit_type == crate::combat::UnitType::NativeSpearman,
+                        )
+                    });
+                } else {
+                    unit.target_x = tile_x;
+                    unit.target_y = tile_y;
+                }
+                unit.combat_target = -1;
+                unit.move_timer_ms = 0;
+                if let Some((runtime_slot, descriptor, native_spearman)) = source_target_update {
+                    if let Some(occupant) = self
+                        .source_kind4_occupants
+                        .iter_mut()
+                        .find(|occupant| occupant.runtime_slot == runtime_slot)
+                    {
+                        occupant.state_descriptor = descriptor;
+                        occupant.route_retry_count = 0;
+                        occupant.idle_remaining_bits = 0;
+                        occupant.route_program =
+                            crate::combat::default_source_kind4_route_program();
+                        occupant.route_program_cursor = 0;
+                        if native_spearman {
+                            occupant.idle_timestamp_ticks = source_time_ticks.wrapping_add(8);
+                        }
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -9214,7 +9335,11 @@ mod tests {
         sim.players = vec![Player::new_human(0), Player::new_ai(1, 0)];
         sim.players[0].gold = 1_051;
         sim.source_kind4_dispatch.remote_owner_dispatch_enabled = true;
-        sim.source_kind4_dispatch.faction_states = [0x0c, 0, 7, 7, 7, 7, 7];
+        // The ship's owner (faction slot 1) must be a controller-eligible
+        // faction (`0x0b..=0x0e`) for the remote purchase-transfer guard to
+        // credit the sale; `0` models a plain human the dispatcher may not buy
+        // from.
+        sim.source_kind4_dispatch.faction_states = [0x0c, 0x0c, 7, 7, 7, 7, 7];
 
         let mut ship = TradeShip::new(1, 0, 0, 0);
         ship.source_figure_kind = Some(1);
@@ -9654,7 +9779,10 @@ mod tests {
                 figure_definition_id: 0x19,
                 direction: 0,
                 source_payload: 0,
-                position: (0.5, 0.5),
+                // The approaching figure is still well outside the source
+                // radius-five arrival raster of the (3, 4) target cell, so
+                // `FUN_00417690` requeues it rather than allocating the city.
+                position: (14.5, 14.5),
                 position_z: 0.0,
                 source_energy: 0,
                 source_score_state: 0,
@@ -10250,8 +10378,11 @@ mod tests {
         let figure = &sim.source_dynamic_combat_figures[0];
         assert_eq!(figure.direction, 2);
         assert_eq!(figure.source_motion.remaining_distance, 2.0);
-        assert_eq!(figure.source_motion.scalar_speed, 0.05);
-        assert_eq!(figure.source_motion.velocity_x, 0.05);
+        // `Speed 500 * 0.0001` is evaluated in f32, so the stored rate is the
+        // exact single-precision product of the source's `Speed * 0.0001`
+        // scale, not the mathematical 0.05.
+        assert_eq!(figure.source_motion.scalar_speed, 500.0 * 0.0001);
+        assert_eq!(figure.source_motion.velocity_x, 500.0 * 0.0001);
         assert_eq!(figure.source_motion.velocity_y, 0.0);
         assert_eq!(sim.source_dynamic_route_programs[0].program[0], 0x32);
     }
@@ -10432,7 +10563,13 @@ mod tests {
         };
         let invalid_descriptor = SourceTargetDescriptor::from_world_coordinate(1, 0)
             .expect("source coordinate fits the descriptor encoding");
-        let valid_descriptor = SourceTargetDescriptor::from_world_coordinate(2, 0)
+        // A category-6 target redirects the launcher's aim through its own
+        // stored descriptor (not its live position). `FUN_00458d80` gates on
+        // the quarter shot radius (`(shot_radius*2)/8`): PIRAT's radius 14
+        // admits a doubled-coordinate metric of 3. World (1,0) doubles to
+        // (2,0) — metric 2, inside the gate; the former world (2,0) doubled
+        // to (4,0) — metric 4, just outside, so no target was ever selectable.
+        let valid_descriptor = SourceTargetDescriptor::from_world_coordinate(1, 0)
             .expect("source coordinate fits the descriptor encoding");
         let mut invalid_target = figure(2, 1, (1.0, 0.0), invalid_descriptor);
         invalid_target.figure_kind = 1;
@@ -10468,9 +10605,15 @@ mod tests {
         let action = sim
             .dispatch_source_kind6_action(0, 0, true, 0x0e)
             .expect("the lower-ranked category-six row remains eligible");
+        // `FUN_00458e60` skips the top-ranked kind-1 target (its descriptor
+        // byte0 == 1 with defeated owner-state 0x0e and no soldier-policy
+        // ware slot), leaving the kind-6 figure at runtime_slot 1. Its
+        // descriptor is `FUN_00445650`'s `[target_kind, list_key, slot_lo,
+        // slot_hi]` = [6, 4, 1, 0]. (The former [6,4,2,0] literal conflated
+        // the kind-6 target's kind byte with the kind-1 target's slot.)
         assert_eq!(
             action.target_descriptor,
-            SourceTargetDescriptor::from_bytes([6, 4, 2, 0])
+            SourceTargetDescriptor::from_bytes([6, 4, 1, 0])
         );
     }
 
@@ -10597,7 +10740,13 @@ mod tests {
 
         sim.source_time_ticks = 7;
         sim.tick_source_kind6_deferred_hits();
-        assert_eq!(sim.source_map_cell_states[0].source_damage_accumulator, 2);
+        // `FUN_0047a650` accumulates the category-six map damage on the static
+        // command root (its keyed accumulator record), not on the renderer
+        // selector copy; the selector cell mirrors the anchor only for drawing.
+        assert_eq!(
+            sim.source_static_map_roots[0].source_damage_accumulator,
+            2
+        );
         assert_eq!(sim.source_kind6_deferred_hits.len(), 1);
         assert!(sim.source_kind6_terminal_events.is_empty());
 
@@ -11519,7 +11668,10 @@ mod tests {
         }
 
         assert!(sim.figures.is_empty());
-        assert_eq!(sim.warehouses[0].city_stock_fixed(Good::Cloth), 65);
+        // The KARREN carries the supplier's full 128-fixed stock: its
+        // `Maxtrag 6` (192 fixed) capacity exceeds the load and the city
+        // warehouse's ~1600-fixed capacity leaves the deposit uncapped.
+        assert_eq!(sim.warehouses[0].city_stock_fixed(Good::Cloth), 128);
     }
 
     #[test]
@@ -11924,6 +12076,10 @@ mod tests {
         use anno_formats::szs::IslandSourceResourceState;
 
         let mut sim = Simulation::new();
+        // The pre-deadline raw scan starts each row at a `rand & 3` jitter from
+        // the right edge; seed the source stream so the single-column map's one
+        // cell falls on the scanned start column.
+        sim.seed_source_rand(3);
         sim.island_maps
             .push(IslandMap::new_open(0, 1, 1).with_source_resource_state(
                 IslandSourceResourceState {
@@ -12589,7 +12745,7 @@ mod tests {
         let mut island = IslandMap::new_open(7, 30, 30);
         island.source_world_origin = (220, 260);
         sim.island_maps.push(island);
-        let mut unit = MilitaryUnit::new(UnitType::Infantry, 0, 224, 264);
+        let mut unit = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 224, 264);
         unit.source_island_id = Some(7);
         sim.military_units.push(unit);
 
@@ -12801,9 +12957,10 @@ mod tests {
         // Enemy unit standing right next to the footprint.
         sim.military_units
             .push(MilitaryUnit::new(UnitType::Infantry, 1, 11, 12));
-        // The former fixed damage model destroyed the building here.
+        // The former fixed damage model destroyed the building here. The
+        // legacy military tick is gone; a full tick must not resurrect it.
         for _ in 0..30 {
-            sim.tick_military();
+            sim.tick(1000);
         }
         assert_eq!(sim.buildings.len(), 1);
         assert_eq!(
@@ -12866,39 +13023,13 @@ mod tests {
             .push(MilitaryUnit::new(UnitType::Infantry, 1, 11, 12));
         // No diplomacy edit → relation stays Neutral, no damage.
         for _ in 0..30 {
-            sim.tick_military();
+            sim.tick(1000);
         }
         assert_eq!(sim.buildings.len(), 1);
         assert_eq!(
             sim.buildings[0].health,
             crate::building::BUILDING_MAX_HEALTH
         );
-    }
-
-    #[test]
-    fn military_tick_does_not_synthesize_legacy_combat() {
-        use crate::combat::{Diplomacy, MilitaryUnit, UnitType};
-
-        let mut sim = Simulation::new();
-        sim.players.push(Player::new_human(0));
-        sim.players.push(Player::new_ai(1, 0));
-        sim.diplomacy.set(0, 1, Diplomacy::War);
-        sim.military_units
-            .push(MilitaryUnit::new(UnitType::Musketeer, 0, 5, 5));
-        sim.military_units
-            .push(MilitaryUnit::new(UnitType::Infantry, 1, 6, 5));
-        let health_before: Vec<f32> = sim.military_units.iter().map(|unit| unit.health).collect();
-
-        sim.tick_military();
-
-        assert_eq!(
-            sim.military_units
-                .iter()
-                .map(|unit| unit.health)
-                .collect::<Vec<_>>(),
-            health_before
-        );
-        assert!(sim.military_units.iter().all(|unit| unit.combat_target < 0));
     }
 
     #[test]
@@ -13355,20 +13486,24 @@ mod tests {
         let mut sim = Simulation::new();
         sim.island_maps.push(IslandMap::new_open(7, 20, 1));
 
-        let mut attacker = MilitaryUnit::new(crate::combat::UnitType::Infantry, 0, 0, 0);
+        // A ranged musketeer (`Shotradius 4` -> runtime radius 8) is the
+        // category-four attacker: its direct-action reach covers the ship one
+        // source cell to the east, unlike the melee infantry whose runtime
+        // shot radius is one.
+        let mut attacker = MilitaryUnit::new(crate::combat::UnitType::Musketeer, 0, 0, 0);
         attacker.source_island_id = Some(7);
         attacker.source_runtime_slot = Some(0);
         attacker.source_live_runtime_slot = Some(0);
         attacker.source_candidate_list_key = Some(7);
         attacker.source_figure_kind = Some(4);
-        attacker.source_figure_definition_id = Some(1);
-        attacker.source_energy = anno_formats::szs::LandFigureDefinition::from_id(1)
+        attacker.source_figure_definition_id = Some(9);
+        attacker.source_energy = anno_formats::szs::LandFigureDefinition::from_id(9)
             .expect("source land definition is known")
             .source_runtime_energy_cap();
         sim.military_units.push(attacker);
         sim.source_kind4_occupants.push(SourceKind4Occupant {
             runtime_slot: 0,
-            figure_definition_id: 1,
+            figure_definition_id: 9,
             route_radius: crate::combat::SOURCE_KIND4_DEFAULT_ROUTE_RADIUS,
             route_retry_count: 0,
             route_program: crate::combat::default_source_kind4_route_program(),
@@ -13763,11 +13898,11 @@ mod tests {
         unit.source_figure_kind = Some(4);
         unit.source_figure_definition_id = Some(1);
         unit.source_target_descriptor = Some(descriptor);
-        unit.source_route_program[..3] = [
+        unit.source_route_program[..3].copy_from_slice(&[
             0x71,
             0x81,
             crate::combat::SOURCE_KIND4_ROUTE_PROGRAM_TERMINATOR,
-        ];
+        ]);
         unit.source_route_program_cursor = 2;
         sim.military_units.push(unit);
 

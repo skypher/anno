@@ -17,3 +17,7 @@ tmp/
 
 # Claude Code session state
 .claude/
+
+# Large RE data archive (copyrighted, regeneratable)
+anno-re-data.tar.bz2
+*.log

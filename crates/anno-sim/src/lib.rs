@@ -25,6 +25,7 @@ pub mod prices;
 pub mod production;
 pub mod replay;
 pub mod save;
+pub mod serde_util;
 pub mod simulation;
 pub mod source_cell;
 pub mod source_figure_event;

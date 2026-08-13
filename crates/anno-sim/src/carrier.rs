@@ -52,7 +52,12 @@ const SOURCE_STORAGE_UNIT: u16 = 32;
 /// Compile a `Wegspeed` percentage into the low-seven-bit source path class.
 /// `FUN_00462852` uses `min(126, floor(speed * 32 / 100))`.
 pub const fn source_path_class(speed: u16) -> u8 {
-    (((speed as u32).saturating_mul(32) / 100).min(126)) as u8
+    let scaled = (speed as u32).saturating_mul(32) / 100;
+    if scaled > 126 {
+        126
+    } else {
+        scaled as u8
+    }
 }
 
 /// `FUN_0045d0b0` scales a moving figure's authored `AnimSpeed` by its
@@ -690,8 +695,8 @@ fn try_spawn_carrier_for_request(
     carrier.target_x = reached.0;
     carrier.target_y = reached.1;
     carrier.destination_kind = supplier.kind_code;
-    carrier.supplier_x = supplier.x;
-    carrier.supplier_y = supplier.y;
+    carrier.supplier_x = u16::from(supplier.x);
+    carrier.supplier_y = u16::from(supplier.y);
     carrier.carried_good = request.good as u8;
     carrier.carried_amount = cargo;
     carrier.cargo_fixed = cargo_fixed;
@@ -949,7 +954,7 @@ pub fn try_spawn_city_cart(
     cart.tile_y = start.1;
     cart.target_x = reached.0;
     cart.target_y = reached.1;
-    cart.destination_kind = supplier.kind_code;
+    cart.destination_kind = state.kind_code;
     cart.supplier_x = supplier.x;
     cart.supplier_y = supplier.y;
     cart.origin_island = origin.island;

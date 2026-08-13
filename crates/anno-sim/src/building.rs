@@ -179,6 +179,51 @@ pub struct BuildingDef {
     pub required_fertility: Option<anno_formats::szs::Fertility>,
 }
 
+impl Default for BuildingDef {
+    /// A neutral single-tile craft building: no goods, no costs, the
+    /// haeuser.cod template values for the stateful-parser defaults
+    /// (`Maxnorohst: 6`, `Maxbrand: 4`, `NORUINE`, `Wegspeed [100; 4]`).
+    fn default() -> Self {
+        Self {
+            id: 0,
+            category: 0,
+            width: 1,
+            height: 1,
+            production_type: ProductionType::Craft,
+            kind: String::new(),
+            prod_kind: String::new(),
+            radius: 0,
+            output_good: Good::None,
+            input_good_1: Good::None,
+            input_good_2: Good::None,
+            output_rate: 0,
+            input_1_rate: 0,
+            input_2_rate: 0,
+            storage_capacity: 0,
+            cycle_time_ms: 1000,
+            cost_gold: 0,
+            cost_tools: 0,
+            cost_wood: 0,
+            cost_bricks: 0,
+            maintenance_cost: 0,
+            native: false,
+            min_tier: 0,
+            max_no_input_ticks: 6,
+            can_dry_up: false,
+            wegspeed: [100; 4],
+            has_door: false,
+            upgradeable: false,
+            max_energy: 0,
+            ore_deposit: OreDeposit::None,
+            pirate_owned: false,
+            defensive_cannons: 0,
+            max_brand_damage_ticks: DEFAULT_MAX_BRAND_DAMAGE_TICKS,
+            ruin_id: NO_RUIN_ID,
+            required_fertility: None,
+        }
+    }
+}
+
 /// Ore-deposit size. Manual sec. 6.7 + Tim Howgego's resources
 /// appendix: small deposits give 80 tons, large deposits 240 tons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

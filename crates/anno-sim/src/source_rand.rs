@@ -29,6 +29,12 @@ impl SourceRand {
         self.state = self.state.wrapping_mul(214013).wrapping_add(2531011);
         ((self.state >> 16) & 0x7fff) as u16
     }
+
+    /// Raw LCG state, comparable to the CRT's `holdrand` word in the
+    /// original process when both sides were seeded identically.
+    pub fn state(&self) -> u32 {
+        self.state
+    }
 }
 
 impl Default for SourceRand {

@@ -126,9 +126,12 @@ pub const fn source_ship_cargo_slot_metadata(slot: u32) -> u16 {
 }
 
 const fn source_ship_cargo_slot(ware: u8, quantity: u16, metadata: u16) -> u32 {
-    u32::from(ware)
-        | (u32::from(quantity.min(SOURCE_SHIP_CARGO_SLOT_QUANTITY_CAPACITY)) << 8)
-        | (u32::from(metadata & 0x03ff) << 22)
+    let quantity = if quantity > SOURCE_SHIP_CARGO_SLOT_QUANTITY_CAPACITY {
+        SOURCE_SHIP_CARGO_SLOT_QUANTITY_CAPACITY
+    } else {
+        quantity
+    };
+    (ware as u32) | ((quantity as u32) << 8) | (((metadata & 0x03ff) as u32) << 22)
 }
 
 /// `FUN_00448120` first fills matching entries, then empty entries, preserving
@@ -1174,7 +1177,12 @@ pub fn source_kind4_reverse_route_offset(program: &[u8], cursor: u8, mut steps: 
                 x += count;
                 y += count;
             }
-            _ => {}
+            _ => {
+                // Terminator and padding bytes carry no direction run;
+                // `FUN_0046d130` walks past them without consuming steps.
+                cursor -= 1;
+                continue;
+            }
         }
         steps -= u32::from(command & 0x0f).min(steps);
         cursor -= 1;
@@ -1214,7 +1222,7 @@ pub fn source_terminal_motion_slice_remaining(
     let remainder = if direction & 1 == 0 {
         distance - distance.floor()
     } else {
-        distance - (distance * std::f32::consts::FRAC_1_SQRT_2).floor() * SQRT_2
+        distance - (distance * std::f32::consts::FRAC_1_SQRT_2).floor() * std::f32::consts::SQRT_2
     };
     remainder * 0.5
 }
@@ -1462,7 +1470,10 @@ pub struct MilitaryUnit {
     pub source_route_retry_count: u8,
     /// `SOLDAT3 +0x130` direction-run program. Each nonterminal byte packs a
     /// source direction in its high nibble and a run length in its low nibble.
-    #[serde(default = "default_source_kind4_route_program")]
+    #[serde(
+        default = "default_source_kind4_route_program",
+        with = "crate::serde_util::byte_array"
+    )]
     pub source_route_program: [u8; SOURCE_KIND4_ROUTE_PROGRAM_CAPACITY],
     /// `SOLDAT3 +0x02` byte index into `source_route_program`. The source
     /// increments it when `FUN_00457ce0` starts a direction run.
@@ -1943,7 +1954,7 @@ pub fn source_diplomacy_event_age_score(
     }
     let age = ((source_time_ticks.wrapping_sub(event.timestamp) >> 7).min(0xff)) as u8;
     let magnitude = match event.event_type {
-        1 => source_diplomacy_curve(
+        1 => -source_diplomacy_curve(
             age,
             &[
                 (0, 0x32, 0x1e, 0x12),
@@ -2806,8 +2817,10 @@ fn source_kind4_candidate_score(
     ));
     if candidate_metric <= target_shot_radius {
         let retaliation_ratio = target_strength * 128 / attacker_max_energy;
+        let retaliation_index = retaliation_ratio * retaliation_ratio
+            / u32::from(attacker_definition.source_runtime_hit_points());
         score += u32::from(source_kind4_curve_retaliation(
-            retaliation_ratio.min(0x100) as usize,
+            retaliation_index.min(0x100) as usize,
         ));
     }
 
@@ -2944,8 +2957,10 @@ fn source_common_candidate_score(
     ));
     if candidate_metric <= target_shot_radius {
         let retaliation_ratio = target_strength * 128 / attacker_max_energy;
+        let retaliation_index = retaliation_ratio * retaliation_ratio
+            / u32::from(attacker_definition.runtime_hit_points);
         score += u32::from(source_kind4_curve_retaliation(
-            retaliation_ratio.min(0x100) as usize,
+            retaliation_index.min(0x100) as usize,
         ));
     }
     score += u32::from(source_kind4_curve_approach(
@@ -3324,10 +3339,10 @@ pub fn advance_source_kind15_figure(
         return true;
     }
 
-    let consumed =
-        dt_ms as f32 * SOURCE_GENERIC_FIGURE_TIME_SCALE * figure.source_step_amount;
-    if consumed < figure.remaining_work_time {
-        figure.remaining_work_time -= consumed;
+    let available_time = dt_ms as f32 * SOURCE_GENERIC_FIGURE_TIME_SCALE;
+    let remaining_time = figure.remaining_work_time / figure.source_step_amount;
+    if available_time < remaining_time {
+        figure.remaining_work_time -= available_time * figure.source_step_amount;
         return false;
     }
 
@@ -3345,10 +3360,10 @@ pub fn advance_source_kind14_figure(
     if !figure.active {
         return true;
     }
-    let consumed =
-        dt_ms as f32 * SOURCE_GENERIC_FIGURE_TIME_SCALE * figure.source_step_amount;
-    if consumed < figure.remaining_work_time {
-        figure.remaining_work_time -= consumed;
+    let available_time = dt_ms as f32 * SOURCE_GENERIC_FIGURE_TIME_SCALE;
+    let remaining_time = figure.remaining_work_time / figure.source_step_amount;
+    if available_time < remaining_time {
+        figure.remaining_work_time -= available_time * figure.source_step_amount;
         return false;
     }
     figure.remaining_work_time = 0.0;
@@ -3660,34 +3675,45 @@ pub fn tick_combat_with_maps(
             // than advancing once for every caller invocation.
             let speed = stats.move_speed.max(1) as u32;
             let step_ms = (1000 / speed).max(100);
+            // A source-island unit's coordinates are doubled INSEL5 raw
+            // cells, so one movement step traverses two raw units to keep
+            // the same island-cell cadence as an undoubled figure.
+            let raw_units_per_step = if units[i].source_island_id.is_some() {
+                2
+            } else {
+                1
+            };
             units[i].move_timer_ms = units[i].move_timer_ms.saturating_add(dt_ms);
-            while units[i].move_timer_ms >= step_ms {
-                let current_dist = unit_distance_sq(&units[i], &units[target_idx], island_maps);
-                if current_dist <= range_sq {
-                    units[i].move_timer_ms = 0;
-                    break;
+            'steps: while units[i].move_timer_ms >= step_ms {
+                for _ in 0..raw_units_per_step {
+                    let current_dist =
+                        unit_distance_sq(&units[i], &units[target_idx], island_maps);
+                    if current_dist <= range_sq {
+                        units[i].move_timer_ms = 0;
+                        break 'steps;
+                    }
+                    let target_position = (units[target_idx].tile_x, units[target_idx].tile_y);
+                    let Some((next_x, next_y)) =
+                        next_step_to(&units[i], target_position, ocean_map, island_maps)
+                    else {
+                        break 'steps;
+                    };
+                    let dx = next_x - units[i].tile_x;
+                    let dy = next_y - units[i].tile_y;
+                    units[i].tile_x = next_x;
+                    units[i].tile_y = next_y;
+                    units[i].direction = match (dx.signum(), dy.signum()) {
+                        (0, -1) => 0,
+                        (1, -1) => 1,
+                        (1, 0) => 2,
+                        (1, 1) => 3,
+                        (0, 1) => 4,
+                        (-1, 1) => 5,
+                        (-1, 0) => 6,
+                        (-1, -1) => 7,
+                        _ => units[i].direction,
+                    };
                 }
-                let target_position = (units[target_idx].tile_x, units[target_idx].tile_y);
-                let Some((next_x, next_y)) =
-                    next_step_to(&units[i], target_position, ocean_map, island_maps)
-                else {
-                    break;
-                };
-                let dx = next_x - units[i].tile_x;
-                let dy = next_y - units[i].tile_y;
-                units[i].tile_x = next_x;
-                units[i].tile_y = next_y;
-                units[i].direction = match (dx.signum(), dy.signum()) {
-                    (0, -1) => 0,
-                    (1, -1) => 1,
-                    (1, 0) => 2,
-                    (1, 1) => 3,
-                    (0, 1) => 4,
-                    (-1, 1) => 5,
-                    (-1, 0) => 6,
-                    (-1, -1) => 7,
-                    _ => units[i].direction,
-                };
                 units[i].move_timer_ms -= step_ms;
             }
             continue;
@@ -3943,7 +3969,7 @@ fn tick_source_terminal_motion_slice(
                         speed = definition.source_move_speed() as f32
                             * SOURCE_FIGURE_SPEED_SCALE
                             * 32.0
-                            / terrain_wegspeed.max(1) as f32;
+                            / (terrain_wegspeed.max(1) as f32 * 0.1);
                         direction = unit.source_motion_target.map(|next| {
                             ((next.0 - unit.tile_x).signum() as f32, (next.1 - unit.tile_y).signum() as f32)
                         });
@@ -4021,7 +4047,10 @@ fn tick_source_kind4_order(
             if unit.source_idle_remaining > f32::EPSILON {
                 break;
             }
+            // The drained idle slice ends this update slice; a route rebuild
+            // happens only when unspent frame time remains.
             unit.source_idle_remaining = 0.0;
+            continue;
         }
 
         if unit.source_step_remaining <= 0.0 || unit.source_motion_target.is_none() {
@@ -4127,8 +4156,11 @@ fn tick_source_kind4_order(
         else {
             break;
         };
+        // `FUN_00457ce0`: compiled `Speed × 0.0001` at `+0x10`, times the 32
+        // fixed by `FUN_00446ca0`, divided by the runtime `Wegspeed` tenth
+        // (authored 100 becomes the divisor 10).
         let rate = definition.source_move_speed() as f32 * SOURCE_FIGURE_SPEED_SCALE * 32.0
-            / terrain_wegspeed.max(1) as f32;
+            / (terrain_wegspeed.max(1) as f32 * 0.1);
         if rate <= 0.0 {
             break;
         }
@@ -4226,6 +4258,15 @@ fn source_kind4_route_program_with_target_resolver(
     let mut grid = map
         .source_land_path_grid(speed_type)?
         .source_window(window_center, usize::from(route_radius))?;
+    // The source carves its route window out of the world static map, whose
+    // cells beyond the island carry sea direction blockers. The local island
+    // grid ends at the island's doubled extent, so restore those blockers
+    // before the wave search runs.
+    grid.block_outside_rect(
+        map.source_world_origin,
+        usize::from(map.width).saturating_mul(2),
+        usize::from(map.height).saturating_mul(2),
+    );
     let (mut steps, reached) = match grid.search_threshold_target(start, target, 7, 0) {
         Ok(result) => (result.steps, result.position),
         Err(crate::source_route::SourcePathSearchError::NoRoute) => {
@@ -5512,6 +5553,7 @@ mod tests {
 
         let mut target = source_candidate(4, 1, 60, 0);
         target.entity = SourceCombatCandidateEntity::DynamicFigure(2);
+        target.runtime_slot = 2;
         target.candidate_list_key = Some(4);
         target.owner = 1;
         target.position = (1.0, 0.0);

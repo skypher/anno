@@ -154,7 +154,7 @@ pub struct IslandSourceResourceState {
 impl IslandSourceResourceState {
     /// Exact 0/64/128 result of `FUN_0046aff0` for one raw ware.
     pub fn resource_strength(self, ware: u8) -> u8 {
-        if !(0x2d..=0x3a).contains(&ware) {
+        if !(0x2d..=0x34).contains(&ware) {
             let mut partial_strength = 0;
             for record in self
                 .records
@@ -374,12 +374,12 @@ pub struct Ship {
     /// loader also copies the raw byte to its shared category-1/2/3 slot at
     /// `+0x1a2`, where `FUN_00454250` reads it as a score-state tier.
     pub heading_byte: u8,
-    /// Up to 7 packed cargo entries at record offsets 0x174, 0x17C, 0x184,
-    /// 0x18C, 0x194, 0x19C, 0x1A4 (stride 8 with the +4 word always zero).
-    /// `FUN_00448120` decodes the low byte as the source ware, bits `8..=21`
-    /// as its exact 1/32-good quantity, and bits `22..=31` as entry metadata.
-    /// The raw array remains available because source special wares are not
-    /// all represented by the local `Good` enum.
+    /// Up to 7 packed cargo entries at record offsets 0x175, 0x17D, 0x185,
+    /// 0x18D, 0x195, 0x19D, 0x1A5 (stride 8; the trailing byte of each 8-byte
+    /// group is zero). `FUN_00448120` decodes the low byte as the source ware,
+    /// bits `8..=21` as its exact 1/32-good quantity, and bits `22..=31` as
+    /// entry metadata. The raw array remains available because source special
+    /// wares are not all represented by the local `Good` enum.
     pub cargo_slots: [u32; 7],
 }
 
@@ -515,7 +515,7 @@ impl LandFigureDefinition {
             (LandFigureFamily::NativeSpearman, 2) => "SPEER2",
             (LandFigureFamily::NativeSpearman, 3) => "SPEER3",
             (LandFigureFamily::NativeSpearman, 4) => "SPEER4",
-            _ => unreachable!("valid LandFigureDefinition has variant 1 through 4"),
+            _ => panic!("valid LandFigureDefinition has variant 1 through 4"),
         }
     }
 
@@ -907,7 +907,7 @@ pub struct City {
 /// 0x0040..0x007E range (bits 1-6 set in various combinations).
 /// The semantic decode of bits 0 / 8 hasn't been pinned to a
 /// specific binary function yet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct IslandTile {
     /// Low 16 bits of the source definition ID. The INSELHAUS loader at
     /// `0x004685af` adds [`INSELHAUS_SOURCE_ID_BASE`] and resolves the
@@ -1480,10 +1480,9 @@ impl SzsFile {
         }
         for (index, record) in state.records.iter_mut().enumerate() {
             let offset = 0x1c + index * 8;
-            if data.len() >= offset + record.raw.len() {
-                record
-                    .raw
-                    .copy_from_slice(&data[offset..offset + record.raw.len()]);
+            let len = record.raw.len();
+            if data.len() >= offset + len {
+                record.raw.copy_from_slice(&data[offset..offset + len]);
             }
         }
         if data.len() >= 0x60 {
@@ -1706,7 +1705,12 @@ impl SzsFile {
             };
             let mut cargo_slots = [0u32; 7];
             for (i, slot) in cargo_slots.iter_mut().enumerate() {
-                let o = off + 0x174 + i * 8;
+                // The packed cargo entry begins at record offset 0x175 (stride
+                // 8). Decoded as `FUN_00448120` does — ware in the low byte,
+                // the 1/32-good quantity in bits 8..=21 — this yields valid
+                // wares and 32-aligned quantities; reading a byte early (0x174)
+                // shifts an invalid ware into the low byte and corrupts both.
+                let o = off + 0x175 + i * 8;
                 if o + 4 <= data.len() {
                     *slot = u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
                 }
@@ -4033,7 +4037,7 @@ mod tests {
             u64::from_le_bytes(ship.raw_record[0x132..0x13a].try_into().unwrap())
         );
         assert_eq!(
-            u32::from_le_bytes(ship.raw_record[0x174..0x178].try_into().unwrap()),
+            u32::from_le_bytes(ship.raw_record[0x175..0x179].try_into().unwrap()),
             ship.cargo_slots[0]
         );
         // Tutorial0's lone ship is the human player's small
@@ -4052,11 +4056,11 @@ mod tests {
 
     #[test]
     fn ship4_cargo_slots_carry_three_loaded_entries_in_tutorial0() {
-        // Tutorial0 starts the player with one ship loaded with
-        // three goods. Audit surfaces the raw u32 cargo entries
-        // 0x03C00003, 0x03C00011, 0x03200033 at slot 0 of the
-        // SHIP4 record's cargo manifest. `FUN_00448120` decodes their
-        // low byte as ware and bits 8 through 21 as quantity.
+        // Tutorial0 starts the player with one ship loaded with three
+        // goods. The packed u32 cargo entries at offset 0x175 are
+        // 0x0003C002, 0x0003C007, 0x00032004. `FUN_00448120` decodes their
+        // low byte as ware (0x02 iron ore, 0x07 meat, 0x04 wool) and bits
+        // 8..=21 as the 1/32-good quantity (960, 960, 800 = 30/30/25 goods).
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -4074,7 +4078,7 @@ mod tests {
         assert_eq!(szs.ships.len(), 1);
         assert_eq!(
             szs.ships[0].cargo_slots,
-            [62915075, 62916561, 52429875, 0, 0, 0, 0],
+            [0x0003C002, 0x0003C007, 0x00032004, 0, 0, 0, 0],
             "Tutorial0 starting cargo"
         );
         // The decoded quantity retains the source's 1/32-good alignment.

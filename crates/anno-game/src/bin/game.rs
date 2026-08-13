@@ -35,6 +35,10 @@
 //!   Escape: quit (or close panels / cancel modes / resume pause)
 
 use anno_audio::engine::AudioEngine;
+use anno_game::game_commands::{
+    can_place_building, demolish_building, missing_required_fertility, PlaceOutcome,
+};
+use anno_game::scenario::init_simulation;
 use anno_formats::cod::CodFile;
 use anno_formats::col::parse_col;
 use anno_formats::szs::{Island, IslandTile, ShipClass, SzsFile};
@@ -558,57 +562,6 @@ fn troop_assembly_slot(key: Keycode) -> Option<usize> {
 }
 
 /// Check if a building can be placed at the given tile position on an island.
-fn can_place_building(
-    island: &Island,
-    island_map: &IslandMap,
-    tile_x: i32,
-    tile_y: i32,
-    width: u8,
-    height: u8,
-) -> bool {
-    // Check all tiles in the footprint
-    for dy in 0..height as i32 {
-        for dx in 0..width as i32 {
-            let tx = tile_x + dx;
-            let ty = tile_y + dy;
-
-            // Must be within island bounds
-            if tx < 0 || ty < 0 || tx >= island.width as i32 || ty >= island.height as i32 {
-                return false;
-            }
-
-            // Must be on walkable terrain (not water or existing building)
-            if !island_map.is_walkable(tx, ty) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Outcome of a placement attempt. The caller drives banners/sound
-/// off these so the placement helper stays free of UI dependencies.
-enum PlaceOutcome {
-    Placed,
-    NotEnoughGold {
-        need: u32,
-        have: i32,
-    },
-    BlockedByTerrain,
-    MissingFertility {
-        required: anno_formats::szs::Fertility,
-    },
-    NotCoastal,
-    NoIslandMap,
-    NoBuildingSelected,
-    /// Bauinfra gate: player's highest-populated tier is below the
-    /// building's `min_tier` (manual sec. 6.7.1).
-    WrongTier {
-        needed: u8,
-        have: u8,
-    },
-}
-
 fn fertility_label(fertility: anno_formats::szs::Fertility) -> &'static str {
     use anno_formats::szs::Fertility;
     match fertility {
@@ -633,14 +586,6 @@ fn fertility_list_label(island: &Island) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     }
-}
-
-fn missing_required_fertility(
-    def: &anno_sim::building::BuildingDef,
-    island: &Island,
-) -> Option<anno_formats::szs::Fertility> {
-    let required = def.required_fertility?;
-    (!data_bridge::island_can_host_building(def, island)).then_some(required)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -774,10 +719,11 @@ fn ship_list_line(row: &ShipListRow) -> String {
 }
 
 /// Attempt to place the placer's currently-selected building at
-/// `(tile_x, tile_y)` on `current_island`. Mirrors the original
-/// click-place flow: fertility gate, fishery coast gate, walkability,
-/// gold cost, materials trickle. Side-effecting helper used by both
-/// the click handler and the drag-place loop.
+/// `(tile_x, tile_y)` on `current_island`. Thin UI wrapper over
+/// `game_commands::place_building`: resolves the placer's selection to a
+/// def index + orientation, applies it, and records the equivalent
+/// `Command::PlaceBuilding` when a recorder is active.
+#[allow(clippy::too_many_arguments)]
 fn try_place_building(
     sim: &mut anno_sim::simulation::Simulation,
     islands: &mut [Island],
@@ -787,192 +733,40 @@ fn try_place_building(
     placer: &BuildingPlacer,
     tile_x: i32,
     tile_y: i32,
+    recorder: &mut Option<anno_sim::replay::Recorder>,
 ) -> PlaceOutcome {
     let bb = match placer.selected_building() {
         Some(b) => b,
         None => return PlaceOutcome::NoBuildingSelected,
     };
-    let def_idx = bb.def_idx;
-    let def = &defs[def_idx];
-    let island_number = islands[current_island].number;
-    let bld_w = def.width;
-    let bld_h = def.height;
-    let cost = def.cost_gold;
-
-    let island_map_idx = sim
-        .island_maps
-        .iter()
-        .position(|m| m.island_id == island_number);
-
-    let isl = &islands[current_island];
-    if let Some(required) = missing_required_fertility(def, isl) {
-        return PlaceOutcome::MissingFertility { required };
-    }
-
-    // Fishery coast gate.
-    if def.output_good == Good::Fish {
-        let coast_ok = if let Some(idx) = island_map_idx {
-            let map = &sim.island_maps[idx];
-            (0..bld_h as i32)
-                .any(|dy| (0..bld_w as i32).any(|dx| map.is_coastal(tile_x + dx, tile_y + dy)))
-        } else {
-            false
-        };
-        if !coast_ok {
-            return PlaceOutcome::NotCoastal;
-        }
-    }
-
-    let map_idx = match island_map_idx {
-        Some(i) => i,
-        None => return PlaceOutcome::NoIslandMap,
-    };
-    if !can_place_building(
-        &islands[current_island],
-        &sim.island_maps[map_idx],
+    let outcome = anno_game::game_commands::place_building(
+        sim,
+        islands,
+        current_island,
+        defs,
+        cod,
+        bb.def_idx,
+        placer.orientation,
+        0,
         tile_x,
         tile_y,
-        bld_w,
-        bld_h,
-    ) {
-        return PlaceOutcome::BlockedByTerrain;
-    }
-    let owner = 0u8;
-    let owner_idx = owner as usize;
-    if owner_idx >= sim.players.len() || sim.players[owner_idx].gold < cost as i32 {
-        return PlaceOutcome::NotEnoughGold {
-            need: cost,
-            have: sim.players.get(owner_idx).map(|p| p.gold).unwrap_or(0),
-        };
-    }
-    // Bauinfra gate: building requires the player to have at
-    // least `min_tier` population in the matching tier or
-    // higher. Manual sec. 6.7.1: civilization-level governs
-    // which buildings unlock.
-    if def.min_tier > 0 && owner_idx < sim.players.len() {
-        let p = &sim.players[owner_idx];
-        let highest = (0..p.population.len() as u8)
-            .filter(|&t| p.population[t as usize] > 0)
-            .max()
-            .unwrap_or(0);
-        if highest < def.min_tier {
-            return PlaceOutcome::WrongTier {
-                needed: def.min_tier,
-                have: highest,
-            };
-        }
-    }
-
-    // All gates passed — apply the placement.
-    if owner_idx < sim.players.len() {
-        sim.players[owner_idx].gold -= cost as i32;
-    }
-    let cod_b = &cod.buildings[def_idx];
-    let rot_count = cod_b.rotate.max(1) as u8;
-    let orient = placer.orientation % rot_count;
-    let source_definition_offset = (cod_b.source_id - anno_formats::szs::INSELHAUS_SOURCE_ID_BASE)
-        .try_into()
-        .ok();
-    let source_map_owner_slot = islands[current_island]
-        .tiles
-        .iter()
-        .find(|tile| tile.x as i32 == tile_x && tile.y as i32 == tile_y)
-        .map(|tile| tile.source_owner())
-        .unwrap_or(7);
-    let source_random_seed = (sim.next_source_rand() & 0x1f) as u8;
-    for dy in 0..bld_h as u8 {
-        for dx in 0..bld_w as u8 {
-            let tx = tile_x as u8 + dx;
-            let ty = tile_y as u8 + dy;
-            sim.island_maps[map_idx].set_walkable(tx as u16, ty as u16, false);
-        }
-    }
-
-    let mut instance = BuildingInstance::new(
-        def_idx as u16,
-        island_number,
-        tile_x as u16,
-        tile_y as u16,
-        owner,
     );
-    instance.source_placement_command = source_definition_offset.map(|definition_offset| {
-        anno_sim::building::SourceBuildingCommand {
-            definition_offset,
-            orientation: orient,
-            // `DAT_006c2f10 = *DAT_0049f790` in `FUN_0040a190`; the
-            // low byte is the selected island record identifier.
-            metadata: island_number,
-            // The player command path explicitly clears `DAT_0049e6f8` for
-            // definitions without a source-selected variant. This placement
-            // path has no variant selector yet, so it carries that zero form.
-            variant: 0,
-            map_owner_slot: source_map_owner_slot,
-            // `FUN_004631b0` itself writes `rand() & 31` into bits 17..=21.
-            random_seed: source_random_seed,
-            dynamic_object_owner: owner,
+    if matches!(outcome, PlaceOutcome::Placed) {
+        if let Some(rec) = recorder.as_mut() {
+            rec.record(
+                sim.game_clock,
+                anno_sim::commands::Command::PlaceBuilding {
+                    player: 0,
+                    island: islands[current_island].number,
+                    tile_x: tile_x as u16,
+                    tile_y: tile_y as u16,
+                    def_index: bb.def_idx as u16,
+                    orientation: placer.orientation,
+                },
+            );
         }
-    });
-    // Mines tap a finite ore deposit (RE: haeuser.cod Erzbergnr).
-    // Non-mine buildings keep the u16::MAX uncapped default.
-    let cap = def.ore_deposit.capacity();
-    if cap > 0 {
-        instance.remaining_ore = cap;
     }
-    let footprint = (def.width as u32) * (def.height as u32);
-    let build_ms = (2_000u32 * footprint).max(2_000);
-    instance.construction_ms_total = build_ms;
-    instance.construction_ms_remaining = build_ms;
-    instance.wood_needed = def.cost_wood;
-    instance.tools_needed = def.cost_tools;
-    instance.bricks_needed = def.cost_bricks;
-    let source_cell_state = instance.source_placement_command.and_then(|command| {
-        let mut state = anno_sim::source_cell::SourceMapCellState::new(
-            island_number,
-            tile_x as u8,
-            tile_y as u8,
-            cod_b,
-            ((sim.game_clock / 10) & 7) as u8,
-        )?;
-        let (footprint_width, footprint_height) = if matches!(orient & 3, 1 | 3) {
-            (cod_b.size.1, cod_b.size.0)
-        } else {
-            cod_b.size
-        };
-        state.set_footprint(footprint_width, footprint_height);
-        state.set_source_command(command);
-        state.configure_terminal_replacement(cod);
-        Some(state)
-    });
-    let source_static_root = instance.source_placement_command.and_then(|command| {
-        let mut state = anno_sim::source_cell::SourceMapCellState::new_static(
-            island_number,
-            tile_x as u8,
-            tile_y as u8,
-            cod_b,
-            ((sim.game_clock / 10) & 7) as u8,
-        )?;
-        let (footprint_width, footprint_height) = if matches!(orient & 3, 1 | 3) {
-            (cod_b.size.1, cod_b.size.0)
-        } else {
-            cod_b.size
-        };
-        state.set_footprint(footprint_width, footprint_height);
-        state.set_source_command(command);
-        state.configure_terminal_replacement(cod);
-        Some(state)
-    });
-    sim.buildings.push(instance);
-    if let Some(state) = source_cell_state {
-        sim.source_map_cell_states.push(state);
-    }
-    if let Some(root) = source_static_root {
-        sim.replace_source_static_map_footprint(root);
-    }
-    let building_index = sim.buildings.len() - 1;
-    if def.kind == "HQ" {
-        let _ = sim.allocate_source_dynamic_map_object_for_building(building_index);
-    }
-    PlaceOutcome::Placed
+    outcome
 }
 
 fn push_ruin_tiles(island: &mut Island, cod: &CodFile, clear: TileClear) {
@@ -1137,7 +931,7 @@ fn apply_kind13_replacement_static(
     else {
         return;
     };
-    let (Some(cod_definition), Some(definition)) = (
+    let (Some(cod_definition), Some(_)) = (
         cod.buildings.get(definition_index),
         sim.building_defs.get(definition_index),
     ) else {
@@ -1152,7 +946,7 @@ fn apply_kind13_replacement_static(
         replacement.island_id,
         replacement.tile_x,
         replacement.tile_y,
-        definition,
+        cod_definition,
         0,
     ) else {
         return;
@@ -1368,9 +1162,11 @@ fn main() {
     let civilian_config = anno_sim::civilian::CivilianConfig::from_figures(&figures);
     let _ = &figures;
 
-    // Parse CLI: positional scenario path + optional --host PORT / --join HOST:PORT
+    // Parse CLI: positional scenario path + optional --host PORT /
+    // --join HOST:PORT / --record FILE.
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let mut net_role: NetRole = NetRole::Solo;
+    let mut record_path: Option<std::path::PathBuf> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < raw_args.len() {
@@ -1386,6 +1182,10 @@ fn main() {
             i += 1;
             let addr = raw_args.get(i).cloned().expect("--join needs HOST:PORT");
             net_role = NetRole::Client { addr };
+        } else if a == "--record" {
+            i += 1;
+            let path = raw_args.get(i).cloned().expect("--record needs a file path");
+            record_path = Some(std::path::PathBuf::from(path));
         } else {
             positional.push(a.clone());
         }
@@ -1595,6 +1395,15 @@ fn main() {
             anno_sim::carrier::CityCartConfig::from_figure_def(traeger2);
     }
     sim.civilian_config = civilian_config;
+    // Command recorder (--record FILE): snapshots the fully-initialized sim
+    // and logs every player command so the run can be replayed tick-exactly
+    // (headless --replay, or replay_advancing) for lockstep comparison.
+    let mut recorder: Option<anno_sim::replay::Recorder> = record_path
+        .as_ref()
+        .map(|_| anno_sim::replay::Recorder::start(&sim));
+    if let Some(path) = &record_path {
+        println!("Recording commands to {}", path.display());
+    }
     println!(
         "Simulation initialized: {} buildings, {} warehouses, {} island maps",
         sim.buildings.len(),
@@ -2164,11 +1973,16 @@ fn main() {
                                 // Route through apply_command so war stays
                                 // unilateral while peace/alliance wait for the
                                 // source diplomacy acceptance path.
-                                sim.apply_command(&anno_sim::commands::Command::SetDiplomacy {
+                                let cmd = anno_sim::commands::Command::SetDiplomacy {
                                     a: 0,
                                     b: diplomacy_target,
                                     state: next,
-                                });
+                                };
+                                if sim.apply_command(&cmd) {
+                                    if let Some(rec) = recorder.as_mut() {
+                                        rec.record(sim.game_clock, cmd);
+                                    }
+                                }
                             }
                             Keycode::D | Keycode::Escape => {
                                 diplomacy_panel = false;
@@ -2647,6 +2461,7 @@ fn main() {
                                 &placer,
                                 tile_x,
                                 tile_y,
+                                &mut recorder,
                             );
                             match outcome {
                                 PlaceOutcome::Placed => {
@@ -2735,81 +2550,37 @@ fn main() {
                             let island = &islands[current_island];
                             let island_id = island.number;
 
-                            // Find building at this tile (only player-owned)
-                            let building_idx = sim.buildings.iter().position(|b| {
-                                b.owner == 0 && b.island_id == island_id && {
-                                    let def = &defs[b.def_id as usize];
-                                    let bx = b.tile_x as i32;
-                                    let by = b.tile_y as i32;
-                                    tile_x >= bx
-                                        && tile_x < bx + def.width as i32
-                                        && tile_y >= by
-                                        && tile_y < by + def.height as i32
+                            if let Some(demolished) =
+                                demolish_building(&mut sim, &defs, island_id, tile_x, tile_y, 0)
+                            {
+                                if let Some(rec) = recorder.as_mut() {
+                                    rec.record(
+                                        sim.game_clock,
+                                        anno_sim::commands::Command::DemolishBuilding {
+                                            player: 0,
+                                            island: island_id,
+                                            tile_x: tile_x as u16,
+                                            tile_y: tile_y as u16,
+                                        },
+                                    );
                                 }
-                            });
-
-                            if let Some(bi) = building_idx {
-                                let b = &sim.buildings[bi];
-                                let def = &defs[b.def_id as usize];
-                                let bx = b.tile_x;
-                                let by = b.tile_y;
-                                let bw = def.width;
-                                let bh = def.height;
-                                let source_orientation = b
-                                    .source_placement_command
-                                    .map(|command| command.orientation)
-                                    .unwrap_or(0);
-                                let (source_width, source_height) = if source_orientation & 1 == 0 {
-                                    (bw, bh)
-                                } else {
-                                    (bh, bw)
-                                };
-                                let refund = def.cost_gold / 2;
-                                let name = cod.buildings[b.def_id as usize]
+                                let name = cod.buildings[demolished.def_id as usize]
                                     .properties
                                     .get("Name")
                                     .cloned()
-                                    .unwrap_or_else(|| format!("Bldg#{}", b.def_id));
-
-                                // Refund half of construction cost
-                                sim.players[0].gold += refund as i32;
-
-                                // Restore walkability
-                                let island_map_idx = sim
-                                    .island_maps
-                                    .iter()
-                                    .position(|m| m.island_id == island_id);
-                                if let Some(map_idx) = island_map_idx {
-                                    for dy in 0..bh {
-                                        for dx in 0..bw {
-                                            sim.island_maps[map_idx].set_walkable(
-                                                bx + dx as u16,
-                                                by + dy as u16,
-                                                true,
-                                            );
-                                        }
-                                    }
-                                }
-
-                                // Remove building from simulation
-                                let _ = sim.release_source_dynamic_map_object_for_building(bi);
-                                sim.remove_source_map_footprint(
-                                    island_id,
-                                    bx,
-                                    by,
-                                    source_width,
-                                    source_height,
-                                );
-                                sim.buildings.remove(bi);
-
+                                    .unwrap_or_else(|| format!("Bldg#{}", demolished.def_id));
                                 println!(
                                     "Demolished {} at ({},{}) on island {} [refund: {} gold]",
-                                    name, bx, by, island_id, refund,
+                                    name,
+                                    demolished.tile_x,
+                                    demolished.tile_y,
+                                    island_id,
+                                    demolished.refund,
                                 );
                                 needs_redraw = true;
                                 // Clear inspection if it was pointing at this building
                                 if let Some(ref insp) = inspection {
-                                    if insp.building_idx == Some(bi) {
+                                    if insp.building_idx == Some(demolished.building_index) {
                                         inspection = None;
                                     }
                                 }
@@ -2965,72 +2736,19 @@ fn main() {
                             );
                             let mut moved = 0;
                             let active_island_id = islands[current_island].number;
-                            let source_time_ticks = sim.source_time_ticks;
                             for &ui in &selected_units {
-                                let mut source_target_update = None;
-                                if let Some(u) = sim.military_units.get_mut(ui) {
-                                    if u.is_alive() {
-                                        if let Some(island_id) = u.source_island_id {
-                                            if island_id != active_island_id {
-                                                continue;
-                                            }
-                                            let Some(target) = sim
-                                                .island_maps
-                                                .iter()
-                                                .find(|map| map.island_id == island_id)
-                                                .and_then(|map| {
-                                                    map.local_to_source_world((tile_x, tile_y))
-                                                })
-                                            else {
-                                                continue;
-                                            };
-                                            u.target_x = target.0;
-                                            u.target_y = target.1;
-                                            let Some(descriptor) = anno_sim::source_route::SourceTargetDescriptor::from_source_land_route_coordinate(
-                                                target.0, target.1,
-                                            ) else {
-                                                continue;
-                                            };
-                                            u.source_target_descriptor = Some(descriptor);
-                                            u.source_route_retry_count = 0;
-                                            u.source_idle_remaining = 0.0;
-                                            u.clear_source_route_program();
-                                            source_target_update =
-                                                u.source_runtime_slot.map(|slot| {
-                                                    (
-                                                        slot,
-                                                        descriptor,
-                                                        u.unit_type == UnitType::NativeSpearman,
-                                                    )
-                                                });
-                                        } else {
-                                            u.target_x = tile_x;
-                                            u.target_y = tile_y;
-                                        }
-                                        u.combat_target = -1;
-                                        u.move_timer_ms = 0;
-                                        moved += 1;
+                                let cmd = anno_sim::commands::Command::MoveUnit {
+                                    player: 0,
+                                    unit_index: ui as u32,
+                                    island: active_island_id,
+                                    tile_x,
+                                    tile_y,
+                                };
+                                if sim.apply_command(&cmd) {
+                                    if let Some(rec) = recorder.as_mut() {
+                                        rec.record(sim.game_clock, cmd);
                                     }
-                                }
-                                if let Some((runtime_slot, descriptor, native_spearman)) =
-                                    source_target_update
-                                {
-                                    if let Some(occupant) = sim
-                                        .source_kind4_occupants
-                                        .iter_mut()
-                                        .find(|occupant| occupant.runtime_slot == runtime_slot)
-                                    {
-                                        occupant.state_descriptor = descriptor;
-                                        occupant.route_retry_count = 0;
-                                        occupant.idle_remaining_bits = 0;
-                                        occupant.route_program =
-                                            anno_sim::combat::default_source_kind4_route_program();
-                                        occupant.route_program_cursor = 0;
-                                        if native_spearman {
-                                            occupant.idle_timestamp_ticks =
-                                                source_time_ticks.wrapping_add(8);
-                                        }
-                                    }
+                                    moved += 1;
                                 }
                             }
                             println!("Move order → ({},{}) for {moved} unit(s)", tile_x, tile_y,);
@@ -3255,6 +2973,7 @@ fn main() {
                                     &placer,
                                     tile_x,
                                     tile_y,
+                                    &mut recorder,
                                 );
                                 if matches!(outcome, PlaceOutcome::Placed) {
                                     needs_redraw = true;
@@ -3357,6 +3076,11 @@ fn main() {
                         // anything else is a stray broadcast we ignore.
                         if let Some(cmd) = anno_sim::commands::Command::decode(&data) {
                             let applied = sim.apply_command(&cmd);
+                            if applied {
+                                if let Some(rec) = recorder.as_mut() {
+                                    rec.record(sim.game_clock, cmd.clone());
+                                }
+                            }
                             println!("[cmd] from p{from_player}: {:?} (applied={applied})", cmd,);
                         }
                     }
@@ -5516,6 +5240,18 @@ fn main() {
 
         canvas.present();
     }
+
+    if let (Some(rec), Some(path)) = (recorder.take(), record_path.as_ref()) {
+        let recording = rec.finish();
+        match anno_sim::replay::save_recording(path, &recording) {
+            Ok(()) => println!(
+                "Recorded {} command(s) to {}",
+                recording.entries.len(),
+                path.display()
+            ),
+            Err(error) => eprintln!("Failed to write recording: {error}"),
+        }
+    }
 }
 
 /// Cached terrain render with coordinate info for overlay.
@@ -6438,15 +6174,21 @@ mod tests {
         }
     }
 
-    fn load_test_cod() -> CodFile {
+    /// Load the shipping haeuser.cod corpus, or `None` when `extracted/` is
+    /// not present in this checkout (corpus tests silently skip, matching
+    /// the data-corpus tests in anno-formats).
+    fn load_test_cod() -> Option<CodFile> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
             .unwrap()
             .join("extracted/haeuser.cod");
+        if !path.exists() {
+            return None;
+        }
         let data = std::fs::read(&path).expect("read haeuser.cod");
-        CodFile::parse(&data).expect("parse haeuser.cod")
+        Some(CodFile::parse(&data).expect("parse haeuser.cod"))
     }
 
     fn seeded_draw(seed: u32) -> u16 {
@@ -6456,7 +6198,9 @@ mod tests {
 
     #[test]
     fn tile_clear_event_places_land_ruin_from_ruinenr() {
-        let cod = load_test_cod();
+        let Some(cod) = load_test_cod() else {
+            return;
+        };
         let mut islands = vec![test_island(10, [7; 8])];
         islands[0].tiles.push(IslandTile {
             building_id: cod.constants["GFXBODEN"] as u16,
@@ -6499,18 +6243,38 @@ mod tests {
 
     #[test]
     fn no_ruin_terminal_replays_backing_root_into_visible_island_tiles() {
-        let cod = load_test_cod();
-        let definition_offset = cod.constants["GFXBODEN"] as u16;
+        let Some(cod) = load_test_cod() else {
+            return;
+        };
+        // A no-ruin terminal event restores the backing ground root into the
+        // visible INSELHAUS stream. A static root's INSELHAUS building_id is
+        // its id-offset (`source_id - base`) — the key that resolves the
+        // definition again — not the gfx sprite index that `new_static`
+        // defaults `source_definition_offset` to. Real roots overwrite that
+        // default via `set_source_command` (scenario load / placement), so
+        // build the backing the same way; otherwise the reconstructed tile
+        // carries a gfx that resolves to nothing and renders as non-walkable.
         let definition = cod
-            .building_by_source_id(
-                anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + i32::from(definition_offset),
-            )
-            .expect("BODEN definition");
+            .buildings
+            .iter()
+            .find(|b| {
+                b.kind == "BODEN" && b.source_id > anno_formats::szs::INSELHAUS_SOURCE_ID_BASE
+            })
+            .expect("terrain BODEN definition");
+        let definition_offset =
+            (definition.source_id - anno_formats::szs::INSELHAUS_SOURCE_ID_BASE) as u16;
         let mut backing =
             anno_sim::source_cell::SourceMapCellState::new_static(0, 3, 4, definition, 0)
                 .expect("static BODEN command");
-        backing.set_source_orientation(3);
-        backing.set_terminal_command_fields(0, 5);
+        backing.set_source_command(anno_sim::building::SourceBuildingCommand {
+            definition_offset,
+            orientation: 3,
+            variant: 0,
+            metadata: 0,
+            map_owner_slot: 5,
+            random_seed: 0,
+            dynamic_object_owner: 0,
+        });
         let clear = TileClear {
             island_id: 0,
             tile_x: 3,
@@ -6565,7 +6329,9 @@ mod tests {
 
     #[test]
     fn tile_clear_event_uses_strand_ruin_table_shift() {
-        let cod = load_test_cod();
+        let Some(cod) = load_test_cod() else {
+            return;
+        };
         let strand_gfx = cod
             .buildings
             .iter()
@@ -6614,7 +6380,9 @@ mod tests {
 
     #[test]
     fn tile_clear_event_places_multitile_kontor_ruin_ladder() {
-        let cod = load_test_cod();
+        let Some(cod) = load_test_cod() else {
+            return;
+        };
         let mut islands = vec![test_island(10, [7; 8])];
         islands[0].tiles.push(IslandTile {
             building_id: (cod.constants["GFXKONTOR"] as u16),
@@ -6663,7 +6431,9 @@ mod tests {
 
     #[test]
     fn tile_clear_event_uses_randanz_randadd_variant_definition() {
-        let cod = load_test_cod();
+        let Some(cod) = load_test_cod() else {
+            return;
+        };
         let mut islands = vec![test_island(10, [7; 8])];
         islands[0].tiles.push(IslandTile {
             building_id: cod.constants["GFXBODEN"] as u16,
@@ -6706,7 +6476,9 @@ mod tests {
 
     #[test]
     fn tile_clear_event_uses_per_cell_strand_table_in_fallback_order() {
-        let cod = load_test_cod();
+        let Some(cod) = load_test_cod() else {
+            return;
+        };
         let mut islands = vec![test_island(10, [7; 8])];
         let draws = vec![
             seeded_draw(1),
@@ -6762,7 +6534,9 @@ mod tests {
 
     #[test]
     fn tile_clear_event_preserves_orientation_for_kontor_ruin_command() {
-        let cod = load_test_cod();
+        let Some(cod) = load_test_cod() else {
+            return;
+        };
         let mut islands = vec![test_island(10, [7; 8])];
         islands[0].tiles.push(IslandTile {
             building_id: cod.constants["GFXKONTOR"] as u16,
@@ -7046,7 +6820,8 @@ mod tests {
         let mut placer = BuildingPlacer::new(&cod, &defs);
         placer.active = true;
 
-        let outcome = try_place_building(&mut sim, &mut islands, 0, &defs, &cod, &placer, 1, 1);
+        let outcome =
+            try_place_building(&mut sim, &mut islands, 0, &defs, &cod, &placer, 1, 1, &mut None);
 
         assert!(matches!(outcome, PlaceOutcome::Placed));
         assert_eq!(sim.buildings.len(), 1);
@@ -7084,14 +6859,21 @@ mod tests {
         let mut placer = BuildingPlacer::new(&cod, &defs);
         placer.active = true;
 
-        let outcome = try_place_building(&mut sim, &mut islands, 0, &defs, &cod, &placer, 1, 1);
+        let outcome =
+            try_place_building(&mut sim, &mut islands, 0, &defs, &cod, &placer, 1, 1, &mut None);
 
         assert!(matches!(outcome, PlaceOutcome::Placed));
         assert_eq!(sim.buildings[0].source_dynamic_object_slot, Some(0));
         assert_eq!(sim.source_static_map_roots.len(), 1);
         assert!(sim.source_static_map_roots[0].matches(4, 1, 1));
         assert_eq!(sim.source_static_map_roots[0].kind_code, 35);
-        assert!(sim.source_map_cell_states.is_empty());
+        // The kontor-production HQ also enters the live selector-state
+        // vector: `SourceMapCellState::new` admits production kinds 7|8|30
+        // so city-transfer scheduling can find it (see the matching filter
+        // in `source_map_cell_states_from_scenario`).
+        assert_eq!(sim.source_map_cell_states.len(), 1);
+        assert!(sim.source_map_cell_states[0].matches(4, 1, 1));
+        assert!(sim.source_map_cell_states[0].is_type11_transfer_root());
         assert_eq!(
             sim.buildings[0].source_placement_command,
             Some(anno_sim::building::SourceBuildingCommand {
@@ -7146,7 +6928,8 @@ mod tests {
         placer.active = true;
         placer.orientation = 1;
 
-        let outcome = try_place_building(&mut sim, &mut islands, 0, &defs, &cod, &placer, 1, 1);
+        let outcome =
+            try_place_building(&mut sim, &mut islands, 0, &defs, &cod, &placer, 1, 1, &mut None);
 
         assert!(matches!(outcome, PlaceOutcome::Placed));
         assert_eq!(sim.source_static_map_roots.len(), 6);
@@ -8072,279 +7855,6 @@ fn draw_diamond(
             }
         }
     }
-}
-
-/// Initialize the simulation from scenario data (like sim_test but automated).
-fn init_simulation(
-    szs: &SzsFile,
-    cod: &CodFile,
-    defs: &[anno_sim::building::BuildingDef],
-    ship_cargo_config: anno_sim::trade::ShipCargoConfig,
-) -> Simulation {
-    let instances = data_bridge::load_building_instances(szs, cod, defs);
-
-    // Create warehouses — one per island with production
-    // buildings OR a STADT4 city. The STADT4 fallback covers
-    // pirate / native islands that ship as dwelling-only
-    // settlements with no production tiles in INSELHAUS; the
-    // original engine spawns a Kontor for those slots
-    // dynamically at scenario start.
-    let mut island_ids: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
-    for inst in &instances {
-        island_ids.insert(inst.island_id);
-    }
-    for island in &szs.islands {
-        if let Some(city) = island.city.as_ref() {
-            if !city.name.is_empty() {
-                island_ids.insert(island.number);
-            }
-        }
-    }
-    let island_ids: Vec<u8> = island_ids.into_iter().collect();
-
-    // Prefer the actual KONTOR tile placement from INSELHAUS
-    // when the scenario provides it. Falls back to a centroid
-    // of production buildings only when no Kontor is placed
-    // (Continous-Play templates with bare land).
-    let mut warehouses = anno_sim::data_bridge::kontor_warehouses_from_szs(szs, cod, defs);
-    let kontor_islands: std::collections::HashSet<u8> =
-        warehouses.iter().map(|w| w.island_id).collect();
-    for &island_id in &island_ids {
-        if kontor_islands.contains(&island_id) {
-            continue;
-        }
-        let island_buildings: Vec<_> = instances
-            .iter()
-            .filter(|b| b.island_id == island_id)
-            .collect();
-        // Pick the fallback warehouse owner from the island's
-        // STADT4 city when present.
-        let island = szs.islands.iter().find(|i| i.number == island_id);
-        let owner = island
-            .and_then(|i| i.city.as_ref())
-            .map(|c| c.owner_slot)
-            .unwrap_or(0);
-        let city_population = island
-            .and_then(|i| i.city.as_ref())
-            .map(|c| c.tier_population)
-            .unwrap_or([0; 5]);
-        let (avg_x, avg_y) = if !island_buildings.is_empty() {
-            let ax = island_buildings
-                .iter()
-                .map(|b| b.tile_x as u32)
-                .sum::<u32>()
-                / island_buildings.len() as u32;
-            let ay = island_buildings
-                .iter()
-                .map(|b| b.tile_y as u32)
-                .sum::<u32>()
-                / island_buildings.len() as u32;
-            (ax as u16, ay as u16)
-        } else if let Some(island) = island {
-            // Dwelling-only pirate/native settlements: anchor on
-            // the island centre. The original engine drops a
-            // Kontor here on first sight.
-            (
-                island.x_pos + island.width as u16 / 2,
-                island.y_pos + island.height as u16 / 2,
-            )
-        } else {
-            continue;
-        };
-        warehouses.push(Warehouse::with_capacity_and_population(
-            island_id,
-            owner,
-            avg_x,
-            avg_y,
-            anno_sim::warehouse::BASE_KONTOR_CAPACITY,
-            city_population,
-        ));
-    }
-
-    // Build island walkability maps
-    let island_maps: Vec<IslandMap> = szs
-        .islands
-        .iter()
-        .enumerate()
-        .map(|(index, island)| {
-            IslandMap::from_island(island, &cod.buildings)
-                .with_source_runtime_classification(szs.island_source_runtime_classification(index))
-                .with_source_resource_state(szs.island_source_resource_state(index))
-        })
-        .collect();
-
-    // Build coverage maps for each island
-    let coverage_maps: Vec<anno_sim::coverage::CoverageMap> = szs
-        .islands
-        .iter()
-        .map(|island| {
-            anno_sim::coverage::CoverageMap::new(
-                island.number,
-                island.width as u16,
-                island.height as u16,
-            )
-        })
-        .collect();
-
-    // Build the source static-map overlay for ship pathfinding.
-    let ocean_map = anno_sim::ocean_map::OceanMap::from_source_scenario(szs, &cod.buildings);
-    println!(
-        "Ocean map: {}x{} ({} navigable tiles)",
-        ocean_map.width,
-        ocean_map.height,
-        (0..ocean_map.height as i32)
-            .flat_map(|y| (0..ocean_map.width as i32).map(move |x| (x, y)))
-            .filter(|&(x, y)| ocean_map.is_navigable(x, y))
-            .count()
-    );
-
-    let mut sim = Simulation::new();
-    sim.diplomacy = anno_sim::data_bridge::diplomacy_from_player4_relationships(&szs.players);
-    sim.source_kind4_dispatch =
-        anno_sim::data_bridge::source_kind4_dispatch_state_from_scenario(szs);
-    sim.configure_source_controller_figure_capacity_limits(&szs.players);
-    sim.building_defs = defs.to_vec();
-    sim.source_dynamic_map_objects =
-        anno_sim::data_bridge::source_dynamic_map_objects_from_scenario(szs, cod);
-    sim.source_map_cell_states =
-        anno_sim::data_bridge::source_map_cell_states_from_scenario(szs, cod);
-    sim.source_static_map_roots =
-        anno_sim::data_bridge::source_static_map_roots_from_scenario(szs, cod);
-    sim.source_static_map_backing_cells =
-        anno_sim::data_bridge::source_static_map_backing_cells_from_scenario(szs, cod);
-    sim.source_kind13_locations =
-        anno_sim::data_bridge::source_kind13_locations_from_scenario(szs, cod);
-    sim.source_kind13_promotion_definitions =
-        anno_sim::data_bridge::source_kind13_promotion_definitions(cod);
-    sim.source_cities = anno_sim::data_bridge::source_cities_from_scenario(szs);
-    sim.source_kind4_occupants = anno_sim::data_bridge::source_kind4_occupants_from_scenario(szs);
-    sim.buildings = instances;
-    sim.warehouses = warehouses;
-    sim.island_maps = island_maps;
-    sim.configure_source_controller_active_cities();
-    sim.mark_loaded_source_islands_visible();
-    sim.coverage_maps = coverage_maps;
-    sim.ocean_map = Some(ocean_map);
-    sim.ship_cargo_config = ship_cargo_config;
-
-    // Initialise the seven player slots from PLAYER4's state_byte
-    // (0x00 = human, 0x0c = AI rival, 0x0d/0x0e/0x0b = reserved
-    // trader / native / pirate factions). Reserved factions stay
-    // PlayerState::Empty so the defeat checker skips them — the
-    // trader / native / pirate subsystems address those slots
-    // directly by index. Slots without a PLAYER4 record fall back
-    // to PlayerState::Empty as a placeholder.
-    //
-    // AI rivals further gate on `ai_active`: when byte 0x0d of
-    // the slot record is 0x01, `1602_exe.c::FUN_00473c50:82622`
-    // skips the slot entirely, so we mirror that by promoting
-    // it to PlayerState::Empty. Exile / New Horizons2 ship
-    // pre-configured-but-disabled AI rosters this way.
-    use anno_sim::player::PlayerState;
-    for slot in 0u8..7 {
-        let init = szs.players.get(slot as usize);
-        let state_byte = init.map(|p| p.state_byte).unwrap_or(0xff);
-        let ai_active = init.map(|p| p.ai_active).unwrap_or(true);
-        let effective_state = if state_byte == 0x0c && !ai_active {
-            0xff // disabled AI → treat as empty
-        } else {
-            state_byte
-        };
-        let mut p = match effective_state {
-            0x00 => Player::new_human(slot),
-            0x0c => Player::new_ai(slot, 0),
-            _ => {
-                let mut p = Player::new_ai(slot, 0);
-                p.state = PlayerState::Empty;
-                p
-            }
-        };
-        if let Some(init) = init {
-            p.gold = init.starting_gold;
-        }
-        sim.players.push(p);
-
-        // Spawn an AI controller alongside every AI rival slot. The raw
-        // PLAYER4 `slot_u16_0x18` byte is parsed, but its binary semantics are
-        // not pinned, so `personality_from_slot_byte` currently returns the
-        // conservative default instead of inventing per-scenario AI behavior.
-        if effective_state == 0x0c {
-            let slot_byte = init.map(|p| p.slot_u16_0x18).unwrap_or(0);
-            let (personality, difficulty) = anno_sim::ai::personality_from_slot_byte(slot_byte);
-            sim.ai_controllers
-                .push(AiController::new(slot, personality, difficulty));
-        }
-    }
-
-    // Seed populations from STADT4 city records when the
-    // scenario provides them. Each city's tier_population
-    // contributes to its owner_slot's player_population.
-    for island in &szs.islands {
-        let Some(city) = island.city.as_ref() else {
-            continue;
-        };
-        if city.tier_population.iter().all(|&v| v == 0) {
-            continue;
-        }
-        let slot = city.owner_slot as usize;
-        if let Some(p) = sim.players.get_mut(slot) {
-            for tier in 0..5 {
-                p.population[tier] += city.tier_population[tier];
-            }
-        }
-    }
-    for p in &mut sim.players {
-        p.total_population = p.population.iter().sum();
-    }
-
-    // Reconstruct every static type-4 land figure from SOLDAT3. These units
-    // retain their source slots so combat removal can update the matching
-    // source island-owner occupancy record.
-    let land_units = anno_sim::data_bridge::land_units_from_scenario(szs);
-    if !land_units.is_empty() {
-        println!(
-            "Spawning {} static land unit(s) from SOLDAT3",
-            land_units.len()
-        );
-        sim.military_units.extend(land_units);
-    }
-
-    // Spawn warships from SHIP4: SmallWarship / LargeWarship /
-    // PirateShip records become MilitaryUnit instances at the
-    // exact spawn coordinates the scenario author placed them.
-    let mut warships = anno_sim::data_bridge::warships_from_ships(&szs.ships);
-    // Spawn trader hulls from SHIP4 too: SmallTrader / LargeTrader
-    // records become TradeShip instances at their authored
-    // coordinates with a sentinel route_id so the trade tick
-    // leaves them inert until a route is assigned.
-    let mut traders = anno_sim::data_bridge::traders_from_ships(&szs.ships, sim.ship_cargo_config);
-    anno_sim::data_bridge::resolve_ship_kind6_policy_slots(&cod, &mut warships, &mut traders);
-    if !warships.is_empty() {
-        let named: Vec<&str> = warships
-            .iter()
-            .filter(|u| !u.name.is_empty())
-            .map(|u| u.name.as_str())
-            .take(5)
-            .collect();
-        let suffix = if named.is_empty() {
-            String::new()
-        } else if warships.iter().filter(|u| !u.name.is_empty()).count() > 5 {
-            format!(" — {} …", named.join(", "))
-        } else {
-            format!(" — {}", named.join(", "))
-        };
-        println!(
-            "Spawning {} static warship(s) from SHIP4{suffix}",
-            warships.len()
-        );
-        sim.military_units.extend(warships);
-    }
-    if !traders.is_empty() {
-        println!("Spawning {} static trader(s) from SHIP4", traders.len());
-        sim.trade_ships.extend(traders);
-    }
-
-    sim
 }
 
 fn decode_sprites(

@@ -130,7 +130,9 @@ pub fn source_target_direction(dx: i32, dy: i32) -> u8 {
             return 7;
         }
         if north < dx {
-            if -2 * dy < dx {
+            // The source branch is `dx < 2 * north -> diagonal`, so the exact
+            // 2:1 boundary falls through to the axial return.
+            if -2 * dy <= dx {
                 return 2;
             }
         } else if 2 * dx < north {
@@ -1765,10 +1767,12 @@ impl SourcePathGrid {
                     .index(position)
                     .expect("frontier position is in bounds");
                 if self.cells[index].metadata & 0x80 != 0 {
+                    // The source scan finishes the current fixed-cost band
+                    // even once the completion window is reached, so a later
+                    // candidate in the same band replaces this one.
                     selected = Some(position);
                     if completion_delay.saturating_add(0x40) <= elapsed_cost {
                         stop_band = true;
-                        break;
                     }
                 }
 

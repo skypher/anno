@@ -27,3 +27,7 @@ path = "src/bin/sim_test.rs"
 [[bin]]
 name = "game"
 path = "src/bin/game.rs"
+
+[[bin]]
+name = "headless"
+path = "src/bin/headless.rs"

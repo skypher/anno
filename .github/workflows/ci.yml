@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # anno-audio (rodio -> alsa-sys) needs ALSA headers; anno-render and
+      # anno-game build SDL2 from source via the `bundled` feature, which
+      # needs cmake and a C toolchain. No display is required — the tests are
+      # pure logic and never open a window. The copyrighted game corpus under
+      # extracted/ is gitignored and absent here, so every data-dependent
+      # corpus test self-skips (each guards its file read and returns early).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev cmake
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked

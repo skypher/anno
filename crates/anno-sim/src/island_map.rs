@@ -352,8 +352,10 @@ impl IslandMap {
         for cell in &self.source_map_kind_cells {
             let penalty = match cell {
                 Some(cell) if cell.map_owner == 7 || cell.map_owner == owner => {
+                    // Plain ground (kind 11) takes the default single-point
+                    // penalty; only the forest and ruin/ore kinds cost four.
                     match cell.kind_code {
-                        10..=12 => 4,
+                        10 | 12 => 4,
                         25 | 26 => 2,
                         _ => 1,
                     }
@@ -579,7 +581,13 @@ impl IslandMap {
 
     fn source_controller_city_clearance_kind(&self, position: (i32, i32)) -> bool {
         self.source_map_kind_cell(position)
-            .map(|cell| matches!(cell.kind_code, 10..=12 | 19))
+            .map(|cell| {
+                // Open terrain, sea, and the shore kinds accepted by the
+                // candidate scan itself all leave the clearance ray intact;
+                // a perpendicular beach run does not disqualify a segment.
+                matches!(cell.kind_code, 10..=12 | 19)
+                    || source_controller_city_candidate_kind(cell.kind_code)
+            })
             .unwrap_or(true)
     }
 
@@ -655,11 +663,17 @@ impl IslandMap {
                 let valid = cell.is_some_and(|cell| {
                     cell.map_owner == source_owner && matches!(cell.kind_code, 1 | 18)
                 });
+                // Cells outside the owner's road kinds are skipped without
+                // disturbing an open span; only a road cell whose transverse
+                // edges are blocked interrupts it.
+                if !valid {
+                    continue;
+                }
                 let direction = cell.map(|cell| cell.map_direction).unwrap_or(u8::MAX);
                 let edge_clear = matches!(direction, 2 | 3)
                     && self.source_controller_city_construction_edge_clear(x, y, 0);
 
-                if valid && (direction <= 1 || edge_clear) {
+                if direction <= 1 || edge_clear {
                     if direction == 0 {
                         if start_x == 0 && start_y == 0 {
                             start_x = x;
@@ -723,11 +737,16 @@ impl IslandMap {
                 let valid = cell.is_some_and(|cell| {
                     cell.map_owner == source_owner && matches!(cell.kind_code, 1 | 18)
                 });
+                // Same skip rule as the row pass: only owner road cells
+                // participate, and only blocked edges interrupt a span.
+                if !valid {
+                    continue;
+                }
                 let direction = cell.map(|cell| cell.map_direction).unwrap_or(u8::MAX);
                 let edge_clear = matches!(direction, 2 | 3)
                     && self.source_controller_city_construction_edge_clear(x, y, 1);
 
-                if valid && (direction <= 1 || edge_clear) {
+                if direction <= 1 || edge_clear {
                     if direction == 0 {
                         if start_x == 0 && start_y == 0 {
                             start_x = x;
@@ -1541,7 +1560,7 @@ impl IslandMap {
 
     fn local_index(&self, position: (i32, i32)) -> Option<usize> {
         self.contains_local(position.0, position.1)
-            .then_some(position.1 as usize * self.width as usize + position.0 as usize)
+            .then(|| position.1 as usize * self.width as usize + position.0 as usize)
     }
 
     /// Mark a tile as walkable (e.g., for warehouse placement after map creation).
@@ -2303,7 +2322,7 @@ mod tests {
                 map_direction: 0,
             })
         };
-        let index = |x, y| y * 6 + x;
+        let index = |x: usize, y: usize| y * 6 + x;
 
         map.source_map_kind_cells[index(2, 1)] = cell(1, false);
         map.source_map_kind_cells[index(1, 2)] = cell(18, false);
@@ -2408,7 +2427,7 @@ mod tests {
                 map_direction,
             })
         };
-        let index = |x, y| y * 16 + x;
+        let index = |x: usize, y: usize| y * 16 + x;
 
         // `FUN_00417220` skips the first eight directional cells.
         map.source_map_kind_cells[index(1, 1)] = cell(11, 7, 0, 3);
@@ -2443,7 +2462,7 @@ mod tests {
     #[test]
     fn controller_city_construction_edge_replays_fun_00417bf0() {
         let mut map = IslandMap::new_open(1, 8, 8);
-        let index = |x, y| y * 8 + x;
+        let index = |x: usize, y: usize| y * 8 + x;
         let cell = |kind_code| {
             Some(SourceMapKindCell {
                 kind_code,
@@ -2472,7 +2491,7 @@ mod tests {
     #[test]
     fn controller_city_construction_calls_replay_both_fun_00417c80_passes() {
         let mut map = IslandMap::new_open(1, 8, 8);
-        let index = |x, y| y * 8 + x;
+        let index = |x: usize, y: usize| y * 8 + x;
         let cell = |direction| {
             Some(SourceMapKindCell {
                 kind_code: 1,
@@ -2533,7 +2552,7 @@ mod tests {
                 map_direction: 0,
             })
         };
-        let index = |x, y| y * 16 + x;
+        let index = |x: usize, y: usize| y * 16 + x;
 
         for y in 4..10 {
             map.source_map_kind_cells[index(8, y)] = cell(23, 7);
@@ -2625,7 +2644,7 @@ mod tests {
             path_class: 42,
         });
 
-        let grid = map.plantation_worker_path_grid((0, 0), (0, 0), (1, 1), 2, 2, 0x2d, &[]);
+        let mut grid = map.plantation_worker_path_grid((0, 0), (0, 0), (1, 1), 2, 2, 0x2d, &[]);
 
         assert_eq!(grid.metadata((0, 0)), Some(0x28));
         assert_eq!(grid.metadata((1, 0)), Some(41));
@@ -2657,7 +2676,7 @@ mod tests {
             .unwrap()
         };
 
-        let grid = map.plantation_worker_path_grid((0, 0), (0, 0), (1, 1), 2, 2, 0x2d, &[growth]);
+        let mut grid = map.plantation_worker_path_grid((0, 0), (0, 0), (1, 1), 2, 2, 0x2d, &[growth]);
 
         assert_eq!(grid.metadata((1, 0)), Some(46));
         assert!(grid.route_to((0, 0), (1, 0)).is_ok());

@@ -91,7 +91,7 @@ impl SourceTransferFigure {
 }
 
 /// The renderer-relevant subset of one source 20-byte map-cell record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceMapCellState {
     pub island: u8,
     pub x: u8,
@@ -951,8 +951,7 @@ pub const fn source_resource_harvest_transition(
     } else {
         4
     };
-    let mask_index =
-        (((x & 3) as u32 + (y as u32) * 4 + island as u32 + ware as u32) & 31) as usize;
+    let mask_index = (((x & 3) as u32 + (y as u32) * 4 + island as u32) & 31) as usize;
     if SOURCE_RESOURCE_GROWTH_MASKS[band][mask_index] {
         SourceResourceHarvestTransition::Regrowth
     } else {
@@ -1269,8 +1268,8 @@ mod tests {
             for dy in 0..height {
                 for dx in 0..width {
                     assert_eq!(
-                        state.source_definition_offset_at(dx, dy),
-                        expected[usize::from(dy)][usize::from(dx)],
+                        state.source_definition_offset_at(dx as u8, dy as u8),
+                        expected[dy as usize][dx as usize],
                         "orientation {orientation}, destination ({dx}, {dy})"
                     );
                 }
