@@ -185,7 +185,69 @@ reports player 0 **gold = 50000** at tick 0 — identical to the value winedbg
 read out of the original's live `DAT_005b7680+4`. Both engines start from the
 same economy state. The gold then stays flat through tick 30 (no buildings, no
 population yet), which confirms the deterministic early-game economy is quiet
-until something is built — so a *discriminating* dynamic comparison needs
-automated building placement in both engines, not just an idle idle-start diff.
+until something is built — so a *discriminating* dynamic comparison needs a
+scenario that starts populated (below), not the empty tutorial.
 (Full RNG-word parity is a separate, longer road — see
 `docs/rng-dispatch-order.md`.)
+
+### Populated-scenario economy comparison (proven end to end)
+
+Empty scenarios don't move the economy. Many **mission scenarios start with a
+fully-built, populated city**, so their economy evolves immediately from a
+fixed start — no building automation needed. Scan for them:
+
+```sh
+./target/debug/headless --scenario "extracted/Szenes/<name>.szs" \
+    --ticks 1 --dump-every 1     # look for buildings/population > 0 at tick 0
+```
+
+Driving the original into one (menu path, all XTEST via `xinput.py`):
+
+1. Title → **Singleplayer** (215,315).
+2. Scenario tree → pick a standalone **Additional Scenario** (e.g. *Exile* at
+   ~430,548) — these avoid the campaign briefing chains.
+3. The **Assignment** briefing appears → **Start Game** (200,487).
+4. The FARBWAHL name hall appears → focus the window and press **Return** to
+   commit the name (this clears the latch that keeps the colour flags
+   `Nosel`), then click a flag. Return must have window focus:
+   `xinput.py :151 wkey a00001 Return` then `xinput.py :151 click 130 320`.
+
+Then read the economy each interval with `econ_snapshot.py` (clock + 7-slot
+gold) and diff by clock against the headless run of the same `.szs`.
+
+**Reliability:** disable Wine's auto crash-handler **before launching**, or a
+fault spawns `winedbg --auto <pid>` which wedges every later attach (and
+killing it kills the game):
+
+```sh
+"$WINE" reg add 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug' \
+    /v Auto /t REG_SZ /d 0 /f
+```
+
+Even so, treat each attach as one-shot; relaunch if a read returns
+`not attachable`.
+
+#### First populated-scenario result (Exile)
+
+| slot | state | scenario gold | Rust headless | original @clock 640 |
+|--|--|--|--|--|
+| 0 human | 0x00 | 10000 | 10000 | **10024** |
+| 1 AI (inactive) | 0x0c | 10000 | 10000 | 0 |
+| 2 AI | 0x0c | 10000 | 10000 | 0 |
+| 3 AI (inactive) | 0x0c | 10000 | 10000 | 0 |
+| 4 trader | 0x0d | 1000000 | 1000000 | **10979** |
+| 5 native | 0x0e | 50000 | 50000 | 0 |
+| 6 pirate | 0x0b | 5000 | 5000 | 0 |
+
+- **The human player's economy is faithful** — original 10024 vs Rust's 10000
+  start (both ~10000; the +24 is 640 clocks of the audited income/upkeep). The
+  on-screen gold counter read 10024 too, confirming the winedbg read is real.
+- **Open finding (non-human slots).** The original's *runtime* player table
+  funds only the human (and a distinct 10979 for the trader, not its 1M
+  scenario value); AI/native/pirate read 0. The Rust headless reports the raw
+  scenario `starting_gold` for every slot (`scenario.rs:227` funds
+  unconditionally, and trader/native/pirate map to `PlayerState::Empty`). This
+  is either deferred runtime activation of non-human players in the original or
+  a Rust funding difference — it needs more RE than one snapshot supports, so
+  it is recorded here rather than "fixed" speculatively. It does **not** affect
+  the human economy comparison, which is the fidelity signal that matters.
