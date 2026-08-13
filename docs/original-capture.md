@@ -137,3 +137,37 @@ Paths that do not crash the game:
 Until one of those is wired into `capture.py`, the Rust side of the
 lockstep harness is fully usable on its own (`docs/lockstep.md`). See
 `tools/capture/README.md`.
+
+## winedbg state capture (works, read-only)
+
+`winedbg` **can** read the running game's live memory without crashing it —
+proven end to end. `tools/capture/winedbg_snapshot.py` drives it. The module
+loads at its preferred base `0x400000` (no ASLR under Wine), so decompiled
+addresses are usable directly.
+
+```sh
+# with the game already in-game (tools/capture/xinput.py start-tutorial + a flag click):
+WINE=~/wine/bin/wine python tools/capture/winedbg_snapshot.py :150
+```
+
+Verified live at tutorial start: the player-data table `DAT_005b7680`
+(160 B × 7) reads back player 0's **gold at +4 = `0xc350` = 50000** (matches
+the on-screen value and the economy audit's RE) and its name at +8 =
+`"Anonymous"`. So the whole capture chain works: headless launch → XTEST
+menu drive → running sim → winedbg snapshot of the original's real state,
+comparable against `crates/anno-game/src/bin/headless.rs`.
+
+Two constraints, both real:
+
+1. **No code breakpoints.** An INT3 at e.g. `FUN_00489670` page-faults in the
+   wow64 32-bit code, which trips Wine's *auto* crash handler
+   (`winedbg --auto <pid>`). That handler then holds the debug attachment
+   (further attaches fail with "error 5"), and killing it takes the game
+   down. So this is **attach → read → detach → repeat** (interval snapshots),
+   not per-tick. Any fault in the game itself spawns the same blocking
+   auto-debugger; disabling Wine's `AeDebug` handler is the next reliability
+   step for long snapshot loops.
+2. **No RNG seed pinning.** That needs code injection (blocked here), so
+   RNG-dependent state diverges from a headless Rust run. Compare the
+   deterministic early-game economy/population instead, where both sides
+   evolve from the same fixed scenario start.
