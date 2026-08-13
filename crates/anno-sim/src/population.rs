@@ -58,31 +58,37 @@ pub const TIER_DEMANDS: &[&[Good]] = &[
 /// Higher tiers consume more per capita because they demand more
 /// distinct goods.
 ///
-/// RE-cited from the Anno-1602 community population-per-industry
-/// appendix
-/// (anno-capsu.netlify.app/1602/population_per_industry.html), which
-/// transcribes the binary's per-80-inhabitants-per-minute table:
+/// REPORT-GAP (consumption mechanism is config-driven and only
+/// partially reproduced here). The original does NOT use a single
+/// per-tier consumption scalar. Instead (`FUN_0047f8a0`,
+/// `1602_exe.c:91379-91434`):
+///   * Per tier, per good, a smoothed *demand accumulator* at struct
+///     `0x150` (food) / `0x15c+` (goods 1..7) is grown by
+///     `weight * population_measure` each tick, then decayed by
+///     `×15/16` (`:91430`).
+///   * The per-good `weight` values come from the `BGRUPPE_WARE`
+///     blocks in haeuser.cod (recovered — the `Ware: NAME, f` floats),
+///     scaled at load (`:66651`, `/600`); the food rate is
+///     `DAT_0049af2c = ftol(Nahrung)/600` (`:66678`).
+///   * Goods are then pulled from the warehouse as WHOLE units via
+///     `FUN_0047a9b0`, sized by `((demand-supply) >> 8) + 1` and
+///     capped by stock (`:91330-91347`).
 ///
-/// | Tier       | Sum over all demanded goods (per 80 per minute) |
-/// |------------|-------------------------------------------------|
-/// | Pioneer    | 0.95 (food only)                                |
-/// | Settler    | 1.75 (0.95 + 0.45 + 0.35)                       |
-/// | Citizen    | 2.60 (0.95 + 0.5 + 0.45 + 0.35 + 0.35)          |
-/// | Merchant   | 3.40 (+0.55 + 0.5 + 0.45 + 0.45 + 0.5)          |
-/// | Aristocrat | 3.30 (+0.55 + 0.45 + 0.45 + 0.45 + 0.35 + 0.1) |
+/// The recovered `BGRUPPE_WARE` demand weights (per tier, per good)
+/// are, from haeuser.cod:
+///   Settler   : STOFFE 0.6, ALKOHOL 0.5
+///   Citizen   : STOFFE 0.7, ALKOHOL 0.6, TABAKWAREN 0.5, GEWUERZE 0.5
+///   Merchant  : STOFFE 0.8, ALKOHOL 0.7, KAKAO 0.7, TABAKWAREN 0.6, GEWUERZE 0.6
+///   Aristocrat: ALKOHOL 0.8, KAKAO 0.6, TABAKWAREN 0.6, GEWUERZE 0.6, KLEIDUNG 0.5, SCHMUCK 0.2
+/// (Pioneer consumes food only, via the `Nahrung` rate.)
 ///
-/// Scaled to per-100-pop-per-economy-tick (10 000 ms = 1/6 minute)
-/// and rounded so the integer math at tick time is meaningful:
-/// Pioneer 2, Settler 4, Citizen 5, Merchant 7, Aristocrat 7.
-///
-/// haeuser.cod's residence buildings (Nr=270/442/448/455) all
-/// carry `Nahrung: 1.3` and `Steuer: 2.6` — the per-pop food
-/// consumption and gold-per-pop tax baseline the original
-/// engine seeds for every tier. These represent the BASE
-/// rates; the per-tier demand multiplier above is empirically
-/// derived to match observed game balance. Pinning the COD
-/// baseline values via `cargo run --example
-/// probe_residence_demands`.
+/// Faithfully reproducing the accumulator EMA + whole-unit pull
+/// dynamics is a larger, higher-risk change that would ripple through
+/// warehouse withdrawal and every economy/population test, so it is
+/// intentionally left as a gap. The scalar below is the prior
+/// empirical approximation (community population-per-industry table,
+/// scaled to per-100-pop-per-economy-tick), retained pending a full
+/// port of the accumulator model.
 const CONSUMPTION_PER_100: [u16; NUM_POP_TIERS] = [
     2, // Pioneer
     4, // Settler
@@ -206,11 +212,15 @@ pub fn update_population_demands(player: &mut Player, warehouses: &mut [Warehous
         }
 
         if num_goods > 0 {
-            let avg = (total_fulfillment / num_goods) as u8;
-            // Blend with current satisfaction (weighted average: 3/4 new + 1/4 old)
-            let old = player.satisfaction[tier] as u32;
-            let new = avg as u32;
-            player.satisfaction[tier] = ((new * 3 + old) / 4) as u8;
+            // Satisfaction is recomputed FRESH each economy tick from
+            // this tick's goods fulfillment — it is NOT blended with
+            // the previous value and NOT decayed. RE: `1602_exe.c:91396`
+            // stores the freshly computed satisfaction at struct
+            // `0x248+tier`; the `×15/16` decay nearby (`:91430`) applies
+            // to the demand/supply accumulators, not to satisfaction.
+            // Each per-good fulfillment is already clamped to 0x80, so
+            // the average stays within 0..=128.
+            player.satisfaction[tier] = (total_fulfillment / num_goods) as u8;
         }
     }
 }

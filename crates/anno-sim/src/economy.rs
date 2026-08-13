@@ -1,16 +1,27 @@
-//! Population happiness and economy model.
+//! Player economy tick.
 //!
-//! Ported from FUN_0047f8a0 (population/player settlement tick).
-//! Timer: 10 000 ms intervals (game-tick aligned).
+//! Ported from the settlement economy tick `FUN_0047f8a0`
+//! (`1602_exe.c:91272`+). Timer: 10 000 ms intervals (game-tick
+//! aligned).
 //!
-//! Happiness model:
-//! - For each demand category: fulfillment = (supply << 7) / demand (0-128 scale)
-//! - Per-tier satisfaction is a weighted sum of fulfilled demands
-//! - Satisfaction decays by 15/16 per tick
-//! - Citizens leave when satisfaction drops below 60% (0x4C)
+//! Model:
+//! - Per demand category, fulfillment = `(supply << 7) / demand`
+//!   clamped at 0x80 (128).
+//! - Per-tier satisfaction is **recomputed fresh** each tick from
+//!   goods fulfillment (`1602_exe.c:91396`, stored at struct
+//!   `0x248+tier`); it is NOT decayed. See `population.rs`.
+//! - Gross tax income (`FUN_0047f740`) minus running costs
+//!   (`FUN_0047f6b0`), applied as `(income - costs) / 6` to the
+//!   player's gold (`1602_exe.c:91438-91440`).
+//!
+//! Note on the `×15/16` decay in the source (`1602_exe.c:91430`,
+//! `*puVar9 = *puVar9 * 0xf >> 4`): it decays the goods
+//! demand/supply *accumulators* at struct `0x150`/`0x154`, NOT
+//! satisfaction. An earlier port misattributed that factor to
+//! satisfaction and decayed happiness every tick — that invented
+//! decay has been removed.
 
 use crate::player::Player;
-use crate::types::NUM_POP_TIERS;
 
 /// Economy tick interval in milliseconds. The population/economy
 /// ticker `FUN_0047f8a0` accumulates elapsed ms into `DAT_0054a3b4`
@@ -21,16 +32,12 @@ use crate::types::NUM_POP_TIERS;
 /// here.)
 pub const ECONOMY_TICK_MS: u32 = 10_000;
 
-/// Satisfaction threshold below which citizens leave (60%).
-pub const LEAVE_THRESHOLD: u8 = 0x4C;
-
-/// Satisfaction decay factor: multiply by 15/16 each tick.
-const SATISFACTION_DECAY_NUM: u32 = 15;
-const SATISFACTION_DECAY_DEN: u32 = 16;
-
 /// Update the player's economy for one tick.
+///
+/// Satisfaction is set fresh in `population::update_population_demands`
+/// before this runs and must NOT be decayed here (see module docs).
 pub fn tick_economy(player: &mut Player) {
-    // 1. Calculate demand fulfillment ratios
+    // 1. Record the latest demand fulfillment ratio per category.
     for slot in &mut player.demands {
         if slot.demand > 0 {
             let fulfillment = ((slot.supply as u64 * 128) / slot.demand as u64).min(128) as u8;
@@ -43,44 +50,18 @@ pub fn tick_economy(player: &mut Player) {
         }
     }
 
-    // 2. Apply satisfaction decay (only for tiers with population)
-    for tier in 0..NUM_POP_TIERS {
-        if player.population[tier] > 0 {
-            let sat = player.satisfaction[tier] as u32;
-            player.satisfaction[tier] =
-                ((sat * SATISFACTION_DECAY_NUM) / SATISFACTION_DECAY_DEN) as u8;
-        }
-    }
-
-    // 3. Apply economy balance
+    // 2. Apply economy balance: (income - costs) / 6 to gold
+    //    (`1602_exe.c:91438-91440`).
     let balance = player.net_balance();
     player.gold += balance;
 
-    // 4. Track bankruptcy
+    // 3. Track bankruptcy
     if player.is_bankrupt() {
         player.bankruptcy_ticks += 1;
     } else {
         player.bankruptcy_ticks = 0;
     }
 
-    // 5. Update total population
+    // 4. Update total population
     player.total_population = player.total_population();
-}
-
-/// Check if a population tier should grow (upgrade houses).
-/// Returns true if satisfaction is high enough for growth.
-pub fn can_grow(player: &Player, tier: usize) -> bool {
-    if tier >= NUM_POP_TIERS {
-        return false;
-    }
-    // Growth requires high satisfaction (>= 75% = 96/128)
-    player.satisfaction[tier] >= 96
-}
-
-/// Check if citizens should leave (satisfaction too low).
-pub fn should_citizens_leave(player: &Player, tier: usize) -> bool {
-    if tier >= NUM_POP_TIERS {
-        return false;
-    }
-    player.satisfaction[tier] < LEAVE_THRESHOLD
 }

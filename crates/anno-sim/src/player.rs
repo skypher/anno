@@ -11,20 +11,24 @@ pub const MAX_PLAYERS: usize = 7;
 /// Number of demand categories.
 pub const NUM_DEMAND_CATEGORIES: usize = 8;
 
-/// Per-tier tax multiplier in 16-fixed-point. The canonical
-/// Anno 1602 progression has higher tiers paying more gold
-/// per inhabitant than lower tiers — the manual quotes ratios
-/// of roughly 1 (Pioneer) → 2 → 3 → 5 → 8 (Aristocrat). We
-/// keep the Citizen tier near 16 (= 1.0×) so existing
-/// economy tuning stays close to its legacy curve, scaling
-/// Pioneer down and Aristocrat up around that anchor.
-pub const TAX_TIER_MULTIPLIER_16: [u8; NUM_POP_TIERS] = [
-    4,  // Pioneer    (0.25×)
-    8,  // Settler    (0.5×)
-    16, // Citizen    (1.0× = legacy baseline)
-    24, // Merchant   (1.5×)
-    32, // Aristocrat (2.0×)
-];
+/// Per-tier tax income "per capita" table (`DAT_0061fa50`),
+/// compiled from each population tier's `Steuer` field in
+/// haeuser.cod at load. This is the *real* per-tier income
+/// weight — it replaces the invented `TAX_TIER_MULTIPLIER_16`.
+///
+/// RE: `1602_exe.c:461add-461af5` (in `FUN_00460750`, the
+/// haeuser.cod key/value parser). For the `Steuer` key the engine
+/// loads the parsed value as a double, multiplies by the `.rdata`
+/// constant at `0x496448` (= 16/3 ≈ 5.333333) and truncates toward
+/// zero via `_ftol`, storing the result at `DAT_0061fa50 +
+/// tier*0x48`.
+///
+/// The five `Objekt: BGRUPPE` tiers in haeuser.cod (Nummer 0..4)
+/// carry `Steuer` = 1.4 / 1.6 / 2.1 / 2.4 / 2.6, so the stored
+/// per-capita values are:
+///   trunc(1.4·16/3)=7, trunc(1.6·16/3)=8, trunc(2.1·16/3)=11,
+///   trunc(2.4·16/3)=12, trunc(2.6·16/3)=13.
+pub const INCOME_PERCAPITA: [i32; NUM_POP_TIERS] = [7, 8, 11, 12, 13];
 
 /// Bankruptcy threshold (gold balance).
 ///
@@ -104,7 +108,12 @@ impl Player {
             color_index,
             population: [0; NUM_POP_TIERS],
             satisfaction: [128; NUM_POP_TIERS],
-            tax_rates: [64; NUM_POP_TIERS], // 50% default
+            // Default per-tier tax = 0x80 (128 = 100%). RE:
+            // `1602_exe.c:73137` initializes the tax bytes at struct
+            // `0x24d` to `0x80808080` on settlement creation, and the
+            // economy tick resets any empty tier back to `0x80`
+            // (`1602_exe.c:91405`).
+            tax_rates: [128; NUM_POP_TIERS],
             demands: Default::default(),
             building_maintenance: 0,
             military_maintenance: 0,
@@ -122,32 +131,35 @@ impl Player {
         }
     }
 
-    /// Calculate tax income for this player.
+    /// Calculate gross tax income for this player.
     ///
-    /// Per-tier formula:
-    ///   `pop × tax_rate × satisfaction × tier_multiplier
-    ///    / (128 × 128 × 16)`
+    /// RE: `FUN_0047f740` (`1602_exe.c:91167`) sums, over the five
+    /// population tiers, the per-tier income computed by
+    /// `FUN_0047f370`/`FUN_0047f2f0` (`1602_exe.c:90924` / `:90886`):
     ///
-    /// where `tax_rate` and `satisfaction` are both in
-    /// 0..=128 scale (=0..=100%) and `tier_multiplier` comes
-    /// from `TAX_TIER_MULTIPLIER_16` — a 16-fixed-point per-
-    /// tier scale that rises with population tier (the
-    /// canonical Anno 1602 progression has Aristocrats paying
-    /// roughly 8× Pioneers per inhabitant).
+    /// ```text
+    ///   base        = INCOME_PERCAPITA[tier] * pop[tier] * 6 / 32   (FUN_0047f2f0)
+    ///   tier_income = base * tax_rate[tier] / 128                   (FUN_0047f370)
+    /// ```
     ///
-    /// The /16 denominator keeps the integer-math output near
-    /// the legacy single-tier value at the Citizen baseline,
-    /// so existing scenario tuning stays close to its prior
-    /// gold curve.
+    /// Both divisions truncate toward zero (the decompiled
+    /// `(x + (x>>31 & mask)) >> shift` idiom — a `>>5` then a `>>7`;
+    /// every operand here is non-negative, so it is a plain floor,
+    /// and the two truncations are applied separately to stay
+    /// bit-exact with the original). `tax_rate[tier]` is the per-tier
+    /// tax byte at struct `0x24d+tier` on a 0..=128 scale (0..=100%).
+    ///
+    /// There is **no satisfaction term** in income: satisfaction
+    /// (struct `0x248`) drives population growth, not gold. The former
+    /// `× satisfaction × TAX_TIER_MULTIPLIER_16 / (128·128·16)` factors
+    /// were invented approximations and have been removed.
     pub fn calculate_income(&self) -> i32 {
         let mut income = 0i32;
         for tier in 0..NUM_POP_TIERS {
-            let mult = TAX_TIER_MULTIPLIER_16[tier] as i32;
-            income += (self.population[tier] as i32
-                * self.tax_rates[tier] as i32
-                * self.satisfaction[tier] as i32
-                * mult)
-                / (128 * 128 * 16);
+            // FUN_0047f2f0: percapita * pop * 6 / 32.
+            let base = INCOME_PERCAPITA[tier] * self.population[tier] as i32 * 6 / 32;
+            // FUN_0047f370 / FUN_0047f740 inner: base * tax_rate / 128.
+            income += base * self.tax_rates[tier] as i32 / 128;
         }
         income
     }
@@ -188,41 +200,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tax_income_scales_per_tier() {
-        // At full satisfaction + tax_rate, an Aristocrat
-        // should pay ~8× a Pioneer per inhabitant (the
-        // canonical Anno 1602 manual ratio). Citizen sits at
-        // the 1.0× legacy baseline.
+    fn tax_income_matches_source_percapita_table() {
+        // 100 inhabitants in a single tier at 100% tax. Values are
+        // the exact source formula: INCOME_PERCAPITA[tier]*100*6/32.
+        // Pioneer  : 7*100*6/32  = 4200/32 = 131
+        // Settler  : 8*100*6/32  = 4800/32 = 150
+        // Citizen  : 11*100*6/32 = 6600/32 = 206
+        // Merchant : 12*100*6/32 = 7200/32 = 225
+        // Aristocrat:13*100*6/32 = 7800/32 = 243
         let mk = |tier: usize| {
             let mut p = Player::new_human(0);
-            // 100 inhabitants in just this tier, 100% tax / sat.
             p.population[tier] = 100;
             p.tax_rates[tier] = 128;
-            p.satisfaction[tier] = 128;
             p.calculate_income()
         };
-        let pioneer = mk(0);
-        let citizen = mk(2);
-        let aristo = mk(4);
-        assert!(citizen > 0);
-        // Aristocrat should out-earn Pioneer by ≥4× per 100 pop.
-        assert!(
-            aristo >= pioneer * 4,
-            "Aristocrat income {aristo} should be ≥4× Pioneer {pioneer}"
-        );
-        // Citizen ≈ legacy baseline (100 pop × full settings).
-        // The TAX_TIER_MULTIPLIER_16 for Citizen is 16, so
-        // the /16 division cancels and we recover the legacy
-        // pop × rate × sat / 128² formula → 100.
-        assert_eq!(citizen, 100);
+        assert_eq!([mk(0), mk(1), mk(2), mk(3), mk(4)], [131, 150, 206, 225, 243]);
+        // Strictly increasing with tier (the real Steuer progression).
+        assert!(mk(0) < mk(1) && mk(1) < mk(2) && mk(2) < mk(3) && mk(3) < mk(4));
     }
 
     #[test]
-    fn calculate_income_zero_at_zero_satisfaction() {
+    fn income_independent_of_satisfaction() {
+        // Income has NO satisfaction term (FUN_0047f740): satisfaction
+        // drives population growth, not gold. Vary satisfaction across
+        // its whole range and income must not move.
+        let base = {
+            let mut p = Player::new_human(0);
+            p.population[2] = 250;
+            p.tax_rates[2] = 128;
+            p.satisfaction[2] = 128;
+            p.calculate_income()
+        };
+        for sat in [0u8, 32, 64, 96, 128] {
+            let mut p = Player::new_human(0);
+            p.population[2] = 250;
+            p.tax_rates[2] = 128;
+            p.satisfaction[2] = sat;
+            assert_eq!(p.calculate_income(), base, "satisfaction {sat} changed income");
+        }
+    }
+
+    #[test]
+    fn income_zero_without_tax_or_population() {
         let mut p = Player::new_human(0);
         p.population[0] = 100;
-        p.tax_rates[0] = 128;
-        p.satisfaction[0] = 0;
+        p.tax_rates[0] = 0; // 0% tax → no income
+        assert_eq!(p.calculate_income(), 0);
+
+        let mut p = Player::new_human(0);
+        // pop all zero (default) → no income regardless of tax
         assert_eq!(p.calculate_income(), 0);
     }
 }

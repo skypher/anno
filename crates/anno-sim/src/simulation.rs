@@ -5724,7 +5724,9 @@ impl Simulation {
             player.building_maintenance = maintenance[i];
             // Update demands and consume goods from warehouses
             population::update_population_demands(player, &mut self.warehouses, i as u8);
-            // Apply economy (gold balance, bankruptcy, satisfaction decay)
+            // Apply economy (gold balance, bankruptcy). Satisfaction is
+            // set fresh in update_population_demands above; tick_economy
+            // must not decay it.
             economy::tick_economy(player);
             // Grow / shrink population by tier and promote satisfied tiers up,
             // clamped to current housing capacity.
