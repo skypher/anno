@@ -878,15 +878,16 @@ pub struct City {
     /// numbering). 0 for the player's main settlement; AI
     /// rivals 1..=3; reserved factions 4..=6.
     pub owner_slot: u8,
-    /// Per-tier inhabitant counts at offsets 0x60, 0x64,
-    /// 0x68, 0x6C, 0x70. Five u32 values matching the five
-    /// population tiers (Pioneer, Settler, Citizen, Merchant,
-    /// Aristocrat). Audit-confirmed by `cargo run --example
-    /// audit_stadt4_bytes`: shipping scenarios pre-populate
-    /// cities with totals like Saint Claer 438 Pioneers,
-    /// Falkenstain [85 Settlers, 800 Citizens], Queckborm
-    /// [775 Citizens, 440 Merchants]. Empty placeholder
-    /// cities leave the array all-zero.
+    /// Per-tier inhabitant counts at record offsets 0x5C, 0x60,
+    /// 0x64, 0x68, 0x6C (five u32, stride 4). Binary-confirmed:
+    /// the city loader `FUN_00484af0` copies exactly these five
+    /// dwords (`edi = record + 0x5C`, 5 iterations) into the
+    /// runtime city record at `+0x220`. Values form a class
+    /// pyramid ascending index 0 → 4 — e.g. "Metropolis" carries
+    /// `[2, 108, 143, 800, 4440]`, so index 0 (0x5C) is the
+    /// smallest, highest tier and index 4 (0x6C) the largest,
+    /// lowest tier. Empty placeholder cities leave the array
+    /// all-zero.
     pub tier_population: [u32; 5],
     pub name: String,
 }
@@ -1380,9 +1381,14 @@ pub struct PlayerSlotInit {
     /// `FUN_00478160` copies these from `DAT_005b7740`; `FUN_00475c60`
     /// applies the same population curve to this directed scale term.
     pub diplomacy_scale_0x60: [u16; 7],
-    /// Seven u32 values at slot offsets `0x80, 0x88, ..., 0xb0`.
-    /// These are the directed runtime `DAT_005b7750` activity counters used
-    /// by `FUN_00477390` and deducted by `FUN_00475c60`.
+    /// Seven u32 values at slot offsets `0x80, 0x84, ..., 0x98`
+    /// (stride 4, contiguous — verified against both the loader
+    /// `FUN_00477912` and the writer `FUN_00478160`, which each
+    /// walk this block one dword at a time). These are the
+    /// directed runtime `DAT_005b7750` activity counters used by
+    /// `FUN_00477390` and deducted by `FUN_00475c60`. Uniformly
+    /// zero across the shipping corpus (runtime state, not
+    /// authored).
     pub diplomacy_activity_0x80: [u32; 7],
     /// Seven u32 values at slot offsets 0xC0, 0xC8, … 0xF0
     /// (stride 8; padding +4 uniformly zero). `FUN_00478160`
@@ -1860,7 +1866,22 @@ impl SzsFile {
             };
             let diplomacy_base_0x40 = read_u16_array(0x40);
             let diplomacy_scale_0x60 = read_u16_array(0x60);
-            let diplomacy_activity_0x80 = read_array(0x80);
+            // Both the loader (`FUN_00477912`, spilled pointer `[esp+0x1c]`
+            // advanced by 4) and the writer (`FUN_00478160`, output cursor
+            // `[esp+0x14]` advanced by 4) lay this array out as seven
+            // contiguous u32 at 0x80..0x9C — stride 4, not the stride 8 used
+            // by the 0xC0/0x140/0x1C0 tables.
+            let diplomacy_activity_0x80 = {
+                let mut arr = [0u32; 7];
+                for (i, slot_val) in arr.iter_mut().enumerate() {
+                    let o = off + 0x80 + i * 4;
+                    if o + 4 <= data.len() {
+                        *slot_val =
+                            u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                    }
+                }
+                arr
+            };
             let relations_0xc0 = read_array(0xC0);
             let relationships = read_array(0x140);
             let events_0x1c0 = read_array(0x1C0);
@@ -1960,12 +1981,17 @@ impl SzsFile {
         let read_u32 = |off: usize| {
             u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
         };
+        // The city loader `FUN_00484af0` copies five per-tier population
+        // dwords from record offsets 0x5C..0x70 (stride 4) into the runtime
+        // city record at `+0x220` (`0x00484c65..0x00484cbb`, edi = record + 1
+        // + 0x5b). Reading from 0x60 drops the first tier and appends a
+        // spurious trailing zero.
         let tier_population = [
+            read_u32(0x5C),
             read_u32(0x60),
             read_u32(0x64),
             read_u32(0x68),
             read_u32(0x6C),
-            read_u32(0x70),
         ];
         let name_start = 0x87;
         let name_end = data[name_start..]
@@ -3906,9 +3932,10 @@ mod tests {
     #[test]
     fn stadt4_extracts_per_tier_population() {
         // Peaceful Reign's "Falkenstain" carries
-        // [0, 85, 800, 0, 0] (85 Settlers + 800 Citizens) per
-        // the audit; "Fraiburg" has [8, 596, 0, 0, 0].
-        // Empty placeholders stay all-zero.
+        // [0, 0, 85, 800, 0] per the loader's 0x5C..0x6C dword
+        // window; "Fraiburg" has [4, 8, 596, 0, 0] (its top-tier
+        // count of 4 at 0x5C was dropped by the earlier 0x60
+        // read). Empty placeholders stay all-zero.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -3930,10 +3957,10 @@ mod tests {
                 .find(|c| c.name == n)
         };
         if let Some(c) = by_name("Falkenstain") {
-            assert_eq!(c.tier_population, [0, 85, 800, 0, 0]);
+            assert_eq!(c.tier_population, [0, 0, 85, 800, 0]);
         }
         if let Some(c) = by_name("Fraiburg") {
-            assert_eq!(c.tier_population, [8, 596, 0, 0, 0]);
+            assert_eq!(c.tier_population, [4, 8, 596, 0, 0]);
         }
         // Total inhabitants across every populated city must be
         // strictly positive — sanity-check that the parser
