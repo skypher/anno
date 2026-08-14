@@ -371,6 +371,30 @@ undercounts operating costs; and the city *event block* (rand-gated
 `+0x1e0` re-arm) is not yet ported — it only matters once houses are below
 capacity or satisfaction moves, which the current comparisons don't exercise.
 
+### Promotion pipeline agreement (post-SIEDLER fixes)
+
+Two follow-up fixes brought the Rust kind-13 pipeline into the same
+intermediate state the live original shows at +150 s:
+
+- **AI-city satisfaction defaults**: every live city (human, AI, trader,
+  native, pirate) reads `0x80` per group at clock 0; the Rust default was
+  zero, so the kind-13 decay path immediately drained and downgraded every
+  AI city. `SourceCityRecord` now initializes satisfied.
+- **Replacement commands are sim-owned**: `FUN_0047c080`'s map replacement is
+  synchronous in the source; the Rust queued it for the game frontend only,
+  so headless runs left the map def stale while city/location tables had
+  already changed group. `Simulation::drain_source_kind13_replacements`
+  applies the static half everywhere; the game frontend keeps only its
+  renderer-overlay patch.
+
+With those, the Rust human city develops `promotion_reservations[2] = 6`
+(one settler house reserved toward citizens) and holds — matching the
+original's observed reservation-driven TABAKWAREN/GEWUERZE demand at
+constant `[0,156,0,0,0]`. Full settler→citizen maturation is gated on
+lifecycle bits `0x20`/`0x100` (`FUN_0047bfa0`), which an unported
+infrastructure scan (BAUINFRA: tavern/school coverage) sets at runtime —
+that scan is the next port target for the growth chain.
+
 Wine stability note: the original dies within ~5 minutes of entering Exile on
 this setup even with zero winedbg attaches (reproduced three times; the crash
 log shows `wine: Unhandled page fault on read access to FFF210EC` — a wild

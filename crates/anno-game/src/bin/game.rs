@@ -899,63 +899,6 @@ fn apply_kind13_replacement_command(
     true
 }
 
-/// Apply the source map writer's static-cell half of a kind-13 replacement.
-/// `FUN_00463ef0` removes the old root footprint before `FUN_004631b0`
-/// writes the selected command; static roots include housing even though the
-/// selector-state vector only keeps kinds 1 through 8 and 30.
-fn apply_kind13_replacement_static(
-    sim: &mut Simulation,
-    cod: &CodFile,
-    replacement: anno_sim::simulation::SourceKind13ReplacementCommand,
-) {
-    if let Some(previous) = sim.source_static_map_roots.iter().copied().find(|root| {
-        root.island == replacement.island_id
-            && root.source_command_anchor_x == replacement.tile_x
-            && root.source_command_anchor_y == replacement.tile_y
-    }) {
-        sim.remove_source_map_footprint(
-            replacement.island_id,
-            u16::from(replacement.tile_x),
-            u16::from(replacement.tile_y),
-            previous.footprint_width,
-            previous.footprint_height,
-        );
-    }
-
-    let source_id = anno_formats::szs::INSELHAUS_SOURCE_ID_BASE
-        .saturating_add(i32::from(replacement.command.definition_offset));
-    let Some(definition_index) = cod
-        .buildings
-        .iter()
-        .position(|definition| definition.source_id == source_id)
-    else {
-        return;
-    };
-    let (Some(cod_definition), Some(_)) = (
-        cod.buildings.get(definition_index),
-        sim.building_defs.get(definition_index),
-    ) else {
-        return;
-    };
-    let (width, height) = if matches!(replacement.command.orientation & 3, 1 | 3) {
-        (cod_definition.size.1, cod_definition.size.0)
-    } else {
-        cod_definition.size
-    };
-    let Some(mut root) = anno_sim::source_cell::SourceMapCellState::new_static(
-        replacement.island_id,
-        replacement.tile_x,
-        replacement.tile_y,
-        cod_definition,
-        0,
-    ) else {
-        return;
-    };
-    root.set_footprint(width, height);
-    root.set_source_command(replacement.command);
-    root.configure_terminal_replacement(cod);
-    sim.replace_source_static_map_footprint(root);
-}
 
 /// Materialize the roots rebuilt by `FUN_004641d0` after a `NORUINE`
 /// terminal event. The static-cell table has already applied the source
@@ -3254,15 +3197,13 @@ fn main() {
             }
 
             // `FUN_0047c080` has already changed the source city and
-            // kind-13 location tables. Replay its queued INSELHAUS command
-            // here, where the game owns the scenario command stream and the
-            // static island-map overlay.
-            if !sim.source_kind13_replacement_commands.is_empty() {
-                let replacements: Vec<_> =
-                    sim.source_kind13_replacement_commands.drain(..).collect();
+            // kind-13 location tables. The simulation applies the static
+            // map-writer half; this frontend additionally patches its
+            // scenario-tile overlay for the renderer.
+            let replacements = sim.drain_source_kind13_replacements(&cod);
+            if !replacements.is_empty() {
                 for replacement in replacements {
                     if apply_kind13_replacement_command(&mut islands, replacement) {
-                        apply_kind13_replacement_static(&mut sim, &cod, replacement);
                         refresh_simulation_island_map(
                             &mut sim,
                             &islands,

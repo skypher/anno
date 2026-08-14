@@ -4680,6 +4680,83 @@ impl Simulation {
         }
     }
 
+    /// Drain and apply the queued kind-13 replacement commands' static-map
+    /// half (`FUN_00463ef0` footprint removal + `FUN_004631b0` command
+    /// write): the source map writer runs synchronously inside
+    /// `FUN_0047c080`/`FUN_0047bbc0`, so every frontend must consume the
+    /// queue each slice — a headless run that leaves it unconsumed keeps
+    /// the map def stale while the location/city tables have already
+    /// changed group. Returns the drained commands so a rendering
+    /// frontend can update its own scenario-tile overlay.
+    pub fn drain_source_kind13_replacements(
+        &mut self,
+        cod: &anno_formats::cod::CodFile,
+    ) -> Vec<SourceKind13ReplacementCommand> {
+        let replacements: Vec<_> = self.source_kind13_replacement_commands.drain(..).collect();
+        for &replacement in &replacements {
+            self.apply_source_kind13_replacement_static(cod, replacement);
+        }
+        replacements
+    }
+
+    /// The static-cell half of one kind-13 replacement. `FUN_00463ef0`
+    /// removes the old root footprint before `FUN_004631b0` writes the
+    /// selected command; static roots include housing even though the
+    /// selector-state vector only keeps kinds 1 through 8 and 30.
+    fn apply_source_kind13_replacement_static(
+        &mut self,
+        cod: &anno_formats::cod::CodFile,
+        replacement: SourceKind13ReplacementCommand,
+    ) {
+        if let Some(previous) = self.source_static_map_roots.iter().copied().find(|root| {
+            root.island == replacement.island_id
+                && root.source_command_anchor_x == replacement.tile_x
+                && root.source_command_anchor_y == replacement.tile_y
+        }) {
+            self.remove_source_map_footprint(
+                replacement.island_id,
+                u16::from(replacement.tile_x),
+                u16::from(replacement.tile_y),
+                previous.footprint_width,
+                previous.footprint_height,
+            );
+        }
+
+        let source_id = anno_formats::szs::INSELHAUS_SOURCE_ID_BASE
+            .saturating_add(i32::from(replacement.command.definition_offset));
+        let Some(definition_index) = cod
+            .buildings
+            .iter()
+            .position(|definition| definition.source_id == source_id)
+        else {
+            return;
+        };
+        let (Some(cod_definition), Some(_)) = (
+            cod.buildings.get(definition_index),
+            self.building_defs.get(definition_index),
+        ) else {
+            return;
+        };
+        let (width, height) = if matches!(replacement.command.orientation & 3, 1 | 3) {
+            (cod_definition.size.1, cod_definition.size.0)
+        } else {
+            cod_definition.size
+        };
+        let Some(mut root) = crate::source_cell::SourceMapCellState::new_static(
+            replacement.island_id,
+            replacement.tile_x,
+            replacement.tile_y,
+            cod_definition,
+            0,
+        ) else {
+            return;
+        };
+        root.set_footprint(width, height);
+        root.set_source_command(replacement.command);
+        root.configure_terminal_replacement(cod);
+        self.replace_source_static_map_footprint(root);
+    }
+
     fn source_kind13_promotion_materials(
         &self,
         city: SourceCityRecord,

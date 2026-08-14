@@ -79,6 +79,7 @@ fn main() {
     dump(&sim, "t0");
     for t in 1..=ticks {
         sim.tick(1000);
+        sim.drain_source_kind13_replacements(&cod);
         if t % 100 == 0 {
             dump(&sim, &format!("t{t}"));
         }

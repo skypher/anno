@@ -3,7 +3,7 @@
 //! house transfers -> per-player mirror. Self-skips without the data
 //! corpus (extracted/ is gitignored).
 
-fn load_exile() -> Option<anno_sim::simulation::Simulation> {
+fn load_exile() -> Option<(anno_sim::simulation::Simulation, anno_formats::cod::CodFile)> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()?
         .parent()?
@@ -21,12 +21,12 @@ fn load_exile() -> Option<anno_sim::simulation::Simulation> {
         });
     let mut sim = anno_game::scenario::build_simulation(&szs, &cod, &defs, &figures);
     sim.seed_source_rand(1);
-    Some(sim)
+    Some((sim, cod))
 }
 
 #[test]
 fn exile_population_holds_at_the_house_bound() {
-    let Some(mut sim) = load_exile() else {
+    let Some((mut sim, cod)) = load_exile() else {
         println!("Skipping test: data corpus not found");
         return;
     };
@@ -63,7 +63,13 @@ fn exile_population_holds_at_the_house_bound() {
     // former invented growth exploded past 400.
     for _ in 0..2_000 {
         sim.tick(100);
+        sim.drain_source_kind13_replacements(&cod);
     }
+    // With the infrastructure lifecycle flags (`FUN_0047bfa0` bits
+    // 0x20/0x100) not yet scanned in, settler houses cannot promote to
+    // citizens, so the total is exactly the authored roster. Once that
+    // scan is ported, the original's behavior is a slow settler->citizen
+    // shift at constant total.
     assert_eq!(
         sim.players[0].population,
         [0, 156, 0, 0, 0],

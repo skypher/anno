@@ -435,11 +435,17 @@ pub struct SourceCityRecord {
     #[serde(default)]
     pub satisfaction_pressure: u16,
     /// Source city bytes `+0x248..+0x24c`, written by `FUN_0047f850`.
-    #[serde(default)]
+    /// Live-verified 2026-08-14: every Exile city (human, AI, trader,
+    /// native, pirate) reads `0x80` per group at clock 0, so scenario
+    /// cities initialize satisfied. Cities whose owner never passes the
+    /// local-player satisfaction gate keep this value — with a zero
+    /// default the kind-13 decay path immediately drained every AI city.
+    #[serde(default = "source_city_initial_group_satisfaction")]
     pub satisfaction_by_group: [u8; 5],
     /// Source city byte `+0x255`, supplied by the city-demand dispatcher to
-    /// `FUN_0047b410` as its cross-group satisfaction operand.
-    #[serde(default)]
+    /// `FUN_0047b410` as its cross-group satisfaction operand. Initialized
+    /// satisfied for the same reason as `satisfaction_by_group`.
+    #[serde(default = "source_city_initial_overall_satisfaction")]
     pub overall_satisfaction: u8,
     /// Source city u16 `+0x1fe`; a nonzero value suppresses positive
     /// kind-13 amount changes in `FUN_0047b410`.
@@ -463,6 +469,14 @@ const fn source_city_initial_satisfaction_weights() -> [u8; 5] {
     [0x80; 5]
 }
 
+const fn source_city_initial_group_satisfaction() -> [u8; 5] {
+    [0x80; 5]
+}
+
+const fn source_city_initial_overall_satisfaction() -> u8 {
+    0x80
+}
+
 impl Default for SourceCityRecord {
     fn default() -> Self {
         Self {
@@ -484,8 +498,8 @@ impl Default for SourceCityRecord {
             worst_ware_slot: 0,
             satisfaction_weights: source_city_initial_satisfaction_weights(),
             satisfaction_pressure: 0,
-            satisfaction_by_group: [0; 5],
-            overall_satisfaction: 0,
+            satisfaction_by_group: source_city_initial_group_satisfaction(),
+            overall_satisfaction: source_city_initial_overall_satisfaction(),
             growth_blocked: false,
             promotion_blocked: false,
             promotion_reservations: [0; 5],

@@ -244,6 +244,9 @@ fn main() {
 
         let events = scheduler.advance_real_time(opts.dt_ms, sim.speed_multiplier);
         sim.tick(opts.dt_ms);
+        // Apply queued kind-13 house replacements (the source map writer
+        // runs synchronously; headless has no renderer overlay to patch).
+        sim.drain_source_kind13_replacements(&cod);
 
         if tick % opts.dump_every == 0 || tick == opts.ticks {
             let fired: Vec<&'static str> = events
