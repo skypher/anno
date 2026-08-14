@@ -445,11 +445,13 @@ fn source_supplier_ware_admits(candidate_ware_slot: u8, requested_good: Good) ->
 /// Run FUN_00471380's first-reservable type-8 supplier search. The callback
 /// accepts the first same-owner root whose requested input has at least half
 /// a TRAEGER load available, reserving up to the full fixed-point load.
+#[allow(clippy::too_many_arguments)]
 fn select_carrier_source_wave(
     start: (i32, i32),
     island: u8,
     owner: u8,
     requested_good: Good,
+    origin_footprint: (u8, u8),
     suppliers: &[CarrierSupplier],
     source_cells: &[SourceMapCellState],
     warehouses: &[Warehouse],
@@ -489,6 +491,21 @@ fn select_carrier_source_wave(
         // FUN_004704d0 replaces both the callback bit and the low-seven-bit
         // path class with the candidate root's `Wegspeed[Speedtyp]` entry.
         grid.set_target_region_metadata(target, (supplier.source_path_class & 0x7f) | 0x80);
+    }
+
+    // `FUN_00459150` (`1602_exe.c:61677`) runs `FUN_004710b0` on the carrier's
+    // own tile between the raster and the flood, reopening the requesting
+    // workshop's whole footprint at cost class `0x28` with the goal bit clear.
+    // `FUN_004704d0` has just stamped that footprint as a goal — the workshop
+    // is nested production kind 1, inside `1..=8` (`1602_exe.c:79457`) — and a
+    // goal cell terminates the wave, so the search would otherwise be confined
+    // to its single anchor tile.
+    if let Some(footprint) = SourcePathTargetRect::new(
+        start,
+        usize::from(origin_footprint.0.max(1)),
+        usize::from(origin_footprint.1.max(1)),
+    ) {
+        grid.open_source_object_footprint(footprint);
     }
 
     let mut selected: Option<(usize, CarrierSupplier, (i32, i32), u16)> = None;
@@ -623,6 +640,17 @@ fn try_spawn_carrier_for_request(
         .iter()
         .find(|map| map.island_id == building.island_id);
 
+    // `FUN_004710b0` resolves the footprint through `FUN_00463980`, i.e. from
+    // the live map record under the figure's own tile; the port's equivalent
+    // record is the requesting root's `SourceMapCellState`.
+    let origin_footprint = source_cells
+        .iter()
+        .find(|cell| {
+            cell.matches(building.island_id, building.tile_x, building.tile_y)
+        })
+        .map(|cell| (cell.footprint_width, cell.footprint_height))
+        .unwrap_or((1, 1));
+
     let mut selected: Option<(usize, CarrierSupplier, (i32, i32), Vec<(i32, i32)>, u16)> = None;
     if let Some(map) = map {
         let (state_idx, supplier, reached, path, cargo_fixed) = select_carrier_source_wave(
@@ -630,6 +658,7 @@ fn try_spawn_carrier_for_request(
             building.island_id,
             building.owner,
             request.good,
+            origin_footprint,
             suppliers,
             source_cells,
             warehouses,
@@ -758,6 +787,18 @@ fn try_spawn_carrier_for_request(
     Some(carrier)
 }
 
+/// `FUN_004706e0`, the type-11 window raster, sets a cell's goal bit only for
+/// nested production kinds `1..=6` (`1602_exe.c:79565-79570`:
+/// `if ((*(uint *)(iVar3 + 0x1c) == 0) || (6 < *(uint *)(iVar3 + 0x1c))) bVar10 = false;`).
+/// The type-8 raster `FUN_004704d0` uses `1..=8` at `1602_exe.c:79457`; the
+/// two rasters are otherwise the same routine, and this is the difference that
+/// stops a city cart from collecting out of another MARKT or KONTOR store —
+/// including the requesting root's own.
+#[inline]
+const fn source_city_cart_goal_kind(production_kind_code: u8) -> bool {
+    production_kind_code != 0 && production_kind_code <= 6
+}
+
 /// Start a type-11 city cart from a MARKT or KONTOR source root.
 /// `FUN_004717b0` retains the strictly highest `storage_fill × 128 /
 /// Maxlager` candidate, accepts consumer goods 11 through 24 at any positive
@@ -768,6 +809,7 @@ fn select_city_cart_source_wave(
     island: u8,
     source_radius: u8,
     map_owner_slot: u8,
+    origin_footprint: (u8, u8),
     city: CityCartEligibility,
     suppliers: &[CarrierSupplier],
     source_cells: &[SourceMapCellState],
@@ -782,18 +824,19 @@ fn select_city_cart_source_wave(
 )> {
     let mut grid = map.city_cart_path_grid();
     let radius = i32::from(source_radius);
-    if source_radius != 0 {
-        let window_origin = (start.0.checked_sub(radius)?, start.1.checked_sub(radius)?);
-        let window_size = usize::try_from(radius.checked_mul(2)?.checked_add(1)?).ok()?;
-        grid.block_outside_rect(window_origin, window_size, window_size);
-    }
 
     // `FUN_004717b0` applies no map-kind test to a candidate producer
     // (`1602_exe.c:80578-80586`): it indexes the city eligibility table by the
     // candidate's compiled `Ware` byte and scores it `fill * 128 / Maxlager`,
-    // both of which the acceptance callback below already replays.
+    // both of which the acceptance callback below already replays. The goal
+    // bit itself comes from the raster, `FUN_004706e0` (`1602_exe.c:79565`),
+    // which admits only nested production kinds `1..=6` — a city cart never
+    // collects from another MARKT, KONTOR or kind-30 root.
     for candidate in source_cells.iter().copied() {
-        if candidate.island != island || candidate.source_map_owner_slot != map_owner_slot {
+        if candidate.island != island
+            || candidate.source_map_owner_slot != map_owner_slot
+            || !source_city_cart_goal_kind(candidate.source_production_kind_code)
+        {
             continue;
         }
         if source_radius != 0
@@ -821,6 +864,30 @@ fn select_city_cart_source_wave(
         grid.set_target_region_metadata(target, (supplier.source_path_class & 0x7f) | 0x80);
     }
 
+    // `FUN_004596b0` (`1602_exe.c:61878`) runs `FUN_004710b0` on the cart's own
+    // tile straight after the raster, which reopens the requesting root's whole
+    // footprint at cost class `0x28` with the goal bit cleared. The raster has
+    // just stamped that footprint as a goal (the root is production kind 7 or 8
+    // in this settlement), and a goal cell terminates the wave rather than
+    // expanding it, so without this step a MARKT or KONTOR can only ever leave
+    // its single anchor tile.
+    if let Some(footprint) = SourcePathTargetRect::new(
+        start,
+        usize::from(origin_footprint.0.max(1)),
+        usize::from(origin_footprint.1.max(1)),
+    ) {
+        grid.open_source_object_footprint(footprint);
+    }
+
+    // The window is the scratch-grid allocation in the source
+    // (`1602_exe.c:79546-79553`), so it also clips the footprint reopened
+    // above; applying it last reproduces that clip.
+    if source_radius != 0 {
+        let window_origin = (start.0.checked_sub(radius)?, start.1.checked_sub(radius)?);
+        let window_size = usize::try_from(radius.checked_mul(2)?.checked_add(1)?).ok()?;
+        grid.block_outside_rect(window_origin, window_size, window_size);
+    }
+
     let mut selected: Option<(usize, CarrierSupplier, (i32, i32), u32)> = None;
     let _ = grid.search_with_blocked_cell_callback(start, |position, _| {
         let Some((state_idx, candidate, supplier)) = source_cells
@@ -837,6 +904,7 @@ fn select_city_cart_source_wave(
                 })?;
                 let within_footprint = candidate.island == island
                     && candidate.source_map_owner_slot == map_owner_slot
+                    && source_city_cart_goal_kind(candidate.source_production_kind_code)
                     && position.0 >= i32::from(candidate.x)
                     && position.1 >= i32::from(candidate.y)
                     && position.0
@@ -924,6 +992,7 @@ pub fn try_spawn_city_cart(
                 origin.island,
                 origin.source_transfer_radius,
                 origin.source_map_owner_slot,
+                (origin.footprint_width, origin.footprint_height),
                 city,
                 suppliers,
                 source_cells,
@@ -936,7 +1005,9 @@ pub fn try_spawn_city_cart(
         if map.is_some() {
             break;
         }
-        if candidate.island != origin.island || candidate.is_type11_transfer_root() {
+        if candidate.island != origin.island
+            || !source_city_cart_goal_kind(candidate.source_production_kind_code)
+        {
             continue;
         }
         let Some(supplier) = suppliers.iter().find(|supplier| {
@@ -1685,10 +1756,12 @@ mod tests {
     #[test]
     fn generic_carrier_keeps_supplier_anchor_when_wave_reaches_footprint_edge() {
         let consumer = BuildingInstance::new(0, 0, 2, 2, 0);
+        // The supplier's east cell (1, 1) is the one the wave meets; its
+        // anchor (0, 1) is a further step west.
         let supplier = CarrierSupplier {
             island: 0,
             owner: 0,
-            x: 1,
+            x: 0,
             y: 1,
             good: Good::Iron,
             available: 4,
@@ -1696,7 +1769,7 @@ mod tests {
             source_path_class: 32,
             source_footprint: (2, 1),
         };
-        let mut states = [supplier_state(1, 1, 128, Good::Iron)];
+        let mut states = [supplier_state(0, 1, 128, Good::Iron)];
 
         let carrier = try_spawn_carrier(
             &consumer,
@@ -1709,9 +1782,9 @@ mod tests {
         )
         .expect("the footprint's east edge is a valid source-grid callback");
 
-        assert_eq!((carrier.target_x, carrier.target_y), (2, 1));
-        assert_eq!((carrier.supplier_x, carrier.supplier_y), (1, 1));
-        assert_eq!(carrier.path.last(), Some(&(2, 1)));
+        assert_eq!((carrier.target_x, carrier.target_y), (1, 1));
+        assert_eq!((carrier.supplier_x, carrier.supplier_y), (0, 1));
+        assert_eq!(carrier.path.last(), Some(&(1, 1)));
     }
 
     #[test]
@@ -2004,6 +2077,83 @@ mod tests {
         assert_eq!(states[1].reserved_storage, 0);
     }
 
+    /// `FUN_004706e0` (`1602_exe.c:79565-79570`) refuses the goal bit to any
+    /// nested production kind above 6, so a MARKT or KONTOR is never a city
+    /// cart's collection target — the store-to-store hop does not exist. The
+    /// port used to test only `is_type11_transfer_root()` on its fallback
+    /// path and nothing at all on the wave path, which let a Kontor sitting on
+    /// a `Ware`-bearing terrain cell offer itself as its own supplier.
+    #[test]
+    fn city_cart_source_wave_never_collects_from_another_transfer_root() {
+        let origin = SourceMapCellState::new(
+            0,
+            0,
+            0,
+            &anno_formats::cod::BuildingDef {
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        let mut other_market = SourceMapCellState {
+            storage_fill: 320,
+            source_output_ware_slot: Good::Cloth.source_ware_slot().unwrap(),
+            ..SourceMapCellState::new(
+                0,
+                2,
+                0,
+                &anno_formats::cod::BuildingDef {
+                    kind: "GEBAEUDE".into(),
+                    properties: [("ProdKind".into(), "MARKT".into())].into(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        };
+        other_market.storage_animation_capacity = 320;
+        let supplier = CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 2,
+            y: 0,
+            good: Good::Cloth,
+            available: 10,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 32,
+            source_footprint: (1, 1),
+        };
+
+        assert!(
+            try_spawn_city_cart(
+                origin,
+                CityCartEligibility::from_priorities(0, [1; 25]),
+                &[supplier],
+                &mut [other_market],
+                &[IslandMap::new_open(0, 3, 1)],
+                CityCartConfig::default(),
+            )
+            .is_none(),
+            "a kind-7 root must not be a city cart's supplier"
+        );
+
+        // The same root as a plain workshop is collected, so the rejection is
+        // the production kind and not the geometry.
+        let mut workshop = supplier_state(2, 0, 320, Good::Cloth);
+        workshop.storage_animation_capacity = 320;
+        assert!(try_spawn_city_cart(
+            origin,
+            CityCartEligibility::from_priorities(0, [1; 25]),
+            &[supplier],
+            &mut [workshop],
+            &[IslandMap::new_open(0, 3, 1)],
+            CityCartConfig::default(),
+        )
+        .is_some());
+    }
+
     #[test]
     fn city_cart_source_wave_rejects_a_supplier_from_another_map_owner() {
         let mut origin = SourceMapCellState::new(
@@ -2287,18 +2437,21 @@ mod tests {
         priorities[Good::Cloth.source_ware_slot().unwrap() as usize] = 2;
         priorities[Good::Alcohol.source_ware_slot().unwrap() as usize] = 2;
 
+        // Record order is east-then-west; the wave reaches west first and
+        // `FUN_004717b0` breaks out of its band on the first priority-two hit,
+        // so the wave order is what decides.
         let cart = try_spawn_city_cart(
             origin,
             CityCartEligibility::from_priorities(0, priorities),
             &suppliers,
-            &mut [west, east],
+            &mut [east, west],
             &[IslandMap::new_open(0, 5, 5)],
             CityCartConfig::default(),
         )
-        .expect("source wave should reach the eastern root first");
+        .expect("source wave should reach the western root first");
 
-        assert_eq!((cart.target_x, cart.target_y), (3, 2));
-        assert_eq!(cart.carried_good, Good::Alcohol as u8);
+        assert_eq!((cart.target_x, cart.target_y), (1, 2));
+        assert_eq!(cart.carried_good, Good::Cloth as u8);
     }
 
     #[test]
@@ -2360,7 +2513,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let mut source = supplier_state(1, 1, 128, Good::Cloth);
+        let mut source = supplier_state(0, 1, 128, Good::Cloth);
         source.storage_animation_capacity = 320;
         let mut north = supplier_state(2, 0, 128, Good::Alcohol);
         north.storage_animation_capacity = 320;
@@ -2368,7 +2521,7 @@ mod tests {
             CarrierSupplier {
                 island: 0,
                 owner: 0,
-                x: 1,
+                x: 0,
                 y: 1,
                 good: Good::Cloth,
                 available: 4,
@@ -2402,8 +2555,8 @@ mod tests {
         )
         .expect("source wave should select the nearer non-anchor footprint cell");
 
-        assert_eq!((cart.target_x, cart.target_y), (2, 1));
-        assert_eq!((cart.supplier_x, cart.supplier_y), (1, 1));
+        assert_eq!((cart.target_x, cart.target_y), (1, 1));
+        assert_eq!((cart.supplier_x, cart.supplier_y), (0, 1));
         assert_eq!(cart.carried_good, Good::Cloth as u8);
     }
 
@@ -2421,15 +2574,15 @@ mod tests {
             0,
         )
         .unwrap();
-        let mut west = supplier_state(1, 1, 128, Good::Cloth);
+        let mut west = supplier_state(0, 1, 128, Good::Cloth);
         west.storage_animation_capacity = 320;
-        let mut east = supplier_state(2, 1, 128, Good::Alcohol);
+        let mut east = supplier_state(1, 1, 128, Good::Alcohol);
         east.storage_animation_capacity = 320;
         let suppliers = [
             CarrierSupplier {
                 island: 0,
                 owner: 0,
-                x: 1,
+                x: 0,
                 y: 1,
                 good: Good::Cloth,
                 available: 4,
@@ -2440,7 +2593,7 @@ mod tests {
             CarrierSupplier {
                 island: 0,
                 owner: 0,
-                x: 2,
+                x: 1,
                 y: 1,
                 good: Good::Alcohol,
                 available: 4,
@@ -2463,7 +2616,7 @@ mod tests {
         )
         .expect("last writer should own the shared source-grid target cell");
 
-        assert_eq!((cart.target_x, cart.target_y), (2, 1));
+        assert_eq!((cart.target_x, cart.target_y), (1, 1));
         assert_eq!(cart.carried_good, Good::Alcohol as u8);
     }
 

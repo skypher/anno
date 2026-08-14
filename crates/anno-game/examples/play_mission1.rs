@@ -33,18 +33,92 @@ fn main() {
         .iter()
         .position(|m| m.island_id == 10)
         .unwrap();
-    // Prefer a west-coast anchor with land around it (skip the corner).
-    let anchor = (2..island.height as i32 - 2)
-        .flat_map(|y| (2..island.width as i32 - 2).map(move |x| (x, y)))
-        .find(|&(x, y)| {
+    // The transfer waves rasterise the live map with `FUN_004704d0` /
+    // `FUN_004706e0` and open only outer kinds `{1, 0xb, 0xc, 0xd, 0x12, 0x1d,
+    // 0x1e}` (`1602_exe.c:79470-79477`) — road, ground, ruin, plaza, bridge,
+    // beach-ruin, pier. Sea, the surf/beach ring and forest are impassable.
+    // `IslandMap::is_walkable` counts `MEER` as walkable, so siting by that
+    // helper alone put the whole colony out at sea, where every Karren search
+    // returns `NoRoute` and nothing the colony makes can ever be collected.
+    let open_ground = |k: u8| matches!(k, 1 | 11 | 12 | 13 | 18 | 29 | 30);
+    let kind_at = |sim: &anno_sim::simulation::Simulation, x: i32, y: i32| {
+        sim.island_maps[mi]
+            .source_map_kind_and_owner(x, y)
+            .map(|(k, _)| k)
+            .unwrap_or(u8::MAX)
+    };
+    // How much ground can a Karren reach from a 2x3 Kontor rooted here? The
+    // transfer wave floods the rasterised window out of the requesting root's
+    // own footprint (`FUN_004710b0`, `1602_exe.c:80003`) and only over the
+    // open outer kinds, taking a diagonal solely when both orthogonal cells
+    // beside it are clear (`FUN_0046c7d0`). A producer outside that component
+    // is stranded however much it makes, so found where the component is
+    // biggest — which is what a player picking a harbour does by eye.
+    let cart_component = |sim: &anno_sim::simulation::Simulation, anchor: (i32, i32)| {
+        let kind = |x: i32, y: i32| {
+            sim.island_maps[mi]
+                .source_map_kind_and_owner(x, y)
+                .map(|(k, _)| k)
+                .unwrap_or(u8::MAX)
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut queue: Vec<(i32, i32)> = (0..3)
+            .flat_map(|dy| (0..2).map(move |dx| (anchor.0 + dx, anchor.1 + dy)))
+            .collect();
+        for cell in &queue {
+            seen.insert(*cell);
+        }
+        while let Some((x, y)) = queue.pop() {
+            for (dx, dy) in [
+                (1, 0),
+                (-1, 0),
+                (0, 1),
+                (0, -1),
+                (1, 1),
+                (1, -1),
+                (-1, 1),
+                (-1, -1),
+            ] {
+                let next = (x + dx, y + dy);
+                if next.0 < 0
+                    || next.1 < 0
+                    || next.0 >= island.width as i32
+                    || next.1 >= island.height as i32
+                    || seen.contains(&next)
+                    || !open_ground(kind(next.0, next.1))
+                {
+                    continue;
+                }
+                if dx != 0
+                    && dy != 0
+                    && !(open_ground(kind(x + dx, y)) && open_ground(kind(x, y + dy)))
+                {
+                    continue;
+                }
+                seen.insert(next);
+                queue.push(next);
+            }
+        }
+        seen
+    };
+    let anchor = (2..island.height as i32 - 5)
+        .flat_map(|y| (2..island.width as i32 - 4).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
             sim.island_maps[mi].is_coastal(x, y)
-                && sim.island_maps[mi].is_walkable(x + 1, y)
-                && sim.island_maps[mi].is_walkable(x + 2, y)
+                && (0..3).any(|dy| (0..2).any(|dx| open_ground(kind_at(&sim, x + dx, y + dy))))
         })
-        .expect("coastal anchor with hinterland");
+        .max_by_key(|&anchor| cart_component(&sim, anchor).len())
+        .expect("coastal anchor whose Kontor footprint reaches open ground");
+    // The ship has to stop on navigable water within `found_kontor`'s range.
+    let dock = (-8i32..=8)
+        .flat_map(|dy| (-8i32..=8).map(move |dx| (dx, dy)))
+        .map(|(dx, dy)| (anchor.0 + dx, anchor.1 + dy))
+        .filter(|&(x, y)| x >= 0 && y >= 0 && kind_at(&sim, x, y) == 19)
+        .min_by_key(|&(x, y)| (x - anchor.0).abs() + (y - anchor.1).abs())
+        .expect("open water beside the anchor");
     let world = (
-        i32::from(island.x_pos) + anchor.0,
-        i32::from(island.y_pos) + anchor.1,
+        i32::from(island.x_pos) + dock.0,
+        i32::from(island.y_pos) + dock.1,
     );
     assert!(sim.apply_command(&Command::SailShip {
         player: 0,
@@ -75,6 +149,20 @@ fn main() {
     println!("founded at {anchor:?}: {ok}");
     assert!(ok);
 
+    // Which ground can a Karren actually reach from the Kontor? The transfer
+    // wave floods the rasterised window from the requesting root's own
+    // footprint (`FUN_004710b0`, `1602_exe.c:80003`) across the open kinds
+    // only, so a producer in a forest clearing is stranded no matter how much
+    // it makes. Flood the same kinds once, from the Kontor footprint, and
+    // refuse to build anywhere the cart cannot follow.
+    let reachable = cart_component(&sim, anchor);
+    println!("cart-reachable open ground from the Kontor: {}", reachable.len());
+    let cart_can_reach = |x: i32, y: i32, w: u8, h: u8| {
+        (0..i32::from(h))
+            .flat_map(|dy| (0..i32::from(w)).map(move |dx| (dx, dy)))
+            .any(|(dx, dy)| reachable.contains(&(x + dx, y + dy)))
+    };
+
     // --- Stage 1b: place market, chapel, huts on free land ---
     let find_spot =
         |sim: &anno_sim::simulation::Simulation, w: u8, h: u8, used: &[(i32, i32, u8, u8)]| {
@@ -86,8 +174,16 @@ fn main() {
                 .collect();
             candidates.sort_by_key(|&(x, y)| (x - anchor.0).abs() + (y - anchor.1).abs());
             candidates.into_iter().find(|&(x, y)| {
-                (0..i32::from(h))
-                    .all(|dy| (0..i32::from(w)).all(|dx| map.is_walkable(x + dx, y + dy)))
+                (0..i32::from(h)).all(|dy| {
+                    (0..i32::from(w)).all(|dx| {
+                        map.is_walkable(x + dx, y + dy)
+                            && open_ground(
+                                map.source_map_kind_and_owner(x + dx, y + dy)
+                                    .map(|(k, _)| k)
+                                    .unwrap_or(u8::MAX),
+                            )
+                    })
+                }) && cart_can_reach(x, y, w, h)
                     && !used.iter().any(|&(ux, uy, uw, uh)| {
                         x < ux + i32::from(uw)
                             && ux < x + i32::from(w)
@@ -96,7 +192,8 @@ fn main() {
                     })
             })
         };
-    let mut used: Vec<(i32, i32, u8, u8)> = Vec::new();
+    // The Kontor already owns its 2x3 footprint.
+    let mut used: Vec<(i32, i32, u8, u8)> = vec![(anchor.0, anchor.1, 2, 3)];
     let build = |sim: &mut anno_sim::simulation::Simulation,
                  used: &mut Vec<(i32, i32, u8, u8)>,
                  def_index: u16,
@@ -166,15 +263,22 @@ fn main() {
                 if dx * dx + dy * dy > 16 * 16 {
                     continue;
                 }
-                let free = (0..i32::from(h))
-                    .all(|dy| (0..i32::from(w)).all(|dx| map.is_walkable(x + dx, y + dy)))
-                    && !used.iter().any(|&(ux, uy, uw, uh)| {
+                let free = (0..i32::from(h)).all(|dy| {
+                    (0..i32::from(w)).all(|dx| {
+                        map.is_walkable(x + dx, y + dy)
+                            && open_ground(
+                                map.source_map_kind_and_owner(x + dx, y + dy)
+                                    .map(|(k, _)| k)
+                                    .unwrap_or(u8::MAX),
+                            )
+                    })
+                }) && !used.iter().any(|&(ux, uy, uw, uh)| {
                         x < ux + i32::from(uw)
                             && ux < x + i32::from(w)
                             && y < uy + i32::from(uh)
                             && uy < y + i32::from(h)
                     });
-                if !free {
+                if !free || !cart_can_reach(x, y, w, h) {
                     continue;
                 }
                 // The worker's search grid is a circle of the building's
@@ -187,15 +291,22 @@ fn main() {
                         dx * dx + dy * dy <= radius * radius
                     })
                     .count();
-                if n > 0 && best.is_none_or(|(bn, _)| n > bn) {
-                    best = Some((n, (x, y)));
+                // Rank by resource count, then by nearness to the Kontor:
+                // a producer the Karren wave cannot reach is stranded output.
+                let reach = 64usize.saturating_sub(
+                    (x - anchor.0).abs().max((y - anchor.1).abs()).clamp(0, 63) as usize,
+                );
+                let rank = n * 64 + reach;
+                if n > 0 && best.is_none_or(|(bn, _)| rank > bn) {
+                    best = Some((rank, (x, y)));
                 }
             }
         }
-        let Some((n, (x, y))) = best else {
+        let Some((rank, (x, y))) = best else {
             println!("no {label} site with ware {ware} in range");
             return false;
         };
+        let n = rank / 64;
         let placed = anno_game::game_commands::apply_game_command(
             sim,
             &szs.islands,

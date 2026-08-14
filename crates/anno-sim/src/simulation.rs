@@ -13142,12 +13142,18 @@ mod tests {
         let event_slot = sim.figures[0]
             .source_event_slot
             .expect("type-11 cart owns its source event");
+        // Two eastward steps, but they no longer share a route byte: the first
+        // leaves the MARKT's own footprint, which `FUN_004710b0`
+        // (`1602_exe.c:80048-80049`) pins at cost class `0x28`, while the
+        // second stands on the synthetic map's class `0`. `FUN_00473740` only
+        // merges consecutive steps of equal metadata, so the program is
+        // `[dir 3 x1, dir 3 x1]` where it used to be `[dir 3 x2]`.
         assert_eq!(
             sim.source_figure_events
                 .slot(event_slot)
                 .unwrap()
-                .route_program[..2],
-            [0x32, crate::source_route::SOURCE_ROUTE_TERMINATOR]
+                .route_program[..3],
+            [0x31, 0x31, crate::source_route::SOURCE_ROUTE_TERMINATOR]
         );
         assert_eq!(sim.source_map_cell_states[1].reserved_storage, 65);
         sim.source_map_cell_states[1].storage_fill += 64;

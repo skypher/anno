@@ -139,6 +139,59 @@ already has, and switch the supplier match to settlement-slot equality. Risk
 MEDIUM — it *removes* supply links that currently work, so re-baseline the
 economy tests in the same commit.
 
+## 2b. The two rasters are not the same routine — and the origin's own footprint
+
+**Confirmed, and this is where a founded colony's Karren actually dies.**
+
+§2 quotes `FUN_004704d0` as if one raster served both transfer searches. It
+does not. `FUN_00459150` (type 8, `:61675`) calls `FUN_004704d0` (`:79393`);
+`FUN_004596b0` (type 11, `:61876`) calls **`FUN_004706e0`** (`:79500`). The two
+are otherwise identical code, and differ in exactly two constants:
+
+| | `FUN_004704d0` (type 8) | `FUN_004706e0` (type 11) |
+| --- | --- | --- |
+| goal `def[0x1c]` range | `1..=8` (`:79457`) | `1..=6` (`:79565`) |
+| opened outer kinds | `{1, 0xb, 0xc, 0xd, 0x12, 0x1d, 0x1e}` (`:79470-79477`) | `{1, 0xd, 0x12, 0x1e}` (`:79578-79581`) |
+
+So a **city cart never collects from another MARKT or KONTOR** — kinds 7, 8 and
+30 are excluded from the goal test, which is why store-to-store hops do not
+exist — and a **city cart travels only on `STRASSE`, `PLATZ`, `BRUECKE` and
+`PIER`**: no `BODEN`, no `RUINE`. The Karren needs a road. The type-8 workshop
+carrier is the one that walks over open ground.
+
+Both searches then run **`FUN_004710b0`** (`:80003`, called at `:61677` and
+`:61878`) between the raster and the flood. It resolves the object under the
+figure's own tile through `FUN_00463980` and writes `direction = 0`,
+`metadata = 0x28` over that object's whole clipped footprint — dropping the
+goal bit the raster just set there. Without it a root is walled in by itself:
+its own cells carry the goal bit (it is a production kind inside the range, in
+its own settlement) and `FUN_0046c7d0`'s blocked-cell branch does not expand,
+so only the single start tile is ever traversable. A KONTOR is 2x3 and normally
+sits with most of its footprint on the impassable beach line, so this is not a
+corner case — it is the ordinary harbour.
+
+`FUN_004710b0` has a second arm at `:80059-80081` for definitions with
+`def[0x6b] & 1`, which opens only the footprint cells whose **backing** record
+is an outer kind in `10..=12`. The port carries no `+0x6b` byte, so it always
+takes the unconditional arm; that is the permissive direction.
+
+**In the port**, neither search opened the origin footprint, and
+`select_city_cart_source_wave` applied no production-kind test at all on its
+wave path (only `is_type11_transfer_root()` on the synthetic-map fallback) —
+which let a KONTOR rooted on a `Ware`-bearing `MEER` cell offer itself as its
+own supplier. Both are fixed; `open_source_object_footprint` on `SourcePathGrid`
+is the `FUN_004710b0` port. Note that opening the start cell changes its cost
+class to `0x28`, which moves the first frontier ring one fixed-cost band later
+and merges the diagonal and cardinal neighbours into one band — four wave-order
+unit tests were re-baselined for it.
+
+**Still open (tracked here, not implemented):** the port builds
+`city_cart_path_template` from the same `source_fixed_path_kind` set as the
+carrier template, so its Karren walks over `BODEN`. Making it road-only is
+blocked on §3 — the templates are built once at load, so a road the player lays
+never enters them, and a road-only cart could then never reach anything a
+player built.
+
 ## 3. Carrier path templates — the framing was wrong
 
 **The original keeps no path cache at all.** `FUN_004704d0` / `FUN_004706e0`
@@ -311,6 +364,21 @@ Caveat: the replay/network apply path `FUN_00409150` (`:7874-7930`) calls
 `FUN_00465170` + `FUN_00481450` **without** the gate — it trusts the command. So
 do not gate the port's replay branch either, or saves and multiplayer desync.
 
+**A second, cruder hole in the same gate, found while chasing §2b.** The port's
+only terrain test is `can_place_building`, which asks `IslandMap::is_walkable`,
+and `WALKABLE_KINDS` lists `MEER` (`island_map.rs`, "Sea (for coastal)").
+Every building the port places may therefore stand in open water. Nothing in
+the simulation objects: the producer gets its live record, its harvest workers
+walk (they use the civilian raster, which is far more permissive), its store
+fills. Only the transfer wave notices, because `FUN_004704d0` / `FUN_004706e0`
+open no sea cell — so an all-at-sea colony produces normally and can never ship
+anything anywhere. That is exactly what the `play_mission1` driver was doing:
+its `find_spot` ranked candidate tiles by `is_walkable`, put the Kontor, the
+market, the fishery and the weaving hut on `MEER`, and every
+`select_city_cart_source_wave` on that island returned `NoRoute`. The driver now
+sites on the open outer kinds and floods the wave's own connectivity before
+choosing, but the gate itself still belongs here.
+
 **On rejection the original shows nothing** — `param_5` selects cost query /
 preview / commit, a rejected tile is simply skipped, and the build cursor never
 becomes valid. The build menu is separately greyed at `:40029-40045`.
@@ -325,6 +393,7 @@ claim will start failing; land it with the test updates.
 
 | item | risk | blast radius |
 | --- | --- | --- |
+| §2b origin footprint + type-11 goal kinds | LOW | done |
 | §1 Kontor live cell | LOW | founded colonies only — do first, §5(c) depends on it |
 | §4 `Randwachs` layer | LOW | arid maps only; data already present |
 | §5 store capacity | MEDIUM | all deposits; split (a)+(e) from (d), (b) blocked on the OPEN question |
