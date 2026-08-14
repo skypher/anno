@@ -69,3 +69,52 @@ Missing, in dependency order:
    city event block (immigration waves, `FUN_0047a020`) becomes
    active-path; port it when the driver reaches that scale (full RE
    notes in the task and `docs/original-capture.md`).
+
+## The colony plan (2026-08-14)
+
+`examples/probe_islands` reports the rolled fertilities of the twelve
+free islands for the driver's fixed seed (1). The AI holds islands 0 and
+1 (100×90, Tobacco); the rest are settleable:
+
+| island | size | fertilities |
+| --- | --- | --- |
+| 2, 6, 14 | 40×40 / 30×30 | Vines, Vines |
+| 3, 5 | 40×40 | Grain, Grain |
+| 4 | 40×40 | Tobacco, Sugarcane |
+| 7 | 40×40 | Cotton, Tobacco |
+| 8 | 50×52 | Vines, Vines |
+| 9 | 50×52 | Tobacco, Sugarcane |
+| 10 | 50×52 | Spices, Cotton |
+| 11 | 30×30 | Sugarcane, Cocoa |
+| 13 | 30×30 | Cocoa, Spices |
+
+The demand ladder needs Food, TobaccoProducts, Spices, Cocoa, Alcohol,
+Cloth, Clothing and Jewelry, so no single island can finish the mission —
+which is the authored point of the scenario. The driver's colony plan:
+
+- **Island 10 (home).** Spices for the citizen tier; Cotton →
+  Baumwollplantage (`Ware: WOLLE`) → Webstube (`Ware: STOFFE,
+  Rohstoff: WOLLE`) for cloth. Both goods the settler tier demands are
+  therefore local except alcohol.
+- **Island 9 or 11 (second colony).** Sugarcane → Rumbrennerei
+  (`Ware: ALKOHOL, Rohstoff: ZUCKER`) for alcohol, plus Tobacco (9) or
+  Cocoa (11) for the higher tiers. A northern Vines island (2/6/8/14)
+  is the alternative alcohol source via the Weinanbau-Plantage
+  (`Ware: ALKOHOL, Rohstoff: WEINTRAUBEN`).
+
+Alcohol is thus the first good that forces a second settlement — the
+gate the driver hits right after pioneers mature.
+
+## Stage status
+
+- **Stage 1 (done).** Sail → found → market + chapel + 10 huts; the
+  pioneer settlement grows to the hut cap.
+- **Stage 2 (done).** With cloth and alcohol injected into the
+  warehouse, tier-1 satisfaction rises from 0 to 128 and pioneers
+  promote to settlers (first promotion ~3 sim-minutes after supply
+  starts, charged ~194 gold), then settlers accumulate while a tier-2
+  reservation opens. This confirms the promotion gate is supply-driven,
+  not time-driven: the stage-1 plateau at `sat[1] = 0` was faithful.
+- **Stage 3 (next).** Replace the injection with the real chains above,
+  which first requires the build-availability ladder and the
+  haeuser.cod template-inheritance fix.

@@ -87,7 +87,7 @@ fn main() {
             })
     };
     let mut used: Vec<(i32, i32, u8, u8)> = Vec::new();
-    let mut build = |sim: &mut anno_sim::simulation::Simulation, used: &mut Vec<(i32, i32, u8, u8)>, def_index: u16, label: &str| {
+    let build = |sim: &mut anno_sim::simulation::Simulation, used: &mut Vec<(i32, i32, u8, u8)>, def_index: u16, label: &str| {
         let (w, h) = (defs[def_index as usize].width, defs[def_index as usize].height);
         let Some((x, y)) = find_spot(sim, w, h, used) else {
             println!("no spot for {label}");
@@ -120,11 +120,7 @@ fn main() {
     }
 
     // --- Stage 1c: run 10 minutes of sim and report ---
-    for minute in 1..=10u32 {
-        for _ in 0..600 {
-            sim.tick(100);
-            sim.drain_source_kind13_replacements(&cod);
-        }
+    let report = |sim: &anno_sim::simulation::Simulation, label: String| {
         let city = sim
             .source_cities
             .active_records()
@@ -136,19 +132,57 @@ fn main() {
             .iter()
             .find(|w| w.island_id == 10 && w.owner == 0)
             .unwrap();
-        let p = &sim.players[0];
         println!(
-            "min {minute}: pop={:?} sat={:?} food={} wood={} gold={} objectives={:?}",
+            "{label}: pop={:?} sat={:?} food={} cloth={} alc={} resv={:?} blocked={} gold={}",
             city.tier_population,
             city.satisfaction_by_group,
             wh.stock(Good::Food),
-            wh.stock(Good::Wood),
-            p.gold,
-            sim.objectives
-                .items
-                .iter()
-                .map(|(o, done)| (o.label(), *done))
-                .collect::<Vec<_>>(),
+            wh.stock(Good::Cloth),
+            wh.stock(Good::Alcohol),
+            city.promotion_reservations,
+            city.promotion_blocked,
+            sim.players[0].gold,
         );
+    };
+    for minute in 1..=10u32 {
+        for _ in 0..600 {
+            sim.tick(100);
+            sim.drain_source_kind13_replacements(&cod);
+        }
+        report(&sim, format!("min {minute}"));
     }
+
+    // --- Stage 2: supply the settler-tier goods and watch promotion ---
+    // Cloth and alcohol are what tier 1 demands (weights 8 and 6). The real
+    // chain is sheep farm -> weaving hut and a vineyard; this stage injects
+    // the goods directly so the promotion gate itself can be isolated from
+    // the production chain, which stage 3 will build for real.
+    println!("--- stage 2: supplying cloth + alcohol ---");
+    for minute in 11..=40u32 {
+        if let Some(wh) = sim
+            .warehouses
+            .iter_mut()
+            .find(|w| w.island_id == 10 && w.owner == 0)
+        {
+            for good in [Good::Cloth, Good::Alcohol, Good::Food] {
+                let have = wh.stock(good);
+                if have < 40 {
+                    wh.deposit(good, 40 - have);
+                }
+            }
+        }
+        for _ in 0..600 {
+            sim.tick(100);
+            sim.drain_source_kind13_replacements(&cod);
+        }
+        report(&sim, format!("min {minute}"));
+    }
+    println!(
+        "objectives={:?}",
+        sim.objectives
+            .items
+            .iter()
+            .map(|(o, done)| (o.label(), *done))
+            .collect::<Vec<_>>()
+    );
 }

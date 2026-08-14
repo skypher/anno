@@ -251,3 +251,56 @@ fn verena_founds_a_settlement_on_the_free_island() {
         "store overflow stays aboard"
     );
 }
+
+/// The scenario's AUFTRAG4 goals must reach the simulation. New Horizons0
+/// authors flag bit 0 (population) with the triple [100, 4, 100]: one
+/// hundred inhabitants of whom one hundred are Aristocrats. A simulation
+/// built with an empty objective set can never report the mission won.
+#[test]
+fn new_horizons0_loads_its_mission_objectives() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let (Ok(szs_data), Ok(cod_data)) = (
+        std::fs::read(root.join("extracted/Szenes/New Horizons0.szs")),
+        std::fs::read(root.join("extracted/haeuser.cod")),
+    ) else {
+        println!("Skipping test: data corpus not found");
+        return;
+    };
+    let mut szs = anno_formats::szs::SzsFile::parse(&szs_data).unwrap();
+    anno_game::scenario::instantiate_stock_islands(&mut szs, &root.join("extracted"), 1);
+    let goals = szs.mission.as_ref().expect("New Horizons0 has AUFTRAG4").goals();
+    let primary = goals.primary.expect("primary population goal");
+    assert_eq!(primary.total, 100);
+    assert_eq!(primary.tier, Some(4));
+    assert_eq!(primary.at_tier, 100);
+
+    let cod = anno_formats::cod::CodFile::parse(&cod_data).unwrap();
+    let defs = anno_sim::data_bridge::load_building_defs(&cod);
+    let figures = std::fs::read(root.join("extracted/figuren.cod"))
+        .map(|bytes| anno_formats::figuren::FiguresFile::parse(&bytes))
+        .unwrap_or_else(|_| anno_formats::figuren::FiguresFile {
+            constants: Default::default(),
+            figures: Vec::new(),
+        });
+    let sim = anno_game::scenario::build_simulation(&szs, &cod, &defs, &figures);
+    let labels: Vec<String> = sim
+        .objectives
+        .items
+        .iter()
+        .map(|(objective, _)| objective.label())
+        .collect();
+    assert_eq!(
+        labels,
+        vec![
+            "Reach 100 total inhabitants".to_string(),
+            "Reach 100 Aristocrats".to_string(),
+        ],
+        "the mission's own goals must replace the starter set"
+    );
+    assert!(sim.objectives.items.iter().all(|(_, done)| !done));
+}

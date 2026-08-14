@@ -126,6 +126,15 @@ pub fn build_simulation(
             anno_sim::carrier::CityCartConfig::from_figure_def(traeger2);
     }
     sim.civilian_config = anno_sim::civilian::CivilianConfig::from_figures(figures);
+    // The scenario's AUFTRAG4 goals are the mission's win condition; without
+    // this the simulation ran with an empty objective set and could never
+    // report the scenario complete.
+    if let Some(mission) = szs.mission.as_ref() {
+        let objectives = anno_sim::objectives::ObjectiveSet::from_mission_goals(&mission.goals());
+        if !objectives.items.is_empty() {
+            sim.objectives = objectives;
+        }
+    }
     sim
 }
 
