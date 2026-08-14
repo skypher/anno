@@ -70,8 +70,14 @@ fn main() {
     // --- Stage 1b: place market, chapel, huts on free land ---
     let find_spot = |sim: &anno_sim::simulation::Simulation, w: u8, h: u8, used: &[(i32, i32, u8, u8)]| {
         let map = &sim.island_maps[mi];
-        (2..island.height as i32 - i32::from(h) - 2)
+        // Stay inside the Kontor/market service radius (16) so houses
+        // keep coverage: order candidates by distance from the anchor.
+        let mut candidates: Vec<(i32, i32)> = (2..island.height as i32 - i32::from(h) - 2)
             .flat_map(|y| (2..island.width as i32 - i32::from(w) - 2).map(move |x| (x, y)))
+            .collect();
+        candidates.sort_by_key(|&(x, y)| (x - anchor.0).abs() + (y - anchor.1).abs());
+        candidates
+            .into_iter()
             .find(|&(x, y)| {
                 (0..i32::from(h)).all(|dy| (0..i32::from(w)).all(|dx| map.is_walkable(x + dx, y + dy)))
                     && !used.iter().any(|&(ux, uy, uw, uh)| {
