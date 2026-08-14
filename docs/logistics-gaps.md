@@ -364,9 +364,10 @@ Caveat: the replay/network apply path `FUN_00409150` (`:7874-7930`) calls
 `FUN_00465170` + `FUN_00481450` **without** the gate — it trusts the command. So
 do not gate the port's replay branch either, or saves and multiplayer desync.
 
-**A second, cruder hole in the same gate, found while chasing §2b.** The port's
-only terrain test is `can_place_building`, which asks `IslandMap::is_walkable`,
-and `WALKABLE_KINDS` lists `MEER` (`island_map.rs`, "Sea (for coastal)").
+**A second, cruder hole in the same gate, found while chasing §2b. FIXED —
+see "The terrain gate, ported" below.** The port's
+only terrain test was `can_place_building`, which asked `IslandMap::is_walkable`,
+and `WALKABLE_KINDS` listed `MEER` (`island_map.rs`, "Sea (for coastal)").
 Every building the port places may therefore stand in open water. Nothing in
 the simulation objects: the producer gets its live record, its harvest workers
 walk (they use the civilian raster, which is far more permissive), its store
@@ -378,6 +379,61 @@ market, the fishery and the weaving hut on `MEER`, and every
 `select_city_cart_source_wave` on that island returned `NoRoute`. The driver now
 sites on the open outer kinds and floods the wave's own connectivity before
 choosing, but the gate itself still belongs here.
+
+### The terrain gate, ported
+
+`FUN_00464450` (`:69927-70035`) is what `FUN_004084d0` calls at `:7609`, and
+its per-cell verdict `FUN_00464660` (`:70042-70280`) is the whole terrain
+rule. It is a table over the *pair* (definition outer kind `+0x04`, live cell
+outer kind), not a walkability test:
+
+| definition kind | admitted ground kinds |
+| --- | --- |
+| `default:` — `GEBAEUDE`, `PLANTAGE`, `WALD`, `BODEN`, `FELS`, … | 10 `WALD`, 11 `BODEN`, 12 `RUINE` |
+| 1 `STRASSE` / 13 `PLATZ` | 1, 10-12 |
+| 3 `TOR` | 1, 4-7, 10-12, 23-27, 29 |
+| 4 `MAUER` / 5 `MAUERSTRAND` | 4-7, 10-12, 23-27, 29 |
+| 6 `TURM` | as 4/5, minus 24 |
+| 16/17 `FLUSS`/`FLUSSECK` | 10-12, 16, 17 |
+| 18 `BRUECKE` | 16, 18 |
+| 19 `MEER` | 10-12, 19-27, 29 |
+| 20-22 `BRANDUNG`/`BRANDECK`/`MUENDUNG` | 10-12, 19-22 |
+| 23-27, 29 (the beach ring) | 11, 12, 19-29 |
+| 28 `STRANDHAUS` (the fishery) | 23, 27 |
+| 30 `PIER` | 23, 25-27, 29, another pier |
+| 31-33 `HANG`/`HANGECK`/`HANGQUELL` | 10-12, 31-33 |
+| 34 `MINE` | 31 |
+| 35 `HQ` (the Kontor) | 1, 10-13 |
+| 36 `HAFEN` (the shipyards) | 1, 4, 5, 10-13, 23, 25-27, 29 |
+| 37 `WMUEHLE` | 10-12, 16 |
+
+So **no player-placeable definition is admitted on `MEER` (19)**. The harbour
+classes reach the water line through the beach kinds and through the shore
+resolvers `FUN_00468300` dispatches (`:72615-72646`): `Strandflg` (`def+0x6a`
+bit 5) sends `GEBAEUDE` and `HQ` to `FUN_00467af0` (`:72246-72364`), which
+accepts a rotation only when one whole footprint edge is flanked by a run of
+`FUN_00467e10` beach kinds `{23, 24, 25, 26, 27, 29, 30}`; `HAFEN` goes to
+`FUN_00467e60` (`:72392-72488`), which wants one of the footprint's *own* edge
+rows to be `FUN_00468090` kinds `{5, 23, 24, 25, 26, 27, 29, 30}`. The Kontor
+therefore stands on ordinary land and fronts a beach — it never stands in the
+water. `PlaceFlg` (`def+0x6a` bit 2) is the flag that lets it be built on
+unclaimed ground at all (`:69941`).
+
+Ported as `anno_sim::island_map::source_placement_admits_ground_kind` plus
+`IslandMap::source_placement_terrain_admits`, with `can_place_building` and
+`found_kontor` routed through them. Three arms are approximated, all
+permissively and all unreachable from the player path: the `KreuzBase`
+(`+0x08`) group comparisons for road/wall retiling, the pier-over-pier
+definition-id comparison, and the `ProdKind: ROHSTWACHS` self-collision rules
+in `default:` (`:70066-70078`).
+
+Still missing from `FUN_00464450` itself: the settlement-slot edge test
+(`:69960-70011` — one whole footprint edge must already carry the target
+slot), the figure-collision test `FUN_00442980` (`:46091-46130`), and the
+orientation resolvers above, which the port replaces with `is_coastal` for the
+Kontor. The port also does not yet rewrite the live map kinds when a building
+goes up at runtime the way `FUN_004631b0` does, so runtime occupancy is
+tracked in a separate `IslandMap` overlay.
 
 **On rejection the original shows nothing** — `param_5` selects cost query /
 preview / commit, a rejected tile is simply skipped, and the build cursor never

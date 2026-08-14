@@ -1122,15 +1122,63 @@ impl SourcePathGrid {
             return false;
         }
 
+        self.block_outside_source_radius_window(
+            self.origin,
+            self.width,
+            self.height,
+            radius,
+            0,
+            root_height - 1,
+        )
+    }
+
+    /// Run the same `FUN_00471280` carve over a grid that is **larger** than
+    /// the source's scratch window.
+    ///
+    /// `FUN_004704d0` / `FUN_004706e0` allocate a window that is exactly
+    /// `extra_x + 1 + radius * 2` by `extra_y + 1 + radius * 2`
+    /// (`1602_exe.c:61664-61671`), so in the original the window and the grid
+    /// are the same object and `FUN_00471280` indexes from its corner. A port
+    /// that floods a whole-island grid has to be told where that window sits,
+    /// which is what `window_origin` supplies; `extra_x`/`extra_y` are the
+    /// source's own `param_2`/`param_3`, the `(size - 1) & 1` parity bits of
+    /// the requesting root's oriented footprint.
+    ///
+    /// Only the direction byte is written, exactly as `FUN_00471340`
+    /// (`1602_exe.c:80140`) does: a goal bit already stamped into the
+    /// metadata survives the carve, and the cell is unreachable because the
+    /// wave cannot step onto direction `0x0c`. Cells outside the window are
+    /// the caller's business — in the source they do not exist.
+    pub fn block_outside_source_radius_window(
+        &mut self,
+        window_origin: (i32, i32),
+        window_width: usize,
+        window_height: usize,
+        radius: usize,
+        extra_x: usize,
+        extra_y: usize,
+    ) -> bool {
+        // `if (1 < (int)param_1)` at `1602_exe.c:80113` — radius 0 and 1 keep
+        // the raw rectangle.
+        if radius <= 1 {
+            return true;
+        }
+
         for (offset, half_width) in source_radius_profile(radius).into_iter().enumerate() {
-            let left = radius - half_width;
-            let right_exclusive = radius + half_width + 1;
-            for y in [radius - offset, radius + root_height - 1 + offset] {
-                for x in 0..left {
-                    self.cells[y * self.width + x].direction = 0x0c;
+            let left = radius.saturating_sub(half_width);
+            // `iVar1 = extra_x + radius + table[offset]` is the last retained
+            // column, and `FUN_00471340` starts blocking at `iVar1 + 1`.
+            let right_exclusive = radius + extra_x + half_width + 1;
+            for row in [radius - offset, radius + extra_y + offset] {
+                if row >= window_height {
+                    continue;
                 }
-                for x in right_exclusive..self.width {
-                    self.cells[y * self.width + x].direction = 0x0c;
+                let y = window_origin.1 + row as i32;
+                for column in (0..left).chain(right_exclusive..window_width) {
+                    let position = (window_origin.0 + column as i32, y);
+                    if let Some(index) = self.index(position) {
+                        self.cells[index].direction = 0x0c;
+                    }
                 }
             }
         }

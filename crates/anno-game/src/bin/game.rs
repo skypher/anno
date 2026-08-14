@@ -3431,6 +3431,7 @@ fn main() {
                                 can_place_building(
                                     island,
                                     &sim.island_maps[idx],
+                                    def,
                                     hover_tx,
                                     hover_ty,
                                     def.width,

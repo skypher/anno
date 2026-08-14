@@ -423,6 +423,51 @@ pub struct SourceMapCellState {
     /// a newly placed kind-10 tile with `def[0x3a] + param_7 % 3`.
     #[serde(default)]
     pub source_placement_variant: u8,
+    /// Compiled `Destroyflg` at definition offset `+0x6a`, bit 7.
+    ///
+    /// `FUN_00479ca0` refuses to register an affliction on a definition that
+    /// carries it (`1602_exe.c:86842`), and `FUN_0047f510` uses it together
+    /// with production kind 7 to recognise the "Zerstörter Marktplatz"
+    /// record (`Id: IDDIVERS+22`) it reaps once per city event cycle.
+    ///
+    /// It is authored on far more than the ruin records: every `HANG`,
+    /// `STRAND*`, `FLUSS*`, `RUINE`, `STRANDRUINE`, the `HQ` at `IDHAFEN+20`,
+    /// two native `GEBAEUDE` plantations, and the destroyed marketplace.
+    #[serde(default)]
+    pub source_destroy_flag: bool,
+    /// Compiled `HAUS_BAUKOST Holz` at definition offset `+0x4e`, in the
+    /// source's `<< 5` fixed-point scale. `FUN_0047a020`'s fire-spread branch
+    /// and `FUN_0047b540`'s ignition roll both select a `DAT_0049af08` row
+    /// with `Ziegel <= Holz` off an arbitrary target definition, so this has
+    /// to be present on every record and not only the five housing rows.
+    #[serde(default)]
+    pub source_wood_cost_fixed: u16,
+    /// Compiled `HAUS_BAUKOST Ziegel` at definition offset `+0x50`.
+    #[serde(default)]
+    pub source_bricks_cost_fixed: u16,
+    /// Compiled `Wegspeed[3]` path class at definition offset `+0x5b`, the
+    /// class `FUN_00472930` writes into the shared scratch grid for the
+    /// hazard area scan (`param_3 == 3`). Every authored `Wegspeed` quad ends
+    /// in `100`, so the shipped data compiles this to 32 throughout — and
+    /// `FUN_0046f8a0` gives classes `0..=0x20` the same `(0x40, 0x5b)`
+    /// orthogonal/diagonal step costs, which makes the flood uniform-cost.
+    #[serde(default)]
+    pub source_path_class_loaded_road: u8,
+}
+
+/// One `Objekt: HAUS_BAUKOST` material cost in the source's compiled
+/// fixed-point scale. `1602_exe.c:67386-67531` shifts `Werkzeug`, `Holz`,
+/// `Ziegel` and `Kanon` left five when it writes definition offsets
+/// `+0x4c..+0x52`; the same conversion already backs
+/// [`crate::data_bridge::SourceKind13PromotionDefinition`].
+fn source_construction_cost_fixed(definition: &BuildingDef, key: &str) -> u16 {
+    (definition
+        .properties
+        .get(key)
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(0)
+        .max(0) as u16)
+        .wrapping_shl(5)
 }
 
 impl SourceMapCellState {
@@ -605,6 +650,16 @@ impl SourceMapCellState {
             source_growth_phase_seen: 0,
             source_growth_phase: 0,
             source_placement_variant: 0,
+            source_destroy_flag: definition
+                .properties
+                .get("Destroyflg")
+                .is_some_and(|value| value.trim() == "1"),
+            source_wood_cost_fixed: source_construction_cost_fixed(definition, "Holz"),
+            source_bricks_cost_fixed: source_construction_cost_fixed(definition, "Ziegel"),
+            source_path_class_loaded_road: definition
+                .source_path_classes()
+                .map(|classes| classes[3])
+                .unwrap_or_default(),
         })
     }
 

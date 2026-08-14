@@ -149,6 +149,13 @@ const SOURCE_GROWTH_TABLE_SLOTS: u32 = 0x805c;
 /// Slots `FUN_0047ca80` visits per call, so a full sweep takes 160 calls.
 const SOURCE_GROWTH_SWEEP_SLOTS: u32 = 0xce;
 
+/// Entry count of the source kind-1..7 scheduler-record table `DAT_0054a3b8`
+/// — 0x1030 slots of 0x14 bytes each, hashed by `FUN_0047cc60`.
+const SOURCE_KIND17_TABLE_SLOTS: usize = 0x1030;
+/// Linear probe window used by `FUN_0047cbf0` and `FUN_00481fc0`, and the
+/// same `+0x30` that bounds an island's slice in `FUN_0047d250`.
+const SOURCE_KIND17_PROBE_LENGTH: usize = 0x30;
+
 /// `FUN_0047c810` (`1602_exe.c:88863`), the growth table's home slot for one
 /// map cell. Collisions are resolved by linear probing in the executable; this
 /// port keeps timer state on the cell itself and uses the home slot only to
@@ -269,6 +276,21 @@ impl TileClear {
 pub struct SourceKind6TerminalEvent {
     pub target: SourceTargetDescriptor,
     pub event_kind: u8,
+}
+
+/// A type-7 map action posted by `FUN_0046a8c0` (`1602_exe.c:74160-74163`).
+///
+/// Both hazard producers post rather than demolish: `FUN_0047f510` when it
+/// finds a destroyed marketplace, and `FUN_0047a020`'s fire expiry. The
+/// action is executed later by `FUN_0046a630` case 7, which runs
+/// `FUN_00463f40` — the ruin conversion, and the only place the removal's
+/// `rand()` draws happen. That is a different dispatcher slot from the one
+/// that posted, so the draws land at a different position in the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceDeferredMapDemolition {
+    pub island_id: u8,
+    pub tile_x: u8,
+    pub tile_y: u8,
 }
 
 /// Terminal control record created by `FUN_00445930` when a category-one
@@ -866,6 +888,12 @@ pub struct Simulation {
     pub source_kind13_replacement_commands: Vec<SourceKind13ReplacementCommand>,
     /// Phase clocks and physical source-table cursor for `FUN_0047b9c0`.
     pub source_kind13_dispatch: SourceKind13DispatchState,
+    /// The source affliction table `DAT_005a5100`, with `FUN_0047a020`'s
+    /// 10 s phase clock and sweep cursor.
+    pub source_afflictions: crate::data_bridge::SourceAfflictionTable,
+    /// Type-7 map actions posted by `FUN_0046a8c0` and drained one
+    /// dispatcher slice later at the S6 deferred-queue position.
+    pub source_deferred_map_demolitions: Vec<SourceDeferredMapDemolition>,
     /// Fixed source city-record pool read by `FUN_0047f8a0`.
     pub source_cities: SourceCityTable,
     /// Shared `DAT_00505e38` event table used by map-anchored source figures.
@@ -1273,6 +1301,8 @@ impl Simulation {
             source_kind13_promotion_definitions: std::array::from_fn(|_| None),
             source_kind13_replacement_commands: Vec::new(),
             source_kind13_dispatch: SourceKind13DispatchState::default(),
+            source_afflictions: crate::data_bridge::SourceAfflictionTable::default(),
+            source_deferred_map_demolitions: Vec::new(),
             source_cities: SourceCityTable::default(),
             source_figure_events: SourceFigureEventRegistry::default(),
             source_kind4_occupants: Vec::new(),
@@ -3322,6 +3352,11 @@ impl Simulation {
         self.tick_source_map_dispatch(dt_ms);
         self.tick_source_kind4_deferred_hits();
         self.tick_source_kind6_deferred_hits();
+        // Type-7 map actions land in the same S6 deferred-queue drain, which
+        // is why a fire's ruin conversion runs one slice after the affliction
+        // sweep (S9) posted it, and its `rand()` draws sit at a different
+        // point in the stream from the sweep's.
+        self.tick_source_deferred_map_demolitions();
         self.tick_source_kind4_deferred_relocations();
         self.tick_source_kind14_combat_figures(dt_ms);
         self.tick_source_kind15_combat_figures(dt_ms);
@@ -3360,6 +3395,10 @@ impl Simulation {
 
         self.tick_source_city_dispatch(dt_ms);
         self.tick_source_kind13_dispatch(dt_ms);
+        // `FUN_0047a020` is slot S9, after S3/S4 above and after the S5/S6
+        // ports hoisted to the head of this method, so this position keeps
+        // the correct relative order against every subsystem already ported.
+        self.tick_source_afflictions(dt_ms);
         self.tick_source_player_controllers(dt_ms);
 
         // Entity movement (every step)
@@ -4460,6 +4499,10 @@ impl Simulation {
                 if let Some(record) = self.source_cities.record_mut(slot) {
                     *record = city;
                 }
+                // The hazard event block (`1602_exe.c:91441-91519`), which
+                // sits textually between the demand cycle and the unlock
+                // sweep and shares this same owner gate.
+                self.tick_source_city_hazard_event(slot);
                 // Building-unlock sweep, the tail of the same
                 // `FUN_0047f8a0` city pass (`1602_exe.c:91520-91581`).
                 // It walks INFRA ids 1..=32 and grants each rung the
@@ -4480,6 +4523,622 @@ impl Simulation {
                 self.spawn_source_kind12_figures(city);
             }
         }
+    }
+
+    /// One city's hazard event block, `1602_exe.c:91441-91519`.
+    ///
+    /// The gate is `city[0x1e0] <= DAT_005b6040`, both in 100 ms ticks. Once
+    /// it opens, **two `rand()` draws are unconditional** no matter what else
+    /// the block decides: `FUN_0047f510` at the top and the re-arm at the
+    /// bottom. Everything in between is gated.
+    ///
+    /// Stage 1 implements the fire chain. The plague roll (`pop[1] >= 200`
+    /// and no live affliction) and the vagrant roll (`pop[2] >= 300`) need
+    /// populations a first-mission colony never reaches, and are deliberately
+    /// left out **including their `rand()` draws** — reaching either
+    /// population makes this port's stream diverge from the original's, which
+    /// is the documented Stage 2/3 boundary. The two message emitters draw
+    /// nothing and are presentation-only.
+    ///
+    /// The fire chain is a strict `if`/`else`: at 80 or more pioneers the
+    /// settler branches are never evaluated, and below 80 pioneers with fewer
+    /// than 250 pioneers-plus-settlers and fewer than 250 settlers-and-above
+    /// the whole section draws nothing at all.
+    fn tick_source_city_hazard_event(&mut self, slot: usize) {
+        let Some(city) = self.source_cities.record(slot) else {
+            return;
+        };
+        if city.ready_at_ticks > self.source_time_ticks {
+            return;
+        }
+
+        // `FUN_0047f510`: always one draw, whether or not it finds anything.
+        self.source_reap_destroyed_marketplace(city);
+
+        // Population suffix sums (`:91400-91403`): `pop[1]` is settlers and
+        // above, `pop[2]` citizens and above.
+        let mut population_at_least = [0u32; 5];
+        population_at_least[4] = city.tier_population[4];
+        for group in (0..4).rev() {
+            population_at_least[group] =
+                city.tier_population[group].wrapping_add(population_at_least[group + 1]);
+        }
+
+        let pioneers = city.tier_population[0];
+        if pioneers >= 80 {
+            let modulus = if pioneers >= 150 {
+                100
+            } else if pioneers >= 120 {
+                150
+            } else {
+                200
+            };
+            if u32::from(self.next_source_rand()) % modulus < 31 {
+                self.source_ignite_fire(city);
+            }
+        } else {
+            let pioneers_and_settlers = pioneers.wrapping_add(city.tier_population[1]);
+            if pioneers_and_settlers >= 250 {
+                let modulus = if pioneers_and_settlers >= 350 {
+                    100
+                } else if pioneers_and_settlers >= 300 {
+                    180
+                } else {
+                    250
+                };
+                if u32::from(self.next_source_rand()) % modulus < 16 {
+                    self.source_ignite_fire(city);
+                }
+            } else if population_at_least[1] >= 250 {
+                if self.next_source_rand() & 0xff < 8 {
+                    self.source_ignite_fire(city);
+                }
+            }
+        }
+
+        // Re-arm: always one draw. `DAT_005b6040` counts 100 ms ticks, so
+        // `(60 + (rand() & 7)) * 10` is 60.0 to 67.0 seconds of scaled sim
+        // time, not milliseconds.
+        let jitter = u32::from(self.next_source_rand() & 7);
+        let ready_at = self
+            .source_time_ticks
+            .wrapping_add((60 + jitter).wrapping_mul(10));
+        if let Some(record) = self.source_cities.record_mut(slot) {
+            record.ready_at_ticks = ready_at;
+        }
+    }
+
+    /// `FUN_0047f510` (`1602_exe.c:91032-91073`), the destroyed-marketplace
+    /// reaper.
+    ///
+    /// It draws once, uses the low two bits to pick a phase into the kind-1..7
+    /// record table `DAT_0054a3b8`, and then walks that island's slice with a
+    /// stride of **four** records looking for a live root whose current tile
+    /// definition has production kind 7 and `Destroyflg` — the "Zerstörter
+    /// Marktplatz" at `Id: IDDIVERS+22` — inside this city's settlement slot.
+    /// The first hit gets a deferred type-7 action and the scan stops.
+    ///
+    /// The draw happens whether or not anything is found, which is what makes
+    /// this mandatory for stream fidelity even on a colony that has never
+    /// lost a market.
+    fn source_reap_destroyed_marketplace(&mut self, city: SourceCityRecord) {
+        let phase = usize::from(self.next_source_rand() & 3);
+        let island = city.island_id;
+        // The draw above is the part that matters for the stream; the scan
+        // below only ever finds an authored `Zerstörter Marktplatz`, so skip
+        // rebuilding the record table when the island holds none.
+        if !self.source_static_map_roots.iter().any(|cell| {
+            cell.island == island
+                && cell.source_production_kind_code == 7
+                && cell.source_destroy_flag
+                && cell.source_map_owner_slot == city.source_owner
+        }) {
+            return;
+        }
+        let placements = self.source_kind17_record_slots();
+        let start = Self::source_kind17_index(island, 0, 0) + phase;
+        let end = (Self::source_kind17_index(island, 0x1f, 0x1f)
+            + SOURCE_KIND17_PROBE_LENGTH)
+            .min(SOURCE_KIND17_TABLE_SLOTS);
+        let mut cursor = start;
+        while cursor < end {
+            if let Some(&cell) = placements
+                .get(cursor)
+                .and_then(|entry| entry.as_ref())
+                .and_then(|&index| self.source_map_cell_states.get(index))
+            {
+                if cell.island == island {
+                    if let Some(tile) = self.source_hazard_root_at(island, cell.x, cell.y) {
+                        if tile.source_production_kind_code == 7
+                            && tile.source_destroy_flag
+                            && tile.source_map_owner_slot == city.source_owner
+                        {
+                            self.source_deferred_map_demolitions
+                                .push(SourceDeferredMapDemolition {
+                                    island_id: island,
+                                    tile_x: cell.x,
+                                    tile_y: cell.y,
+                                });
+                            return;
+                        }
+                    }
+                }
+            }
+            cursor += 4;
+        }
+    }
+
+    /// `FUN_0047cc60`, the kind-1..7 record hash.
+    const fn source_kind17_index(island_id: u8, tile_x: u8, tile_y: u8) -> usize {
+        ((island_id as usize & 3) * 0x20 + (tile_x as usize & 0x1f)) * 0x20
+            + (tile_y as usize & 0x1f)
+    }
+
+    /// Physical `DAT_0054a3b8` slot assignment for the live scheduler records.
+    ///
+    /// `FUN_00481fc0` inserts each new root in the first free slot of its
+    /// 0x30-long probe window, so the placement depends on insertion order.
+    /// This port has no hook on that insertion, so the table is replayed from
+    /// [`Self::source_map_cell_states`] in its own order — which *is* command
+    /// order both for the scenario loader and for runtime placement. Two
+    /// approximations remain: a slot freed by a demolition is reused by the
+    /// replay but was not reused by the original, and the source also keeps
+    /// service buildings (production kinds `0x11..=0x1b`) in this table while
+    /// this port does not allocate records for them.
+    fn source_kind17_record_slots(&self) -> Vec<Option<usize>> {
+        let mut slots: Vec<Option<usize>> = vec![None; SOURCE_KIND17_TABLE_SLOTS];
+        for (index, cell) in self.source_map_cell_states.iter().enumerate() {
+            let start = Self::source_kind17_index(cell.island, cell.x, cell.y);
+            let end = (start + SOURCE_KIND17_PROBE_LENGTH).min(SOURCE_KIND17_TABLE_SLOTS);
+            if let Some(free) = (start..end).find(|&slot| slots[slot].is_none()) {
+                slots[free] = Some(index);
+            }
+        }
+        slots
+    }
+
+    /// The live map cell at one island coordinate: the last static root
+    /// written there, exactly as the source's `+0xaf8` array holds it.
+    ///
+    /// Every cell of an oriented footprint carries a copy of its root's
+    /// compiled fields, so this answers definition questions (`+0x1c`,
+    /// `Destroyflg`, `HAUS_BAUKOST`, the path class) and carries the anchor
+    /// `FUN_00463900` would resolve.
+    fn source_hazard_root_at(&self, island: u8, x: u8, y: u8) -> Option<SourceMapCellState> {
+        self.source_static_map_roots
+            .iter()
+            .rev()
+            .find(|cell| cell.island == island && cell.x == x && cell.y == y)
+            .copied()
+    }
+
+    /// `FUN_00479ca0` (`1602_exe.c:86810-86902`), the affliction registrar.
+    ///
+    /// Removes any entry already on the tile — decrementing the city counter
+    /// with it — then takes the first free slot in the tile's probe window.
+    /// With only three hash bits per axis that window is regularly full, and
+    /// the source's response is to register nothing and return, having
+    /// already dropped the previous entry. A definition carrying `Destroyflg`
+    /// is refused outright.
+    ///
+    /// Stage 1 applies the per-object state for nested kinds 1..7 (the
+    /// scheduler record's `+0x0f` bit 7 "burning" flag, which also clears its
+    /// activity) and `0x0d` (the kind-13 record's two lifecycle bits). Kind
+    /// `0x0e`'s `+0x11` bit 5 has no record in this port. The message
+    /// emitters are presentation-only and draw nothing.
+    fn source_register_affliction(
+        &mut self,
+        island: u8,
+        x: u8,
+        y: u8,
+        kind: u8,
+        duration_phases: u8,
+    ) -> bool {
+        self.source_remove_affliction_at(island, x, y);
+        let Some(free_slot) = self.source_afflictions.free_slot(island, x, y) else {
+            return false;
+        };
+        let Some(tile) = self.source_hazard_root_at(island, x, y) else {
+            return false;
+        };
+        if tile.source_destroy_flag {
+            return false;
+        }
+        match tile.source_production_kind_code {
+            1..=7 => {
+                if let Some(record) = self
+                    .source_map_cell_states
+                    .iter_mut()
+                    .find(|cell| cell.island == island && cell.x == x && cell.y == y)
+                {
+                    if !record.scheduler_blocked {
+                        record.activity = 0;
+                        record.scheduler_blocked = kind == crate::data_bridge::SOURCE_AFFLICTION_KIND_FIRE;
+                    }
+                }
+            }
+            0x0d => {
+                if let Some(location) = self.source_kind13_locations.location_at_mut(island, x, y) {
+                    location.lifecycle_flags =
+                        (location.lifecycle_flags & !3) | u16::from(kind & 3);
+                }
+            }
+            _ => {}
+        }
+        if let Some(city) = self
+            .source_cities
+            .slot_for_root(island, tile.source_map_owner_slot)
+            .and_then(|city_slot| self.source_cities.record_mut(city_slot))
+        {
+            city.add_affliction();
+        }
+        self.source_afflictions.write_slot(
+            free_slot,
+            crate::data_bridge::SourceAfflictionEntry {
+                island_id: island,
+                tile_x: x,
+                tile_y: y,
+                kind: kind & 0x1f,
+                phase_seen: 0,
+                elapsed_phases: 0,
+                duration_phases,
+                city_slot: tile.source_map_owner_slot & 7,
+            },
+        );
+        true
+    }
+
+    /// `FUN_00479be0` followed by `FUN_00479c50`: drop the entry on one tile
+    /// and decrement its city's `+0x1fe` counter.
+    fn source_remove_affliction_at(&mut self, island: u8, x: u8, y: u8) -> bool {
+        let Some(slot) = self.source_afflictions.slot_at(island, x, y) else {
+            return false;
+        };
+        self.source_clear_affliction_slot(slot)
+    }
+
+    /// `FUN_00479c50` for an already-located physical slot. The source reads
+    /// the owning city back off the *live tile*, not off the entry's own
+    /// city-slot byte.
+    fn source_clear_affliction_slot(&mut self, slot: usize) -> bool {
+        let Some(entry) = self.source_afflictions.clear_slot(slot) else {
+            return false;
+        };
+        let owner_slot = self
+            .source_hazard_root_at(entry.island_id, entry.tile_x, entry.tile_y)
+            .map_or(entry.city_slot, |tile| tile.source_map_owner_slot);
+        if let Some(city_slot) = self.source_cities.slot_for_root(entry.island_id, owner_slot) {
+            if let Some(city) = self.source_cities.record_mut(city_slot) {
+                city.remove_affliction();
+            }
+        }
+        true
+    }
+
+    /// `FUN_0047b540` (`1602_exe.c:88159-88216`), the fire igniter.
+    ///
+    /// Collects this island's kind-13 slice into a candidate list — records
+    /// with no live affliction, BGruppe 0 or 1, and this city's settlement
+    /// slot — then makes up to three attempts. Each attempt draws a uniform
+    /// pick and a `rand() & 7` index into `DAT_0049af08`, so the routine
+    /// costs exactly 2, 4 or 6 draws, or **zero** when nothing is eligible.
+    /// Since it only ever picks BGruppe 0/1 housing, whose `HAUS_BAUKOST` is
+    /// wood-only, the row is always 1 — 3/8 per attempt.
+    fn source_ignite_fire(&mut self, city: SourceCityRecord) -> bool {
+        let island = city.island_id;
+        let candidates: Vec<SourceKind13Location> = self
+            .source_kind13_locations
+            .city_slice(island)
+            .iter()
+            .flatten()
+            .filter(|location| {
+                location.island_id == island
+                    && location.lifecycle_flags & 3 == 0
+                    && location.population_group < 2
+                    && location.source_owner == city.source_owner
+            })
+            .copied()
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
+        for _ in 0..3 {
+            let pick =
+                candidates[usize::from(self.next_source_rand()) % candidates.len()];
+            let row = self
+                .source_hazard_root_at(island, pick.tile_x, pick.tile_y)
+                .map_or(0, |tile| {
+                    usize::from(tile.source_bricks_cost_fixed <= tile.source_wood_cost_fixed)
+                });
+            let index = usize::from(self.next_source_rand() & 7);
+            if crate::data_bridge::SOURCE_FIRE_PROBABILITY_TABLE[row][index] != 0 {
+                self.source_register_affliction(
+                    island,
+                    pick.tile_x,
+                    pick.tile_y,
+                    crate::data_bridge::SOURCE_AFFLICTION_KIND_FIRE,
+                    crate::data_bridge::SOURCE_AFFLICTION_IGNITION_DURATION,
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `FUN_0047a020` (`1602_exe.c:86964-87157`), dispatcher slot S9.
+    ///
+    /// A 10 s phase clock plus eight table entries per call: a full 0x120-slot
+    /// sweep takes 36 calls, well under one phase, so every live entry steps
+    /// exactly once per phase. Stage 1 implements affliction type 2 (fire);
+    /// type 1 (plague) is Stage 2 and its three draws are not made here.
+    fn tick_source_afflictions(&mut self, dt_ms: u32) {
+        for slot in self.source_afflictions.advance(dt_ms) {
+            let Some((entry, expired)) = self.source_afflictions.step_slot(slot) else {
+                continue;
+            };
+            if entry.kind != crate::data_bridge::SOURCE_AFFLICTION_KIND_FIRE {
+                continue;
+            }
+            if expired {
+                self.source_expire_fire(slot, entry);
+            } else {
+                self.source_spread_fire(entry);
+            }
+        }
+    }
+
+    /// The `bVar2 == 2` living branch of `FUN_0047a020` (`:87042-87117`).
+    ///
+    /// Up to three draws: a `rand() & 0x7f < 0x13` gate (19/128), a uniform
+    /// pick over the area-scan results, and a `rand() & 7` index into
+    /// `DAT_0049af08` keyed on the picked root's `Ziegel <= Holz`. The scan's
+    /// radius is `(w + h - 1) / 4 + 2` over the burning root's **unrotated**
+    /// definition size.
+    fn source_spread_fire(&mut self, entry: crate::data_bridge::SourceAfflictionEntry) {
+        if self.next_source_rand() & 0x7f >= 0x13 {
+            return;
+        }
+        let Some(source) =
+            self.source_hazard_root_at(entry.island_id, entry.tile_x, entry.tile_y)
+        else {
+            return;
+        };
+        let span = i32::from(source.source_definition_height) - 1
+            + i32::from(source.source_definition_width);
+        let radius = (span.div_euclid(4)) + 2;
+        let results = self.source_hazard_area_scan(
+            entry.island_id,
+            entry.tile_x,
+            entry.tile_y,
+            radius.max(0) as usize,
+        );
+        if results.is_empty() {
+            return;
+        }
+        let pick = results[usize::from(self.next_source_rand()) % results.len()];
+        let Some(cell) = self.source_hazard_root_at(entry.island_id, pick.0, pick.1) else {
+            return;
+        };
+        let (target_x, target_y) = (cell.source_command_anchor_x, cell.source_command_anchor_y);
+        if (entry.tile_x, entry.tile_y) == (target_x, target_y) {
+            return;
+        }
+        let Some(target) = self.source_hazard_root_at(entry.island_id, target_x, target_y) else {
+            return;
+        };
+        let row = usize::from(target.source_bricks_cost_fixed <= target.source_wood_cost_fixed);
+        let index = usize::from(self.next_source_rand() & 7);
+        if crate::data_bridge::SOURCE_FIRE_PROBABILITY_TABLE[row][index] == 0 {
+            return;
+        }
+        // The post-selection switch is on the target root's *nested* kind.
+        let admitted = match target.source_production_kind_code {
+            1..=7 => self
+                .source_map_cell_states
+                .iter()
+                .any(|cell| {
+                    cell.island == entry.island_id
+                        && cell.x == target_x
+                        && cell.y == target_y
+                        && !cell.scheduler_blocked
+                }),
+            0x0d => {
+                let present = self
+                    .source_kind13_locations
+                    .location_at(entry.island_id, target_x, target_y)
+                    .is_some();
+                if present {
+                    // A residence is re-afflicted even while already burning;
+                    // the source drops the old entry first so the city
+                    // counter does not double-count.
+                    self.source_remove_affliction_at(entry.island_id, target_x, target_y);
+                }
+                present
+            }
+            // Kind `0x0e`'s `+0x11` bit 5 record has no equivalent here.
+            _ => false,
+        };
+        if admitted {
+            self.source_register_affliction(
+                entry.island_id,
+                target_x,
+                target_y,
+                crate::data_bridge::SOURCE_AFFLICTION_KIND_FIRE,
+                crate::data_bridge::SOURCE_AFFLICTION_SPREAD_DURATION,
+            );
+        }
+    }
+
+    /// The `bVar2 == 2` expiry branch of `FUN_0047a020` (`:87128-87147`).
+    ///
+    /// Draws nothing. For the local player's city — and for a remote owner in
+    /// player state `0x0b..=0x0e` — it posts a deferred type-7 action and
+    /// **deliberately leaves the entry in the table**, so the post repeats
+    /// every phase until the removal actually lands. Anything else just frees
+    /// the entry.
+    fn source_expire_fire(&mut self, slot: usize, entry: crate::data_bridge::SourceAfflictionEntry) {
+        let owner = self
+            .source_cities
+            .slot_for_root(entry.island_id, entry.city_slot)
+            .and_then(|city_slot| self.source_cities.record(city_slot))
+            .map(|city| city.owner_slot);
+        // `DAT_005bafc8`, the remote-owner dispatch flag, gates every branch
+        // that is not the local player's own city.
+        let remote = self.source_kind4_dispatch.remote_owner_dispatch_enabled;
+        let demolish = match owner {
+            Some(owner) if owner == self.source_kind4_dispatch.active_player_slot => true,
+            Some(owner) => {
+                remote
+                    && self
+                        .source_kind4_dispatch
+                        .faction_states
+                        .get(usize::from(owner))
+                        .is_some_and(|state| (0x0b..=0x0e).contains(state))
+            }
+            // The island's city pointer is null: the source still posts the
+            // action when remote dispatch is on.
+            None => remote,
+        };
+        if !demolish {
+            self.source_clear_affliction_slot(slot);
+            return;
+        }
+        self.source_deferred_map_demolitions
+            .push(SourceDeferredMapDemolition {
+                island_id: entry.island_id,
+                tile_x: entry.tile_x,
+                tile_y: entry.tile_y,
+            });
+    }
+
+    /// `FUN_004722f0` plus `FUN_00472930`, `FUN_00471fb0` and `LAB_00472ad0`:
+    /// the hazard area scan, in the shape the fire-spread branch uses it.
+    ///
+    /// The work struct centres an orientation-aware bounding box on the burning
+    /// root — `centre = anchor + (oriented_size - 1) / 2`, box origin
+    /// `centre - radius`, box extent `2 * radius + 1 + ((oriented_size - 1) &
+    /// 1)` per axis — clips it against the island, rasterises the burnable
+    /// outer kinds into the shared scratch grid, and floods outward from the
+    /// centre until the 20-entry result buffer fills or the flood runs out.
+    ///
+    /// The result *count* feeds `rand() % n`, so it participates in the shared
+    /// stream: it has to be the source's set, not a plausible one.
+    fn source_hazard_area_scan(
+        &self,
+        island: u8,
+        root_x: u8,
+        root_y: u8,
+        radius: usize,
+    ) -> Vec<(u8, u8)> {
+        let Some(root) = self.source_hazard_root_at(island, root_x, root_y) else {
+            return Vec::new();
+        };
+        let Some(map) = self.island_maps.iter().find(|map| map.island_id == island) else {
+            return Vec::new();
+        };
+        let oriented_width = i32::from(root.footprint_width.max(1));
+        let oriented_height = i32::from(root.footprint_height.max(1));
+        let radius_i32 = radius as i32;
+        let box_width = (2 * radius_i32 + 1 + ((oriented_width - 1) & 1)) as usize;
+        let box_height = (2 * radius_i32 + 1 + ((oriented_height - 1) & 1)) as usize;
+        let origin_x = i32::from(root_x) + (oriented_width - 1) / 2 - radius_i32;
+        let origin_y = i32::from(root_y) + (oriented_height - 1) / 2 - radius_i32;
+
+        let mut grid = crate::data_bridge::SourceHazardScanGrid::blocked(box_width, box_height);
+        for grid_y in 0..box_height {
+            for grid_x in 0..box_width {
+                let x = origin_x + grid_x as i32;
+                let y = origin_y + grid_y as i32;
+                if x < 0 || y < 0 || x >= i32::from(map.width) || y >= i32::from(map.height) {
+                    continue;
+                }
+                let (Ok(tile_x), Ok(tile_y)) = (u8::try_from(x), u8::try_from(y)) else {
+                    continue;
+                };
+                let (kind_code, path_class) = match self.source_hazard_root_at(island, tile_x, tile_y)
+                {
+                    Some(cell) => (cell.kind_code, cell.source_path_class_loaded_road),
+                    None => match map.source_map_kind_and_owner(x, y) {
+                        Some((kind_code, _)) => (kind_code, 0),
+                        None => continue,
+                    },
+                };
+                if crate::data_bridge::source_hazard_scan_kind_is_burnable(kind_code) {
+                    grid.set_burnable(grid_x, grid_y, path_class);
+                }
+            }
+        }
+
+        grid.flood(
+            radius,
+            radius,
+            crate::data_bridge::SOURCE_HAZARD_SCAN_RESULT_CAP,
+        )
+        .into_iter()
+        .filter_map(|(grid_x, grid_y)| {
+            let x = u8::try_from(origin_x + grid_x as i32).ok()?;
+            let y = u8::try_from(origin_y + grid_y as i32).ok()?;
+            Some((x, y))
+        })
+        .collect()
+    }
+
+    /// `FUN_0046a630` case 7 (`1602_exe.c:74064-74068`): the deferred type-7
+    /// action runs `FUN_00463f40` — the ruin conversion, and the only place
+    /// its `rand()` draws happen — then the `FUN_00482120` coverage rescan.
+    ///
+    /// The removal path reached through `FUN_00481450` case `0x0d` also
+    /// releases the kind-13 record, returns its residents to the city ledger,
+    /// and clears the tile's affliction entry with the matching `+0x1fe`
+    /// decrement, which is what actually ends the fire.
+    fn tick_source_deferred_map_demolitions(&mut self) {
+        for action in std::mem::take(&mut self.source_deferred_map_demolitions) {
+            let Some(root) =
+                self.source_hazard_root_at(action.island_id, action.tile_x, action.tile_y)
+            else {
+                self.source_remove_affliction_at(action.island_id, action.tile_x, action.tile_y);
+                continue;
+            };
+            let anchor_x = root.source_command_anchor_x;
+            let anchor_y = root.source_command_anchor_y;
+            let Some(root) = self.source_hazard_root_at(action.island_id, anchor_x, anchor_y) else {
+                continue;
+            };
+            let width = root.footprint_width.max(1);
+            let height = root.footprint_height.max(1);
+            self.apply_source_kind6_terminal_map_command(root);
+            for dy in 0..height {
+                for dx in 0..width {
+                    let x = anchor_x.saturating_add(dx);
+                    let y = anchor_y.saturating_add(dy);
+                    self.source_release_kind13_record(action.island_id, x, y);
+                    self.source_remove_affliction_at(action.island_id, x, y);
+                }
+            }
+            self.refresh_source_house_infrastructure(action.island_id);
+        }
+    }
+
+    /// `FUN_00481c60`: release one kind-13 record and give its whole
+    /// residents back to the owning city's BGruppe total.
+    fn source_release_kind13_record(&mut self, island: u8, x: u8, y: u8) {
+        let Some(location) = self.source_kind13_locations.location_at(island, x, y) else {
+            return;
+        };
+        self.source_kind13_locations
+            .remove_roots_in_footprint(island, x, y, 1, 1);
+        let Some(city_slot) = self
+            .source_cities
+            .slot_for_root(island, location.source_owner)
+        else {
+            return;
+        };
+        let Some(city) = self.source_cities.record_mut(city_slot) else {
+            return;
+        };
+        let group = usize::from(location.population_group).min(4);
+        let residents = u32::from(location.amount >> 6);
+        city.tier_population[group] = city.tier_population[group].saturating_sub(residents);
     }
 
     /// Advance `DAT_005a6aec` / `DAT_005a6c12` exactly as the leading block
@@ -10501,6 +11160,488 @@ mod tests {
         assert_eq!(sim.players[1].unlock_mask, 0);
     }
 
+    /// A city whose hazard event is armed, with nothing else set up.
+    fn hazard_city(tier_population: [u32; 5]) -> Simulation {
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.source_kind4_dispatch.active_player_slot = 0;
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 2,
+                source_owner: 3,
+                owner_slot: 0,
+                tier_population,
+                ready_at_ticks: 0,
+                ..SourceCityRecord::default()
+            })
+        ));
+        sim.seed_source_rand(7);
+        sim
+    }
+
+    /// How many `rand()` values a call consumed, by comparing LCG states.
+    fn source_rand_draws(before: u32, after: u32) -> u32 {
+        let mut probe = crate::source_rand::SourceRand::new(before);
+        for count in 0..64 {
+            if probe.state() == after {
+                return count;
+            }
+            probe.next();
+        }
+        panic!("state {after:#x} is not within 64 draws of {before:#x}");
+    }
+
+    /// A one-tile wood residence root, enough for the definition lookups the
+    /// registrar and the ignition roll make.
+    fn hazard_house_root(island: u8, x: u8, y: u8, owner_slot: u8) -> SourceMapCellState {
+        let mut root = SourceMapCellState {
+            island,
+            x,
+            y,
+            source_definition_offset: 0,
+            source_command_anchor_x: x,
+            source_command_anchor_y: y,
+            footprint_width: 1,
+            footprint_height: 1,
+            source_definition_width: 1,
+            source_definition_height: 1,
+            source_orientation: 0,
+            source_variant: 0,
+            source_map_owner_slot: owner_slot,
+            source_transfer_figure_limit: 0,
+            source_operating_cost: 0,
+            source_transfer_radius: 0,
+            source_transfer_figure: crate::source_cell::SourceTransferFigure::default(),
+            ruin_id: 0,
+            ruin_footprint_width: 1,
+            ruin_footprint_height: 1,
+            ruin_uses_strand_table: false,
+            fallback_strand_cells: 0,
+            phase: 0,
+            scheduler_enabled: true,
+            scheduler_cooldown: 0,
+            scheduler_blocked: false,
+            frame_selector: 0,
+            activity: 0,
+            work_material_stock: 0,
+            raw_material_stock: 0,
+            storage_fill: 0,
+            reserved_storage: 0,
+            storage_animation_capacity: 0,
+            source_production_amount: 0,
+            source_raw_material_amount: 0,
+            source_work_material_amount: 0,
+            source_max_no_raw_material_count: 0,
+            source_scheduler_interval: 0,
+            source_no_raw_material_count: 0,
+            source_output_ware_slot: 0,
+            source_raw_resource_ware_slot: 0,
+            source_work_material_ware_slot: 0,
+            source_growth_resource_ware_slot: 0,
+            source_resource_is_dry: false,
+            source_plantation_worker_definition: 0,
+            source_resource_reserved: false,
+            source_path_class: 0,
+            source_resource_growth_factor: 0,
+            source_damage_threshold: 0,
+            source_damage_accumulator: 0,
+            progress: 0,
+            source_production_time: 0,
+            animation_frame: 0,
+            animation_count: 1,
+            animation_continues: false,
+            // Outer `Kind: GEBAEUDE`, nested `HAUS_PRODTYP Kind: WOHNUNG`,
+            // which is how every shipped residence is authored.
+            kind_code: 0x0e,
+            source_production_kind_code: 0x0d,
+            source_definition_record: 0,
+            source_resource_records: None,
+            source_growth_enrolled: false,
+            source_growth_bucket: 0,
+            source_growth_phase_seen: 0,
+            source_growth_phase: 0,
+            source_placement_variant: 0,
+            source_destroy_flag: false,
+            // `Wohnhäuser I`: `HAUS_BAUKOST Holz: 3`, no `Ziegel`.
+            source_wood_cost_fixed: 3 << 5,
+            source_bricks_cost_fixed: 0,
+            source_path_class_loaded_road: 0x20,
+        };
+        root.source_command_anchor_x = x;
+        root.source_command_anchor_y = y;
+        root
+    }
+
+    fn hazard_house(island: u8, x: u8, y: u8, owner_slot: u8, group: u8) -> SourceKind13Location {
+        SourceKind13Location {
+            island_id: island,
+            tile_x: x,
+            tile_y: y,
+            orientation: 0,
+            variant: 0,
+            source_owner: owner_slot,
+            phase: 0,
+            state_bits: 0,
+            population_group: group,
+            amount: 0x40,
+            lifecycle_flags: 0,
+        }
+    }
+
+    /// `1602_exe.c:91442` and `:91517`: `FUN_0047f510` and the re-arm draw on
+    /// every opened event cycle regardless of every gate below them, so the
+    /// floor is two draws and never one.
+    #[test]
+    fn source_city_hazard_event_always_draws_exactly_twice() {
+        let mut sim = hazard_city([0; 5]);
+        let before = sim.source_rand_state();
+        sim.tick_source_city_hazard_event(0);
+        assert_eq!(source_rand_draws(before, sim.source_rand_state()), 2);
+
+        // `now + (60 + (rand() & 7)) * 10` in 100 ms ticks: 60.0 to 67.0 s.
+        let ready = sim.source_cities.record(0).unwrap().ready_at_ticks;
+        assert!(
+            (600..=670).contains(&ready) && ready % 10 == 0,
+            "re-arm {ready} outside 600..=670 deciseconds",
+        );
+    }
+
+    /// The whole block sits behind `city[0x1e0] <= DAT_005b6040`; before that
+    /// tick it draws nothing at all.
+    #[test]
+    fn source_city_hazard_event_draws_nothing_before_its_ready_tick() {
+        let mut sim = hazard_city([200; 5]);
+        sim.source_cities.record_mut(0).unwrap().ready_at_ticks = 1;
+        let before = sim.source_rand_state();
+        sim.tick_source_city_hazard_event(0);
+        assert_eq!(source_rand_draws(before, sim.source_rand_state()), 0);
+    }
+
+    /// The exact `rand()` budget of every fire sub-gate, including the paths
+    /// whose roll fails and the paths that are never evaluated.
+    ///
+    /// The chain is a strict `if`/`else` on `tier[0] >= 80`
+    /// (`1602_exe.c:91479-91515`): the settler branches are dead above the
+    /// boundary, and below it a colony under both the 250 pioneer+settler and
+    /// the 250 settlers-and-above thresholds draws **zero** here, leaving only
+    /// the two unconditional draws.
+    #[test]
+    fn source_city_hazard_fire_gate_rand_budget() {
+        // (tier populations, total draws for the whole event cycle)
+        let cases: [([u32; 5], u32); 7] = [
+            // Below every threshold: only `FUN_0047f510` and the re-arm.
+            ([79, 0, 0, 0, 0], 2),
+            ([79, 0, 249, 0, 0], 2),
+            // `tier[0] + tier[1] >= 250` opens the middle branch.
+            ([79, 171, 0, 0, 0], 3),
+            ([79, 221, 0, 0, 0], 3),
+            ([79, 271, 0, 0, 0], 3),
+            // `pop[1] >= 250` with a small pioneer+settler sum opens the
+            // `rand() & 0xff` branch.
+            ([79, 0, 250, 0, 0], 3),
+            // At the boundary the pioneer branch takes over.
+            ([80, 400, 400, 0, 0], 3),
+        ];
+        for (tier_population, expected) in cases {
+            for seed in 1..40u32 {
+                let mut sim = hazard_city(tier_population);
+                sim.seed_source_rand(seed);
+                let before = sim.source_rand_state();
+                sim.tick_source_city_hazard_event(0);
+                assert_eq!(
+                    source_rand_draws(before, sim.source_rand_state()),
+                    expected,
+                    "tier {tier_population:?} seed {seed}",
+                );
+            }
+        }
+    }
+
+    /// `DAT_0049af08` verbatim, and the row `FUN_0047b540` always lands on.
+    #[test]
+    fn source_fire_probability_table_rows_are_pinned() {
+        use crate::data_bridge::SOURCE_FIRE_PROBABILITY_TABLE as TABLE;
+        assert_eq!(TABLE[0], [1, 1, 1, 1, 0, 1, 1, 1]);
+        assert_eq!(TABLE[1], [0, 0, 1, 0, 1, 0, 0, 1]);
+        assert_eq!(TABLE[0].iter().filter(|&&hit| hit != 0).count(), 7);
+        assert_eq!(TABLE[1].iter().filter(|&&hit| hit != 0).count(), 3);
+
+        // Row selection is `Ziegel <= Holz`. Tier-0/1 housing is wood-only,
+        // so ignition always uses row 1 — 3/8 per attempt.
+        let house = hazard_house_root(2, 5, 5, 3);
+        assert!(house.source_bricks_cost_fixed <= house.source_wood_cost_fixed);
+        // A brick-heavy definition takes row 0 instead; both rows are live on
+        // the spread path.
+        let mut stone = house;
+        stone.source_wood_cost_fixed = 0;
+        stone.source_bricks_cost_fixed = 6 << 5;
+        assert!(stone.source_bricks_cost_fixed > stone.source_wood_cost_fixed);
+    }
+
+    /// `FUN_0047b540` costs exactly 2, 4 or 6 draws — a uniform pick plus a
+    /// `rand() & 7` table index per attempt, at most three attempts — and
+    /// exactly zero when the island slice holds no eligible residence.
+    #[test]
+    fn source_fire_ignition_rand_budget_is_two_four_or_six() {
+        use crate::data_bridge::SOURCE_FIRE_PROBABILITY_TABLE as TABLE;
+
+        let city = SourceCityRecord {
+            island_id: 2,
+            source_owner: 3,
+            owner_slot: 0,
+            ..SourceCityRecord::default()
+        };
+
+        // No candidates at all: no draw.
+        let mut empty = Simulation::new();
+        empty.seed_source_rand(5);
+        let before = empty.source_rand_state();
+        assert!(!empty.source_ignite_fire(city));
+        assert_eq!(source_rand_draws(before, empty.source_rand_state()), 0);
+
+        for seed in 1..60u32 {
+            let mut sim = Simulation::new();
+            sim.players.push(Player::new_human(0));
+            sim.source_kind4_dispatch.active_player_slot = 0;
+            assert!(sim.source_cities.set_record(0, Some(city)));
+            sim.source_static_map_roots
+                .push(hazard_house_root(2, 5, 5, 3));
+            assert!(sim
+                .source_kind13_locations
+                .insert(hazard_house(2, 5, 5, 3, 0)));
+            sim.seed_source_rand(seed);
+
+            // Replay the source's own roll sequence off a private generator.
+            let mut expected_rng = crate::source_rand::SourceRand::new(seed);
+            let mut expected_draws = 0;
+            let mut expected_hit = false;
+            for _ in 0..3 {
+                let _pick = expected_rng.next();
+                let index = usize::from(expected_rng.next() & 7);
+                expected_draws += 2;
+                // One wood-only candidate, so always row 1.
+                if TABLE[1][index] != 0 {
+                    expected_hit = true;
+                    break;
+                }
+            }
+
+            let before = sim.source_rand_state();
+            let hit = sim.source_ignite_fire(city);
+            let drawn = source_rand_draws(before, sim.source_rand_state());
+            assert_eq!(drawn, expected_draws, "seed {seed}");
+            assert!(matches!(drawn, 2 | 4 | 6), "seed {seed} drew {drawn}");
+            assert_eq!(hit, expected_hit, "seed {seed}");
+            assert_eq!(
+                sim.source_afflictions.active_entries().len(),
+                usize::from(hit),
+            );
+            if hit {
+                let entry = sim.source_afflictions.entry_at(2, 5, 5).unwrap();
+                assert_eq!(entry.kind, crate::data_bridge::SOURCE_AFFLICTION_KIND_FIRE);
+                assert_eq!(
+                    entry.duration_phases,
+                    crate::data_bridge::SOURCE_AFFLICTION_IGNITION_DURATION,
+                );
+                // `FUN_0047b410`'s growth stop is live the moment any
+                // affliction exists anywhere in the city.
+                let city = sim.source_cities.record(0).unwrap();
+                assert_eq!(city.active_afflictions, 1);
+                assert!(city.growth_blocked());
+                assert_eq!(
+                    sim.source_kind13_locations
+                        .location_at(2, 5, 5)
+                        .unwrap()
+                        .lifecycle_flags
+                        & 3,
+                    2,
+                );
+            }
+        }
+    }
+
+    /// `FUN_00479ca0` hashes only three bits per axis, so its 32-slot probe
+    /// window fills routinely. When it does, the registrar returns without
+    /// registering — **after** it has already dropped the tile's previous
+    /// entry and decremented that city's `+0x1fe`.
+    #[test]
+    fn source_affliction_registrar_registers_nothing_when_the_probe_window_is_full() {
+        use crate::data_bridge::{
+            SourceAfflictionTable, SOURCE_AFFLICTION_IGNITION_DURATION,
+            SOURCE_AFFLICTION_KIND_FIRE, SOURCE_AFFLICTION_PROBE_LENGTH,
+        };
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.source_kind4_dispatch.active_player_slot = 0;
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 2,
+                source_owner: 3,
+                owner_slot: 0,
+                ..SourceCityRecord::default()
+            })
+        ));
+
+        // `((2 & 3) * 8 + (x & 7)) * 8 + (y & 7)`: only the low three bits of
+        // each axis participate, so these two tiles share a home slot.
+        assert_eq!(
+            SourceAfflictionTable::source_index(2, 5, 6),
+            SourceAfflictionTable::source_index(2, 5 + 8, 6 + 8),
+        );
+
+        // The clamp on the probe window is dead: the hash tops out at 255 and
+        // `255 + 0x20 = 287` still fits the 0x120-slot table.
+        assert_eq!(SourceAfflictionTable::source_index(3, 7, 7), 255);
+
+        // Fill the window with 32 residences that all hash to the same home
+        // slot, one per folded (x, y) pair.
+        let mut tiles = Vec::new();
+        let home = SourceAfflictionTable::source_index(2, 5, 6);
+        'outer: for step_y in 0..8u8 {
+            for step_x in 0..8u8 {
+                let (x, y) = (5 + step_x * 8, 6 + step_y * 8);
+                assert_eq!(SourceAfflictionTable::source_index(2, x, y), home);
+                tiles.push((x, y));
+                if tiles.len() == SOURCE_AFFLICTION_PROBE_LENGTH + 1 {
+                    break 'outer;
+                }
+            }
+        }
+        for &(x, y) in &tiles {
+            sim.source_static_map_roots
+                .push(hazard_house_root(2, x, y, 3));
+            assert!(sim
+                .source_kind13_locations
+                .insert(hazard_house(2, x, y, 3, 0)));
+        }
+
+        for &(x, y) in tiles.iter().take(SOURCE_AFFLICTION_PROBE_LENGTH) {
+            assert!(sim.source_register_affliction(
+                2,
+                x,
+                y,
+                SOURCE_AFFLICTION_KIND_FIRE,
+                SOURCE_AFFLICTION_IGNITION_DURATION,
+            ));
+        }
+        assert_eq!(
+            sim.source_afflictions.active_entries().len(),
+            SOURCE_AFFLICTION_PROBE_LENGTH,
+        );
+        assert_eq!(
+            sim.source_cities.record(0).unwrap().active_afflictions as usize,
+            SOURCE_AFFLICTION_PROBE_LENGTH,
+        );
+        assert!(sim.source_afflictions.free_slot(2, 5, 6).is_none());
+
+        // The thirty-third tile in the same bucket registers nothing at all,
+        // and — the point of the exercise — the routine does not fall back to
+        // any other part of the table.
+        let (x, y) = tiles[SOURCE_AFFLICTION_PROBE_LENGTH];
+        assert!(!sim.source_register_affliction(
+            2,
+            x,
+            y,
+            SOURCE_AFFLICTION_KIND_FIRE,
+            SOURCE_AFFLICTION_IGNITION_DURATION,
+        ));
+        assert!(sim.source_afflictions.entry_at(2, x, y).is_none());
+        assert_eq!(
+            sim.source_afflictions.active_entries().len(),
+            SOURCE_AFFLICTION_PROBE_LENGTH,
+        );
+        assert_eq!(
+            sim.source_cities.record(0).unwrap().active_afflictions as usize,
+            SOURCE_AFFLICTION_PROBE_LENGTH,
+        );
+
+        // Re-registering a tile that already holds an entry still succeeds
+        // even in a full window: the registrar's leading `FUN_00479c50` frees
+        // that tile's own slot inside the very window it is about to probe.
+        // The counter therefore goes down and straight back up.
+        let (x, y) = tiles[0];
+        assert!(sim.source_register_affliction(
+            2,
+            x,
+            y,
+            SOURCE_AFFLICTION_KIND_FIRE,
+            SOURCE_AFFLICTION_IGNITION_DURATION,
+        ));
+        assert_eq!(
+            sim.source_cities.record(0).unwrap().active_afflictions as usize,
+            SOURCE_AFFLICTION_PROBE_LENGTH,
+        );
+    }
+
+    /// A burning residence expires after its authored phase count, posts the
+    /// deferred type-7 action rather than demolishing inline, and the drain
+    /// converts the root to a ruin while releasing the kind-13 record and the
+    /// city's affliction count.
+    #[test]
+    fn source_fire_expiry_posts_a_deferred_ruin_conversion() {
+        use crate::data_bridge::{
+            SOURCE_AFFLICTION_IGNITION_DURATION, SOURCE_AFFLICTION_KIND_FIRE,
+            SOURCE_AFFLICTION_PHASE_MS,
+        };
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.source_kind4_dispatch.active_player_slot = 0;
+        sim.source_kind4_dispatch.faction_states[0] = 0;
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 2,
+                source_owner: 3,
+                owner_slot: 0,
+                tier_population: [1, 0, 0, 0, 0],
+                ..SourceCityRecord::default()
+            })
+        ));
+        sim.source_static_map_roots
+            .push(hazard_house_root(2, 5, 5, 3));
+        assert!(sim
+            .source_kind13_locations
+            .insert(hazard_house(2, 5, 5, 3, 0)));
+        assert!(sim.source_register_affliction(
+            2,
+            5,
+            5,
+            SOURCE_AFFLICTION_KIND_FIRE,
+            SOURCE_AFFLICTION_IGNITION_DURATION,
+        ));
+        assert_eq!(sim.source_cities.record(0).unwrap().active_afflictions, 1);
+
+        // Step the phase clock until the entry runs out its 25 phases. The
+        // spread branch draws while it lives, so this also proves expiry is
+        // reachable rather than deadlocked on a full result buffer.
+        for _ in 0..(u32::from(SOURCE_AFFLICTION_IGNITION_DURATION) + 2) {
+            sim.tick_source_afflictions(SOURCE_AFFLICTION_PHASE_MS);
+            for _ in 0..40 {
+                sim.tick_source_afflictions(1);
+            }
+        }
+        assert!(
+            !sim.source_deferred_map_demolitions.is_empty(),
+            "expiry must post a type-7 action rather than demolishing inline",
+        );
+        // Expiry deliberately leaves the entry in the table, so it re-posts
+        // every phase until the removal actually lands.
+        assert!(sim.source_afflictions.entry_at(2, 5, 5).is_some());
+        assert_eq!(sim.source_cities.record(0).unwrap().active_afflictions, 1);
+
+        sim.tick_source_deferred_map_demolitions();
+        assert!(sim.source_kind13_locations.location_at(2, 5, 5).is_none());
+        assert!(sim.source_afflictions.entry_at(2, 5, 5).is_none());
+        assert_eq!(sim.source_cities.record(0).unwrap().active_afflictions, 0);
+        assert_eq!(sim.source_cities.record(0).unwrap().tier_population[0], 0);
+        assert_eq!(sim.tile_clears.len(), 1);
+        assert_eq!(sim.tile_clears[0].ruin_id, 0);
+    }
+
     #[test]
     fn source_dynamic_figure_loader_enforces_source_category_tables() {
         let mut sim = Simulation::new();
@@ -13848,6 +14989,11 @@ mod tests {
                 for dy in 0..h {
                     for dx in 0..w {
                         sim.island_maps[map_idx].set_walkable(spot.0 + dx, spot.1 + dy, false);
+                        sim.island_maps[map_idx].set_source_runtime_occupied(
+                            spot.0 + dx,
+                            spot.1 + dy,
+                            true,
+                        );
                     }
                 }
                 let mut inst =

@@ -133,6 +133,17 @@ pub struct IslandMap {
     pub height: u16,
     /// Flat grid: true = walkable. Index = y * width + x.
     walkable: Vec<bool>,
+    /// Cells a placement made *after* the island loaded now occupies.
+    ///
+    /// `IslandMap::from_island` replays the scenario's INSELHAUS commands into
+    /// `source_map_kind_cells`, so a building the scenario authored is refused
+    /// by the terrain gate on its own outer kind, exactly as in the original —
+    /// `FUN_004631b0` writes the placed definition's index into the live map
+    /// word, and `FUN_00464660` then reads that definition back. The port does
+    /// not yet rewrite the kind grid when a building goes up at runtime, so it
+    /// records the occupied cells here and
+    /// [`Self::source_placement_footprint_free`] consults both.
+    source_runtime_occupied: Vec<bool>,
     /// Per-tile road flag. Carriers crossing a road tile pay a
     /// reduced path cost so the A* pathfinder prefers roads when
     /// they're available — RE: haeuser.cod `Wegspeed: 145, 120,
@@ -193,18 +204,125 @@ pub struct IslandMap {
 }
 
 /// Building kinds that represent walkable terrain or roads.
+///
+/// This is the port's *land-figure* raster: "may a walker stand on this
+/// cell". It is deliberately **not** the placement gate — the original has no
+/// single walkability bitmap at all. It rasterises one grid per figure class:
+/// `FUN_004704d0` (`1602_exe.c:79470-79477`) opens outer kinds
+/// `{1, 11, 12, 13, 18, 29, 30}` for a transfer wave, `FUN_0046f920` opens the
+/// fixed land terrain for a harvester, `FUN_0046fb50` opens the sea and surf
+/// ring (19-22) for a fishery worker and nothing else does, and building
+/// placement is gated separately by
+/// [`source_placement_admits_ground_kind`] (`FUN_00464660`).
+///
+/// `MEER` was on this list with the comment "(for coastal)" — that is, purely
+/// so [`IslandMap::is_coastal`] would fire. It does not need it: `is_coastal`
+/// reads the *neighbours'* map kinds and only wants the centre cell to be
+/// land. Leaving sea here made every consumer of the raster — the A*
+/// pathfinder, `reachable`, `can_fit`/`find_open_spot`, and (until this
+/// change) `can_place_building` — treat open water as walkable ground.
 const WALKABLE_KINDS: &[&str] = &[
     "BODEN",      // Ground/terrain
     "STRASSE",    // Road
     "STRANDMUND", // Beach mouth
     "STRAND",     // Beach
-    "MEER",       // Sea (for coastal)
     "FLUSS",      // River
     "MAUER",      // Wall sections can be walked on
     "MAUERSTRAND",
     "PLATZ", // Plaza/square
     "TOR",   // Gate
 ];
+
+/// `FUN_00464660` (`1602_exe.c:70042-70280`): may a definition whose outer
+/// `HAUS Kind` compiles to `building_kind` (definition `+0x04`) stand on a
+/// live map cell whose current outer kind is `ground_kind`?
+///
+/// This is the original's whole terrain rule for building placement, and it
+/// is a per-building-kind table, not a walkability test. `FUN_00464450`
+/// (`1602_exe.c:70012-70032`) runs it over **every** cell of the oriented
+/// footprint and refuses the tile the moment one cell says no.
+///
+/// The shape worth remembering: the `default:` arm — which covers `GEBAEUDE`
+/// (89 of the shipped definitions), `PLANTAGE`, `WALD`, `BODEN`, `RUINE`,
+/// `FELS` and everything else without an explicit case — admits only the
+/// three free-ground kinds `WALD` (10), `BODEN` (11) and `RUINE` (12). Sea is
+/// kind 19 and is admitted by no player-placeable definition at all. The
+/// harbour classes reach the water line through *other* kinds:
+///
+/// * the Kontor (`Nummer: 271`, `Kind: HQ` = 35, `Strandflg: 1`) takes
+///   `{1, 10, 11, 12, 13}` — it stands on ordinary land, and the beach it
+///   fronts is found by the separate orientation resolver `FUN_00467af0`
+///   (`1602_exe.c:72246-72364`), which needs one whole footprint edge flanked
+///   by the beach ring (`FUN_00467e10` accepts kinds 23, 24, 25, 26, 27, 29,
+///   30);
+/// * the shipyards (`Kind: HAFEN` = 36) take `{1, 4, 5, 10, 11, 12, 13, 23,
+///   25, 26, 27, 29}`, so their footprint really does span land and beach,
+///   and `FUN_00467e60` requires one of their own edge rows/columns to be
+///   beach;
+/// * the fishery (`Nummer: 269`, `Kind: STRANDHAUS` = 28) is beach-only:
+///   `{23, 27}`;
+/// * the pier sign (`Kind: PIER` = 30) takes `{23, 25, 26, 27, 29}` plus
+///   another pier of a different definition;
+/// * the mine (`Kind: MINE` = 34) takes only `HANG` (31), and the water mill
+///   (`Kind: WMUEHLE` = 37) adds `FLUSS` (16) to the free ground.
+///
+/// Three arms of the original are approximated here, all of them in the
+/// *permissive* direction and none of them reachable from the port's player
+/// placement path:
+///
+/// * kinds 1/3/4/5/6 on ground of kind 1 or 4 compare the two definitions'
+///   compiled `KreuzBase` group (`+0x08`) and refuse when it is equal, while
+///   ground 5/6/7 refuses when it *differs* — road-over-road and
+///   wall-over-wall retiling. The port does not compile `KreuzBase`, so those
+///   grounds are admitted outright;
+/// * kind 30 on ground 30 compares the two definition ids (`*param_1 !=
+///   *piVar1`);
+/// * the `default:` arm additionally refuses a `ProdKind: ROHSTWACHS`
+///   definition (`+0x1c` == 10) that would land on its own crop or on the
+///   ripe resource it grows into (`1602_exe.c:70066-70078`) — i.e. the
+///   editor/terrain painter re-seeding a field that already carries it.
+pub const fn source_placement_admits_ground_kind(building_kind: u8, ground_kind: u8) -> bool {
+    match building_kind {
+        // case 1 — STRASSE
+        1 => matches!(ground_kind, 1 | 10..=12),
+        // case 3 — TOR. Its inner switch has no `break` before `case 4`, so a
+        // ground kind it does not name falls through into the wall arm below.
+        3 => matches!(ground_kind, 1 | 4..=7 | 10..=12 | 23..=27 | 29),
+        // case 4 / 5 — MAUER, MAUERSTRAND
+        4 | 5 => matches!(ground_kind, 4..=7 | 10..=12 | 23..=27 | 29),
+        // case 6 — TURM. Same list as the wall arm minus STRANDMUND (24).
+        6 => matches!(ground_kind, 4..=7 | 10..=12 | 23 | 25..=27 | 29),
+        // case 0xd — PLATZ. Note 13 itself is *not* admitted.
+        13 => matches!(ground_kind, 1 | 10..=12),
+        // case 0x10 / 0x11 — FLUSS, FLUSSECK
+        16 | 17 => matches!(ground_kind, 10..=12 | 16 | 17),
+        // case 0x12 — BRUECKE
+        18 => matches!(ground_kind, 16 | 18),
+        // case 0x13 — MEER
+        19 => matches!(ground_kind, 10..=12 | 19..=27 | 29),
+        // case 0x14 / 0x15 / 0x16 — BRANDUNG, BRANDECK, MUENDUNG
+        20..=22 => matches!(ground_kind, 10..=12 | 19..=22),
+        // case 0x17 / 0x18 / 0x19 / 0x1a / 0x1b / 0x1d — the beach ring.
+        // WALD (10) is excluded, STRANDHAUS (28) is included.
+        23..=27 | 29 => matches!(ground_kind, 11 | 12 | 19..=29),
+        // case 0x1c — STRANDHAUS (the fishery)
+        28 => matches!(ground_kind, 23 | 27),
+        // case 0x1e — PIER
+        30 => matches!(ground_kind, 23 | 25..=27 | 29 | 30),
+        // case 0x1f / 0x20 / 0x21 — HANG, HANGECK, HANGQUELL
+        31..=33 => matches!(ground_kind, 10..=12 | 31..=33),
+        // case 0x22 — MINE
+        34 => ground_kind == 31,
+        // case 0x23 — HQ (the Kontor)
+        35 => matches!(ground_kind, 1 | 10..=13),
+        // case 0x24 — HAFEN (the shipyards)
+        36 => matches!(ground_kind, 1 | 4 | 5 | 10..=13 | 23 | 25..=27 | 29),
+        // case 0x25 — WMUEHLE
+        37 => matches!(ground_kind, 10..=12 | 16),
+        // default — GEBAEUDE and everything else: free ground only.
+        _ => matches!(ground_kind, 10..=12),
+    }
+}
 
 impl IslandMap {
     /// Build a walkability map from island tile data and building definitions.
@@ -215,6 +333,7 @@ impl IslandMap {
 
         // Start with all tiles as non-walkable (water/empty)
         let mut walkable = vec![false; size];
+        let source_runtime_occupied = vec![false; size];
         let mut road = vec![false; size];
         let mut city_cart_movement_speeds = vec![100; size];
         let mut carrier_movement_speeds = vec![100; size];
@@ -350,6 +469,7 @@ impl IslandMap {
             width,
             height,
             walkable,
+            source_runtime_occupied,
             road,
             city_cart_path_template,
             carrier_path_template,
@@ -1778,6 +1898,72 @@ impl IslandMap {
             .then(|| position.1 as usize * self.width as usize + position.0 as usize)
     }
 
+    /// The terrain half of `FUN_00464450` (`1602_exe.c:69927-70035`): the
+    /// oriented `width × height` footprint anchored at `(x, y)` must fit
+    /// inside the island grid, and every one of its cells must satisfy
+    /// [`source_placement_admits_ground_kind`] for `building_kind`.
+    ///
+    /// `FUN_00464450`'s bounds test is `-1 < x && width + x <= island[3]`
+    /// (and the same on y), i.e. the whole footprint, not just its anchor,
+    /// has to lie on the map. The per-cell sweep is `1602_exe.c:70012-70032`,
+    /// which walks the footprint bottom-up and returns false on the first
+    /// cell `FUN_00464660` rejects.
+    ///
+    /// Not modelled here, because they are not terrain: the settlement-slot
+    /// edge test that precedes the sweep (`1602_exe.c:69960-70011` — one
+    /// whole footprint edge must already carry the target slot), the
+    /// figure-collision test `FUN_00442980` that follows it, and the
+    /// per-kind orientation resolvers reached through `FUN_00468300`.
+    pub fn source_placement_terrain_admits(
+        &self,
+        building_kind: u8,
+        x: i32,
+        y: i32,
+        width: u8,
+        height: u8,
+    ) -> bool {
+        let footprint_width = i32::from(width.max(1));
+        let footprint_height = i32::from(height.max(1));
+        if x < 0
+            || y < 0
+            || x + footprint_width > i32::from(self.width)
+            || y + footprint_height > i32::from(self.height)
+        {
+            return false;
+        }
+        (0..footprint_height).all(|dy| {
+            (0..footprint_width).all(|dx| {
+                self.source_map_kind_cell((x + dx, y + dy))
+                    .is_some_and(|cell| {
+                        source_placement_admits_ground_kind(building_kind, cell.kind_code)
+                    })
+            })
+        })
+    }
+
+    /// True when no runtime placement already occupies the `width × height`
+    /// footprint at `(x, y)`. See [`Self::source_runtime_occupied`] for why
+    /// this is tracked separately from the live map kinds.
+    pub fn source_placement_footprint_free(&self, x: i32, y: i32, width: u8, height: u8) -> bool {
+        (0..i32::from(height.max(1))).all(|dy| {
+            (0..i32::from(width.max(1))).all(|dx| !self.source_runtime_occupied(x + dx, y + dy))
+        })
+    }
+
+    /// Whether a building placed after load stands on this cell.
+    #[inline]
+    pub fn source_runtime_occupied(&self, x: i32, y: i32) -> bool {
+        self.local_index((x, y))
+            .is_some_and(|index| self.source_runtime_occupied[index])
+    }
+
+    /// Record (or release) a runtime placement's footprint cell.
+    pub fn set_source_runtime_occupied(&mut self, x: u16, y: u16, occupied: bool) {
+        if x < self.width && y < self.height {
+            self.source_runtime_occupied[y as usize * self.width as usize + x as usize] = occupied;
+        }
+    }
+
     /// Mark a tile as walkable (e.g., for warehouse placement after map creation).
     pub fn set_walkable(&mut self, x: u16, y: u16, val: bool) {
         if x < self.width && y < self.height {
@@ -1817,6 +2003,12 @@ impl IslandMap {
     /// True for a walkable tile bordering the sea: a 4-neighbor that is
     /// open water (no map cell), a shoreline kind (MEER/BRANDUNG/STRAND
     /// family, codes 19..=28, or PIER 30), or beyond the island bounds.
+    ///
+    /// Sea is seen through the *neighbour's* map kind, never through the
+    /// centre tile's walkability — which is why dropping `MEER` from
+    /// [`WALKABLE_KINDS`] does not break this and in fact repairs it: an
+    /// open-water cell used to satisfy both halves of the test and report
+    /// itself as coastline.
     pub fn is_coastal(&self, x: i32, y: i32) -> bool {
         if !self.is_walkable(x, y) {
             return false;
@@ -1982,6 +2174,7 @@ impl IslandMap {
             width,
             height,
             walkable: vec![true; size],
+            source_runtime_occupied: vec![false; size],
             road: vec![false; size],
             city_cart_path_template: SourcePathGrid::new(
                 (0, 0),
@@ -2191,6 +2384,148 @@ mod tests {
         // fish carry slot 4 and the water slot 3, and both still resolve.
         let claimed = map.fishery_worker_path_grid((5, 5), (5, 5), (1, 1), 5, 0, FISCHE, &statics);
         assert_eq!(claimed.metadata((5, 7)), Some(0xa0));
+    }
+
+    /// `FUN_00464660` (`1602_exe.c:70042-70280`) decides buildability from
+    /// the *pair* (definition's outer kind, live cell's outer kind), and the
+    /// four kinds exercised here are the ones the shipped haeuser.cod
+    /// authors — `crates/anno-game/tests/source_placement_terrain.rs` pins
+    /// each definition against the real file:
+    ///
+    /// | definition | `Kind` | code |
+    /// | --- | --- | --- |
+    /// | weaving hut `Nummer: 387` | `GEBAEUDE` | 14 (the `default:` arm) |
+    /// | fishery `Nummer: 269` | `STRANDHAUS` | 28 |
+    /// | founding Kontor `Nummer: 271` | `HQ` | 35 |
+    /// | large shipyard | `HAFEN` | 36 |
+    #[test]
+    fn placement_terrain_gate_follows_the_source_kind_table() {
+        const GEBAEUDE: u8 = 14;
+        const STRANDHAUS: u8 = 28;
+        const HQ: u8 = 35;
+        const HAFEN: u8 = 36;
+
+        let mut map = IslandMap::new_open(1, 12, 12);
+        let index = |x: usize, y: usize| y * 12 + x;
+        let kind = |kind_code: u8| {
+            Some(SourceMapKindCell {
+                kind_code,
+                kind3_center_cell: false,
+                map_owner: 7,
+                ware_slot: 0,
+                map_direction: 0,
+            })
+        };
+        // Open sea over the whole grid, then a plain-ground island with a
+        // beach strip along its western edge and a stand of forest inland.
+        for cell in map.source_map_kind_cells.iter_mut() {
+            *cell = kind(19);
+        }
+        for y in 2..10 {
+            for x in 3..10 {
+                map.source_map_kind_cells[index(x, y)] = kind(11);
+            }
+            // 27 = STRANDVARI, the beach kind island 10 carries 117 of;
+            // 23 = STRAND, the one it carries four of.
+            map.source_map_kind_cells[index(2, y)] = kind(27);
+        }
+        map.source_map_kind_cells[index(2, 4)] = kind(23);
+        for y in 6..9 {
+            for x in 6..9 {
+                map.source_map_kind_cells[index(x, y)] = kind(10);
+            }
+        }
+
+        // An ordinary land building takes the `default:` arm: WALD, BODEN and
+        // RUINE, and nothing else. Open sea is refused, and so is the beach.
+        assert!(map.source_placement_terrain_admits(GEBAEUDE, 4, 4, 2, 2));
+        assert!(
+            map.source_placement_terrain_admits(GEBAEUDE, 6, 6, 2, 2),
+            "the original clears forest and builds (`1602_exe.c:70060-70065`)",
+        );
+        assert!(!map.source_placement_terrain_admits(GEBAEUDE, 0, 0, 2, 2));
+        assert!(!map.source_placement_terrain_admits(STRANDHAUS, 4, 4, 1, 1));
+        assert!(!map.source_placement_terrain_admits(GEBAEUDE, 2, 4, 1, 1));
+        assert!(
+            !map.source_placement_terrain_admits(GEBAEUDE, 2, 2, 2, 2),
+            "one refused cell refuses the whole footprint",
+        );
+
+        // The fishery is beach-only — it is `Kind: STRANDHAUS`, and case 0x1c
+        // admits exactly STRAND and STRANDVARI. It is *not* a sea building.
+        assert!(map.source_placement_terrain_admits(STRANDHAUS, 2, 4, 1, 1));
+        assert!(map.source_placement_terrain_admits(STRANDHAUS, 2, 5, 1, 1));
+        assert!(!map.source_placement_terrain_admits(STRANDHAUS, 1, 4, 1, 1));
+
+        // The Kontor stands on land and fronts the beach; its own footprint
+        // never covers a beach or a sea cell.
+        assert!(map.source_placement_terrain_admits(HQ, 3, 3, 2, 3));
+        assert!(map.source_placement_terrain_admits(HQ, 6, 6, 2, 3));
+        assert!(!map.source_placement_terrain_admits(HQ, 2, 3, 2, 3));
+        assert!(!map.source_placement_terrain_admits(HQ, 0, 0, 2, 3));
+
+        // The shipyard is the one harbour class whose footprint really does
+        // span land and beach — case 0x24 admits both — but still not sea.
+        assert!(map.source_placement_terrain_admits(HAFEN, 2, 3, 3, 3));
+        assert!(!map.source_placement_terrain_admits(HAFEN, 1, 3, 3, 3));
+
+        // The bounds test is `FUN_00464450`'s: the whole oriented footprint,
+        // not just its anchor, has to lie on the island grid.
+        assert!(!map.source_placement_terrain_admits(GEBAEUDE, 9, 4, 4, 1));
+        assert!(!map.source_placement_terrain_admits(GEBAEUDE, -1, 4, 2, 2));
+
+        // Occupancy is tracked apart from terrain, because the port does not
+        // rewrite the live kind grid when a building goes up at runtime.
+        assert!(map.source_placement_footprint_free(4, 4, 2, 2));
+        map.set_source_runtime_occupied(5, 5, true);
+        assert!(!map.source_placement_footprint_free(4, 4, 2, 2));
+        assert!(map.source_placement_footprint_free(6, 6, 2, 2));
+        assert!(
+            map.source_placement_terrain_admits(GEBAEUDE, 4, 4, 2, 2),
+            "occupancy does not change what the terrain admits",
+        );
+    }
+
+    /// The remaining arms of the table, spot-checked against the switch.
+    #[test]
+    fn placement_terrain_table_matches_the_source_switch() {
+        // case 1 STRASSE / case 0xd PLATZ: road plus the free ground.
+        assert!(source_placement_admits_ground_kind(1, 1));
+        assert!(source_placement_admits_ground_kind(1, 12));
+        assert!(!source_placement_admits_ground_kind(1, 13));
+        assert!(source_placement_admits_ground_kind(13, 1));
+        assert!(!source_placement_admits_ground_kind(13, 13));
+        // case 3 TOR falls through into the wall arm, so it keeps the beach
+        // kinds the wall arm names; case 6 TURM drops STRANDMUND (24).
+        assert!(source_placement_admits_ground_kind(3, 24));
+        assert!(source_placement_admits_ground_kind(4, 24));
+        assert!(!source_placement_admits_ground_kind(6, 24));
+        assert!(source_placement_admits_ground_kind(6, 23));
+        // case 0x12 BRUECKE: river and bridge only.
+        assert!(source_placement_admits_ground_kind(18, 16));
+        assert!(source_placement_admits_ground_kind(18, 18));
+        assert!(!source_placement_admits_ground_kind(18, 11));
+        // case 0x1e PIER: the beach ring minus STRANDMUND, plus other piers.
+        assert!(source_placement_admits_ground_kind(30, 23));
+        assert!(source_placement_admits_ground_kind(30, 30));
+        assert!(!source_placement_admits_ground_kind(30, 24));
+        assert!(!source_placement_admits_ground_kind(30, 11));
+        // case 0x22 MINE: the hillside kind and nothing else.
+        assert!(source_placement_admits_ground_kind(34, 31));
+        assert!(!source_placement_admits_ground_kind(34, 11));
+        // case 0x25 WMUEHLE: free ground plus FLUSS.
+        assert!(source_placement_admits_ground_kind(37, 16));
+        assert!(!source_placement_admits_ground_kind(37, 17));
+        // No definition kind at all admits open sea except the terrain kinds
+        // the editor paints the sea with.
+        for building_kind in 0..=37u8 {
+            let sea = source_placement_admits_ground_kind(building_kind, 19);
+            assert_eq!(
+                sea,
+                matches!(building_kind, 19..=27 | 29),
+                "kind {building_kind} on MEER",
+            );
+        }
     }
 
     #[test]

@@ -14,7 +14,6 @@ use anno_sim::building::{BuildingDef, BuildingInstance};
 use anno_sim::commands::Command;
 use anno_sim::island_map::IslandMap;
 use anno_sim::simulation::Simulation;
-use anno_sim::types::Good;
 
 /// Outcome of a placement attempt. The caller drives banners/sound
 /// off these so the placement helper stays free of UI dependencies.
@@ -25,6 +24,9 @@ pub enum PlaceOutcome {
         have: i32,
     },
     BlockedByTerrain,
+    /// No longer produced: the fishery's shoreline requirement is part of the
+    /// terrain gate (`FUN_00464660` case 0x1c), which reports
+    /// [`Self::BlockedByTerrain`]. Kept because the UI still matches on it.
     NotCoastal,
     NoIslandMap,
     NoBuildingSelected,
@@ -38,39 +40,62 @@ pub enum PlaceOutcome {
     },
 }
 
+/// The original's terrain gate for one candidate tile: `FUN_00464450`
+/// (`1602_exe.c:69927-70035`), whose per-cell verdict is `FUN_00464660`
+/// (`:70042-70280`) — see
+/// [`anno_sim::island_map::source_placement_admits_ground_kind`] for the
+/// table itself. `FUN_004084d0` calls it at `1602_exe.c:7609` and its result
+/// (`local_5bc`) gates the whole per-tile accept path.
+///
+/// This asks two questions, and they are different questions:
+///
+/// * *terrain* — every cell of the oriented footprint must carry a live map
+///   kind this definition's own outer kind admits. A `GEBAEUDE` wants
+///   `WALD`/`BODEN`/`RUINE`; the fishery wants beach; nothing player-placeable
+///   wants `MEER`. This used to be asked of `IslandMap::is_walkable`, which
+///   answered for a *walker*, not a builder: it counted `MEER` as walkable
+///   (so the whole colony could be sited on open water, where no transfer
+///   wave reaches it — `docs/logistics-gaps.md` §6) while counting `WALD` as
+///   blocked (so the 559 forest cells of New Horizons0's island 10 were
+///   refused, though the original clears trees and builds);
+/// * *occupancy* — no building placed since the island loaded may already
+///   stand there. Scenario-authored buildings are covered by the terrain
+///   question, because their own outer kind is on the live map cell.
 pub fn can_place_building(
     island: &Island,
     island_map: &IslandMap,
+    def: &BuildingDef,
     tile_x: i32,
     tile_y: i32,
     width: u8,
     height: u8,
 ) -> bool {
-    // Check all tiles in the footprint
-    for dy in 0..height as i32 {
-        for dx in 0..width as i32 {
-            let tx = tile_x + dx;
-            let ty = tile_y + dy;
-
-            // Must be within island bounds
-            if tx < 0 || ty < 0 || tx >= island.width as i32 || ty >= island.height as i32 {
-                return false;
-            }
-
-            // Must be on walkable terrain (not water or existing building)
-            if !island_map.is_walkable(tx, ty) {
-                return false;
-            }
-        }
+    // Must be within island bounds. `FUN_00464450` bounds-checks the whole
+    // oriented footprint against the island's own grid, not just its anchor.
+    if tile_x < 0
+        || tile_y < 0
+        || tile_x + i32::from(width) > i32::from(island.width)
+        || tile_y + i32::from(height) > i32::from(island.height)
+    {
+        return false;
     }
-    true
+    if !island_map.source_placement_terrain_admits(
+        def.source_kind_code().unwrap_or(u8::MAX),
+        tile_x,
+        tile_y,
+        width,
+        height,
+    ) {
+        return false;
+    }
+    island_map.source_placement_footprint_free(tile_x, tile_y, width, height)
 }
 
 /// Attempt to place building definition `def_index` at `(tile_x, tile_y)`
 /// on `current_island` for `owner`. Mirrors the original click-place flow:
-/// fishery coast gate, walkability, gold cost, Bauinfra unlock mask,
-/// materials trickle. Side-effecting helper used by the game's click
-/// handler, its drag-place loop, and command replay.
+/// terrain gate (`FUN_00464450`), gold cost, Bauinfra unlock mask, materials
+/// trickle. Side-effecting helper used by the game's click handler, its
+/// drag-place loop, and command replay.
 ///
 /// Note that fertility is deliberately **not** a placement gate. The
 /// original's only refusal is the Bauinfra unlock test `FUN_0042d530`
@@ -114,31 +139,35 @@ pub fn place_building(
         .iter()
         .position(|m| m.island_id == island_number);
 
-    // Fishery coast gate.
-    if def.output_good == Good::Fish {
-        let coast_ok = if let Some(idx) = island_map_idx {
-            let map = &sim.island_maps[idx];
-            (0..bld_h as i32)
-                .any(|dy| (0..bld_w as i32).any(|dx| map.is_coastal(tile_x + dx, tile_y + dy)))
-        } else {
-            false
-        };
-        if !coast_ok {
-            return PlaceOutcome::NotCoastal;
-        }
-    }
-
+    // There is no fishery coast gate in the original — `FUN_004084d0` has no
+    // per-definition special case at all. The fishery is `Kind: STRANDHAUS`,
+    // and `FUN_00464660` case 0x1c (`1602_exe.c:70206-70216`) admits it on
+    // `STRAND` (23) and `STRANDVARI` (27) and nothing else, which is both
+    // stricter and more accurate than "some footprint cell is coastal": the
+    // port's `is_coastal` needs a *walkable* centre cell, and `STRANDVARI` —
+    // 117 of island 10's 121 shore-buildable cells — is not walkable ground.
+    // The terrain gate below is the whole rule.
     let map_idx = match island_map_idx {
         Some(i) => i,
         None => return PlaceOutcome::NoIslandMap,
     };
+    // The oriented footprint is what the original tests: `FUN_00464450`
+    // swaps the definition's `Size` pair for rotations 1 and 3
+    // (`1602_exe.c:69943-69953`).
+    let orient = orientation % cod.buildings[def_idx].rotate.max(1) as u8;
+    let (gate_w, gate_h) = if matches!(orient & 3, 1 | 3) {
+        (bld_h, bld_w)
+    } else {
+        (bld_w, bld_h)
+    };
     if !can_place_building(
         &islands[current_island],
         &sim.island_maps[map_idx],
+        def,
         tile_x,
         tile_y,
-        bld_w,
-        bld_h,
+        gate_w,
+        gate_h,
     ) {
         return PlaceOutcome::BlockedByTerrain;
     }
@@ -184,8 +213,6 @@ pub fn place_building(
         sim.players[owner_idx].gold -= cost as i32;
     }
     let cod_b = &cod.buildings[def_idx];
-    let rot_count = cod_b.rotate.max(1) as u8;
-    let orient = orientation % rot_count;
     let source_definition_offset = (cod_b.source_id - anno_formats::szs::INSELHAUS_SOURCE_ID_BASE)
         .try_into()
         .ok();
@@ -214,11 +241,12 @@ pub fn place_building(
         owner,
     );
     let source_random_seed = (sim.next_source_rand() & 0x1f) as u8;
-    for dy in 0..bld_h as u8 {
-        for dx in 0..bld_w as u8 {
-            let tx = tile_x as u8 + dx;
-            let ty = tile_y as u8 + dy;
-            sim.island_maps[map_idx].set_walkable(tx as u16, ty as u16, false);
+    for dy in 0..gate_h {
+        for dx in 0..gate_w {
+            let tx = tile_x as u16 + u16::from(dx);
+            let ty = tile_y as u16 + u16::from(dy);
+            sim.island_maps[map_idx].set_walkable(tx, ty, false);
+            sim.island_maps[map_idx].set_source_runtime_occupied(tx, ty, true);
         }
     }
 
@@ -425,9 +453,15 @@ pub fn demolish_building(
         .iter()
         .position(|m| m.island_id == island_id);
     if let Some(map_idx) = island_map_idx {
-        for dy in 0..bh {
-            for dx in 0..bw {
+        // Release exactly the oriented footprint `place_building` blocked.
+        for dy in 0..source_height {
+            for dx in 0..source_width {
                 sim.island_maps[map_idx].set_walkable(bx + dx as u16, by + dy as u16, true);
+                sim.island_maps[map_idx].set_source_runtime_occupied(
+                    bx + dx as u16,
+                    by + dy as u16,
+                    false,
+                );
             }
         }
     }
@@ -533,8 +567,27 @@ pub fn found_kontor(
     else {
         return false;
     };
-    // Anchor must sit on the island's coastline.
+    // Anchor must sit on the island's coastline, and its footprint must sit
+    // on ground the Kontor definition admits. The founding Kontor is
+    // `Kind: HQ` with `Strandflg: 1`, so the original resolves its rotation
+    // through `FUN_00467af0` (`1602_exe.c:72246-72364`) — one whole footprint
+    // edge flanked by the beach ring — and then runs the same
+    // `FUN_00464450` terrain gate as any other build, which for kind 35
+    // admits only `{STRASSE, WALD, BODEN, RUINE, PLATZ}`. Sea is not on that
+    // list: a Kontor never stands in the water, it stands on the land the
+    // beach fronts.
     if !sim.island_maps[map_idx].is_coastal(i32::from(tile_x), i32::from(tile_y)) {
+        return false;
+    }
+    if !can_place_building(
+        island,
+        &sim.island_maps[map_idx],
+        &defs[def_index],
+        i32::from(tile_x),
+        i32::from(tile_y),
+        defs[def_index].width,
+        defs[def_index].height,
+    ) {
         return false;
     }
     // Ship gate: player-owned, unrouted, docked near the anchor's world
@@ -607,6 +660,11 @@ pub fn found_kontor(
         for dx in 0..def.width {
             sim.island_maps[map_idx]
                 .set_walkable(tile_x + u16::from(dx), tile_y + u16::from(dy), false);
+            sim.island_maps[map_idx].set_source_runtime_occupied(
+                tile_x + u16::from(dx),
+                tile_y + u16::from(dy),
+                true,
+            );
         }
     }
     let source_map_owner_slot = sim

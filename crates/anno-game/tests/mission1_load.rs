@@ -212,20 +212,67 @@ fn verena_founds_a_settlement_on_the_free_island() {
         .position(|ship| ship.name == "Verena")
         .expect("Verena spawns") as u32;
 
-    // Island 10 at (201,231): find a coastal tile on its western side.
+    // Island 10 at (201,231): find a coastal tile the founding Kontor's
+    // 2x3 footprint actually fits on.
+    //
+    // This used to take the first `is_coastal` tile in row-major order and
+    // sail the ship onto it. That tile was `(0, 0)` — open `MEER`, which
+    // `WALKABLE_KINDS` counted as walkable, so `is_coastal` accepted it and
+    // the campaign's Kontor was founded a dozen cells out to sea. The
+    // original's gate (`FUN_00464450`/`FUN_00464660`) admits kind 35 (`HQ`)
+    // on `{STRASSE, WALD, BODEN, RUINE, PLATZ}` only, and the port now
+    // enforces it, so the anchor has to be real ground on the shoreline. The
+    // ship is sailed to navigable water beside it instead, which is what
+    // `found_kontor`'s 12-unit dock range wants anyway.
     let island = szs.islands.iter().find(|i| i.number == 10).unwrap();
     let map_idx = sim
         .island_maps
         .iter()
         .position(|m| m.island_id == 10)
         .unwrap();
-    let anchor = (0..island.height as i32)
+    let kontor = defs
+        .iter()
+        .zip(&cod.buildings)
+        .find(|(_, building)| building.source_id == 22103)
+        .map(|(def, _)| def)
+        .expect("founding Kontor definition");
+    let ship_start = {
+        let ship = &sim.trade_ships[ship_index as usize];
+        (ship.world_x, ship.world_y)
+    };
+    let dock_beside = |anchor: (i32, i32)| {
+        (-8_i32..=8)
+            .flat_map(|dy| (-8_i32..=8).map(move |dx| (anchor.0 + dx, anchor.1 + dy)))
+            .filter(|&(x, y)| {
+                sim.island_maps[map_idx]
+                    .source_map_kind_and_owner(x, y)
+                    .is_some_and(|(kind, _)| kind == 19)
+            })
+            .min_by_key(|&(x, y)| (x - anchor.0).abs() + (y - anchor.1).abs())
+    };
+    let (anchor, dock) = (0..island.height as i32)
         .flat_map(|y| (0..island.width as i32).map(move |x| (x, y)))
-        .find(|&(x, y)| sim.island_maps[map_idx].is_coastal(x, y))
-        .expect("island 10 has a coastline");
+        .filter(|&(x, y)| {
+            sim.island_maps[map_idx].is_coastal(x, y)
+                && anno_game::game_commands::can_place_building(
+                    island,
+                    &sim.island_maps[map_idx],
+                    kontor,
+                    x,
+                    y,
+                    kontor.width,
+                    kontor.height,
+                )
+        })
+        .filter_map(|anchor| dock_beside(anchor).map(|dock| (anchor, dock)))
+        .min_by_key(|&(_, dock)| {
+            (ship_start.0 - (i32::from(island.x_pos) + dock.0)).abs()
+                + (ship_start.1 - (i32::from(island.y_pos) + dock.1)).abs()
+        })
+        .expect("island 10 has a buildable coastline");
     let world = (
-        i32::from(island.x_pos) + anchor.0,
-        i32::from(island.y_pos) + anchor.1,
+        i32::from(island.x_pos) + dock.0,
+        i32::from(island.y_pos) + dock.1,
     );
 
     // Sail alongside, then found.
@@ -235,10 +282,17 @@ fn verena_founds_a_settlement_on_the_free_island() {
         world_x: world.0,
         world_y: world.1,
     }));
+    // `found_kontor` measures the ship against the *anchor*, not the water
+    // cell it was sent to — the two differ by the width of the beach ring —
+    // so approach until that distance is inside its range.
+    let anchor_world = (
+        i32::from(island.x_pos) + anchor.0,
+        i32::from(island.y_pos) + anchor.1,
+    );
     for _ in 0..3_000 {
         sim.tick(100);
         let ship = &sim.trade_ships[ship_index as usize];
-        if (ship.world_x - world.0).abs() + (ship.world_y - world.1).abs() < 12 {
+        if (ship.world_x - anchor_world.0).abs() + (ship.world_y - anchor_world.1).abs() < 12 {
             break;
         }
     }

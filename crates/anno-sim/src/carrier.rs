@@ -443,13 +443,31 @@ fn source_supplier_ware_admits(candidate_ware_slot: u8, requested_good: Good) ->
 }
 
 /// Run FUN_00471380's first-reservable type-8 supplier search. The callback
-/// accepts the first same-owner root whose requested input has at least half
-/// a TRAEGER load available, reserving up to the full fixed-point load.
+/// accepts the first root of the requesting settlement whose requested input
+/// has at least half a TRAEGER load available, reserving up to the full
+/// fixed-point load.
+///
+/// `map_owner_slot` is the requesting root's settlement slot, which
+/// `FUN_0044ab60` reads out of that root's own map word
+/// (`uVar5 = *puVar1 >> 0x13 & 7`, `1602_exe.c:51975`) and stores in the
+/// figure-8 event record at `+0x2b`; `FUN_004704d0` compares it against every
+/// candidate cell's slot bits (`1602_exe.c:79457-79462`). It is a settlement
+/// index, not a player index — two settlements of the same player on one
+/// island do not supply each other.
+///
+/// `source_radius` is the requesting root's compiled `Radius` (`def+0x20`),
+/// passed through the event record at `+0x00` (`1602_exe.c:51975-52007`). It
+/// bounds the search twice: the scratch window `FUN_004704d0` allocates is the
+/// whole coordinate space the wave has, and `FUN_00471280` then carves that
+/// rectangle down to the `FUN_00404d70` disc. Both write the impassable
+/// direction marker, so a supplier inside the disc whose only walkable route
+/// leaves it is unreachable rather than merely distant.
 #[allow(clippy::too_many_arguments)]
 fn select_carrier_source_wave(
     start: (i32, i32),
     island: u8,
-    owner: u8,
+    map_owner_slot: u8,
+    source_radius: u8,
     requested_good: Good,
     origin_footprint: (u8, u8),
     suppliers: &[CarrierSupplier],
@@ -466,15 +484,48 @@ fn select_carrier_source_wave(
     let minimum_fixed = (max_fixed / 2).min(0x40);
     let mut grid = map.carrier_path_grid();
 
+    // `FUN_00459150` sizes the scratch window from the requesting root's
+    // oriented footprint (`1602_exe.c:61664-61671`): each axis is
+    // `((size - 1) & 1) + 1 + radius * 2`, so an even extent buys one extra
+    // cell on the high side. `left`/`top` are `centre - radius`.
+    let radius = usize::from(source_radius);
+    let extra_x = usize::from((origin_footprint.0.max(1) - 1) & 1);
+    let extra_y = usize::from((origin_footprint.1.max(1) - 1) & 1);
+    let window_origin = (
+        start.0 - i32::from(source_radius),
+        start.1 - i32::from(source_radius),
+    );
+    let window_width = extra_x + 1 + radius * 2;
+    let window_height = extra_y + 1 + radius * 2;
+    // A root whose oriented footprint misses the window is never rasterised,
+    // so it can never carry the goal bit. The source gets that for free — its
+    // raster only ever walks window cells — while the port scans the island's
+    // whole root table, so the same bound has to be applied by hand. The test
+    // uses the candidate's extents rather than its anchor because
+    // `FUN_004704d0` stamps the goal bit per cell: a root anchored outside the
+    // window still becomes a target through whichever of its cells reach in.
+    let intersects_window = |candidate: &SourceMapCellState| {
+        if source_radius == 0 {
+            return true;
+        }
+        let last_x = i32::from(candidate.x) + i32::from(candidate.footprint_width.max(1)) - 1;
+        let last_y = i32::from(candidate.y) + i32::from(candidate.footprint_height.max(1)) - 1;
+        last_x >= window_origin.0
+            && i32::from(candidate.x) < window_origin.0 + window_width as i32
+            && last_y >= window_origin.1
+            && i32::from(candidate.y) < window_origin.1 + window_height as i32
+    };
+
     for candidate in source_cells.iter().copied() {
         if candidate.island != island
+            || candidate.source_map_owner_slot != map_owner_slot
             || !source_supplier_ware_admits(candidate.source_output_ware_slot, requested_good)
+            || !intersects_window(&candidate)
         {
             continue;
         }
         let Some(supplier) = suppliers.iter().copied().find(|supplier| {
             supplier.island == candidate.island
-                && supplier.owner == owner
                 && supplier.x == u16::from(candidate.x)
                 && supplier.y == u16::from(candidate.y)
         }) else {
@@ -508,6 +559,30 @@ fn select_carrier_source_wave(
         grid.open_source_object_footprint(footprint);
     }
 
+    // The window is the scratch-grid allocation itself (`1602_exe.c:79439`
+    // stamps `0x0c` over every cell of it before the island intersection is
+    // filled in), so it also clips the footprint reopened above; applying it
+    // after `FUN_004710b0` reproduces that clip. `FUN_00471280` then carves
+    // the rectangle to the `FUN_00404d70` disc, which is the order
+    // `FUN_00459150` runs them in (`1602_exe.c:61675-61681`).
+    //
+    // A zero `Radius` keeps the port's unclipped search: the source would give
+    // such a root a degenerate `1 x 1` window that can reach nothing at all,
+    // and the port's synthetic maps and hand-built fixtures leave the compiled
+    // byte at zero. This mirrors the type-11 guard in
+    // `select_city_cart_source_wave`.
+    if source_radius != 0 {
+        grid.block_outside_rect(window_origin, window_width, window_height);
+        grid.block_outside_source_radius_window(
+            window_origin,
+            window_width,
+            window_height,
+            radius,
+            extra_x,
+            extra_y,
+        );
+    }
+
     let mut selected: Option<(usize, CarrierSupplier, (i32, i32), u16)> = None;
     let result = grid
         .search_with_blocked_cell_callback(start, |position, _| {
@@ -516,11 +591,11 @@ fn select_carrier_source_wave(
                     |(state_idx, candidate)| {
                         let supplier = suppliers.iter().copied().find(|supplier| {
                             supplier.island == candidate.island
-                                && supplier.owner == owner
                                 && supplier.x == u16::from(candidate.x)
                                 && supplier.y == u16::from(candidate.y)
                         })?;
                         let within_footprint = candidate.island == island
+                            && candidate.source_map_owner_slot == map_owner_slot
                             && source_supplier_ware_admits(
                                 candidate.source_output_ware_slot,
                                 requested_good,
@@ -642,21 +717,31 @@ fn try_spawn_carrier_for_request(
 
     // `FUN_004710b0` resolves the footprint through `FUN_00463980`, i.e. from
     // the live map record under the figure's own tile; the port's equivalent
-    // record is the requesting root's `SourceMapCellState`.
-    let origin_footprint = source_cells
+    // record is the requesting root's `SourceMapCellState`. The same record
+    // supplies the two bounds `FUN_0044ab60` copies into the figure-8 event:
+    // the compiled `Radius` at `+0x00` and the root's own settlement slot at
+    // `+0x2b` (`1602_exe.c:51975-52007`).
+    let origin_cell = source_cells
         .iter()
-        .find(|cell| {
-            cell.matches(building.island_id, building.tile_x, building.tile_y)
-        })
+        .copied()
+        .find(|cell| cell.matches(building.island_id, building.tile_x, building.tile_y));
+    let origin_footprint = origin_cell
         .map(|cell| (cell.footprint_width, cell.footprint_height))
         .unwrap_or((1, 1));
+    let source_radius = origin_cell
+        .map(|cell| cell.source_transfer_radius)
+        .unwrap_or(0);
+    let map_owner_slot = origin_cell
+        .map(|cell| cell.source_map_owner_slot)
+        .unwrap_or(0);
 
     let mut selected: Option<(usize, CarrierSupplier, (i32, i32), Vec<(i32, i32)>, u16)> = None;
     if let Some(map) = map {
         let (state_idx, supplier, reached, path, cargo_fixed) = select_carrier_source_wave(
             start,
             building.island_id,
-            building.owner,
+            map_owner_slot,
+            source_radius,
             request.good,
             origin_footprint,
             suppliers,
@@ -1838,6 +1923,226 @@ mod tests {
         assert_eq!(states[0].storage_fill, 0);
         assert_eq!(states[0].reserved_storage, 0);
         assert_eq!(warehouses[0].reserved(Good::Iron), 4);
+    }
+
+    /// The requesting workshop's own live record. `FUN_0044ab60` reads the
+    /// compiled `Radius` and the settlement slot out of that root's map word
+    /// (`uVar5 = *puVar1 >> 0x13 & 7`) into the figure-8 event record
+    /// (`1602_exe.c:51974-52007`), and `FUN_00459150` bounds the whole search
+    /// with the pair. Its own `Ware` stays `NOWARE`, so the raster never marks
+    /// the requester as a goal for an Iron request.
+    fn requester_state(x: u8, y: u8, radius: u8, slot: u8) -> SourceMapCellState {
+        SourceMapCellState {
+            source_transfer_radius: radius,
+            source_map_owner_slot: slot,
+            ..SourceMapCellState::new(
+                0,
+                x,
+                y,
+                &anno_formats::cod::BuildingDef {
+                    kind: "GEBAEUDE".into(),
+                    properties: [("ProdKind".into(), "HANDWERK".into())].into(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
+        }
+    }
+
+    fn iron_supplier(x: u16, y: u16) -> CarrierSupplier {
+        CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x,
+            y,
+            good: Good::Iron,
+            available: 4,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 32,
+            source_footprint: (1, 1),
+        }
+    }
+
+    /// A square island of open ground with the listed cells left out.
+    /// `populate_static_island_cells` pre-fills the whole TRAEGER template
+    /// with the `0x0c` blocker and opens only the tiles it is given, exactly
+    /// as `FUN_004704d0` fills its window (`1602_exe.c:79439-79446`), so an
+    /// absent tile is impassable.
+    fn open_island_map_without(size: u8, blocked: &[(u8, u8)]) -> IslandMap {
+        let ground = anno_formats::cod::BuildingDef {
+            source_id: 20_001,
+            kind: "BODEN".to_owned(),
+            properties: [("Wegspeed".to_owned(), "100,100,100,100".to_owned())].into(),
+            ..Default::default()
+        };
+        let tiles = (0..size)
+            .flat_map(|y| (0..size).map(move |x| (x, y)))
+            .filter(|position| !blocked.contains(position))
+            .map(|(x, y)| anno_formats::szs::IslandTile {
+                building_id: 1,
+                x,
+                y,
+                orientation: 0,
+                anim_count: 0,
+                flags: 0,
+            })
+            .collect();
+        let island = anno_formats::szs::Island {
+            number: 0,
+            width: size,
+            height: size,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles,
+            city: None,
+        };
+        IslandMap::from_island(&island, &[ground])
+    }
+
+    /// `FUN_00471280` carves the raw `radius * 2 + 1` window down to the
+    /// `FUN_00404d70` disc (`1602_exe.c:80102-80131`). Five rows above the
+    /// centre `DAT_005b7460[5]` retains a half-width of 2, so an Iron
+    /// producer at `dx == 2` is still a goal.
+    #[test]
+    fn generic_carrier_source_wave_accepts_a_supplier_on_the_radius_disc_edge() {
+        let consumer = BuildingInstance::new(0, 0, 10, 10, 0);
+        let mut states = vec![
+            requester_state(10, 10, 5, 0),
+            supplier_state(12, 5, 128, Good::Iron),
+        ];
+
+        let carrier = try_spawn_carrier(
+            &consumer,
+            &consumer_def(),
+            &[iron_supplier(12, 5)],
+            &mut states,
+            &mut [],
+            &[IslandMap::new_open(0, 20, 20)],
+            CarrierConfig::default(),
+        )
+        .expect("a producer inside the radius-5 disc is reachable");
+
+        assert_eq!((carrier.target_x, carrier.target_y), (12, 5));
+        assert_eq!(states[1].reserved_storage, 128);
+    }
+
+    /// One column further out the same row is outside the disc — but still
+    /// inside the `11 x 11` rectangle, so only `FUN_00471280`'s carve rejects
+    /// it. Before the radius bound existed the port searched the whole island
+    /// and accepted this producer.
+    #[test]
+    fn generic_carrier_source_wave_rejects_a_supplier_one_tile_outside_the_disc() {
+        let consumer = BuildingInstance::new(0, 0, 10, 10, 0);
+        let mut states = vec![
+            requester_state(10, 10, 5, 0),
+            supplier_state(13, 5, 128, Good::Iron),
+        ];
+
+        assert!(try_spawn_carrier(
+            &consumer,
+            &consumer_def(),
+            &[iron_supplier(13, 5)],
+            &mut states,
+            &mut [],
+            &[IslandMap::new_open(0, 20, 20)],
+            CarrierConfig::default(),
+        )
+        .is_none());
+        assert_eq!(states[1].reserved_storage, 0);
+    }
+
+    /// The disc is a wall, not a scoring bound: `FUN_00471280` writes the same
+    /// `0x0c` direction marker the raster uses for impassable ground
+    /// (`1602_exe.c:80140-80147`), and `FUN_00471380` has no step budget, so a
+    /// producer sitting inside the disc whose only walkable route leaves it is
+    /// unreachable. The wall here spans exactly the disc's width three rows
+    /// above the centre (`half_width == 4`), leaving the two carved-out cells
+    /// of that row as the island's only way around.
+    #[test]
+    fn generic_carrier_source_wave_cannot_route_around_the_disc() {
+        let wall: Vec<(u8, u8)> = (6..=14).map(|x| (x, 7)).collect();
+        let consumer = BuildingInstance::new(0, 0, 10, 10, 0);
+        let mut states = vec![
+            requester_state(10, 10, 5, 0),
+            supplier_state(10, 5, 128, Good::Iron),
+        ];
+
+        assert!(try_spawn_carrier(
+            &consumer,
+            &consumer_def(),
+            &[iron_supplier(10, 5)],
+            &mut states,
+            &mut [],
+            &[open_island_map_without(20, &wall)],
+            CarrierConfig::default(),
+        )
+        .is_none());
+        assert_eq!(states[1].reserved_storage, 0);
+
+        // The detour at `x == 5` and `x == 15` is open ground, so the same
+        // fixture succeeds for a root whose compiled `Radius` leaves the
+        // search unclipped — which is what every type-8 search did before the
+        // window and the carve were ported.
+        let mut unbounded = vec![
+            requester_state(10, 10, 0, 0),
+            supplier_state(10, 5, 128, Good::Iron),
+        ];
+        assert!(try_spawn_carrier(
+            &consumer,
+            &consumer_def(),
+            &[iron_supplier(10, 5)],
+            &mut unbounded,
+            &mut [],
+            &[open_island_map_without(20, &wall)],
+            CarrierConfig::default(),
+        )
+        .is_some());
+    }
+
+    /// `FUN_004704d0` compares the candidate cell's slot bits with the event
+    /// record's `+0x2b` (`1602_exe.c:79457-79462`), which `FUN_0044ab60` took
+    /// from the requesting root's own map word. That is a settlement index,
+    /// not a player index: one player's second settlement on the same island
+    /// is as foreign to this workshop as another player's.
+    #[test]
+    fn generic_carrier_source_wave_rejects_a_producer_from_another_settlement_slot() {
+        let consumer = BuildingInstance::new(0, 0, 10, 10, 0);
+        let mut states = vec![
+            requester_state(10, 10, 5, 0),
+            SourceMapCellState {
+                source_map_owner_slot: 1,
+                ..supplier_state(11, 10, 128, Good::Iron)
+            },
+        ];
+
+        assert!(try_spawn_carrier(
+            &consumer,
+            &consumer_def(),
+            &[iron_supplier(11, 10)],
+            &mut states,
+            &mut [],
+            &[IslandMap::new_open(0, 20, 20)],
+            CarrierConfig::default(),
+        )
+        .is_none());
+        assert_eq!(states[1].reserved_storage, 0);
+
+        let mut same_settlement = vec![
+            requester_state(10, 10, 5, 0),
+            supplier_state(11, 10, 128, Good::Iron),
+        ];
+        assert!(try_spawn_carrier(
+            &consumer,
+            &consumer_def(),
+            &[iron_supplier(11, 10)],
+            &mut same_settlement,
+            &mut [],
+            &[IslandMap::new_open(0, 20, 20)],
+            CarrierConfig::default(),
+        )
+        .is_some());
     }
 
     #[test]

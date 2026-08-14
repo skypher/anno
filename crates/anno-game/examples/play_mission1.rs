@@ -101,14 +101,32 @@ fn main() {
         }
         seen
     };
+    // The Kontor is `Kind: HQ` (35), whose terrain arm admits only
+    // `{STRASSE, WALD, BODEN, RUINE, PLATZ}` (`FUN_00464660`), and it reaches
+    // the water through `Strandflg` — it stands on land and *fronts* a beach
+    // rather than standing in the surf. Ask the real gate: "coastal plus one
+    // open footprint cell" used to accept a footprint half in the sea.
+    let kontor_def_index = cod
+        .buildings
+        .iter()
+        .position(|b| b.source_id == 22103)
+        .expect("Kontor definition");
     let anchor = (2..island.height as i32 - 5)
         .flat_map(|y| (2..island.width as i32 - 4).map(move |x| (x, y)))
         .filter(|&(x, y)| {
             sim.island_maps[mi].is_coastal(x, y)
-                && (0..3).any(|dy| (0..2).any(|dx| open_ground(kind_at(&sim, x + dx, y + dy))))
+                && anno_game::game_commands::can_place_building(
+                    &island,
+                    &sim.island_maps[mi],
+                    &defs[kontor_def_index],
+                    x,
+                    y,
+                    2,
+                    3,
+                )
         })
         .max_by_key(|&anchor| cart_component(&sim, anchor).len())
-        .expect("coastal anchor whose Kontor footprint reaches open ground");
+        .expect("buildable coastal anchor for the Kontor footprint");
     // The ship has to stop on navigable water within `found_kontor`'s range.
     let dock = (-8i32..=8)
         .flat_map(|dy| (-8i32..=8).map(move |dx| (dx, dy)))
@@ -157,9 +175,13 @@ fn main() {
     // refuse to build anywhere the cart cannot follow.
     let reachable = cart_component(&sim, anchor);
     println!("cart-reachable open ground from the Kontor: {}", reachable.len());
+    // A supplier's own cell is opened by the raster as a *goal* whatever its
+    // terrain (`FUN_004704d0` stamps the goal bit before the kind test), so the
+    // cart only has to reach a cell adjacent to the footprint — which is what
+    // lets a beach-only fishery be collected at all.
     let cart_can_reach = |x: i32, y: i32, w: u8, h: u8| {
-        (0..i32::from(h))
-            .flat_map(|dy| (0..i32::from(w)).map(move |dx| (dx, dy)))
+        (-1..=i32::from(h))
+            .flat_map(|dy| (-1..=i32::from(w)).map(move |dx| (dx, dy)))
             .any(|(dx, dy)| reachable.contains(&(x + dx, y + dy)))
     };
 
@@ -263,16 +285,18 @@ fn main() {
                 if dx * dx + dy * dy > 16 * 16 {
                     continue;
                 }
-                let free = (0..i32::from(h)).all(|dy| {
-                    (0..i32::from(w)).all(|dx| {
-                        map.is_walkable(x + dx, y + dy)
-                            && open_ground(
-                                map.source_map_kind_and_owner(x + dx, y + dy)
-                                    .map(|(k, _)| k)
-                                    .unwrap_or(u8::MAX),
-                            )
-                    })
-                }) && !used.iter().any(|&(ux, uy, uw, uh)| {
+                // Ask the real terrain gate rather than a walkability guess:
+                // the fishery is `Kind: STRANDHAUS` and is admitted only on
+                // beach, which no walkability predicate describes.
+                let free = anno_game::game_commands::can_place_building(
+                    &island,
+                    map,
+                    def,
+                    x,
+                    y,
+                    w,
+                    h,
+                ) && !used.iter().any(|&(ux, uy, uw, uh)| {
                         x < ux + i32::from(uw)
                             && ux < x + i32::from(w)
                             && y < uy + i32::from(uh)
@@ -461,12 +485,37 @@ fn main() {
     // colony earn its own cloth through sheep farm -> weaving hut, which is
     // enough on its own because group-1 satisfaction saturates on cloth.
     println!("--- stage 3: colony produces its own cloth ---");
-    for minute in 11..=60u32 {
+    for minute in 11..=40u32 {
         for _ in 0..600 {
             sim.tick(100);
             sim.drain_source_kind13_replacements(&cod);
         }
         report(&sim, format!("min {minute}"));
+    }
+
+    // --- Stage 4: scale toward the goal ---
+    // The colony is self-sustaining but capped by its house count: pioneer
+    // huts hold 2 and settler houses 6, so 100 inhabitants needs far more
+    // than the opening four. Expand the core once wood is flowing, and add a
+    // second food and cloth line to carry the larger population.
+    println!("--- stage 4: expanding the colony ---");
+    build_on_resource(&mut sim, &mut used, 270, 57, "fishery1");
+    build_on_resource(&mut sim, &mut used, 402, 53, "forester1");
+    build_on_resource(&mut sim, &mut used, 412, 52, "sheep2");
+    build(&mut sim, &mut used, 388, "weaver1");
+    for n in 4..24 {
+        build(&mut sim, &mut used, 414, &format!("hut{n}"));
+    }
+    site_report(&sim);
+    for minute in 41..=120u32 {
+        for _ in 0..600 {
+            sim.tick(100);
+            sim.drain_source_kind13_replacements(&cod);
+        }
+        report(&sim, format!("min {minute}"));
+        if minute % 20 == 0 {
+            cell_report(&sim);
+        }
     }
     println!(
         "objectives={:?}",

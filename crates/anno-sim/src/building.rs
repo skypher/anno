@@ -184,6 +184,16 @@ pub struct BuildingDef {
     pub required_fertility: Option<anno_formats::szs::Fertility>,
 }
 
+impl BuildingDef {
+    /// The compiled outer-`Kind` code at definition offset `+0x04`, which
+    /// `FUN_00464660` (`1602_exe.c:70050`) switches on to decide which ground
+    /// this definition may be built on. `None` for a definition whose `Kind`
+    /// string is absent or outside the original's name table.
+    pub fn source_kind_code(&self) -> Option<u8> {
+        anno_formats::cod::BuildingDef::source_kind_code_for(&self.kind)
+    }
+}
+
 impl Default for BuildingDef {
     /// A neutral single-tile craft building: no goods, no costs, the
     /// haeuser.cod template values for the stateful-parser defaults

@@ -274,7 +274,14 @@ use std::path::Path;
 ///       `DAT_00562dc8` entry (bucket, counter snapshot, growth phase,
 ///       placement jitter). The table itself is not saved by the original
 ///       either; it is rebuilt from tile state on load.
-pub const SAVE_VERSION: u32 = 141;
+/// v142: the city hazard block. Source city records carry `+0x1fe` as the
+///       signed affliction **count** it really is rather than a boolean, and
+///       the `DAT_005a5100` affliction table and undrained `FUN_0046a8c0`
+///       type-7 actions persist. The original saves neither the table nor
+///       the kind-13 records' two affliction bits, so an original save/load
+///       cures every plague and puts out every fire; keeping them here is a
+///       deliberate improvement, not a reproduction.
+pub const SAVE_VERSION: u32 = 142;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -288,7 +295,13 @@ pub const SAVE_VERSION: u32 = 141;
 /// warehouse records retain city population, source-root footprint, and
 /// type-8 path-class data; figures retain independent source animation
 /// accumulators and the kind-13 source slot table in a distinct bincode layout.
-pub const MIN_LOADABLE_VERSION: u32 = 138;
+///
+/// v142 baseline: bincode is not self-describing, so neither the city
+/// record's `growth_blocked: bool` -> `active_afflictions: i16` widening nor
+/// the four fields appended to `SourceMapCellState` can be read out of an
+/// older payload — `#[serde(default)]` cannot fill a field the encoding
+/// never delimits. Everything before v142 is a hard binary incompatibility.
+pub const MIN_LOADABLE_VERSION: u32 = 142;
 
 /// Magic bytes prefixing every save file.
 pub const SAVE_MAGIC: [u8; 4] = *b"ASV1";
@@ -319,6 +332,17 @@ pub struct SaveState {
     pub source_static_map_backing_cells: Vec<SourceMapCellState>,
     pub source_kind13_locations: SourceKind13LocationTable,
     pub source_kind13_dispatch: SourceKind13DispatchState,
+    /// The source affliction table `DAT_005a5100`. The original persists
+    /// none of it — no save chunk touches the table and `FUN_00485530`
+    /// drops the kind-13 records' two affliction bits — so an original
+    /// save/reload cures every plague and extinguishes every fire. This
+    /// port keeps it, which is strictly better behaviour.
+    #[serde(default)]
+    pub source_afflictions: crate::data_bridge::SourceAfflictionTable,
+    /// Posted-but-undrained `FUN_0046a8c0` type-7 map actions.
+    #[serde(default)]
+    pub source_deferred_map_demolitions:
+        Vec<crate::simulation::SourceDeferredMapDemolition>,
     pub source_kind13_replacement_commands: Vec<crate::simulation::SourceKind13ReplacementCommand>,
     pub source_cities: SourceCityTable,
     pub source_figure_events: crate::source_figure_event::SourceFigureEventRegistry,
@@ -438,6 +462,8 @@ impl Simulation {
             source_static_map_backing_cells: self.source_static_map_backing_cells.clone(),
             source_kind13_locations: self.source_kind13_locations.clone(),
             source_kind13_dispatch: self.source_kind13_dispatch.clone(),
+            source_afflictions: self.source_afflictions.clone(),
+            source_deferred_map_demolitions: self.source_deferred_map_demolitions.clone(),
             source_kind13_replacement_commands: self.source_kind13_replacement_commands.clone(),
             source_cities: self.source_cities.clone(),
             source_figure_events: self.source_figure_events.clone(),
@@ -524,6 +550,8 @@ impl Simulation {
         self.source_static_map_backing_cells = s.source_static_map_backing_cells;
         self.source_kind13_locations = s.source_kind13_locations;
         self.source_kind13_dispatch = s.source_kind13_dispatch;
+        self.source_afflictions = s.source_afflictions;
+        self.source_deferred_map_demolitions = s.source_deferred_map_demolitions;
         self.source_kind13_replacement_commands = s.source_kind13_replacement_commands;
         self.source_cities = s.source_cities;
         self.source_figure_events = s.source_figure_events;
@@ -677,6 +705,8 @@ mod tests {
             source_static_map_backing_cells: vec![],
             source_kind13_locations: SourceKind13LocationTable::default(),
             source_kind13_dispatch: SourceKind13DispatchState::default(),
+            source_afflictions: crate::data_bridge::SourceAfflictionTable::default(),
+            source_deferred_map_demolitions: vec![],
             source_kind13_replacement_commands: vec![],
             source_cities: SourceCityTable::default(),
             source_figure_events: crate::source_figure_event::SourceFigureEventRegistry::default(),
@@ -998,6 +1028,10 @@ mod tests {
                 source_growth_phase_seen: 0,
                 source_growth_phase: 0,
                 source_placement_variant: 17,
+                source_destroy_flag: true,
+                source_wood_cost_fixed: 320,
+                source_bricks_cost_fixed: 96,
+                source_path_class_loaded_road: 32,
             });
         let mut static_root = sim.source_map_cell_states[0];
         static_root.x = 14;
@@ -1442,6 +1476,10 @@ mod tests {
                 source_growth_phase_seen: 0,
                 source_growth_phase: 0,
                 source_placement_variant: 17,
+                source_destroy_flag: true,
+                source_wood_cost_fixed: 320,
+                source_bricks_cost_fixed: 96,
+                source_path_class_loaded_road: 32,
             }]
         );
         assert_eq!(sim2.source_map_cell_states[0].market_frame_selector(4), 3);

@@ -392,7 +392,15 @@ fn a_forester_depletes_and_regrows_its_woodland() {
     // sub-step a rollover still takes 150 sub-steps, roughly one per sweep.
     const FOREST_BUCKET: usize = 20;
     let mut seen_ripe_again: HashSet<(u8, u8)> = HashSet::new();
-    let mut regrown_output = depleted_output;
+    // Collect the store first. `Maxlager: 10` is the forester's cap and phase
+    // one now reaches it — the build gate lets the hut stand in the woodland
+    // itself, so it depletes its three cells with a full store — and a
+    // producer whose store is full cannot make one more unit no matter how
+    // much woodland grows back. Emptying it is what a city cart's collection
+    // does, and it makes "resumed producing" observable at all: the counter
+    // below has to climb from zero again.
+    sim.buildings[building_index].output_stock = 0;
+    let mut regrown_output = 0;
     let mut steps_to_regrow = 0;
     for step in 0..2_000 {
         sim.source_growth_bucket_elapsed_ms[FOREST_BUCKET] += 1_000;
@@ -408,14 +416,14 @@ fn a_forester_depletes_and_regrows_its_woodland() {
             }
         }
         regrown_output = regrown_output.max(sim.buildings[building_index].output_stock);
-        if seen_ripe_again.len() == harvested.len() && regrown_output > depleted_output {
+        if seen_ripe_again.len() == harvested.len() && regrown_output > 0 {
             break;
         }
     }
 
     println!(
         "after {steps_to_regrow} more sub-steps: {}/{} harvested cells ripened again, \
-         {depleted_output} -> {regrown_output} whole wood",
+         {depleted_output} whole wood before collection, {regrown_output} made since",
         seen_ripe_again.len(),
         harvested.len()
     );
@@ -432,8 +440,8 @@ fn a_forester_depletes_and_regrows_its_woodland() {
         harvested.len()
     );
     assert!(
-        regrown_output > depleted_output,
-        "the forester never resumed producing: {depleted_output} wood before regrowth, \
-         {regrown_output} after"
+        regrown_output > 0,
+        "the forester never resumed producing after regrowth: it had made \
+         {depleted_output} wood before its store was collected, and none since"
     );
 }

@@ -390,7 +390,10 @@ impl BuildingDef {
             .and_then(|group| group.trim().parse().ok())
     }
 
-    fn source_kind_code_for(kind: &str) -> Option<u8> {
+    /// The same name → code table applied to a bare `Kind` string, for
+    /// callers that hold a definition converted away from this type (the
+    /// simulation's own `BuildingDef` keeps only the name).
+    pub fn source_kind_code_for(kind: &str) -> Option<u8> {
         match kind {
             "UNUSED" => Some(0),
             "STRASSE" | "HANDWERK" => Some(1),

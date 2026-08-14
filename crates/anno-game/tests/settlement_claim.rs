@@ -136,28 +136,63 @@ fn found_island_ten(corpus: &Corpus) -> Settlement {
         .iter()
         .position(|map| map.island_id == 10)
         .expect("island 10 map");
+    // The anchor has to be ground the Kontor's own build gate admits —
+    // `FUN_00464660` case 0x23, `{STRASSE, WALD, BODEN, RUINE, PLATZ}` — with
+    // hinterland behind it. This used to take the first coastal tile with two
+    // walkable cells east of it, which on this island was open `MEER` with
+    // more `MEER` behind it: the whole settlement under test was founded at
+    // sea, and the ship was sailed *onto* the anchor.
+    let kontor = &corpus.defs[definition_index(&corpus.cod, "22103")];
+    let ship_start = {
+        let ship = &sim.trade_ships[ship_index as usize];
+        (ship.world_x, ship.world_y)
+    };
     let anchor = (2..i32::from(island.height) - 2)
         .flat_map(|y| (2..i32::from(island.width) - 2).map(move |x| (x, y)))
-        .find(|&(x, y)| {
+        .filter(|&(x, y)| {
             sim.island_maps[map_index].is_coastal(x, y)
+                && anno_game::game_commands::can_place_building(
+                    island,
+                    &sim.island_maps[map_index],
+                    kontor,
+                    x,
+                    y,
+                    kontor.width,
+                    kontor.height,
+                )
                 && sim.island_maps[map_index].is_walkable(x + 1, y)
                 && sim.island_maps[map_index].is_walkable(x + 2, y)
         })
+        .min_by_key(|&(x, y)| {
+            (ship_start.0 - (i32::from(island.x_pos) + x)).abs()
+                + (ship_start.1 - (i32::from(island.y_pos) + y)).abs()
+        })
         .expect("a west-coast anchor with hinterland");
-    let world = (
+    let anchor_world = (
         i32::from(island.x_pos) + anchor.0,
         i32::from(island.y_pos) + anchor.1,
     );
+    // The ship stops on navigable water beside the anchor, and approaches
+    // until `found_kontor`'s own anchor-relative range is satisfied.
+    let dock = (-8_i32..=8)
+        .flat_map(|dy| (-8_i32..=8).map(move |dx| (anchor.0 + dx, anchor.1 + dy)))
+        .filter(|&(x, y)| {
+            sim.island_maps[map_index]
+                .source_map_kind_and_owner(x, y)
+                .is_some_and(|(kind, _)| kind == 19)
+        })
+        .min_by_key(|&(x, y)| (x - anchor.0).abs() + (y - anchor.1).abs())
+        .expect("open water beside the anchor");
     assert!(sim.apply_command(&anno_sim::commands::Command::SailShip {
         player: 0,
         ship_index,
-        world_x: world.0,
-        world_y: world.1,
+        world_x: i32::from(island.x_pos) + dock.0,
+        world_y: i32::from(island.y_pos) + dock.1,
     }));
     for _ in 0..3_000 {
         sim.tick(100);
         let ship = &sim.trade_ships[ship_index as usize];
-        if (ship.world_x - world.0).abs() + (ship.world_y - world.1).abs() < 12 {
+        if (ship.world_x - anchor_world.0).abs() + (ship.world_y - anchor_world.1).abs() < 12 {
             break;
         }
     }
@@ -456,7 +491,16 @@ fn a_forester_placed_after_founding_harvests() {
                 .2
                 .max(settlement.sim.buildings[building].output_stock);
         }
-        if peak[0].2 >= 2 && peak[1].2 >= 2 {
+        // Stop only once every quantity the assertions below read has
+        // arrived. Breaking on `output_stock` alone raced the harvest chain:
+        // the legacy building counter reaches 2 within ~200 s wherever the
+        // hut stands, while the source-cell raw buffer it is supposed to be
+        // evidence of takes longer from a site deep in the woodland — which
+        // is where the real build gate now lets the hut go.
+        if peak
+            .iter()
+            .all(|&(raw, fill, output)| raw > 0 && fill > 0 && output >= 2)
+        {
             break;
         }
     }

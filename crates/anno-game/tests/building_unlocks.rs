@@ -61,9 +61,14 @@ fn def_index(defs: &[BuildingDef], pick: impl Fn(&BuildingDef) -> bool) -> usize
         .expect("definition present in haeuser.cod")
 }
 
-/// First tile on `island` where the non-unlock placement gates
-/// (footprint walkability, fishery coastline) all pass, so the only
-/// thing `place_building` can still object to is the unlock mask.
+/// First tile on `island` where the non-unlock placement gate — the
+/// original's terrain table `FUN_00464450`/`FUN_00464660` — passes, so
+/// the only thing `place_building` can still object to is the unlock
+/// mask.
+///
+/// The separate fishery-coastline check that used to sit here is gone
+/// with the one in `place_building`: the fishery is `Kind: STRANDHAUS`,
+/// and the terrain gate already admits it on beach kinds only.
 ///
 /// Fertility is deliberately not consulted: the original's only
 /// placement refusal is `FUN_0042d530` (`1602_exe.c:33210-33265`),
@@ -79,7 +84,6 @@ fn free_tile(
         .island_maps
         .iter()
         .find(|m| m.island_id == island.number)?;
-    let needs_coast = def.output_good == Good::Fish;
     for y in 0..island.height as i32 {
         for x in 0..island.width as i32 {
             if skip.iter().any(|&(sx, sy)| {
@@ -87,13 +91,7 @@ fn free_tile(
             }) {
                 continue;
             }
-            if !can_place_building(island, map, x, y, def.width, def.height) {
-                continue;
-            }
-            if needs_coast
-                && !(0..def.height as i32)
-                    .any(|dy| (0..def.width as i32).any(|dx| map.is_coastal(x + dx, y + dy)))
-            {
+            if !can_place_building(island, map, def, x, y, def.width, def.height) {
                 continue;
             }
             return Some((x, y));

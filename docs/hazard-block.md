@@ -4,9 +4,14 @@ Companion to `docs/growth-timer.md` and `docs/logistics-gaps.md`. Addresses are
 VA in `extracted/1602.exe`; line numbers are `decompiled/1602_exe.c`. Claims are
 VERIFIED against the disassembly unless marked INFERRED.
 
-Nothing here is implemented. The Rust already models the *effects* of
-`house.lifecycle_flags & 3` (`source_transfer_delta`) and of `city[0x1fe]`
-(`growth_blocked`) — but nothing ever sets either.
+**Status.** §9 Stage 1 is implemented (`data_bridge.rs`, `simulation.rs`,
+`source_cell.rs`): the affliction table and registrar, `FUN_0047b540`,
+`FUN_0047f510`, the fire branch of the event block, `FUN_0047a020` type 2, the
+deferred type-7 ruin conversion, `DAT_0049af08`, and the `FUN_004722f0` area
+scan. Stage 2 (plague) and Stage 3 (vagrant, message emitters) are not, and
+their `rand()` draws are **not** made — see the deviations noted in §9.
+
+**Corrections found while implementing Stage 1** are marked `[FIX]` below.
 
 ## 0. Corrections to earlier notes
 
@@ -128,15 +133,26 @@ for (; p < end; p += 0x50)                         // stride FOUR records
     }
 ```
 
-`def[0x6a] & 0x80` is **`Destroyflg`** (loader `:66892` → `:66913-66915`;
-authored only on `RUINE` / `STRANDRUINE` records). So this is the burnt-out
-marketplace reaper: one ruined market removed per event cycle, at a random
-stride-4 phase. **It draws one `rand()` whether or not it finds anything**,
-which is what makes it mandatory for stream fidelity.
+`def[0x6a] & 0x80` is **`Destroyflg`** (loader `:66892` → `:66913-66915`).
+So this is the burnt-out marketplace reaper: one destroyed market removed per
+event cycle, at a random stride-4 phase. **It draws one `rand()` whether or not
+it finds anything**, which is what makes it mandatory for stream fidelity.
+
+`[FIX]` `Destroyflg` is **not** "authored only on `RUINE` / `STRANDRUINE`". The
+shipped haeuser.cod authors it on 26 records: `RUINE`, `STRANDRUINE`, every
+`HANG`/`HANGECK`/`HANGQUELL`, `STRAND`/`STRANDECKA`/`STRANDECKI`/`STRANDMUND`,
+`FLUSS`/`FLUSSECK`, the `IDHAFEN+20` `HQ`, two native `GEBAEUDE` plantations —
+and, decisively, **`Zerstörter Marktplatz`** (`Id: IDDIVERS+22`,
+`Kind: GEBAEUDE`, nested `HAUS_PRODTYP Kind: MARKT`, `Destroyflg: 1`). That
+last record is the *only* definition in the file satisfying both of
+`FUN_0047f510`'s tests, so the reaper's identification is right — but it selects
+a specific authored ruined-marketplace building, not "a ruin standing where a
+market used to be".
 
 This also answers the open question in `docs/logistics-gaps.md` §5: `def+0x6a`
-bit 7 is `Destroyflg`, and the same bit makes `FUN_00479ca0` refuse to afflict a
-ruin (`:86842`).
+bit 7 is `Destroyflg`, and the same bit makes `FUN_00479ca0` refuse to afflict
+any tile carrying it (`:86842`) — which excludes ruins, but also river, beach,
+slope and the destroyed marketplace itself.
 
 ## 4. The affliction table `DAT_005a5100`
 
@@ -150,16 +166,31 @@ Base `0x005A5100`, **8 bytes/entry, 0x120 = 288 entries**. `FUN_00478580`
 | 3 | bits 0..4 type (**1 plague, 2 fire**); bits 5..7 last-seen phase |
 | 4 | zeroed, never read |
 | 5 | elapsed phase counter |
-| 6 | duration in phases (`0x14` = 20 plague, `0x19` = 25 fire) |
+| 6 | duration in phases — see below |
 | 7 | island-local city slot |
 
+`[FIX]` Byte 6 is **not** "20 plague / 25 fire". It is written by the caller,
+and the two callers disagree: `FUN_0047b540` pushes `0x19` (25 phases) when it
+*ignites* a fire, while both spread paths converge on `LAB_0047a56d`, which
+pushes a literal `0x14` for plague **and** fire alike (verified in the
+disassembly: `push 0x14` at `0x0047a3ad` and `0x0047a562`). So an ignited fire
+burns for 25 phases and a fire that spread from one burns for 20.
+
 Hash `FUN_0047a630` (`:87204`): `((island & 3) * 8 + (x & 7)) * 8 + (y & 7)`,
-probe window `[h, min(h + 0x20, 0x120))` — 32 linear probes, clamp dead. This is
-**much coarser** than the kind-13 hash: only the low 3 bits of each axis
-participate, so a 64×64 island folds 8×8-fold. **Collisions are the norm.** When
-the window is full, insert returns 0 and registers nothing — and it has already
-removed the tile's previous entry, so an over-full bucket silently loses
-afflictions.
+probe window `[h, min(h + 0x20, 0x120))` — 32 linear probes, clamp dead (the
+hash tops out at 255 and `255 + 0x20 = 287 < 0x120`). This is **much coarser**
+than the kind-13 hash: only the low 3 bits of each axis participate, so a 64×64
+island folds 8×8-fold. **Collisions are the norm.** When the window is full,
+insert returns 0 and registers nothing.
+
+`[FIX]` "…and it has already removed the tile's previous entry, so an over-full
+bucket silently loses afflictions" overstates it. `FUN_00479be0` (the removal
+lookup) and `FUN_00479ca0` (the free-slot search) probe the **same** window from
+the **same** home slot, so a tile that already held an entry always finds its own
+just-freed slot: re-registering an existing affliction never fails, even in a
+completely full bucket. What a full window loses is a *new* affliction on a tile
+that had none — the roll is spent, the object state is not applied, and
+`city[0x1fe]` does not move.
 
 There is a parallel identical table at `DAT_005624a8` using the same hash; that
 one is combat damage accumulation, not afflictions. Do not conflate them.
@@ -187,9 +218,10 @@ sets `record[0x11] & 0x20`. Then `city[0x1fe] += 1` and the entry is written.
 Messages: plague posts only when the city has **more than two** simultaneous
 afflictions; fire posts unconditionally to the local player.
 
-`city[0x1fe]` is a **signed 16-bit count**, not a flag. The Rust models it as
-`growth_blocked: bool`, which suffices for `source_transfer_delta` but not for
-the plague gate (`== 0`) or the message threshold (`> 2`).
+`city[0x1fe]` is a **signed 16-bit count**, not a flag. The Rust used to model
+it as `growth_blocked: bool`, which sufficed for `source_transfer_delta` but not
+for the plague gate (`== 0`) or the message threshold (`> 2`); it is now
+`SourceCityRecord::active_afflictions: i16` with a `growth_blocked()` accessor.
 
 ### The processor `FUN_0047a020(dt_ms)` — slot S9 (`:86964-87157`)
 
@@ -208,7 +240,22 @@ capacity.
 **Fire spread** (`:87042-87117`) draws up to 3: a `rand() & 0x7F < 0x13`
 (19/128) gate, a uniform pick over the area scan, then a 3-bit roll into
 `DAT_0049af08` keyed on `Holz >= Ziegel`. Radius is `(w + h - 1)/4 + 2` using
-the signed-divide idiom, over building kinds 1-7, `0x0d`, `0x0e`.
+the signed-divide idiom, off the burning root's **unrotated** `+0x10`/`+0x14`
+size (the bounding box uses the *oriented* size instead, via `FUN_00463880`).
+
+`[FIX]` "over building kinds 1-7, `0x0d`, `0x0e`" conflates two different
+filters. Those are the **nested** kinds (`def+0x1c`) of the *post-selection*
+switch, applied to the root the pick resolves to. The area scan itself has no
+kind filter of that shape: `FUN_00472930` opens and reports **outer** map kinds
+(`def+0x04`) `{3, 4, 5, 6, 7, 10, 0x0e, 0x24, 0x25}` — `TOR`, `MAUER`,
+`MAUERSTRAND`, `TURM`, `TURMSTRAND`, `WALD`, `GEBAEUDE`, `HAFEN`, `WMUEHLE` —
+and marks every one of them as a candidate, unconditionally. Residences are
+outer `Kind: GEBAEUDE` with nested `Kind: WOHNUNG`, so they are in the set;
+`STRASSE` (1) and `BODEN` (11) are not, and are not even traversable. Fire
+therefore only ever walks between structures that physically touch, and never
+crosses a street or a patch of grass. Contrast the plague's `FUN_004724d0`,
+which opens `{1, 0x0b, 0x0c, 0x0d, 0x12, 0x1d, 0x1e}` for *travel* but reports
+only cells matching the caller's kind bitmask and city slot.
 
 **Expiry** (`:87119-87147`): plague just heals (`flags &= 0xFFFC`), frees the
 entry, **0 rand**, no demolition. Fire posts deferred action type 7 and
@@ -229,6 +276,32 @@ centre; `LAB_00472ad0` appends until the cap.
 **This is the single largest implementation cost of the feature**, and the only
 part whose result set is not trivially derivable. It must be exact because
 `rand() % n` consumes the stream and `n` is the result count.
+
+Mechanics, now that it is ported (`SourceHazardScanGrid` in `data_bridge.rs`):
+
+- `FUN_004722f0` centres the box on `anchor + (oriented_size - 1) / 2` and sizes
+  it `2r + 1 + ((oriented_size - 1) & 1)` per axis, so an even footprint gets an
+  extra column/row. `param_3` is dead; the work struct's owner slot comes from
+  the **centre tile's** map word, and `7` in that field is a wildcard.
+- Byte 0 of each scratch cell is the traversal marker (`0` free, `0x0c` the
+  blocked fill, `1..=8` the direction stamped on enqueue, `0x0b` the origin);
+  byte 1 holds the path class in bits 0..6 and the "report me" flag in bit 7.
+- `FUN_00471fb0` is a bucketed Dijkstra, bucket width `0x40`. The seed carries
+  cost `0x40`; each round subtracts `0x40` from every queued entry and expands
+  only those that reach zero or below, carrying the residue. Levels are walked
+  **backwards** into a double buffer; the four diagonals are enqueued before the
+  four orthogonals and each diagonal refuses to cut a corner.
+- Step costs come from `FUN_0046f8a0` (`:78686-78717`): classes `0x00..=0x20`
+  cost `(0x40, 0x5b)` orthogonal/diagonal, then two ramps run to class 126, and
+  class `0x7f` is the stored `(0x1f8, 0x2cc)`. `param_3 == 3` selects
+  `Wegspeed[3]`, and **every** authored `Wegspeed` quad ends in `100`, which
+  compiles to class `0x20` — so in the shipped data the hazard flood is
+  uniform-cost, orthogonal `0x40`, diagonal `0x5b`.
+- `LAB_00472ad0` appends `(work.local_x + x, work.local_y + y)` at stride `0x18`
+  and returns the struct's stored `1`, so a reported cell is always expanded;
+  what it controls is the continue flag `ws+0x20`, which it clears the moment
+  the 20-entry buffer fills, stopping the flood mid-round. The origin cell is
+  never reported — the flood clears its candidate bit before starting.
 
 ## 5. The igniters
 
@@ -268,7 +341,8 @@ DAT_0049af18  2 rows x 8    (vagrant)
 ```
 
 The **positions** matter, not just the counts — the index is `rand() & 15` or
-`rand() & 7`.
+`rand() & 7`. All three verified byte-for-byte against `extracted/1602.exe`
+(2026-08-15).
 
 Row selection. Plague: `((flags >> 9) & 1) + ((flags >> 6) & 1)` = how many of
 **doctor** (`KLINIK`, bit `0x200`) and **bathhouse** (`BADEHAUS`, bit `0x40`)
@@ -326,6 +400,26 @@ the unlock sweep; a new `tick_source_afflictions` at the S9 position. Bump
 `SAVE_VERSION`; all new fields `#[serde(default)]`, which reproduces the
 original's save behaviour anyway.
 
+**As built (Stage 1).** `data_bridge.rs`: `SourceAfflictionTable` /
+`SourceAfflictionEntry`, `SOURCE_FIRE_PROBABILITY_TABLE`,
+`SourceHazardScanGrid` + `source_path_step_costs` +
+`source_hazard_scan_kind_is_burnable`, and `SourceCityRecord::
+active_afflictions` with a `growth_blocked()` accessor.
+`source_cell.rs`: `source_destroy_flag`, `source_wood_cost_fixed`,
+`source_bricks_cost_fixed`, `source_path_class_loaded_road` on every map cell.
+`simulation.rs`: `tick_source_city_hazard_event`,
+`source_reap_destroyed_marketplace`, `source_ignite_fire`,
+`source_register_affliction` / `source_remove_affliction_at`,
+`tick_source_afflictions` → `source_spread_fire` / `source_expire_fire`,
+`source_hazard_area_scan`, and `tick_source_deferred_map_demolitions` (drained
+at the S6 position, which is what puts the ruin conversion's draws one slice
+after the sweep that posted them).
+
+`SAVE_VERSION` 141 → 142, and `MIN_LOADABLE_VERSION` with it: bincode is not
+self-describing, so the `bool` → `i16` widening and the four appended map-cell
+fields cannot be read out of an older payload — `#[serde(default)]` does not
+help there.
+
 ## 9. Staging
 
 **Stage 1 — required for RNG fidelity on a ~100-inhabitant pioneer city.** At
@@ -337,7 +431,33 @@ family. Plague and vagrant are unreachable (they need 200 / 300 citizens).
 
 Boundary worth checking before assuming: at **79 or fewer** pioneers with fewer
 than 250 settlers, the entire fire section draws **zero** `rand()` and only the
-two unconditional draws remain.
+two unconditional draws remain. Confirmed, and pinned by
+`source_city_hazard_fire_gate_rand_budget` in `simulation.rs`.
+
+**Stage 1 deviations, deliberate and documented in the code:**
+
+- The plague roll (`pop[1] >= 200 && city[0x1fe] == 0`) and the vagrant roll
+  (`pop[2] >= 300`) are omitted **including their `rand()` draws**. Reaching
+  either population diverges this port's stream from the original's; that is
+  the Stage 2 / Stage 3 boundary.
+- The two message emitters draw nothing and are presentation-only.
+- The kind-`0x0e` object-state branch of the registrar (`record[0x11] & 0x20`)
+  has no record in this port.
+- The kind-1..7 table `DAT_0054a3b8` has no insertion hook here, so
+  `FUN_0047f510`'s physical scan order is replayed from `source_map_cell_states`
+  in command order rather than maintained incrementally. Two consequences: a
+  slot freed by a demolition is reused by the replay but was not by the
+  original, and the source also keeps service buildings (nested kinds
+  `0x11..=0x1b`) in that table while this port allocates them no record.
+- The port **persists** the affliction table and the kind-13 affliction bits.
+  The original persists neither (§4), so an original save/reload cures
+  everything; this is a deliberate improvement, not a reproduction.
+- `source_cities_from_scenario` does not read `+0x1e0` out of `STADT4`, so a
+  scenario-loaded city keeps `ready_at_ticks == 0` and opens its first event on
+  the very first dispatcher visit rather than 60 s in. Cities created at
+  runtime through `allocate_source_city` do get the `now + 600` arming
+  `FUN_00468e10` applies. Pre-existing gap in the field extraction, now
+  observable; worth closing when `STADT4` parsing is revisited.
 
 **Stage 2 — 200+ residents.** Plague: `FUN_0047b850`, `FUN_0047a020` type 1,
 `DAT_0049aed8`, `DAT_005a7758`, the capacity table, the doctor/bathhouse bits,

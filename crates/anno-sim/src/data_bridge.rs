@@ -515,10 +515,17 @@ pub struct SourceCityRecord {
     /// satisfied for the same reason as `satisfaction_by_group`.
     #[serde(default = "source_city_initial_overall_satisfaction")]
     pub overall_satisfaction: u8,
-    /// Source city u16 `+0x1fe`; a nonzero value suppresses positive
-    /// kind-13 amount changes in `FUN_0047b410`.
+    /// Source city i16 `+0x1fe`: the number of live afflictions (plague or
+    /// fire) registered anywhere in this city.
+    ///
+    /// `FUN_00479ca0` increments it per registration and `FUN_00479c50`
+    /// decrements it per removal. It is a **count**, not a flag: a nonzero
+    /// value suppresses positive kind-13 amount changes in `FUN_0047b410`
+    /// ([`Self::growth_blocked`]), the plague gate at `1602_exe.c:91455`
+    /// requires it to be exactly zero, and the plague message emitter fires
+    /// only above two.
     #[serde(default)]
-    pub growth_blocked: bool,
+    pub active_afflictions: i16,
     /// Source city byte `+0x257`, bit zero. `FUN_0047c080` permits a
     /// material-gated BGruppe promotion only while this bit is clear.
     #[serde(default)]
@@ -568,7 +575,7 @@ impl Default for SourceCityRecord {
             satisfaction_pressure: 0,
             satisfaction_by_group: source_city_initial_group_satisfaction(),
             overall_satisfaction: source_city_initial_overall_satisfaction(),
-            growth_blocked: false,
+            active_afflictions: 0,
             promotion_blocked: false,
             promotion_reservations: [0; 5],
             promotion_reservation_positions: [(0, 0); 5],
@@ -756,12 +763,29 @@ impl SourceCityRecord {
         self.satisfaction_pressure = (u32::from(self.satisfaction_pressure) * 0xff >> 8) as u16;
     }
 
+    /// Source city `+0x1fe != 0`, the growth stop `FUN_0047b410` applies the
+    /// moment any affliction exists anywhere in this city.
+    pub const fn growth_blocked(self) -> bool {
+        self.active_afflictions != 0
+    }
+
+    /// `FUN_00479ca0`'s trailing `city[0x1fe] += 1`.
+    pub fn add_affliction(&mut self) {
+        self.active_afflictions = self.active_afflictions.wrapping_add(1);
+    }
+
+    /// `FUN_00479c50`'s `city[0x1fe] -= 1`. The source does not clamp, and a
+    /// removal never runs without a matching registration.
+    pub fn remove_affliction(&mut self) {
+        self.active_afflictions = self.active_afflictions.wrapping_sub(1);
+    }
+
     /// Assemble the source city operands consumed by `FUN_0047b410`.
     pub const fn source_kind13_transfer_inputs(self) -> SourceKind13TransferInputs {
         SourceKind13TransferInputs {
             satisfaction_by_group: self.satisfaction_by_group,
             overall_satisfaction: self.overall_satisfaction,
-            growth_blocked: self.growth_blocked,
+            growth_blocked: self.growth_blocked(),
         }
     }
 }
@@ -1735,6 +1759,378 @@ impl SourceKind13LocationTable {
 /// kind-13 fixed-point amount changes a city population total.
 const fn source_kind13_population_units(amount: i32) -> i32 {
     (amount + ((amount >> 31) & 0x3f)) >> 6
+}
+
+/// `DAT_0049af08`: the two eight-entry fire probability rows.
+///
+/// Both the ignition roll in `FUN_0047b540` and the spread roll in
+/// `FUN_0047a020` index a row with `rand() & 7`; a nonzero byte means the
+/// fire takes. The row is `(Ziegel <= Holz) as usize`, i.e. row 1 whenever
+/// the target's compiled `HAUS_BAUKOST Holz` is at least its `Ziegel`.
+/// Row 0 is 7/8 = 87.5 %, row 1 is 3/8 = 37.5 %; the *positions* matter, not
+/// only the counts. Ignition only ever picks BGruppe 0/1 housing, whose
+/// costs are wood-only, so ignition always uses row 1.
+pub const SOURCE_FIRE_PROBABILITY_TABLE: [[u8; 8]; 2] = [
+    [1, 1, 1, 1, 0, 1, 1, 1],
+    [0, 0, 1, 0, 1, 0, 0, 1],
+];
+
+/// `DAT_005a5100`: 0x120 eight-byte affliction records.
+pub const SOURCE_AFFLICTION_TABLE_SLOTS: usize = 0x120;
+/// Linear probe window used by `FUN_00479be0` and `FUN_00479ca0`, clamped
+/// to the end of the table rather than wrapped.
+pub const SOURCE_AFFLICTION_PROBE_LENGTH: usize = 0x20;
+/// Byte 3 low five bits: `FUN_0047b850` registers 1, `FUN_0047b540` 2.
+pub const SOURCE_AFFLICTION_KIND_PLAGUE: u8 = 1;
+pub const SOURCE_AFFLICTION_KIND_FIRE: u8 = 2;
+/// Byte 6 for a freshly ignited fire (`FUN_0047b540`, `1602_exe.c:88213`).
+pub const SOURCE_AFFLICTION_IGNITION_DURATION: u8 = 0x19;
+/// Byte 6 for anything the `FUN_0047a020` spread branch registers. Both the
+/// plague and the fire spread paths converge on `LAB_0047a56d`, which pushes
+/// a literal `0x14` — verified in the disassembly at `0x0047a3ad` and
+/// `0x0047a562`. A *spread* fire therefore lives 20 phases, not the 25 an
+/// *ignited* one gets.
+pub const SOURCE_AFFLICTION_SPREAD_DURATION: u8 = 0x14;
+/// `FUN_0047a020`'s phase clock (`DAT_0055eb78 > 9999`).
+pub const SOURCE_AFFLICTION_PHASE_MS: u32 = 10_000;
+/// Records visited per dispatcher call; a full 0x120-slot sweep therefore
+/// takes 36 calls, comfortably inside one 10 s phase.
+pub const SOURCE_AFFLICTION_RECORDS_PER_UPDATE: usize = 8;
+
+/// One live `DAT_005a5100` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct SourceAfflictionEntry {
+    /// Byte 0. `0xff` marks a free slot, which this port models as `None`.
+    pub island_id: u8,
+    /// Bytes 1 and 2: island-local coordinates of the afflicted object's root.
+    pub tile_x: u8,
+    pub tile_y: u8,
+    /// Byte 3, bits 0..4.
+    pub kind: u8,
+    /// Byte 3, bits 5..7: the `DAT_005a6c11` phase counter value last seen.
+    pub phase_seen: u8,
+    /// Byte 5: completed phases. The source increments before comparing.
+    pub elapsed_phases: u8,
+    /// Byte 6: lifetime in phases.
+    pub duration_phases: u8,
+    /// Byte 7: island-local city slot copied from the root tile's map word.
+    pub city_slot: u8,
+}
+
+/// The source affliction table `DAT_005a5100` plus `FUN_0047a020`'s phase
+/// clock and sweep cursor.
+///
+/// Unlike the kind-13 location table the probe policy has to be modelled
+/// literally. `FUN_0047a630` hashes only three bits per axis
+/// (`((island & 3) * 8 + (x & 7)) * 8 + (y & 7)`), so a 64x64 island folds
+/// 8x8-fold onto 288 slots: collisions are the norm and "probe window full"
+/// is a routine outcome, not an edge case. When it happens the registrar has
+/// already removed the tile's previous entry and then silently registers
+/// nothing.
+///
+/// **Persistence.** The original saves none of this — `DAT_005a5100` appears
+/// at exactly four sites (reset, lookup, registrar, processor) and no chunk
+/// touches it, and `FUN_00485530` drops kind-13 flag bits 0 and 1 too, so
+/// saving and reloading the original cures every plague and puts out every
+/// fire. This port persists the table (and the kind-13 lifecycle bits it
+/// already saved), which is strictly better behaviour; nothing here assumes
+/// an original save carries it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceAfflictionTable {
+    slots: Vec<Option<SourceAfflictionEntry>>,
+    /// `PTR_DAT_0049aed0`, the physical sweep cursor.
+    cursor: usize,
+    /// `DAT_0055eb78`, the 10 s phase accumulator.
+    elapsed_ms: u32,
+    /// `DAT_005a6c11`, the three-bit phase counter.
+    phase: u8,
+}
+
+impl Default for SourceAfflictionTable {
+    fn default() -> Self {
+        Self {
+            slots: vec![None; SOURCE_AFFLICTION_TABLE_SLOTS],
+            cursor: 0,
+            elapsed_ms: 0,
+            phase: 0,
+        }
+    }
+}
+
+impl SourceAfflictionTable {
+    /// `FUN_0047a630`.
+    pub const fn source_index(island_id: u8, tile_x: u8, tile_y: u8) -> usize {
+        ((island_id as usize & 3) * 8 + (tile_x as usize & 7)) * 8 + (tile_y as usize & 7)
+    }
+
+    /// The clamped probe window shared by `FUN_00479be0` and `FUN_00479ca0`.
+    fn probe_range(island_id: u8, tile_x: u8, tile_y: u8) -> std::ops::Range<usize> {
+        let start = Self::source_index(island_id, tile_x, tile_y);
+        let end = start
+            .saturating_add(SOURCE_AFFLICTION_PROBE_LENGTH)
+            .min(SOURCE_AFFLICTION_TABLE_SLOTS);
+        start..end
+    }
+
+    /// `FUN_00479be0`: the physical slot holding this tile's entry.
+    pub fn slot_at(&self, island_id: u8, tile_x: u8, tile_y: u8) -> Option<usize> {
+        Self::probe_range(island_id, tile_x, tile_y).find(|&slot| {
+            self.slots[slot].is_some_and(|entry| {
+                entry.island_id == island_id
+                    && entry.tile_x == tile_x
+                    && entry.tile_y == tile_y
+            })
+        })
+    }
+
+    pub fn entry_at(&self, island_id: u8, tile_x: u8, tile_y: u8) -> Option<SourceAfflictionEntry> {
+        self.slot_at(island_id, tile_x, tile_y)
+            .and_then(|slot| self.slots[slot])
+    }
+
+    pub fn entry(&self, slot: usize) -> Option<SourceAfflictionEntry> {
+        self.slots.get(slot).copied().flatten()
+    }
+
+    /// `FUN_00479c50`'s `*param_1 = 0xff`. The caller owns the paired
+    /// `city[0x1fe] -= 1`, exactly as the source splits them.
+    pub fn clear_slot(&mut self, slot: usize) -> Option<SourceAfflictionEntry> {
+        self.slots.get_mut(slot).and_then(Option::take)
+    }
+
+    /// The first free slot in this tile's probe window, or `None` when the
+    /// window is full — `FUN_00479ca0`'s `return 0`.
+    pub fn free_slot(&self, island_id: u8, tile_x: u8, tile_y: u8) -> Option<usize> {
+        Self::probe_range(island_id, tile_x, tile_y).find(|&slot| self.slots[slot].is_none())
+    }
+
+    /// Write one record into an already-selected free slot.
+    pub fn write_slot(&mut self, slot: usize, entry: SourceAfflictionEntry) {
+        if let Some(cell) = self.slots.get_mut(slot) {
+            *cell = Some(entry);
+        }
+    }
+
+    /// Live entries in physical slot order, for assertions and audits.
+    pub fn active_entries(&self) -> Vec<SourceAfflictionEntry> {
+        self.slots.iter().flatten().copied().collect()
+    }
+
+    pub fn phase(&self) -> u8 {
+        self.phase
+    }
+
+    /// Advance `DAT_0055eb78` / `DAT_005a6c11` and return the physical slots
+    /// this dispatcher call visits, in source order. The caller replays the
+    /// per-entry branches, which need the whole simulation.
+    pub fn advance(&mut self, dt_ms: u32) -> Vec<usize> {
+        self.elapsed_ms = self.elapsed_ms.saturating_add(dt_ms);
+        if self.elapsed_ms > SOURCE_AFFLICTION_PHASE_MS - 1 {
+            self.elapsed_ms = 0;
+            self.phase = self.phase.wrapping_add(1) & 7;
+        }
+        let mut visited = Vec::with_capacity(SOURCE_AFFLICTION_RECORDS_PER_UPDATE);
+        for _ in 0..SOURCE_AFFLICTION_RECORDS_PER_UPDATE {
+            // `if ((byte *)0x5a59ff < pbVar6) pbVar6 = &DAT_005a5100;` wraps
+            // the cursor *before* the visit, so a cursor parked at the end
+            // restarts at slot zero.
+            if self.cursor >= SOURCE_AFFLICTION_TABLE_SLOTS {
+                self.cursor = 0;
+            }
+            visited.push(self.cursor);
+            self.cursor += 1;
+        }
+        visited
+    }
+
+    /// `pbVar6[3] = pbVar6[3] & 0x1f | DAT_005a6c11 << 5` followed by the
+    /// `pbVar6[5] += 1` step. Returns the entry as it stands after the write
+    /// together with whether this visit crosses its lifetime, or `None` when
+    /// the slot is free or already stepped this phase.
+    pub fn step_slot(&mut self, slot: usize) -> Option<(SourceAfflictionEntry, bool)> {
+        let phase = self.phase;
+        let entry = self.slots.get_mut(slot)?.as_mut()?;
+        if entry.phase_seen == phase {
+            return None;
+        }
+        entry.phase_seen = phase;
+        entry.elapsed_phases = entry.elapsed_phases.wrapping_add(1);
+        let expired = entry.elapsed_phases >= entry.duration_phases;
+        Some((*entry, expired))
+    }
+}
+
+/// Outer map kinds `FUN_00472930` rasterises for the hazard area scan
+/// (`1602_exe.c:81415-81423`): `TOR`, `MAUER`, `MAUERSTRAND`, `TURM`,
+/// `TURMSTRAND`, `WALD`, `GEBAEUDE`, `HAFEN`, `WMUEHLE`.
+///
+/// Every cell of that set is both traversable **and** a scan result — the
+/// rasteriser sets the candidate bit unconditionally, unlike the plague's
+/// `FUN_004724d0`, which opens roads and ground for travel but only reports
+/// kind-13 targets. Residences carry outer `Kind: GEBAEUDE` with nested
+/// `HAUS_PRODTYP Kind: WOHNUNG`, so they are in the set; roads (`STRASSE`)
+/// and bare ground (`BODEN`) are not, which is why fire only ever walks
+/// between structures that physically touch.
+pub const fn source_hazard_scan_kind_is_burnable(kind_code: u8) -> bool {
+    matches!(kind_code, 3 | 4 | 5 | 6 | 7 | 10 | 0x0e | 0x24 | 0x25)
+}
+
+/// Result buffer capacity `FUN_0047a020` gives `FUN_00472b20`.
+pub const SOURCE_HAZARD_SCAN_RESULT_CAP: usize = 0x14;
+
+/// Bucket width of the weighted flood in `FUN_00471fb0`. Each outer round
+/// subtracts it from every queued entry's remaining cost and expands only
+/// the entries that reach zero or below, carrying the residue forward.
+const SOURCE_PATH_STEP_BUCKET: i32 = 0x40;
+
+/// `DAT_005db8a0` / `DAT_005bb280` as `FUN_0046f8a0` compiles them: the
+/// orthogonal and diagonal step costs for one path class.
+///
+/// Classes `0..=0x20` all cost `(0x40, 0x5b)`; above that the ramps are
+/// `0x800 + 0x40*n` and `0xb60 + 0x5b*n` over 32, and class `0x7f` is the
+/// explicitly stored `(0x1f8, 0x2cc)`. Every shipped `Wegspeed` quad ends in
+/// `100`, which compiles to class `0x20`, so the hazard flood is
+/// uniform-cost in practice.
+pub const fn source_path_step_costs(class: u8) -> (i32, i32) {
+    let class = (class & 0x7f) as i32;
+    if class < 0x20 {
+        (0x40, 0x5b)
+    } else if class < 0x7f {
+        let steps = class - 0x20;
+        ((0x800 + steps * 0x40) >> 5, (0xb60 + steps * 0x5b) >> 5)
+    } else {
+        (0x1f8, 0x2cc)
+    }
+}
+
+/// The shared two-byte scratch grid `DAT_005bb480` over one work struct's
+/// bounding box.
+///
+/// Byte 0 is the traversal marker: `0` free, `0x0c` the blocked fill,
+/// `1..=8` a direction stamped when the flood enqueues the cell, `0x0b` the
+/// flood origin. Byte 1 keeps the cell's path class in bits 0..6 and the
+/// "report me" candidate flag in bit 7.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceHazardScanGrid {
+    pub width: usize,
+    pub height: usize,
+    marks: Vec<u8>,
+    costs: Vec<u8>,
+}
+
+impl SourceHazardScanGrid {
+    /// A grid in the state `FUN_00472930` leaves after its `0x0c` fill and
+    /// before it walks the clipped island rectangle.
+    pub fn blocked(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            marks: vec![0x0c; width * height],
+            costs: vec![0; width * height],
+        }
+    }
+
+    /// One admitted cell: traversable, and a scan result.
+    pub fn set_burnable(&mut self, x: usize, y: usize, path_class: u8) {
+        let Some(index) = self.index(x, y) else {
+            return;
+        };
+        self.marks[index] = 0;
+        self.costs[index] = path_class | 0x80;
+    }
+
+    fn index(&self, x: usize, y: usize) -> Option<usize> {
+        (x < self.width && y < self.height).then(|| y * self.width + x)
+    }
+
+    fn mark(&self, x: usize, y: usize) -> u8 {
+        self.index(x, y).map_or(0x0c, |index| self.marks[index])
+    }
+
+    /// `FUN_00471fb0` with `LAB_00472ad0` as its callback.
+    ///
+    /// The appender returns the work struct's stored `1` unconditionally, so
+    /// a reported cell is always expanded; what it does control is the
+    /// continue flag, which it clears the moment the result buffer fills and
+    /// which then stops the flood. The distance argument the flood passes is
+    /// unused by this callback and is not modelled.
+    pub fn flood(&mut self, start_x: usize, start_y: usize, cap: usize) -> Vec<(usize, usize)> {
+        let mut results = Vec::new();
+        let Some(start) = self.index(start_x, start_y) else {
+            return results;
+        };
+        self.marks[start] = 0x0b;
+        self.costs[start] &= 0x7f;
+
+        let mut running = true;
+        let mut current = vec![(start_x, start_y, SOURCE_PATH_STEP_BUCKET)];
+        let mut next: Vec<(usize, usize, i32)> = Vec::new();
+        while running {
+            next.clear();
+            // The source walks the finished level from its last entry back
+            // to its first, appending expansions to the other buffer front
+            // to back.
+            for &(px, py, cost) in current.iter().rev() {
+                let remaining = cost - SOURCE_PATH_STEP_BUCKET;
+                if remaining >= 1 {
+                    next.push((px, py, remaining));
+                    continue;
+                }
+                let index = py * self.width + px;
+                if self.costs[index] & 0x80 != 0 && results.len() < cap {
+                    results.push((px, py));
+                    running = results.len() < cap;
+                }
+                let (orthogonal, diagonal) = source_path_step_costs(self.costs[index]);
+                let orthogonal = orthogonal + remaining;
+                let diagonal = diagonal + remaining;
+
+                let xm = px.saturating_sub(1);
+                let xp = if px + 1 < self.width { px + 1 } else { px };
+                let ym = py.saturating_sub(1);
+                let yp = if py + 1 < self.height { py + 1 } else { py };
+
+                // Diagonals first, and each one refuses to cut a corner:
+                // both shared orthogonal neighbours must still be open.
+                let mut push = |grid: &mut Self, x: usize, y: usize, stamp: u8, cost: i32| {
+                    grid.marks[y * grid.width + x] = stamp;
+                    next.push((x, y, cost));
+                };
+                if self.mark(xm, ym) == 0 && self.mark(px, ym) == 0 && self.mark(xm, py) == 0 {
+                    push(self, xm, ym, 8, diagonal);
+                }
+                if self.mark(xp, ym) == 0 && self.mark(px, ym) == 0 && self.mark(xp, py) == 0 {
+                    push(self, xp, ym, 2, diagonal);
+                }
+                if self.mark(xm, yp) == 0 && self.mark(px, yp) == 0 && self.mark(xm, py) == 0 {
+                    push(self, xm, yp, 6, diagonal);
+                }
+                if self.mark(xp, yp) == 0 && self.mark(px, yp) == 0 && self.mark(xp, py) == 0 {
+                    push(self, xp, yp, 4, diagonal);
+                }
+                if self.mark(px, ym) == 0 {
+                    push(self, px, ym, 1, orthogonal);
+                }
+                if self.mark(px, yp) == 0 {
+                    push(self, px, yp, 5, orthogonal);
+                }
+                if self.mark(xm, py) == 0 {
+                    push(self, xm, py, 7, orthogonal);
+                }
+                if self.mark(xp, py) == 0 {
+                    push(self, xp, py, 3, orthogonal);
+                }
+                if !running {
+                    break;
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            std::mem::swap(&mut current, &mut next);
+        }
+        results
+    }
 }
 
 /// Mutable phase clocks and physical cursor owned by `FUN_0047b9c0`.
@@ -3537,6 +3933,147 @@ pub fn island_can_host_building(def: &BuildingDef, island: &anno_formats::szs::I
 mod tests {
     use super::*;
 
+    /// `FUN_0047a630` takes two bits of island and three bits of each axis,
+    /// so a 64x64 island folds eight-fold on both axes. The window clamp at
+    /// `0x120` is unreachable: the hash tops out at 255.
+    #[test]
+    fn source_affliction_hash_folds_three_bits_per_axis() {
+        assert_eq!(SourceAfflictionTable::source_index(0, 0, 0), 0);
+        assert_eq!(SourceAfflictionTable::source_index(2, 5, 6), 174);
+        assert_eq!(
+            SourceAfflictionTable::source_index(2, 5, 6),
+            SourceAfflictionTable::source_index(2, 13, 14),
+        );
+        assert_eq!(
+            SourceAfflictionTable::source_index(2, 5, 6),
+            SourceAfflictionTable::source_index(6, 61, 62),
+        );
+        let highest = (0..=u8::MAX)
+            .flat_map(|x| (0..=u8::MAX).map(move |y| SourceAfflictionTable::source_index(3, x, y)))
+            .max()
+            .unwrap();
+        assert_eq!(highest, 255);
+        assert!(highest + SOURCE_AFFLICTION_PROBE_LENGTH < SOURCE_AFFLICTION_TABLE_SLOTS);
+    }
+
+    /// The `FUN_0047a020` phase clock and eight-entry batch: a full sweep of
+    /// the 0x120-slot table takes 36 calls, comfortably inside one 10 s phase
+    /// at any dispatch rate the engine uses.
+    #[test]
+    fn source_affliction_sweep_completes_inside_one_phase() {
+        let mut table = SourceAfflictionTable::default();
+        assert_eq!(table.phase(), 0);
+        let mut visited = std::collections::HashSet::new();
+        for _ in 0..(SOURCE_AFFLICTION_TABLE_SLOTS / SOURCE_AFFLICTION_RECORDS_PER_UPDATE) {
+            for slot in table.advance(1) {
+                assert!(visited.insert(slot));
+            }
+        }
+        assert_eq!(visited.len(), SOURCE_AFFLICTION_TABLE_SLOTS);
+        assert_eq!(table.phase(), 0, "a 36 ms sweep must not cross a phase");
+        table.advance(SOURCE_AFFLICTION_PHASE_MS);
+        assert_eq!(table.phase(), 1);
+    }
+
+    /// `FUN_0046f8a0` (`1602_exe.c:78686-78717`) compiles the orthogonal and
+    /// diagonal step costs. The first 0x20 classes are flat, then two ramps
+    /// run to class 126, and class 127 is the explicitly stored pair.
+    #[test]
+    fn source_path_step_costs_match_the_compiled_ramps() {
+        assert_eq!(source_path_step_costs(0), (0x40, 0x5b));
+        assert_eq!(source_path_step_costs(0x1f), (0x40, 0x5b));
+        // Every shipped `Wegspeed` quad ends in 100, which compiles to
+        // `min(126, 100 * 32 / 100) = 32` — the first ramp entry, which
+        // happens to equal the flat value, so the hazard flood is uniform.
+        assert_eq!(source_path_step_costs(0x20), (0x40, 0x5b));
+        assert_eq!(source_path_step_costs(0x21), (66, 93));
+        assert_eq!(source_path_step_costs(126), (252, 358));
+        assert_eq!(source_path_step_costs(127), (0x1f8, 0x2cc));
+    }
+
+    /// `FUN_00472930` opens only the burnable outer kinds. Roads, bare
+    /// ground and water are blocked, which is why a fire walks between
+    /// structures that touch and never crosses a street.
+    #[test]
+    fn source_hazard_scan_admits_only_the_burnable_outer_kinds() {
+        for kind in 0..64u8 {
+            assert_eq!(
+                source_hazard_scan_kind_is_burnable(kind),
+                matches!(kind, 3 | 4 | 5 | 6 | 7 | 10 | 14 | 36 | 37),
+                "kind {kind}",
+            );
+        }
+        // `STRASSE`, `BODEN`, `PLATZ`/`WOHNUNG`, `MEER`.
+        for kind in [1u8, 11, 13, 19] {
+            assert!(!source_hazard_scan_kind_is_burnable(kind));
+        }
+        // Residences carry outer `Kind: GEBAEUDE`.
+        assert!(source_hazard_scan_kind_is_burnable(14));
+    }
+
+    /// `FUN_00471fb0` with `LAB_00472ad0`: the origin is never reported, the
+    /// flood expands orthogonals a whole bucket before the diagonals it
+    /// enqueued in the same visit, and blocked cells cut the region.
+    #[test]
+    fn source_hazard_flood_reports_neighbours_in_cost_order() {
+        let mut grid = SourceHazardScanGrid::blocked(3, 3);
+        for y in 0..3 {
+            for x in 0..3 {
+                grid.set_burnable(x, y, 0x20);
+            }
+        }
+        let results = grid.flood(1, 1, SOURCE_HAZARD_SCAN_RESULT_CAP);
+        assert!(!results.contains(&(1, 1)), "the origin is never a result");
+        assert_eq!(results.len(), 8);
+        // Orthogonal steps cost 0x40 — exactly one bucket — while diagonals
+        // cost 0x5b and spill into the next round.
+        let first_four: std::collections::HashSet<(usize, usize)> =
+            results[..4].iter().copied().collect();
+        assert_eq!(
+            first_four,
+            [(1, 0), (1, 2), (0, 1), (2, 1)].into_iter().collect(),
+        );
+        assert!(results[4..]
+            .iter()
+            .all(|&(x, y)| x.abs_diff(1) == 1 && y.abs_diff(1) == 1));
+    }
+
+    /// A cell the rasteriser left blocked stops the flood, and the flood is
+    /// confined to what is reachable from the origin rather than to whatever
+    /// is inside the bounding box.
+    #[test]
+    fn source_hazard_flood_is_blocked_by_unburnable_ground() {
+        let mut grid = SourceHazardScanGrid::blocked(5, 5);
+        for y in 0..5 {
+            for x in 0..5 {
+                // Column 3 is a road: the rasteriser never opens it.
+                if x != 3 {
+                    grid.set_burnable(x, y, 0x20);
+                }
+            }
+        }
+        let results = grid.flood(2, 2, SOURCE_HAZARD_SCAN_RESULT_CAP);
+        assert!(results.iter().all(|&(x, _)| x < 3));
+        assert_eq!(results.len(), 14);
+    }
+
+    /// The result cap is the `0x14` `FUN_0047a020` passes to `FUN_00472b20`;
+    /// filling it clears the work struct's continue flag and stops the flood
+    /// mid-round.
+    #[test]
+    fn source_hazard_flood_stops_at_the_result_cap() {
+        let mut grid = SourceHazardScanGrid::blocked(21, 21);
+        for y in 0..21 {
+            for x in 0..21 {
+                grid.set_burnable(x, y, 0x20);
+            }
+        }
+        let results = grid.flood(10, 10, SOURCE_HAZARD_SCAN_RESULT_CAP);
+        assert_eq!(results.len(), SOURCE_HAZARD_SCAN_RESULT_CAP);
+        let unique: std::collections::HashSet<(usize, usize)> = results.iter().copied().collect();
+        assert_eq!(unique.len(), results.len(), "no cell is reported twice");
+    }
+
     #[test]
     fn warships_from_ships_routes_warships_only() {
         use crate::combat::UnitType;
@@ -4865,7 +5402,7 @@ mod tests {
         let mut city = SourceCityRecord {
             luxury_satisfaction: [0, 0, 0, 20, 40, 0, 0],
             overall_satisfaction: 91,
-            growth_blocked: true,
+            active_afflictions: 1,
             ..Default::default()
         };
         city.refresh_group_satisfaction();

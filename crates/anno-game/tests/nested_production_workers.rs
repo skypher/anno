@@ -270,8 +270,30 @@ fn a_fishery_harvests_unclaimed_water_without_a_kontor() {
         let statics = &sim.source_static_map_roots;
         ranked_anchors(&fish, 5)
             .into_iter()
-            .filter(|&(x, y)| map.is_coastal(x, y))
-            .flat_map(|(x, y)| (0..4u8).map(move |orientation| (x, y, orientation)))
+            // The shore rule is the original's build gate, not the port's
+            // `is_coastal` heuristic: `FUN_00464660` case 0x1c admits
+            // `Kind: STRANDHAUS` on `STRAND` (23) and `STRANDVARI` (27) only.
+            // `is_coastal` wants a *walkable* centre cell, and 117 of island
+            // 10's 121 shore-buildable cells are `STRANDVARI`, which is not
+            // walkable ground — so it hid almost every real fishery site.
+            .filter(|&(x, y)| {
+                anno_game::game_commands::can_place_building(
+                    &corpus.szs.islands[island_index],
+                    map,
+                    &corpus.defs[fishery_index],
+                    x,
+                    y,
+                    corpus.defs[fishery_index].width,
+                    corpus.defs[fishery_index].height,
+                )
+            })
+            // `Rotate: 1` — the fishery has exactly one rotation, and
+            // `place_building` reduces any orientation modulo it, so 0 is the
+            // only facing the placement path can ever produce.
+            .flat_map(|(x, y)| {
+                (0..corpus.cod.buildings[fishery_index].rotate.max(1) as u8)
+                    .map(move |orientation| (x, y, orientation))
+            })
             .filter(|&(x, y, orientation)| {
                 let faced = match orientation & 3 {
                     0 => (x, y + 1),
@@ -279,9 +301,18 @@ fn a_fishery_harvests_unclaimed_water_without_a_kontor() {
                     2 => (x, y - 1),
                     _ => (x + 1, y),
                 };
-                map.source_map_kind_and_owner(faced.0, faced.1)
-                    .map(|(kind, _)| kind)
-                    == Some(MEER_KIND)
+                // The faced cell has to be water the fishery overlay opens,
+                // not `MEER` specifically. A beach cell never touches open sea
+                // on these islands — the ring is `MEER` (19), then
+                // `BRANDUNG`/`BRANDECK`/`MUENDUNG` (20-22), then the beach —
+                // and `FUN_0046fb50` (`1602_exe.c:78842`) makes all four
+                // traversable. Demanding `MEER` was only satisfiable while
+                // the fishery could be built out in the water itself.
+                matches!(
+                    map.source_map_kind_and_owner(faced.0, faced.1)
+                        .map(|(kind, _)| kind),
+                    Some(MEER_KIND..=22)
+                )
             })
             .filter_map(|(x, y, orientation)| {
                 let mut grid = map.fishery_worker_path_grid(

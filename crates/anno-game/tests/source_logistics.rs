@@ -111,16 +111,56 @@ fn a_founded_colony_carts_its_forester_wood_into_the_warehouse() {
         .find(|building| building.source_id == 22103)
         .expect("founding Kontor definition");
     let (kontor_w, kontor_h) = kontor.size;
+    let kontor_def = &corpus.defs[corpus
+        .cod
+        .buildings
+        .iter()
+        .position(|building| building.source_id == 22103)
+        .expect("founding Kontor definition")];
     // The anchor has to be near the ship's start (`found_kontor` requires the
     // ship within 12 world tiles) and its 2x3 footprint has to reach open
     // ground, or the cart wave has nowhere to step out to.
+    //
+    // The footprint rule used to be hand-rolled here, because the port had no
+    // build gate; it now runs the original's — `FUN_00464450` /
+    // `FUN_00464660`, which for the Kontor's `Kind: HQ` admits `{STRASSE,
+    // WALD, BODEN, RUINE, PLATZ}` over the *whole* footprint. The
+    // cart-connectivity half stays: `FUN_004704d0` opens a narrower set than
+    // the build gate does — `WALD` is buildable but not passable — so a
+    // Kontor rooted entirely in forest would still strand its colony.
+    let ship = sim
+        .trade_ships
+        .iter()
+        .position(|ship| ship.name == "Verena")
+        .expect("the campaign's starting ship") as u32;
+    let ship_start = {
+        let ship = &sim.trade_ships[ship as usize];
+        (ship.world_x, ship.world_y)
+    };
     let anchor = (2..i32::from(island.height) - kontor_h - 2)
         .flat_map(|y| (2..i32::from(island.width) - kontor_w - 2).map(move |x| (x, y)))
-        .find(|&(x, y)| {
+        .filter(|&(x, y)| {
             sim.island_maps[map_index].is_coastal(x, y)
+                && anno_game::game_commands::can_place_building(
+                    &island,
+                    &sim.island_maps[map_index],
+                    kontor_def,
+                    x,
+                    y,
+                    kontor_def.width,
+                    kontor_def.height,
+                )
                 && (0..kontor_h).any(|dy| {
                     (0..kontor_w).any(|dx| source_open_path_kind(kind_at(&sim, x + dx, y + dy)))
                 })
+        })
+        // "Near the ship" was implicit before — the first row-major hit
+        // happened to be on the western shore the Verena starts off. With the
+        // build gate in place the first hit moves to the northern shore, out
+        // of sailing range, so rank the candidates explicitly.
+        .min_by_key(|&(x, y)| {
+            (ship_start.0 - (i32::from(island.x_pos) + x)).abs()
+                + (ship_start.1 - (i32::from(island.y_pos) + y)).abs()
         })
         .expect("a coastline whose Kontor footprint reaches open ground");
 
@@ -131,11 +171,6 @@ fn a_founded_colony_carts_its_forester_wood_into_the_warehouse() {
         .filter(|&(x, y)| x >= 0 && y >= 0 && kind_at(&sim, x, y) == 19)
         .min_by_key(|&(x, y)| (x - anchor.0).abs() + (y - anchor.1).abs())
         .expect("open water beside the anchor");
-    let ship = sim
-        .trade_ships
-        .iter()
-        .position(|ship| ship.name == "Verena")
-        .expect("the campaign's starting ship") as u32;
     let world = (
         i32::from(island.x_pos) + dock.0,
         i32::from(island.y_pos) + dock.1,
@@ -146,10 +181,17 @@ fn a_founded_colony_carts_its_forester_wood_into_the_warehouse() {
         world_x: world.0,
         world_y: world.1,
     }));
+    // `found_kontor` measures the ship against the *anchor*, not the water
+    // cell it was sent to — the two differ by the width of the beach ring —
+    // so approach until that distance is inside its range.
+    let anchor_world = (
+        i32::from(island.x_pos) + anchor.0,
+        i32::from(island.y_pos) + anchor.1,
+    );
     for _ in 0..3_000 {
         sim.tick(100);
         let ship = &sim.trade_ships[ship as usize];
-        if (ship.world_x - world.0).abs() + (ship.world_y - world.1).abs() < 12 {
+        if (ship.world_x - anchor_world.0).abs() + (ship.world_y - anchor_world.1).abs() < 12 {
             break;
         }
     }
