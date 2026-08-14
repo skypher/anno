@@ -4680,6 +4680,119 @@ impl Simulation {
         }
     }
 
+    /// Replay `FUN_00482120`'s house-coverage rescan for one island: each
+    /// kind-13 residence record's lifecycle infrastructure bits, its
+    /// marketplace-coverage state bit and distance-class variant nibble,
+    /// and the recomputed transition-active state bit. The source runs
+    /// this behind per-island dirty flags set by construction; this port
+    /// runs it at scenario load and after kind-13 replacements.
+    ///
+    /// Not yet modeled: the kind-8 city-activity gate (`FUN_0047f1b0`
+    /// reads city `+0x1fa`/`+0x1fc`, unmapped fields) and the per-city
+    /// `+0x21c` BAUINFRA bitmask the same pass accumulates.
+    pub fn refresh_source_house_infrastructure(&mut self, island_id: u8) {
+        use crate::data_bridge::{
+            source_market_distance_class, source_service_radius_row,
+            SOURCE_HOUSE_INFRA_LIFECYCLE_BITS,
+        };
+
+        struct Coverage {
+            anchor: (u8, u8),
+            footprint: (u8, u8),
+            radius: u8,
+            production_kind: u8,
+            owner_selector: u8,
+        }
+        let coverage: Vec<Coverage> = self
+            .source_static_map_roots
+            .iter()
+            .filter(|root| {
+                root.island == island_id
+                    && matches!(root.source_production_kind_code, 7 | 8 | 0x11..=0x1a)
+            })
+            .map(|root| Coverage {
+                anchor: (root.source_command_anchor_x, root.source_command_anchor_y),
+                footprint: (root.footprint_width, root.footprint_height),
+                radius: root.source_transfer_radius,
+                production_kind: root.source_production_kind_code,
+                owner_selector: root.source_map_owner_slot,
+            })
+            .collect();
+        let mut radius_rows: std::collections::HashMap<u8, Vec<u8>> =
+            std::collections::HashMap::new();
+
+        // `FUN_00482120` measures from the covering building's centered
+        // footprint with the source's even-size asymmetry: a negative
+        // raw delta becomes `-1 - raw`, a positive one loses the
+        // footprint-parity tile.
+        let axis_delta = |house: u8, anchor: u8, extent: u8| -> i32 {
+            let span = i32::from(extent) - 1;
+            let raw = i32::from(house) - i32::from(anchor) - span / 2;
+            if raw < 0 {
+                -1 - raw
+            } else {
+                (raw - (span & 1)).max(0)
+            }
+        };
+
+        for slot in 0..crate::data_bridge::SOURCE_KIND13_LOCATION_TABLE_SLOTS {
+            let Some(location) = self.source_kind13_locations.slot_mut(slot) else {
+                continue;
+            };
+            if location.island_id != island_id {
+                continue;
+            }
+            // Reset pass: keep lifecycle bits 0/1 (transfer in progress)
+            // and 12..15, clear the coverage bits; clear market state bit
+            // 7; reset the distance-class nibble to its 6 ceiling.
+            location.lifecycle_flags &= 0xf003;
+            location.state_bits &= 0x7f;
+            location.variant = (location.variant & 0xf0) | 6;
+
+            for cover in &coverage {
+                if cover.owner_selector != location.source_owner {
+                    continue;
+                }
+                let dx = axis_delta(location.tile_x, cover.anchor.0, cover.footprint.0);
+                let dy = axis_delta(location.tile_y, cover.anchor.1, cover.footprint.1);
+                let radius = i32::from(cover.radius);
+                if dx > radius || dy > radius {
+                    continue;
+                }
+                let row = radius_rows
+                    .entry(cover.radius)
+                    .or_insert_with(|| source_service_radius_row(cover.radius));
+                if dx > i32::from(row[dy as usize]) {
+                    continue;
+                }
+                match cover.production_kind {
+                    7 => {
+                        let class = source_market_distance_class(dx as u8, dy as u8);
+                        if class < location.variant & 0x0f {
+                            location.variant = (location.variant & 0xf0) | class;
+                        }
+                        location.state_bits |= 0x80;
+                    }
+                    8 => {
+                        location.lifecycle_flags |= 0x0400;
+                    }
+                    kind => {
+                        if let Some(&(_, bit)) = SOURCE_HOUSE_INFRA_LIFECYCLE_BITS
+                            .iter()
+                            .find(|&&(code, _)| code == kind)
+                        {
+                            location.lifecycle_flags |= bit;
+                        }
+                    }
+                }
+            }
+
+            // Trailing `FUN_0047bfa0` re-evaluation into state bit 6.
+            let active = location.source_transition_active_for_group(location.population_group);
+            location.state_bits = (location.state_bits & !0x40) | (u8::from(active) << 6);
+        }
+    }
+
     /// Drain and apply the queued kind-13 replacement commands' static-map
     /// half (`FUN_00463ef0` footprint removal + `FUN_004631b0` command
     /// write): the source map writer runs synchronously inside
@@ -4695,6 +4808,18 @@ impl Simulation {
         let replacements: Vec<_> = self.source_kind13_replacement_commands.drain(..).collect();
         for &replacement in &replacements {
             self.apply_source_kind13_replacement_static(cod, replacement);
+        }
+        // Construction dirtied these islands — rerun the `FUN_00482120`
+        // coverage scan the source triggers through its island dirty
+        // flags.
+        let mut touched: Vec<u8> = replacements
+            .iter()
+            .map(|replacement| replacement.island_id)
+            .collect();
+        touched.sort_unstable();
+        touched.dedup();
+        for island_id in touched {
+            self.refresh_source_house_infrastructure(island_id);
         }
         replacements
     }
@@ -6124,11 +6249,15 @@ impl Simulation {
             std::collections::HashMap::new();
         for wh in &self.warehouses {
             if wh.active {
-                // Warehouse base radius = 22 (RADIUS_HQ from original binary)
+                // Warehouse base radius: the executable registers
+                // `RADIUS_HQ = 0x10` (`1602_exe.c:66468`); the earlier 22
+                // recovery was wrong. Confirmed independently: a 3×3
+                // Kontor at radius 16 reproduces Exile's authored house
+                // coverage flags exactly.
                 wh_by_island
                     .entry(wh.island_id)
                     .or_default()
-                    .push((wh.tile_x, wh.tile_y, 22));
+                    .push((wh.tile_x, wh.tile_y, 16));
             }
         }
 

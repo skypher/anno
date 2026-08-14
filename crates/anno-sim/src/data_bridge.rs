@@ -352,6 +352,74 @@ pub const SOURCE_CITY_GROUP_SATISFACTION_SCALES: [u32; 5] = [0, 120, 360, 495, 6
 /// Fixed count of city records at `DAT_005dbae0`.
 pub const SOURCE_CITY_RECORD_SLOTS: usize = 0x4b;
 
+/// `FUN_00404d70`: fill one service-radius row of `DAT_005b7460`.
+/// `row[dy]` is the maximum `dx` still inside the service circle. The
+/// source's integer midpoint fill also mirrors each stepped-down column
+/// symmetrically. Verified bit-exact against the running original's
+/// compiled rows (radii 0..=10, 15..=16, 23..=24 sampled live).
+pub fn source_service_radius_row(radius: u8) -> Vec<u8> {
+    let r = i32::from(radius);
+    let mut row = vec![0u8; radius as usize + 1];
+    let mut dx = r;
+    let mut dy = 0i32;
+    let mut acc = r * r;
+    let mut limit = (r - 1) * r;
+    let mut step = 2 * r;
+    let mut two_dy = 0i32;
+    while dy <= dx {
+        row[dy as usize] = dx as u8;
+        acc += -1 - two_dy;
+        // The source compares unsigned (`ja`), so a negative accumulator
+        // also skips the step-down.
+        if (acc as u32) <= (limit as u32) {
+            dx -= 1;
+            if let Some(cell) = row.get_mut((dx + 1) as usize) {
+                *cell = dy as u8;
+            }
+            step -= 2;
+            limit -= step;
+        }
+        dy += 1;
+        two_dy += 2;
+    }
+    if radius == 1 {
+        row[1] = 1;
+    }
+    row
+}
+
+/// `FUN_00478630`'s 17×17 grid at `DAT_005a6af0`:
+/// `ftol(sqrt(dx² + dy²) × 0.375 + 0.5)` with the CRT's
+/// truncate-toward-zero `ftol` (multiplier and bias read from the
+/// executable's rdata at `0x496458`/`0x496310`; grid verified live).
+/// The house-coverage scan takes the minimum class over the covering
+/// marketplaces into the kind-13 record's variant nibble, which the
+/// `FUN_0047b410` growth/decay curves then consume — houses near a
+/// marketplace grow faster.
+pub fn source_market_distance_class(dx: u8, dy: u8) -> u8 {
+    let dx = f64::from(dx.min(16));
+    let dy = f64::from(dy.min(16));
+    ((dx * dx + dy * dy).sqrt() * 0.375 + 0.5) as u8
+}
+
+/// `FUN_00482120`'s infrastructure coverage bits: production kind code of
+/// the covering building → kind-13 lifecycle flag. The transition
+/// predicates (`source_transition_active_for_group`) read these — e.g.
+/// pioneers need a chapel (`0x0004`), settlers→citizens need tavern +
+/// chapel/church + school/college.
+pub const SOURCE_HOUSE_INFRA_LIFECYCLE_BITS: [(u8, u16); 10] = [
+    (0x11, 0x0010), // WIRT (tavern)
+    (0x12, 0x0004), // KAPELLE (chapel)
+    (0x13, 0x0008), // KIRCHE (church)
+    (0x14, 0x0040), // BADEHAUS (bathhouse)
+    (0x15, 0x0080), // THEATER
+    (0x16, 0x0200), // KLINIK (doctor)
+    (0x17, 0x0020), // SCHULE (school)
+    (0x18, 0x0100), // HOCHSCHULE (college)
+    (0x19, 0x0800), // GALGEN (gallows)
+    (0x1a, 0x1000), // BRUNNEN (well)
+];
+
 /// Mutable source-city fields consumed by `FUN_0047f8a0` and
 /// `FUN_00480370`. The source keeps these in a fixed 75-record pool; an
 /// inactive slot corresponds to the `island == 0xff` sentinel tested by the
@@ -1366,6 +1434,12 @@ impl SourceKind13LocationTable {
 
     /// Mutable form of [`Self::location_at`] retaining the source's first
     /// coordinate match in its 64-slot probe window.
+    /// Mutable access to one physical slot, for full-table passes like the
+    /// `FUN_00482120` coverage rescan.
+    pub fn slot_mut(&mut self, index: usize) -> Option<&mut SourceKind13Location> {
+        self.slots.get_mut(index)?.as_mut()
+    }
+
     pub fn location_at_mut(
         &mut self,
         island_id: u8,
@@ -2079,10 +2153,10 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
     let radius = if let Ok(n) = radius_raw.parse::<i32>() {
         n.max(0) as u16
     } else {
-        // Hardcoded constants from original binary (not defined in COD file)
+        // Executable-registered constants (`1602_exe.c:66467-66468`,
+        // both `FUN_004020d0(..., 0x10)`); not defined in the COD file.
         match radius_raw {
-            "RADIUS_MARKT" => 30,
-            "RADIUS_HQ" => 22,
+            "RADIUS_MARKT" | "RADIUS_HQ" => 16,
             _ => 0,
         }
     };
@@ -4536,6 +4610,51 @@ mod tests {
         city.luxury_satisfaction = [17, 18, 18, 18, 0, 18, 18];
         city.refresh_group_satisfaction();
         assert_eq!(city.satisfaction_by_group[4], 128);
+    }
+
+    #[test]
+    fn service_radius_rows_match_the_live_compiled_tables() {
+        // Rows read out of the running original's `DAT_005b7460`
+        // (2026-08-14). The generator is the `FUN_00404d70` integer
+        // midpoint fill.
+        assert_eq!(source_service_radius_row(0), [0]);
+        assert_eq!(source_service_radius_row(1), [1, 1]);
+        assert_eq!(source_service_radius_row(5), [5, 5, 5, 4, 3, 2]);
+        assert_eq!(
+            source_service_radius_row(8),
+            [8, 8, 8, 7, 7, 6, 5, 4, 2]
+        );
+        assert_eq!(
+            source_service_radius_row(10),
+            [10, 10, 10, 10, 9, 9, 8, 7, 6, 5, 3]
+        );
+        assert_eq!(
+            source_service_radius_row(16),
+            [16, 16, 16, 16, 15, 15, 15, 14, 14, 13, 12, 12, 11, 9, 8, 6, 3]
+        );
+        assert_eq!(
+            source_service_radius_row(24),
+            [
+                24, 24, 24, 24, 24, 23, 23, 23, 23, 22, 22, 21, 21, 20, 19, 19, 18, 17, 16,
+                15, 13, 12, 10, 8, 4
+            ]
+        );
+    }
+
+    #[test]
+    fn market_distance_classes_match_the_live_grid() {
+        // `DAT_005a6af0` sampled live: trunc(sqrt(dx²+dy²)·0.375 + 0.5).
+        let expected_row0 = [0, 0, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 5, 6, 6];
+        for (dx, &expected) in expected_row0.iter().enumerate() {
+            assert_eq!(
+                source_market_distance_class(dx as u8, 0),
+                expected,
+                "class({dx}, 0)"
+            );
+        }
+        assert_eq!(source_market_distance_class(4, 4), 2);
+        assert_eq!(source_market_distance_class(16, 16), 8);
+        assert_eq!(source_market_distance_class(12, 5), 5);
     }
 
     #[test]

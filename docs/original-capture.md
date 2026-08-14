@@ -390,10 +390,39 @@ intermediate state the live original shows at +150 s:
 With those, the Rust human city develops `promotion_reservations[2] = 6`
 (one settler house reserved toward citizens) and holds — matching the
 original's observed reservation-driven TABAKWAREN/GEWUERZE demand at
-constant `[0,156,0,0,0]`. Full settler→citizen maturation is gated on
-lifecycle bits `0x20`/`0x100` (`FUN_0047bfa0`), which an unported
-infrastructure scan (BAUINFRA: tavern/school coverage) sets at runtime —
-that scan is the next port target for the growth chain.
+constant `[0,156,0,0,0]`.
+
+### The FUN_00482120 house-coverage scan (ported)
+
+The infrastructure lifecycle bits are set by a per-island rescan
+(`FUN_00482120`, dirty-flag driven) that walks the residence list against
+the island's coverage buildings, matched by production kind code:
+marketplace (7) sets state bit `0x80` and takes the **minimum distance
+class** into the variant nibble (feeding the `FUN_0047b410` growth curves
+— houses near a market grow faster); Kontor (8) sets `0x0400`; tavern
+`0x0010`, chapel `0x0004`, church `0x0008`, bathhouse `0x0040`, theater
+`0x0080`, doctor `0x0200`, school `0x0020`, college `0x0100`, gallows
+`0x0800`, well `0x1000`. The radius test is `dx ≤ row[dy]` over the
+compiled circle rows (`FUN_00404d70` integer midpoint fill, live-verified)
+measured from the building's centered footprint with even-size asymmetry;
+the distance class is `trunc(sqrt(dx²+dy²)·0.375 + 0.5)` (rdata constants
+`0x496458`/`0x496310`, grid live-verified). State bit 6 is re-evaluated
+from the `FUN_0047bfa0` transition predicate afterwards.
+
+Validation: the scan reproduces Exile's authored SIEDLER flags **exactly
+for all 26 houses** (state, lifecycle, and every distance-class variant) —
+the authored records are frozen output of the same scan (they predate the
+scenario's well, whose `0x1000` bit the runtime adds back). The fit also
+exposed that the compiled service radii are `RADIUS_MARKT = RADIUS_HQ =
+0x10` (`1602_exe.c:66467-66468`) — the previously recovered 30/22 were
+wrong, and the warehouse-coverage radius has been corrected to 16.
+
+Exile's settlers still cannot mature to citizens — the scenario has no
+school or college — so the promotion reservation pends indefinitely,
+matching the live original. The remaining growth-chain gaps are the
+rand-gated event block itself (`FUN_0047b540` immigration enqueue and the
+`FUN_0047a020` pending-wave processor, which matter once houses sit below
+capacity) and the `FUN_0047f510` marketplace-upgrade scan.
 
 Wine stability note: the original dies within ~5 minutes of entering Exile on
 this setup even with zero winedbg attaches (reproduced three times; the crash

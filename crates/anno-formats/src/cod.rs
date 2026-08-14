@@ -411,8 +411,12 @@ impl CodFile {
         // `RADIUS_HQ` (marketplace and warehouse service radius) but never
         // defines them; the original engine seeds them from the binary. Values
         // are the same ones `anno_sim::data_bridge` recovered.
-        constants.insert("RADIUS_MARKT".to_string(), 30);
-        constants.insert("RADIUS_HQ".to_string(), 22);
+        // `1602_exe.c:66467-66468`: the executable registers both as
+        // 0x10 before parsing the file (the earlier 30/22 recovery was
+        // wrong; a 3×3 Kontor at radius 16 reproduces Exile's authored
+        // house-coverage flags exactly).
+        constants.insert("RADIUS_MARKT".to_string(), 16);
+        constants.insert("RADIUS_HQ".to_string(), 16);
         let mut buildings: Vec<BuildingDef> = Vec::new();
         let mut building_by_nummer: HashMap<i32, BuildingDef> = HashMap::new();
         // `@field: +/-value` is evaluated by the executable parser against

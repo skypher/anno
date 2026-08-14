@@ -25,6 +25,70 @@ fn load_exile() -> Option<(anno_sim::simulation::Simulation, anno_formats::cod::
 }
 
 #[test]
+fn exile_house_coverage_scan_reproduces_authored_flags() {
+    // The scenario's SIEDLER records are frozen output of the editor's
+    // own `FUN_00482120` coverage scan (predating the authored well, so
+    // the BRUNNEN bit 0x1000 is ignored below). After the load-time
+    // rescan, every residence must carry identical state bits,
+    // infrastructure lifecycle bits (including the 3×3 Kontor at the
+    // executable's RADIUS_HQ = 16), and marketplace distance-class
+    // variants.
+    let Some((sim, _cod)) = load_exile() else {
+        println!("Skipping test: data corpus not found");
+        return;
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let szs_data = std::fs::read(root.join("extracted/Szenes/Exile.szs")).unwrap();
+    let szs = anno_formats::szs::SzsFile::parse(&szs_data).unwrap();
+    let authored: std::collections::HashMap<(u8, u8), (u8, u16, u8)> = szs
+        .settler_houses
+        .iter()
+        .filter(|house| house.island_id == 0)
+        .map(|house| {
+            (
+                (house.tile_x, house.tile_y),
+                (
+                    house.state_bits,
+                    house.lifecycle_flags,
+                    house.variant & 0x0f,
+                ),
+            )
+        })
+        .collect();
+    let mut compared = 0;
+    for location in sim
+        .source_kind13_locations
+        .active_locations()
+        .into_iter()
+        .filter(|location| location.island_id == 0)
+    {
+        let Some(&(state, lifecycle, variant)) =
+            authored.get(&(location.tile_x, location.tile_y))
+        else {
+            continue;
+        };
+        assert_eq!(
+            (
+                location.state_bits,
+                location.lifecycle_flags & !0x1000,
+                location.variant & 0x0f,
+            ),
+            (state, lifecycle, variant),
+            "coverage mismatch at ({}, {})",
+            location.tile_x,
+            location.tile_y
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 26, "all authored residences compared");
+}
+
+#[test]
 fn exile_population_holds_at_the_house_bound() {
     let Some((mut sim, cod)) = load_exile() else {
         println!("Skipping test: data corpus not found");
@@ -65,11 +129,11 @@ fn exile_population_holds_at_the_house_bound() {
         sim.tick(100);
         sim.drain_source_kind13_replacements(&cod);
     }
-    // With the infrastructure lifecycle flags (`FUN_0047bfa0` bits
-    // 0x20/0x100) not yet scanned in, settler houses cannot promote to
-    // citizens, so the total is exactly the authored roster. Once that
-    // scan is ported, the original's behavior is a slow settler->citizen
-    // shift at constant total.
+    // The coverage scan grants chapel + tavern (+ Kontor/market) flags,
+    // but Exile ships no school or college, so the settler->citizen
+    // transition (`FUN_0047bfa0` requires lifecycle 0x20 or 0x100) stays
+    // gated and the reservation pends — exactly the live original's
+    // observed state. The total holds at the authored roster.
     assert_eq!(
         sim.players[0].population,
         [0, 156, 0, 0, 0],

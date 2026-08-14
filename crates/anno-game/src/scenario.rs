@@ -226,6 +226,23 @@ pub fn init_simulation(
     sim.island_maps = island_maps;
     sim.configure_source_controller_active_cities();
     sim.mark_loaded_source_islands_visible();
+    // Initial `FUN_00482120` coverage scan: derive each residence's
+    // infrastructure lifecycle bits, market state bit, and distance-class
+    // variant from the actual buildings (the SIEDLER-authored values are
+    // snapshots of the same computation).
+    {
+        let mut islands_with_houses: Vec<u8> = sim
+            .source_kind13_locations
+            .active_locations()
+            .into_iter()
+            .map(|location| location.island_id)
+            .collect();
+        islands_with_houses.sort_unstable();
+        islands_with_houses.dedup();
+        for island_id in islands_with_houses {
+            sim.refresh_source_house_infrastructure(island_id);
+        }
+    }
     sim.coverage_maps = coverage_maps;
     sim.ocean_map = Some(ocean_map);
     sim.ship_cargo_config = ship_cargo_config;
