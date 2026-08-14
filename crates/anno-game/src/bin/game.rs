@@ -6837,6 +6837,22 @@ mod tests {
         sim.players.push(Player::new_human(0));
         sim.building_defs = defs.clone();
         sim.island_maps.push(island_map);
+        // The fixture's ground tiles carry map-owner selector 0, which in the
+        // executable can only mean "island settlement slot 0 exists and owns
+        // this tile" — `island + 0xac + 0` is the record `FUN_0046aec0`
+        // (`1602_exe.c:74607`) dereferences to read the settlement's player
+        // byte. Placement joins that settlement, so the record has to be here
+        // for the fixture to describe a reachable state; without it the
+        // resolver correctly reports the unsettled selector 7.
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(data_bridge::SourceCityRecord {
+                island_id: 4,
+                source_owner: 0,
+                owner_slot: 0,
+                ..data_bridge::SourceCityRecord::default()
+            })
+        ));
         let mut placer = BuildingPlacer::new(&cod, &defs);
         placer.active = true;
 

@@ -1577,6 +1577,32 @@ impl IslandMap {
         }
     }
 
+    /// Compiled outer map kind and settlement-slot selector of one live tile.
+    /// Both overlays are rebuilt from the same INSELHAUS word, whose bits
+    /// 19..=21 hold the slot (`1602_exe.c:74606`).
+    pub fn source_map_kind_and_owner(&self, x: i32, y: i32) -> Option<(u8, u8)> {
+        self.source_map_kind_cell((x, y))
+            .map(|cell| (cell.kind_code, cell.map_owner))
+    }
+
+    /// Rewrite only the settlement-slot selector of one live tile.
+    ///
+    /// `FUN_0046ac60` and `FUN_0046ae20` (`1602_exe.c:74483`, `:74539`) both
+    /// apply `word & 0xffc7ffff | (slot & 7) << 0x13`, leaving the definition
+    /// index and every other bit alone. The two overlays rebuilt here are
+    /// separate Rust views of that one word, so both move together.
+    pub fn set_source_map_owner(&mut self, x: i32, y: i32, owner: u8) {
+        let Some(index) = self.local_index((x, y)) else {
+            return;
+        };
+        if let Some(Some(cell)) = self.source_map_kind_cells.get_mut(index) {
+            cell.map_owner = owner & 7;
+        }
+        if let Some(Some(cell)) = self.civilian_path_cells.get_mut(index) {
+            cell.owner = owner & 7;
+        }
+    }
+
     /// A tile is "coastal" if it's walkable AND at least one of its
     /// 4-neighbours is out of bounds — i.e. it sits on the perimeter of
     /// the island's walkable region. Fisheries can only go on coastal tiles.

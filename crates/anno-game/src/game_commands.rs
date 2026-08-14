@@ -189,25 +189,30 @@ pub fn place_building(
     let source_definition_offset = (cod_b.source_id - anno_formats::szs::INSELHAUS_SOURCE_ID_BASE)
         .try_into()
         .ok();
-    // Player construction belongs to the player's city on this island:
-    // the original stamps the city selector into the claimed tiles, and
-    // the kind-13 dispatch resolves a record's city through exactly this
-    // selector. Scenario ground tiles on pristine stock islands carry no
-    // ownership, so prefer the live city record over the tile bits.
-    let source_map_owner_slot = sim
-        .source_cities
-        .active_records()
-        .into_iter()
-        .find(|city| city.island_id == island_number && city.owner_slot == owner)
-        .map(|city| city.source_owner)
-        .or_else(|| {
-            islands[current_island]
-                .tiles
-                .iter()
-                .find(|tile| tile.x as i32 == tile_x && tile.y as i32 == tile_y)
-                .map(|tile| tile.source_owner())
-        })
-        .unwrap_or(7);
+    let (oriented_width, oriented_height) = if matches!(orient & 3, 1 | 3) {
+        (bld_h, bld_w)
+    } else {
+        (bld_w, bld_h)
+    };
+    // `FUN_004084d0` (`1602_exe.c:7521-7535`) resolves the placement's
+    // settlement through `FUN_0046aec0`, which votes over the live
+    // settlement-slot selectors of the tiles the oriented footprint covers,
+    // and stamps 7 when that ground belongs to no settlement of this player.
+    // `FUN_00465170`'s tail then writes exactly that value over the footprint
+    // (`FUN_0046ae20`, `1602_exe.c:70702`).
+    //
+    // Reading the live map rather than the player's city record is what keeps
+    // a harvester's stamp equal to the stamp on the resource cells around it:
+    // `FUN_0046f920` compares the two by exact equality, and terrain only
+    // joins a settlement through the radius claim below.
+    let source_map_owner_slot = sim.source_placement_settlement_slot(
+        island_number,
+        tile_x,
+        tile_y,
+        oriented_width,
+        oriented_height,
+        owner,
+    );
     let source_random_seed = (sim.next_source_rand() & 0x1f) as u8;
     for dy in 0..bld_h as u8 {
         for dx in 0..bld_w as u8 {
@@ -301,6 +306,20 @@ pub fn place_building(
     if def.kind == "HQ" {
         let _ = sim.allocate_source_dynamic_map_object_for_building(building_index);
     }
+    // `FUN_00465170` (`1602_exe.c:70652-70689`): a MARKT extends its
+    // settlement over the still-unowned land inside its compiled `Radius`,
+    // and a KONTOR over `max(Radius, 8)`. Nothing else claims ground.
+    sim.apply_source_settlement_claim(
+        island_number,
+        tile_x,
+        tile_y,
+        oriented_width,
+        oriented_height,
+        cod_b.source_production_kind_code().unwrap_or(0),
+        cod_b.source_transfer_radius,
+        source_map_owner_slot,
+        owner,
+    );
     // `FUN_00478b90`: installing a kind-0x0d object (WOHNUNG/PLATZ)
     // creates its runtime kind-13 record with the 0x40 initial amount
     // (one resident) and the definition's BGruppe.
@@ -629,6 +648,22 @@ pub fn found_kontor(
     if def.kind == "HQ" {
         let _ = sim.allocate_source_dynamic_map_object_for_building(building_index);
     }
+    // `FUN_00468ce0` takes the first free `island + 0xac` settlement slot and
+    // stamps it onto the founding tile; `FUN_00465170`'s production-kind-8
+    // branch then claims the surrounding still-unowned land out to
+    // `max(Radius, 8)` — `RADIUS_HQ` is 16 — into that slot
+    // (`1602_exe.c:70669-70689`). Wild ROHSTOFF cells inside the disc join
+    // the settlement here, which is what later lets a harvester whose own
+    // ground carries the same slot pass `FUN_0046f920`'s equality test.
+    sim.claim_source_settlement_area(
+        island_number,
+        i32::from(tile_x),
+        i32::from(tile_y),
+        u8::try_from(cod_b.size.0).unwrap_or(1),
+        u8::try_from(cod_b.size.1).unwrap_or(1),
+        cod_b.source_transfer_radius.max(8),
+        source_map_owner_slot,
+    );
     sim.refresh_source_house_infrastructure(island_number);
     sim.event_log.push(format!(
         "[found] player {player} settles island {island_number} at ({tile_x},{tile_y})"

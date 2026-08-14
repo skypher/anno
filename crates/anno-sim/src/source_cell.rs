@@ -330,7 +330,27 @@ impl SourceMapCellState {
     /// `FUN_0046f920`'s path-grid admission predicate for an already decoded
     /// static map cell. A fixed terrain kind remains traversable across every
     /// owner; all other cells require both the map owner and compiled `Ware`
-    /// selector to match the worker's root.
+    /// selector to match the worker's root:
+    ///
+    /// ```text
+    /// if ((param_6 == param_8) && ((*param_3 >> 0x13 & 7) == param_2))
+    /// ```
+    ///
+    /// (`1602_exe.c:78803`). The comparison is exact — there is no wildcard
+    /// for the "no settlement" selector 7, unlike the city hazard scan at
+    /// `1602_exe.c:12128`, which admits `(tile & 0x380000) == 0x380000`
+    /// explicitly. `source_owner` is not a player id and is not taken from the
+    /// worker's city: `FUN_0044b7e0` reads it straight off the producing
+    /// root's own map tile (`uVar6 = *puVar1 >> 0x13 & 7`,
+    /// `1602_exe.c:52409`) and stores it at figure record `+0x2b`, which
+    /// `FUN_0045b200` passes here as `param_2` (`1602_exe.c:62982`).
+    ///
+    /// A player therefore harvests wild woodland only because founding
+    /// rewrites that woodland's selector: `FUN_00465170` runs `FUN_0046ac60`
+    /// over the Kontor's `max(Radius, 8)` disc and claims every unowned
+    /// non-`MEER` tile into the new settlement slot
+    /// (`1602_exe.c:70669-70689`, `:74480-74483`). Outside any settlement both
+    /// the harvester and the trees keep 7 and still compare equal.
     pub const fn admits_plantation_worker_path(
         self,
         source_owner: u8,

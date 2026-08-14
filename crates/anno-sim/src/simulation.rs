@@ -3876,6 +3876,231 @@ impl Simulation {
         }
     }
 
+    /// Outer map kind and settlement-slot selector of one live island tile.
+    /// The final-overwrite root is authoritative because it is what the
+    /// executable's `+0xaf8` array holds after the loader replays INSELHAUS;
+    /// islands whose open cells carry no command fall back to the map overlay.
+    fn source_map_tile_kind_and_owner(&self, island: u8, x: i32, y: i32) -> Option<(u8, u8)> {
+        if let Some(root) = self
+            .source_static_map_roots
+            .iter()
+            .rev()
+            .find(|root| root.island == island && i32::from(root.x) == x && i32::from(root.y) == y)
+        {
+            return Some((root.kind_code, root.source_map_owner_slot));
+        }
+        self.island_maps
+            .iter()
+            .find(|map| map.island_id == island)
+            .and_then(|map| map.source_map_kind_and_owner(x, y))
+    }
+
+    /// Rewrite one live tile's settlement-slot selector across every Rust
+    /// view of the executable's single map word (`word & 0xffc7ffff |
+    /// (slot & 7) << 0x13`, `1602_exe.c:74483`).
+    fn set_source_map_tile_owner(&mut self, island: u8, x: i32, y: i32, slot: u8) {
+        let slot = slot & 7;
+        for root in self
+            .source_static_map_roots
+            .iter_mut()
+            .chain(self.source_map_cell_states.iter_mut())
+        {
+            if root.island == island && i32::from(root.x) == x && i32::from(root.y) == y {
+                root.source_map_owner_slot = slot;
+            }
+        }
+        if let Some(map) = self
+            .island_maps
+            .iter_mut()
+            .find(|map| map.island_id == island)
+        {
+            map.set_source_map_owner(x, y, slot);
+        }
+        let (Ok(tile_x), Ok(tile_y)) = (u8::try_from(x), u8::try_from(y)) else {
+            return;
+        };
+        if let Some(location) = self
+            .source_kind13_locations
+            .location_at_mut(island, tile_x, tile_y)
+        {
+            location.source_owner = slot;
+        }
+    }
+
+    /// `FUN_0046aec0` (`1602_exe.c:74558-74640`): resolve which per-island
+    /// settlement a placement joins, by reading the settlement-slot selector
+    /// out of the live tiles the oriented footprint covers.
+    ///
+    /// The source scans the clipped footprint rectangle; a tile whose slot is
+    /// not 7 and whose island settlement record exists either aborts with that
+    /// record (when it belongs to another player, `:74608-74610`) or casts one
+    /// vote for its slot. The winning record is the one with the most votes,
+    /// and a footprint entirely on unowned ground returns none.
+    ///
+    /// `FUN_004084d0` (`1602_exe.c:7521-7535`) then takes the record's own
+    /// slot byte `+0x19` when its player byte `+0x1a` matches the builder, and
+    /// otherwise stamps the placement with 7. That is what this returns: the
+    /// value the build command writes into command bits 14..=16 and
+    /// `FUN_0046ae20` stamps onto the footprint.
+    pub fn source_placement_settlement_slot(
+        &self,
+        island: u8,
+        tile_x: i32,
+        tile_y: i32,
+        width: u8,
+        height: u8,
+        player: u8,
+    ) -> u8 {
+        const UNSETTLED_SLOT: u8 = 7;
+        let mut votes = [0u32; 8];
+        for dy in 0..i32::from(height.max(1)) {
+            for dx in 0..i32::from(width.max(1)) {
+                let Some((_, slot)) =
+                    self.source_map_tile_kind_and_owner(island, tile_x + dx, tile_y + dy)
+                else {
+                    continue;
+                };
+                if slot >= UNSETTLED_SLOT {
+                    continue;
+                }
+                let Some(city) = self
+                    .source_cities
+                    .active_records()
+                    .into_iter()
+                    .find(|city| city.island_id == island && city.source_owner == slot)
+                else {
+                    continue;
+                };
+                // `if (*(byte *)(iVar1 + 0x1a) != param_3) return iVar1;`
+                // — a foreign settlement short-circuits the scan, and the
+                // caller's player test then falls through to slot 7.
+                if city.owner_slot != player {
+                    return UNSETTLED_SLOT;
+                }
+                votes[usize::from(slot)] += 1;
+            }
+        }
+        votes
+            .iter()
+            .enumerate()
+            .fold(None::<(usize, u32)>, |best, (slot, &count)| match best {
+                Some((_, top)) if count <= top => best,
+                _ if count == 0 => best,
+                _ => Some((slot, count)),
+            })
+            .map(|(slot, _)| slot as u8)
+            .unwrap_or(UNSETTLED_SLOT)
+    }
+
+    /// `FUN_0046ac60` (`1602_exe.c:74434-74512`): claim every still-unowned
+    /// land tile inside a settlement's service disc.
+    ///
+    /// `FUN_00465170` calls this for exactly two nested production kinds — 7
+    /// (`MARKT`) with the compiled `Radius`, and 8 (`KONTOR`) with
+    /// `max(Radius, 8)` (`1602_exe.c:70652-70689`) — centring the disc on the
+    /// oriented footprint's integer centre and widening it by the footprint's
+    /// second centre row/column when an extent is even. The per-row half
+    /// widths come from the `FUN_00404d70` raster.
+    ///
+    /// Only tiles whose selector is still 7 change, and the source excludes
+    /// definitions whose outer map kind is `0x13` (`MEER`), so open sea never
+    /// joins a settlement. Everything else on land does — including the wild
+    /// `ROHSTOFF` resource cells, which is precisely why a forester inside a
+    /// settlement can harvest trees that `FUN_0046f920` compares by exact
+    /// slot equality.
+    ///
+    /// Returns true when at least one tile changed (the source's
+    /// `DAT_00633740` map-dirty flag).
+    pub fn claim_source_settlement_area(
+        &mut self,
+        island: u8,
+        tile_x: i32,
+        tile_y: i32,
+        width: u8,
+        height: u8,
+        radius: u8,
+        slot: u8,
+    ) -> bool {
+        const UNSETTLED_SLOT: u8 = 7;
+        const SEA_MAP_KIND: u8 = 19;
+        if slot >= UNSETTLED_SLOT {
+            return false;
+        }
+        let width = i32::from(width.max(1));
+        let height = i32::from(height.max(1));
+        // `(param_7 - 1) / 2 + param_4`, `(param_2 - 1) / 2 + param_5`.
+        let center_x = tile_x + (width - 1) / 2;
+        let center_y = tile_y + (height - 1) / 2;
+        // `uVar6 = param_7 - 1 & 0x80000001`, normalized to 0 or 1: an even
+        // extent has a second centre row/column the raster also covers.
+        let extra_x = (width - 1) & 1;
+        let extra_y = (height - 1) & 1;
+        let rows = crate::data_bridge::source_service_radius_row(radius);
+        let mut claimed = Vec::new();
+        for (dy, &half_width) in rows.iter().enumerate() {
+            let dy = dy as i32;
+            let left = center_x - i32::from(half_width);
+            let right = center_x + 1 + extra_x + i32::from(half_width);
+            for y in [center_y - dy, center_y + dy + extra_y] {
+                for x in left..right {
+                    let Some((kind_code, owner)) =
+                        self.source_map_tile_kind_and_owner(island, x, y)
+                    else {
+                        continue;
+                    };
+                    if owner != UNSETTLED_SLOT || kind_code == SEA_MAP_KIND {
+                        continue;
+                    }
+                    claimed.push((x, y));
+                }
+            }
+        }
+        if claimed.is_empty() {
+            return false;
+        }
+        for (x, y) in claimed {
+            self.set_source_map_tile_owner(island, x, y, slot);
+        }
+        self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+        true
+    }
+
+    /// The territory half of `FUN_00465170` (`1602_exe.c:70652-70689`) for one
+    /// completed placement: `MARKT` claims its compiled `Radius`, `KONTOR`
+    /// claims `max(Radius, 8)` but only when the resolved settlement already
+    /// belongs to the builder. Every other production kind claims nothing.
+    pub fn apply_source_settlement_claim(
+        &mut self,
+        island: u8,
+        tile_x: i32,
+        tile_y: i32,
+        width: u8,
+        height: u8,
+        production_kind_code: u8,
+        radius: u8,
+        slot: u8,
+        player: u8,
+    ) -> bool {
+        let radius = match production_kind_code {
+            7 => radius,
+            // `bVar4 = *(byte *)(iVar2 + 0x20); if (bVar4 < 8) bVar4 = 8;`
+            8 => radius.max(8),
+            _ => return false,
+        };
+        if production_kind_code == 8
+            && !self
+                .source_cities
+                .active_records()
+                .into_iter()
+                .any(|city| {
+                    city.island_id == island && city.source_owner == slot && city.owner_slot == player
+                })
+        {
+            return false;
+        }
+        self.claim_source_settlement_area(island, tile_x, tile_y, width, height, radius, slot)
+    }
+
     /// Materialize a drained terminal ruin command into the static-cell table.
     /// The frozen random draws were consumed when the source event fired, so
     /// this reconstruction never advances the simulation RNG.
@@ -5298,15 +5523,24 @@ impl Simulation {
             return None;
         }
 
+        // `uVar6 = *puVar1 >> 0x13 & 7` (`1602_exe.c:52409`): the worker takes
+        // its settlement-slot selector from the *live map tile* the root
+        // stands on, not from anything held in the 20-byte root record. A
+        // building whose ground is claimed into a settlement after it was
+        // built therefore starts matching that settlement's resource cells.
+        let source_owner = self
+            .source_map_tile_kind_and_owner(root.island, i32::from(root.x), i32::from(root.y))
+            .map(|(_, slot)| slot)
+            .unwrap_or(root.source_map_owner_slot);
         let definition = root.source_plantation_worker_definition;
         let mut figure = Figure::new();
         figure.action = ActionType::Walking;
-        figure.owner = root.source_map_owner_slot;
+        figure.owner = source_owner;
         figure.origin_island = root.island;
         figure.origin_x = u16::from(root.x);
         figure.origin_y = u16::from(root.y);
         figure.origin_kind = root.kind_code;
-        figure.origin_source_map_owner_slot = root.source_map_owner_slot;
+        figure.origin_source_map_owner_slot = source_owner;
         figure.origin_production_kind = root.source_production_kind_code;
         figure.tile_x = start.0;
         figure.tile_y = start.1;
