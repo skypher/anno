@@ -158,6 +158,14 @@ fn main() {
         let mut best: Option<(usize, (i32, i32))> = None;
         for y in 2..island.height as i32 - i32::from(h) - 2 {
             for x in 2..island.width as i32 - i32::from(w) - 2 {
+                // Stay inside the Kontor's radius-16 claim. A producer on
+                // unclaimed ground still harvests, but the city cart filters
+                // suppliers by settlement slot, so its output is stranded —
+                // and the original would refuse the placement outright.
+                let (dx, dy) = (x - anchor.0, y - anchor.1);
+                if dx * dx + dy * dy > 16 * 16 {
+                    continue;
+                }
                 let free = (0..i32::from(h))
                     .all(|dy| (0..i32::from(w)).all(|dx| map.is_walkable(x + dx, y + dy)))
                     && !used.iter().any(|&(ux, uy, uw, uh)| {
@@ -233,7 +241,7 @@ fn main() {
         for cell in sim
             .source_map_cell_states
             .iter()
-            .filter(|c| c.island == 10 && (1..=6).contains(&c.source_production_kind_code))
+            .filter(|c| c.island == 10 && (1..=8).contains(&c.source_production_kind_code))
         {
             println!(
                 "  cell ({},{}) prodkind={} act={} raw={} work={} fill={} cap={} sched={} blocked={}",
@@ -264,6 +272,16 @@ fn main() {
                 .or_default() += 1;
         }
         println!("  worker figures on island 10: {routes:?}");
+        let carts = sim
+            .figures
+            .iter()
+            .filter(|f| {
+                f.is_active()
+                    && f.origin_island == 10
+                    && f.source_worker_route == anno_sim::entity::SourceWorkerRoute::None
+            })
+            .count();
+        println!("  non-harvest figures from island 10: {carts}");
     };
 
     // Which buildings are still owed materials / still under construction?

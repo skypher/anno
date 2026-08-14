@@ -637,6 +637,26 @@ pub fn found_kontor(
     );
     instance.source_placement_command = Some(command);
     let phase = ((sim.game_clock / 10) & 7) as u8;
+    // `FUN_00481450` case 8 (`1602_exe.c:92822-92836`) allocates the founded
+    // Kontor a **live** record through `FUN_00481fc0`, exactly as it does for
+    // any other placed building — there is no separate founding path in the
+    // original. That record is what increments the city's storage-root count
+    // (`:93195`) and, more visibly, what makes the Kontor a type-11 transfer
+    // root: without it a founded colony dispatches no city carts at all and
+    // every producer's output stays stranded in its own store.
+    if let Some(mut state) = anno_sim::source_cell::SourceMapCellState::new(
+        island_number,
+        tile_x as u8,
+        tile_y as u8,
+        cod_b,
+        phase,
+    ) {
+        state.set_footprint(cod_b.size.0, cod_b.size.1);
+        state.set_source_command(command);
+        state.configure_terminal_replacement(cod);
+        state.configure_source_resource_records(cod, cod_b);
+        sim.source_map_cell_states.push(state);
+    }
     if let Some(mut state) = anno_sim::source_cell::SourceMapCellState::new_static(
         island_number,
         tile_x as u8,
