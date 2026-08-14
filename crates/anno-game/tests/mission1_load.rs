@@ -145,3 +145,109 @@ fn verena_sails_to_a_free_island_on_command() {
         ship.world_y
     );
 }
+
+#[test]
+fn verena_founds_a_settlement_on_the_free_island() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let (Ok(szs_data), Ok(cod_data)) = (
+        std::fs::read(root.join("extracted/Szenes/New Horizons0.szs")),
+        std::fs::read(root.join("extracted/haeuser.cod")),
+    ) else {
+        println!("Skipping test: data corpus not found");
+        return;
+    };
+    let mut szs = anno_formats::szs::SzsFile::parse(&szs_data).unwrap();
+    anno_game::scenario::instantiate_stock_islands(&mut szs, &root.join("extracted"), 1);
+    let cod = anno_formats::cod::CodFile::parse(&cod_data).unwrap();
+    let defs = anno_sim::data_bridge::load_building_defs(&cod);
+    let figures = std::fs::read(root.join("extracted/figuren.cod"))
+        .map(|bytes| anno_formats::figuren::FiguresFile::parse(&bytes))
+        .unwrap_or_else(|_| anno_formats::figuren::FiguresFile {
+            constants: Default::default(),
+            figures: Vec::new(),
+        });
+    let mut sim = anno_game::scenario::build_simulation(&szs, &cod, &defs, &figures);
+    sim.seed_source_rand(1);
+    let ship_index = sim
+        .trade_ships
+        .iter()
+        .position(|ship| ship.name == "Verena")
+        .expect("Verena spawns") as u32;
+
+    // Island 10 at (201,231): find a coastal tile on its western side.
+    let island = szs.islands.iter().find(|i| i.number == 10).unwrap();
+    let map_idx = sim
+        .island_maps
+        .iter()
+        .position(|m| m.island_id == 10)
+        .unwrap();
+    let anchor = (0..island.height as i32)
+        .flat_map(|y| (0..island.width as i32).map(move |x| (x, y)))
+        .find(|&(x, y)| sim.island_maps[map_idx].is_coastal(x, y))
+        .expect("island 10 has a coastline");
+    let world = (
+        i32::from(island.x_pos) + anchor.0,
+        i32::from(island.y_pos) + anchor.1,
+    );
+
+    // Sail alongside, then found.
+    assert!(sim.apply_command(&anno_sim::commands::Command::SailShip {
+        player: 0,
+        ship_index,
+        world_x: world.0,
+        world_y: world.1,
+    }));
+    for _ in 0..3_000 {
+        sim.tick(100);
+        let ship = &sim.trade_ships[ship_index as usize];
+        if (ship.world_x - world.0).abs() + (ship.world_y - world.1).abs() < 12 {
+            break;
+        }
+    }
+    let found = anno_game::game_commands::apply_game_command(
+        &mut sim,
+        &szs.islands,
+        &cod,
+        &defs,
+        &anno_sim::commands::Command::FoundKontor {
+            player: 0,
+            ship_index,
+            island: 10,
+            tile_x: anchor.0 as u16,
+            tile_y: anchor.1 as u16,
+        },
+    );
+    assert!(found, "founding must succeed at the coastal anchor");
+
+    // The settlement exists: city record, warehouse with the ship cargo,
+    // and the Kontor building.
+    assert!(sim
+        .source_cities
+        .active_records()
+        .iter()
+        .any(|city| city.island_id == 10 && city.owner_slot == 0));
+    let warehouse = sim
+        .warehouses
+        .iter()
+        .find(|w| w.island_id == 10 && w.owner == 0)
+        .expect("island warehouse created");
+    use anno_sim::types::Good;
+    assert_eq!(warehouse.stock(Good::Tools), 50, "capacity-clamped tools");
+    assert_eq!(warehouse.stock(Good::Wood), 50);
+    assert_eq!(warehouse.stock(Good::Food), 20);
+    assert!(sim
+        .buildings
+        .iter()
+        .any(|b| b.island_id == 10 && b.owner == 0));
+    let ship = &sim.trade_ships[ship_index as usize];
+    assert_eq!(
+        ship.cargo_amount(Good::Tools),
+        10,
+        "store overflow stays aboard"
+    );
+}

@@ -143,10 +143,12 @@ pub fn init_simulation(
     // settlements with no production tiles in INSELHAUS; the
     // original engine spawns a Kontor for those slots
     // dynamically at scenario start.
+    // Only settled islands get a warehouse: a STADT4 city (or an authored
+    // Kontor, handled below). Terrain production instances alone (forests,
+    // ore rocks on pristine stock islands) must not conjure one — the
+    // original has no island store until a Kontor exists, and a phantom
+    // empty warehouse shadows the one `Command::FoundKontor` creates.
     let mut island_ids: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
-    for inst in &instances {
-        island_ids.insert(inst.island_id);
-    }
     for island in &szs.islands {
         if let Some(city) = island.city.as_ref() {
             if !city.name.is_empty() {

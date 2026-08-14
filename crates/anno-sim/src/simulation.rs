@@ -9021,10 +9021,12 @@ impl Simulation {
                     .push(format!("[cart] {placed} {good:?} → warehouse #{ti}",));
                 placed > 0
             }
-            // Placement and demolition need the compiled COD table to
-            // synthesize source map commands; the game layer applies them
-            // via `anno_game::game_commands::apply_game_command`.
-            Command::PlaceBuilding { .. } | Command::DemolishBuilding { .. } => false,
+            // Placement, demolition, and founding need the compiled COD
+            // table to synthesize source map commands; the game layer
+            // applies them via `anno_game::game_commands::apply_game_command`.
+            Command::PlaceBuilding { .. }
+            | Command::DemolishBuilding { .. }
+            | Command::FoundKontor { .. } => false,
             Command::SailShip {
                 player,
                 ship_index,

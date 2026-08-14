@@ -160,6 +160,19 @@ pub enum Command {
         tile_x: u16,
         tile_y: u16,
     },
+    /// Found a settlement: the docked ship builds the island's first
+    /// Kontor at a coastal anchor, allocating the source city record,
+    /// creating the island warehouse, and unloading the ship's cargo
+    /// into the new city store. Free of materials, as in the original's
+    /// ship-founding flow. Applied by the game layer (needs the COD
+    /// table), like [`Command::PlaceBuilding`].
+    FoundKontor {
+        player: u8,
+        ship_index: u32,
+        island: u8,
+        tile_x: u16,
+        tile_y: u16,
+    },
     /// Order one player-owned trade ship to sail to a world coordinate —
     /// the right-click move flow for an unrouted trader. The ship follows
     /// a computed ocean path and docks Idle on arrival.

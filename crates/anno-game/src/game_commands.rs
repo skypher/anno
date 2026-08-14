@@ -406,6 +406,173 @@ pub fn apply_game_command(
             tile_x,
             tile_y,
         } => demolish_building(sim, defs, island, tile_x as i32, tile_y as i32, player).is_some(),
+        Command::FoundKontor {
+            player,
+            ship_index,
+            island,
+            tile_x,
+            tile_y,
+        } => found_kontor(sim, islands, cod, defs, player, ship_index, island, tile_x, tile_y),
         _ => sim.apply_command(cmd),
     }
+}
+
+/// Found a settlement from a docked ship: build the island's first Kontor
+/// at a coastal anchor, allocate the source city record
+/// (`FUN_00468e10`), create the island `Warehouse`, and unload the ship's
+/// cargo into the new city store. The original's ship-founding flow costs
+/// no materials.
+#[allow(clippy::too_many_arguments)]
+pub fn found_kontor(
+    sim: &mut Simulation,
+    islands: &[Island],
+    cod: &CodFile,
+    defs: &[BuildingDef],
+    player: u8,
+    ship_index: u32,
+    island_number: u8,
+    tile_x: u16,
+    tile_y: u16,
+) -> bool {
+    let Some(island) = islands.iter().find(|i| i.number == island_number) else {
+        return false;
+    };
+    // The founding Kontor definition: the same one authored settlements
+    // place (haeuser Nummer 271, source id 22103).
+    let Some(def_index) = cod.buildings.iter().position(|b| b.source_id == 22103) else {
+        return false;
+    };
+    let Some(map_idx) = sim
+        .island_maps
+        .iter()
+        .position(|map| map.island_id == island_number)
+    else {
+        return false;
+    };
+    // Anchor must sit on the island's coastline.
+    if !sim.island_maps[map_idx].is_coastal(i32::from(tile_x), i32::from(tile_y)) {
+        return false;
+    }
+    // Ship gate: player-owned, unrouted, docked near the anchor's world
+    // position (the original requires the ship alongside the beach).
+    let world_x = i32::from(island.x_pos) + i32::from(tile_x);
+    let world_y = i32::from(island.y_pos) + i32::from(tile_y);
+    let cargo = {
+        let Some(ship) = sim.trade_ships.get_mut(ship_index as usize) else {
+            return false;
+        };
+        if !ship.active
+            || ship.owner != player
+            || ship.route_id != anno_sim::data_bridge::UNROUTED_TRADER_ROUTE_ID
+        {
+            return false;
+        }
+        let dist = (ship.world_x - world_x).abs() + (ship.world_y - world_y).abs();
+        if dist > 12 {
+            return false;
+        }
+        std::mem::take(&mut ship.cargo)
+    };
+    if sim
+        .trade_ships
+        .get_mut(ship_index as usize)
+        .map(|ship| ship.cargo_total = 0)
+        .is_none()
+    {
+        return false;
+    }
+
+    // City record + warehouse, then the Kontor building itself.
+    let source_time = sim.source_time_ticks;
+    sim.source_cities.allocate_source_city(
+        island_number,
+        tile_x as u8,
+        tile_y as u8,
+        player,
+        source_time,
+    );
+    let mut warehouse = anno_sim::warehouse::Warehouse::with_capacity(
+        island_number,
+        player,
+        tile_x,
+        tile_y,
+        anno_sim::warehouse::BASE_KONTOR_CAPACITY,
+    );
+    // Unload what fits (Maxlager 50 per good); overflow stays aboard.
+    let mut leftover: Vec<(anno_sim::types::Good, u16)> = Vec::new();
+    for (good, amount) in &cargo {
+        let stored = warehouse.deposit(*good, *amount);
+        if stored < *amount {
+            leftover.push((*good, *amount - stored));
+        }
+    }
+    sim.warehouses.push(warehouse);
+    if let Some(ship) = sim.trade_ships.get_mut(ship_index as usize) {
+        for (good, amount) in leftover {
+            ship.load_unchecked(good, amount);
+        }
+    }
+
+    // Place the Kontor structure: footprint blocking, instance, and the
+    // source records, mirroring `place_building`'s tail without its
+    // land-terrain and cost gates (the Kontor spans the beach line and
+    // founding is free).
+    let def = &defs[def_index];
+    let cod_b = &cod.buildings[def_index];
+    for dy in 0..def.height {
+        for dx in 0..def.width {
+            sim.island_maps[map_idx]
+                .set_walkable(tile_x + u16::from(dx), tile_y + u16::from(dy), false);
+        }
+    }
+    let source_map_owner_slot = sim
+        .source_cities
+        .active_records()
+        .into_iter()
+        .find(|city| city.island_id == island_number && city.owner_slot == player)
+        .map(|city| city.source_owner)
+        .unwrap_or(0);
+    let source_random_seed = (sim.next_source_rand() & 0x1f) as u8;
+    let command = anno_sim::building::SourceBuildingCommand {
+        definition_offset: (cod_b.source_id - anno_formats::szs::INSELHAUS_SOURCE_ID_BASE)
+            .try_into()
+            .unwrap_or(0),
+        orientation: 0,
+        metadata: island_number,
+        variant: 0,
+        map_owner_slot: source_map_owner_slot,
+        random_seed: source_random_seed,
+        dynamic_object_owner: player,
+    };
+    let mut instance = BuildingInstance::new(
+        def_index as u16,
+        island_number,
+        tile_x,
+        tile_y,
+        player,
+    );
+    instance.source_placement_command = Some(command);
+    let phase = ((sim.game_clock / 10) & 7) as u8;
+    if let Some(mut state) = anno_sim::source_cell::SourceMapCellState::new_static(
+        island_number,
+        tile_x as u8,
+        tile_y as u8,
+        cod_b,
+        phase,
+    ) {
+        state.set_footprint(cod_b.size.0, cod_b.size.1);
+        state.set_source_command(command);
+        state.configure_terminal_replacement(cod);
+        sim.replace_source_static_map_footprint(state);
+    }
+    sim.buildings.push(instance);
+    let building_index = sim.buildings.len() - 1;
+    if def.kind == "HQ" {
+        let _ = sim.allocate_source_dynamic_map_object_for_building(building_index);
+    }
+    sim.refresh_source_house_infrastructure(island_number);
+    sim.event_log.push(format!(
+        "[found] player {player} settles island {island_number} at ({tile_x},{tile_y})"
+    ));
+    true
 }
