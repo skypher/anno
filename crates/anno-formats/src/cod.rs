@@ -432,6 +432,12 @@ impl CodFile {
         // `current`, whose fields may be replaced by an ObjFill template.
         let mut directive_values: HashMap<String, i32> = HashMap::new();
         let mut current = BuildingDef::default();
+        // Snapshot of the `@Nummer: 0` default block that the file closes
+        // with `ObjFill: 0,MAXHAUS`. That two-argument form pre-fills every
+        // definition slot `0..MAXHAUS`, so each later `@Nummer:` block is
+        // authored sparsely on top of *this* record, never on top of the
+        // block that happens to precede it.
+        let mut template = BuildingDef::default();
         let mut in_building = false;
         let mut obj_depth = 0i32;
 
@@ -527,15 +533,24 @@ impl CodFile {
                 }
             }
 
-            // Handle ObjFill (copy from a previously emitted template record).
+            // Handle ObjFill. The single-argument form `ObjFill: <Nummer>`
+            // copies a previously emitted record; the two-argument form
+            // `ObjFill: <first>,<count>` pre-fills a whole slot range with
+            // the block just authored, which the shipped file uses exactly
+            // once (`ObjFill: 0,MAXHAUS`) to install the global default
+            // record every later definition starts from.
             if let Some(val_str) = line.strip_prefix("ObjFill:") {
-                let src_expr = val_str.split(',').next().unwrap_or(val_str).trim();
+                let mut args = val_str.split(',').map(str::trim);
+                let src_expr = args.next().unwrap_or("");
+                let is_range_fill = args.next().is_some();
                 let src_nummer = Self::eval(&constants, src_expr);
-                if let Some(template) = building_by_nummer.get(&src_nummer) {
+                if let Some(source) = building_by_nummer.get(&src_nummer) {
                     let nummer = current.nummer;
-                    current = template.clone();
+                    current = source.clone();
                     current.nummer = nummer;
                     constants.insert("Nummer".to_string(), current.nummer);
+                } else if is_range_fill {
+                    template = current.clone();
                 }
                 continue;
             }
@@ -547,15 +562,19 @@ impl CodFile {
                     building_by_nummer.insert(current.nummer, current.clone());
                     buildings.push(current.clone());
                 }
-                // The original pre-fills every definition slot from the
-                // `@Nummer: 0` template (`ObjFill: 0,MAXHAUS`) before the
-                // per-block overrides apply, so sparse properties reset
-                // between blocks rather than inheriting from the previous
-                // definition. This parser carries `current` forward; reset
-                // the sparse `Kosten` pair (56 blocks set it, the template
-                // leaves it zero) so e.g. forests don't inherit the
-                // preceding workshop's operating cost.
-                current.source_operating_costs = (0, 0);
+                // `ObjFill: 0,MAXHAUS` pre-filled every definition slot with
+                // the `@Nummer: 0` default record, so a block that does not
+                // restate a property inherits it from that template and never
+                // from the block that precedes it. Restart from the template
+                // rather than carrying the finished record forward; a
+                // following single-argument `ObjFill:` may still replace it
+                // with a previously emitted definition.
+                //
+                // `@Nummer: +N` is a delta against the last assigned number,
+                // which the template copy must not clobber.
+                let previous_nummer = current.nummer;
+                current = template.clone();
+                current.nummer = previous_nummer;
                 if let Some(delta) = val_str.strip_prefix('+') {
                     current.nummer += Self::eval(&constants, delta.trim());
                 } else {
@@ -1296,37 +1315,20 @@ mod tests {
             cod.buildings.len()
         );
 
-        // Residence/HQ-kind buildings carry the per-pop
-        // baseline rates. Audit confirms every non-Kontor
-        // HQ entry (Nr 270 plus the native chief huts at
-        // 442/448/455) uses Nahrung 1.3 / Steuer 2.6 — those
-        // are the per-population food consumption and tax
-        // baseline values feeding the simulation's
-        // population.rs CONSUMPTION_PER_100 table.
-        for b in &cod.buildings {
-            if b.kind != "HQ" {
-                continue;
-            }
-            if b.properties
-                .get("Bauinfra")
-                .map(|s| s.starts_with("INFRA_KONTOR"))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            assert_eq!(
-                b.properties.get("Nahrung").map(|s| s.as_str()),
-                Some("1.3"),
-                "Nr={}",
-                b.nummer
-            );
-            assert_eq!(
-                b.properties.get("Steuer").map(|s| s.as_str()),
-                Some("2.6"),
-                "Nr={}",
-                b.nummer
-            );
-        }
+        // `Nahrung: 1.3` is a file-level GAMEEINSTELLUNGEN entry authored
+        // before `Objekt: HAUS` opens, and `Steuer:` belongs to the five
+        // `Objekt: BGRUPPE` records. Neither is a HAUS property. They used
+        // to surface on every building definition only because the parser
+        // carried one accumulating record from the file preamble through
+        // every `@Nummer:` block; the `ObjFill: 0,MAXHAUS` template restart
+        // drops them. Keep that as a tripwire against the leak returning.
+        assert!(
+            cod.buildings.iter().all(|building| {
+                !building.properties.contains_key("Nahrung")
+                    && !building.properties.contains_key("Steuer")
+            }),
+            "preamble/BGRUPPE properties must not leak onto HAUS definitions"
+        );
 
         let ruin_cases = [
             (270, 8),   // RUINE_KONTOR_1
@@ -1337,7 +1339,15 @@ mod tests {
             (275, 0),   // RUINE_HOLZ
             (276, 2),   // RUINE_STEIN
             (277, 2),   // RUINE_STEIN
-            (359, 255), // NORUINE
+            // Nr 356 (a beach wall) is the last block to author
+            // `Ruinenr: NORUINE`. The stone gates and stone watchtower that
+            // follow restate no `Ruinenr`, so they take the template's
+            // `RUINE_STEIN`; the previous 255 here was that beach wall's
+            // value leaking three definitions forward.
+            (357, 2), // stone gate, template RUINE_STEIN
+            (358, 2), // stone gate, template RUINE_STEIN
+            (359, 2), // stone watchtower, template RUINE_STEIN
+            (356, 255), // the authored NORUINE beach wall itself
         ];
         for (nummer, ruinenr) in ruin_cases {
             let b = cod
@@ -1445,6 +1455,159 @@ mod tests {
                 b.properties.get("Maxlager").unwrap_or(&"?".into()),
             );
         }
+    }
+
+    /// `ObjFill: 0,MAXHAUS` pre-fills every definition slot with the
+    /// `@Nummer: 0` default record, so a sparse block inherits unrestated
+    /// properties from that template — not from the block above it.
+    #[test]
+    fn definitions_restart_from_the_objfill_template_not_the_previous_block() {
+        // Two consecutive blocks: the first is fully specified, the second
+        // restates only `Holz`. Everything else must fall back to the
+        // template (which itself declares no HAUS_BAUKOST at all), so the
+        // second block must not inherit the first block's Money/Werkzeug/
+        // Ziegel/Kanon, nor its HAUS_PRODTYP output good.
+        let cod = CodFile::parse(
+            b"MAXHAUS = 500\nObjekt: HAUS\n\
+              @Nummer: 0\nId: 0\nKind: UNUSED\nSize: 1, 1\n\
+              Objekt: HAUS_PRODTYP\nKind: UNUSED\nWare: NOWARE\nEndObj;\n\
+              ObjFill: 0,MAXHAUS\n\
+              @Nummer: +1\nId: 20001\nKind: GEBAEUDE\nSize: 2, 2\n\
+              Objekt: HAUS_PRODTYP\nKind: WEIDETIER\nWare: WOLLE\nKosten: 25, 5\nEndObj;\n\
+              Objekt: HAUS_BAUKOST\nWerkzeug: 2\nHolz: 4\nZiegel: 7\nKanon: 1\nMoney: 200\nEndObj;\n\
+              @Nummer: +1\nId: 20002\nKind: GEBAEUDE\n\
+              Objekt: HAUS_BAUKOST\nHolz: 3\nEndObj;\n",
+        )
+        .expect("parse plaintext COD");
+
+        let costs = |building: &BuildingDef| {
+            ["Money", "Holz", "Werkzeug", "Ziegel", "Kanon"]
+                .map(|key| building.properties.get(key).cloned())
+        };
+        let farm = cod.building_by_source_id(20001).expect("farm definition");
+        let hut = cod.building_by_source_id(20002).expect("hut definition");
+
+        assert_eq!(
+            costs(farm),
+            [
+                Some("200".into()),
+                Some("4".into()),
+                Some("2".into()),
+                Some("7".into()),
+                Some("1".into()),
+            ]
+        );
+        // Only `Holz` is authored on the second block.
+        assert_eq!(costs(hut), [None, Some("3".into()), None, None, None]);
+        // ...and the rest of the record falls back to the template too.
+        assert_eq!(hut.properties.get("Ware").map(String::as_str), Some("NOWARE"));
+        assert_eq!(
+            hut.properties.get("ProdKind").map(String::as_str),
+            Some("UNUSED")
+        );
+        assert_eq!(hut.source_operating_costs, (0, 0));
+        assert_eq!(hut.size, (1, 1));
+        assert_eq!(farm.source_operating_costs, (25, 5));
+    }
+
+    /// Shipped-corpus counterpart of the test above: `haeuser.cod` authors
+    /// the pioneer hut's HAUS_BAUKOST as `Holz: 3` alone, immediately after a
+    /// sheep farm that costs 200 gold / 2 tools / 4 wood. Before the template
+    /// restart the hut reported the farm's 200 gold.
+    #[test]
+    fn shipped_build_costs_are_the_authored_ones() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("extracted/haeuser.cod");
+        let Ok(data) = std::fs::read(&path) else {
+            println!("Skipping test: {path:?} not found");
+            return;
+        };
+        let cod = CodFile::parse(&data).expect("failed to parse COD");
+        let costs = |building: &BuildingDef| {
+            ["Money", "Holz", "Werkzeug", "Ziegel", "Kanon"].map(|key| {
+                building
+                    .properties
+                    .get(key)
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .unwrap_or(0)
+            })
+        };
+
+        // BGruppe 0 residence (Wohnhäuser I, Nr 413): `Holz: 3` only.
+        let pioneer = cod
+            .source_population_group_building(0)
+            .expect("BGruppe 0 residence");
+        assert_eq!(pioneer.nummer, 413);
+        assert_eq!(costs(pioneer), [0, 3, 0, 0, 0]);
+        // The preceding sheep farm, whose costs used to leak into it.
+        let sheep_farm = cod
+            .building_by_source_id(cod.constants["IDFARM"] + 14)
+            .expect("sheep farm");
+        assert_eq!(costs(sheep_farm), [200, 4, 2, 0, 0]);
+
+        // Marketplace (Nr 467): no `Ziegel` line; the chapel-tier building
+        // above it costs 19 bricks and used to donate them.
+        let market = cod
+            .buildings
+            .iter()
+            .find(|building| {
+                building
+                    .properties
+                    .get("ProdKind")
+                    .is_some_and(|kind| kind == "MARKT")
+            })
+            .expect("MARKT source definition");
+        assert_eq!(costs(market), [200, 10, 4, 0, 0]);
+
+        // Definitions with no HAUS_BAUKOST block at all are free: the
+        // template declares none. Both ruins below cost nothing.
+        let wohn_ruin = cod
+            .building_by_source_id(cod.constants["IDWOHN"])
+            .expect("residence ruin");
+        assert_eq!(costs(wohn_ruin), [0, 0, 0, 0, 0]);
+        let market_ruin = cod
+            .building_by_source_id(cod.constants["IDDIVERS"] + 22)
+            .expect("destroyed marketplace");
+        assert_eq!(costs(market_ruin), [0, 0, 0, 0, 0]);
+
+        // `ObjFill: <Nummer>` still copies a previously emitted record, so
+        // the six random variants after the pioneer hut keep its 3 wood.
+        for offset in 1..=6 {
+            let variant = cod
+                .building_by_source_id(pioneer.source_id + offset)
+                .unwrap_or_else(|| panic!("pioneer variant +{offset}"));
+            assert_eq!(costs(variant), [0, 3, 0, 0, 0], "variant +{offset}");
+        }
+
+        // Residences produce nothing; the leak used to give the pioneer hut
+        // the sheep farm's WOLLE output and a WORKSTOFF input.
+        assert_eq!(pioneer.properties.get("Ware").map(String::as_str), Some("NOWARE"));
+        assert!(!pioneer.properties.contains_key("Workstoff"));
+        // The palm-forest terrain tiles (Nr 488 authors no HAUS_BAUKOST,
+        // Nr 489..=498 `ObjFill:` it) are free terrain; they used to charge
+        // the 50 bricks of the last building above them in the file.
+        for nummer in 488..=498 {
+            let palm = cod
+                .buildings
+                .iter()
+                .find(|building| building.nummer == nummer)
+                .unwrap_or_else(|| panic!("palm forest Nr={nummer}"));
+            assert_eq!(palm.kind, "WALD");
+            assert_eq!(costs(palm), [0, 0, 0, 0, 0], "Nr={nummer}");
+        }
+        // ...while the grass/forest tiles that *do* author `Money: 5`
+        // (Nr 81 `HAUSWACHS`) keep it, as do the definitions filled from it.
+        let grass = cod
+            .buildings
+            .iter()
+            .find(|building| building.nummer == 81)
+            .expect("Nr 81");
+        assert_eq!(grass.kind, "WALD");
+        assert_eq!(costs(grass), [5, 0, 0, 0, 0]);
     }
 
     #[test]

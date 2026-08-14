@@ -5458,7 +5458,15 @@ mod tests {
             (275, 0),  // RUINE_HOLZ
             (276, 2),  // RUINE_STEIN
             (277, 2),  // RUINE_STEIN
-            (359, crate::building::NO_RUIN_ID),
+            // Nr 356, a beach wall, is the last block that authors
+            // `Ruinenr: NORUINE`. The stone gates and the stone watchtower
+            // after it restate no `Ruinenr` and therefore take the
+            // `ObjFill: 0,MAXHAUS` template's `RUINE_STEIN`. Nr 359 read 255
+            // only while the parser carried the previous record forward.
+            (356, crate::building::NO_RUIN_ID),
+            (357, 2), // stone gate
+            (358, 2), // stone gate
+            (359, 2), // stone watchtower
         ];
         for (nummer, ruin_id) in ruin_cases {
             let def = defs
