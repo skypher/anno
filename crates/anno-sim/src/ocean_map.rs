@@ -702,6 +702,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let definitions = [CodBuilding {
             source_id: 0x4e20,
@@ -737,6 +738,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let ocean = OceanMap::from_source_scenario(&scenario, &[]);
         let target = SourceResolvedStaticTarget {
@@ -779,6 +781,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let ocean = OceanMap::from_source_scenario(&scenario, &[]);
         let target = crate::source_route::SourceResolvedDynamicTarget {
@@ -837,6 +840,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let definitions = [
             CodBuilding {

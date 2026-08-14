@@ -896,6 +896,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let ocean = crate::ocean_map::OceanMap::from_scenario(&szs);
 
@@ -957,6 +958,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let definitions = [anno_formats::cod::BuildingDef {
             source_id: 0x4e20,
@@ -1010,6 +1012,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let ocean = crate::ocean_map::OceanMap::from_source_scenario(&scenario, &[]);
         let mut route = TradeRoute::new(0, 0);
@@ -1064,6 +1067,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let ocean = crate::ocean_map::OceanMap::from_source_scenario(&scenario, &[]);
         let mut route = TradeRoute::new(0, 0);

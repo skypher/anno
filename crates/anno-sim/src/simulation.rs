@@ -4816,6 +4816,10 @@ impl Simulation {
                 mirror.demand[slot] += (city.ware_demand[slot].max(0) as u32) >> 8;
                 mirror.supply[slot] += (city.ware_supply[slot].max(0) as u32) >> 8;
             }
+            for group in 0..5 {
+                mirror.tier_population[group] = mirror.tier_population[group]
+                    .saturating_add(city.tier_population[group]);
+            }
         }
         Some(mirror)
     }
@@ -5787,6 +5791,20 @@ impl Simulation {
         const HOUSING_BY_TIER: [u32; 5] = [2, 6, 15, 25, 40];
         let mut maintenance: Vec<u32> = vec![0; self.players.len()];
         let mut housing: Vec<u32> = vec![0; self.players.len()];
+        // Owners whose cities run the exact `FUN_0047f8a0` cycle evolve
+        // population through the kind-13 house transfers; both invented
+        // approximations (the per-tick house-tier promotion below and
+        // `update_population_growth`) stay off for them.
+        let exact_growth_owner: Vec<bool> = (0..self.players.len())
+            .map(|i| {
+                self.source_city_satisfaction_allows(i as u8)
+                    && self
+                        .source_cities
+                        .active_records()
+                        .iter()
+                        .any(|city| city.owner_slot == i as u8)
+            })
+            .collect();
         // Promotion pass: WOHN buildings whose tier is fully satisfied
         // upgrade up. Done before maintenance/cap so the housing cap
         // immediately reflects the new sizes.
@@ -5811,6 +5829,9 @@ impl Simulation {
                 continue;
             }
             let owner = b.owner as usize;
+            if exact_growth_owner.get(owner).copied().unwrap_or(false) {
+                continue;
+            }
             let Some(p) = self.players.get(owner) else {
                 continue;
             };
@@ -5844,26 +5865,32 @@ impl Simulation {
             .collect();
         for (i, player) in self.players.iter_mut().enumerate() {
             player.building_maintenance = maintenance[i];
-            if city_mirrors[i].is_none() {
-                // Legacy approximation for owners whose cities do not run
-                // the exact `FUN_0047f8a0` cycle (see
-                // `source_city_satisfaction_allows`): update demands and
-                // consume goods from warehouses.
-                population::update_population_demands(player, &mut self.warehouses, i as u8);
+            match &city_mirrors[i] {
+                Some(mirror) => {
+                    // The exact per-city `FUN_0047f8a0` cycle already
+                    // consumed the goods; project its satisfaction,
+                    // population, and fulfillment into the per-player
+                    // layer, then apply the economy against the city
+                    // populations like `FUN_0047f740` reads `+0x220`.
+                    population::mirror_city_demands(player, mirror);
+                    economy::tick_economy(player);
+                    population::mirror_city_fulfillment_history(player, mirror);
+                    // Population evolves through the exact kind-13 house
+                    // transfers for mirrored owners — the invented growth
+                    // approximation stays off.
+                }
+                None => {
+                    // Legacy approximation for owners whose cities do not
+                    // run the exact cycle (see
+                    // `source_city_satisfaction_allows`): update demands,
+                    // consume goods from warehouses, apply the economy,
+                    // and grow/shrink population by tier clamped to the
+                    // housing capacity.
+                    population::update_population_demands(player, &mut self.warehouses, i as u8);
+                    economy::tick_economy(player);
+                    population::update_population_growth(player, housing[i]);
+                }
             }
-            // Apply economy (gold balance, bankruptcy). Satisfaction is
-            // set fresh above or mirrored below; tick_economy must not
-            // decay it.
-            economy::tick_economy(player);
-            if let Some(mirror) = &city_mirrors[i] {
-                // The exact per-city cycle already consumed the goods;
-                // project its satisfaction and fulfillment into the
-                // per-player layer that growth and house upgrades read.
-                population::mirror_city_demands(player, mirror);
-            }
-            // Grow / shrink population by tier and promote satisfied tiers up,
-            // clamped to current housing capacity.
-            population::update_population_growth(player, housing[i]);
         }
 
         if !self.players.is_empty() {
@@ -8140,7 +8167,13 @@ impl Simulation {
             }
         }
 
-        // Remove despawned figures (iterate in reverse to preserve indices)
+        // Remove despawned figures (iterate in reverse to preserve indices).
+        // A figure whose movement loop runs multiple 100 ms slices in one
+        // step can hit a despawn branch more than once, so the index list
+        // may hold duplicates — deduplicate before removing or the second
+        // occurrence swap-removes an arbitrary survivor (or panics).
+        despawn_indices.sort_unstable();
+        despawn_indices.dedup();
         for &idx in despawn_indices.iter().rev() {
             let figure = self.figures.swap_remove(idx);
             if let Some(slot) = figure.source_event_slot {
@@ -10489,6 +10522,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.ocean_map = Some(OceanMap::from_source_scenario(&scenario, &[]));
@@ -15085,6 +15119,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let ocean = OceanMap::from_scenario(&szs);
 
@@ -15137,6 +15172,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -15178,6 +15214,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
@@ -15223,6 +15260,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.ocean_map = Some(OceanMap::from_scenario(&szs));
@@ -15266,6 +15304,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));

@@ -992,6 +992,39 @@ pub struct SzsFile {
     /// Authored city-store contents parsed from the `KONTOR2` chunks,
     /// one per settlement Kontor. Empty when the scenario has none.
     pub kontors: Vec<Kontor>,
+    /// Authored kind-13 residences parsed from the `SIEDLER` chunks.
+    /// Empty when the scenario places no houses.
+    pub settler_houses: Vec<SettlerHouse>,
+}
+
+/// One 16-byte `SIEDLER` record: an authored kind-13 residence.
+///
+/// The loader (`0x483ee0`) and saver (`0x485...`, both in decompiled-dump
+/// gaps, recovered by disassembly) exchange these with the runtime
+/// ten-byte house list at `DAT_005a77e8`. Field mapping, file → runtime:
+/// bytes 0..2 → island/x/y; byte 3 & 7 → phase (runtime `+3` low three
+/// bits); byte 4 & 7 → state bits 3..5; byte 5 → population group; byte
+/// 6 & 0xf → variant low nibble; u16 at 8 → amount (1/64 residents);
+/// dword-2 bit 21/22 → state bits 6/7; dword-2 bits 23,24,25,26,27,28,
+/// 29,30,31 → lifecycle bits 3,4,6,7,10,5,8,2,9. The in-progress
+/// lifecycle bits 0/1 are transient and never serialized.
+#[derive(Debug, Clone, Copy)]
+pub struct SettlerHouse {
+    pub island_id: u8,
+    pub tile_x: u8,
+    pub tile_y: u8,
+    /// Runtime house byte `+3` low three bits (the dispatch phase).
+    pub phase: u8,
+    /// Runtime house byte `+3` bits 3..7 (object state flags).
+    pub state_bits: u8,
+    /// BGruppe of the residence (0 pioneers .. 4 aristocrats).
+    pub population_group: u8,
+    /// Runtime house byte `+4`: gfx-variant nibbles.
+    pub variant: u8,
+    /// Resident amount in 1/64 units (`Maxwohn << 6` when full).
+    pub amount: u16,
+    /// Runtime house u16 `+8`: the kind-13 lifecycle flags.
+    pub lifecycle_flags: u16,
 }
 
 /// One `KONTOR2` chunk: the authored city-store state for a settlement.
@@ -1689,6 +1722,12 @@ impl SzsFile {
             .filter_map(|c| Self::parse_kontor2(&c.data))
             .collect();
 
+        let settler_houses = chunks
+            .iter()
+            .filter(|c| c.name == "SIEDLER")
+            .flat_map(|c| Self::parse_siedler(&c.data))
+            .collect();
+
         Ok(SzsFile {
             chunks,
             islands,
@@ -1698,7 +1737,38 @@ impl SzsFile {
             ships,
             land_figures,
             kontors,
+            settler_houses,
         })
+    }
+
+    fn parse_siedler(data: &[u8]) -> Vec<SettlerHouse> {
+        data.chunks_exact(16)
+            .map(|rec| {
+                let dword2 = u32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                let bit = |n: u32| ((dword2 >> n) & 1) as u16;
+                SettlerHouse {
+                    island_id: rec[0],
+                    tile_x: rec[1],
+                    tile_y: rec[2],
+                    phase: rec[3] & 7,
+                    state_bits: ((rec[4] & 7) << 3)
+                        | ((bit(21) as u8) << 6)
+                        | ((bit(22) as u8) << 7),
+                    population_group: rec[5],
+                    variant: (rec[6] & 0x0f) | ((rec[10] & 0x0f) << 4),
+                    amount: u16::from_le_bytes([rec[8], rec[9]]),
+                    lifecycle_flags: (bit(30) << 2)
+                        | (bit(23) << 3)
+                        | (bit(24) << 4)
+                        | (bit(28) << 5)
+                        | (bit(25) << 6)
+                        | (bit(26) << 7)
+                        | (bit(29) << 8)
+                        | (bit(31) << 9)
+                        | (bit(27) << 10),
+                }
+            })
+            .collect()
     }
 
     fn parse_kontor2(data: &[u8]) -> Option<Kontor> {
@@ -2627,6 +2697,47 @@ mod tests {
         let i1 = &parsed.islands[1];
         assert_eq!(i1.number, 4);
         assert!(i1.tiles.is_empty());
+    }
+
+    #[test]
+    fn siedler_carries_exiles_authored_residences() {
+        // Live-verified against the running original: Exile's human city
+        // holds 156 settlers (STADT4) in exactly 26 houses. The SIEDLER
+        // records carry each house at the settler capacity amount
+        // `Maxwohn << 6 = 0x180`, group 1, with the kind-13 state bit 7
+        // set (transfer-eligible).
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("extracted/Szenes/Exile.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping test: Exile.szs not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("failed to parse Exile.szs");
+        let island0: Vec<_> = szs
+            .settler_houses
+            .iter()
+            .filter(|h| h.island_id == 0)
+            .collect();
+        assert_eq!(island0.len(), 26, "Exile island 0 ships 26 houses");
+        let residents: u32 = island0.iter().map(|h| u32::from(h.amount) >> 6).sum();
+        assert_eq!(residents, 156, "amounts must sum to the STADT4 population");
+        for house in &island0 {
+            assert_eq!(house.population_group, 1, "all settler houses");
+            assert_eq!(house.amount, 0x180, "houses start at Maxwohn capacity");
+            assert_eq!(house.state_bits & 0x80, 0x80, "state bit 7 live");
+            assert!(
+                house.lifecycle_flags & 0x000c != 0,
+                "group-1 transfer eligibility flag set, got {:#06x}",
+                house.lifecycle_flags
+            );
+        }
     }
 
     #[test]

@@ -251,16 +251,21 @@ pub struct CityDemandMirror {
     pub demand: [u32; 8],
     /// Matching supply accumulator sums.
     pub supply: [u32; 8],
+    /// City `+0x220` BGRUPPE populations summed across the player's
+    /// cities. The kind-13 house transfers evolve these; the per-player
+    /// invented growth does not run for mirrored owners.
+    pub tier_population: [u32; 5],
 }
 
 /// Replace the invented per-player consumption with the exact per-city
 /// results. The city cycle already withdrew the goods from the city
-/// stores, so this only projects satisfaction and the demand-slot view;
-/// it never touches warehouses. Runs after `economy::tick_economy` so
-/// the exact fulfillment byte lands in `fulfillment_history[0]` (the
-/// promotion gate's sample) uneclipsed.
+/// stores, so this only projects satisfaction, population, and the
+/// demand-slot view; it never touches warehouses. Runs before
+/// `economy::tick_economy` so tax income sees the current city
+/// populations, exactly like `FUN_0047f740` reading `+0x220`.
 pub fn mirror_city_demands(player: &mut Player, mirror: &CityDemandMirror) {
     player.satisfaction = mirror.satisfaction;
+    player.population = mirror.tier_population;
     for (idx, &good) in DEMAND_GOODS.iter().enumerate() {
         let Some(source_slot) = crate::data_bridge::SOURCE_CITY_DEMAND_WARE_GOODS
             .iter()
@@ -272,6 +277,21 @@ pub fn mirror_city_demands(player: &mut Player, mirror: &CityDemandMirror) {
         slot.demand = mirror.demand[source_slot];
         slot.supply = mirror.supply[source_slot];
         slot.fulfillment_history[0] = mirror.fulfillment[source_slot];
+    }
+}
+
+/// Re-assert the exact per-slot fulfillment bytes after
+/// `economy::tick_economy` has recomputed `fulfillment_history[0]` from
+/// the demand/supply view; the exact byte is the promotion gate's
+/// sample.
+pub fn mirror_city_fulfillment_history(player: &mut Player, mirror: &CityDemandMirror) {
+    for (idx, &good) in DEMAND_GOODS.iter().enumerate() {
+        if let Some(source_slot) = crate::data_bridge::SOURCE_CITY_DEMAND_WARE_GOODS
+            .iter()
+            .position(|&g| g == good)
+        {
+            player.demands[idx].fulfillment_history[0] = mirror.fulfillment[source_slot];
+        }
     }
 }
 

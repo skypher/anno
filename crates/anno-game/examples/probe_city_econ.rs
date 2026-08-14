@@ -24,6 +24,19 @@ fn main() {
     sim.seed_source_rand(1);
 
     let dump = |sim: &anno_sim::simulation::Simulation, label: &str| {
+        let k13: Vec<_> = sim
+            .source_kind13_locations
+            .active_locations()
+            .into_iter()
+            .filter(|l| l.island_id == 0)
+            .collect();
+        let total_amount: u32 = k13.iter().map(|l| u32::from(l.amount)).sum();
+        println!(
+            "  kind13 island0: {} locations, total amount {} (~{} residents)",
+            k13.len(),
+            total_amount,
+            total_amount / 64,
+        );
         println!("== {label} clock={}", sim.game_clock);
         for city in sim.source_cities.active_records() {
             if city.owner_slot != 0 {

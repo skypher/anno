@@ -2781,6 +2781,41 @@ pub fn source_kind13_locations_from_scenario(
         }
     }
 
+    // Authored residences ship in the per-island SIEDLER chunks, not in
+    // the INSELHAUS tile layer — e.g. Exile's 26 settler houses (26 ×
+    // amount 0x180 = the STADT4 population of 156). The source loader
+    // (`0x483ee0`) rebuilds the runtime house list from these records,
+    // deriving each house's city from the map cell selector; the city
+    // populations themselves come from STADT4, so seeding locations here
+    // adds no residents.
+    for house in &szs.settler_houses {
+        let source_owner = szs
+            .islands
+            .iter()
+            .find(|island| island.number == house.island_id)
+            .and_then(|island| {
+                island
+                    .tiles
+                    .iter()
+                    .find(|tile| tile.x == house.tile_x && tile.y == house.tile_y)
+            })
+            .map(|tile| tile.source_owner())
+            .unwrap_or(0);
+        locations.insert(SourceKind13Location {
+            island_id: house.island_id,
+            tile_x: house.tile_x,
+            tile_y: house.tile_y,
+            orientation: 0,
+            variant: house.variant & 0x0f,
+            source_owner,
+            phase: house.phase,
+            state_bits: house.state_bits,
+            population_group: house.population_group,
+            amount: house.amount,
+            lifecycle_flags: house.lifecycle_flags,
+        });
+    }
+
     locations
 }
 
@@ -3363,6 +3398,7 @@ mod tests {
                 },
             ],
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
 
         let occupants = source_kind4_occupants_from_scenario(&scenario);
@@ -3476,6 +3512,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
 
         assert_eq!(
@@ -3570,6 +3607,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
 
         let states = source_map_cell_states_from_scenario(&szs, &cod);
@@ -3633,6 +3671,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
 
         let states = source_map_cell_states_from_scenario(&szs, &cod);
@@ -3724,6 +3763,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
 
         let backing = source_static_map_backing_cells_from_scenario(&szs, &cod);
@@ -3904,6 +3944,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
 
         let states = source_map_cell_states_from_scenario(&szs, &cod);
@@ -3987,6 +4028,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
 
         assert_eq!(
@@ -4855,6 +4897,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
 
         let defs = load_building_defs(&cod);
@@ -5094,6 +5137,7 @@ mod tests {
             ships: Vec::new(),
             land_figures: Vec::new(),
             kontors: Vec::new(),
+            settler_houses: Vec::new(),
         };
 
         let dispatch = source_kind4_dispatch_state_from_scenario(&scenario);

@@ -345,14 +345,35 @@ authored). **Now parsed and seeded** (`SzsFile::kontors` →
 store matches the original bit-exactly, settler satisfaction holds at 128, and
 the food drain follows the exact 1.3 t/min/100-residents rate.
 
-With consumption exact and stores seeded, the dominant remaining divergence is
-the **population growth approximation**: `update_population_growth` grows a
-satisfied tier ~5 %/economy-tick and the house-tier gate upgrades every
-satisfied house each tick, so the Rust Exile population explodes (156 → 844
-settlers+ in 400 s) where the original is bounded by houses and immigrant
-figures (26 houses × Maxwohn 6 ≈ the starting 156 — likely near-flat; the
-kind-13/`FUN_0047b540` house subsystem is the exact model to port next). The
-trajectory measurement against the live original quantifies this.
+With consumption exact and stores seeded, the dominant remaining divergence
+was the **population growth approximation**: `update_population_growth` grew a
+satisfied tier ~5 %/economy-tick and the house-tier gate upgraded every
+satisfied house each tick, so the Rust Exile population exploded (156 → 844
+settlers+ in 400 s) where the original is bounded by houses (26 × Maxwohn 6 =
+exactly the starting 156).
+
+**Fixed via SIEDLER seeding:** the authored residences ship in the per-island
+`SIEDLER` chunks (16-byte records; loader `0x483ee0` / saver both in dump
+gaps, recovered by disassembly — see `SzsFile::settler_houses` for the full
+bit map). Exile island 0 carries 26 houses × amount `0x180` (= `Maxwohn <<
+6`, 156 residents, matching STADT4). Seeding them into the kind-13 location
+table wires the already-ported transfer machinery (`FUN_0047b410` deltas from
+city satisfaction, capacity-clamped increase, promotion reservations): the
+Rust Exile human population now holds **exactly 156** indefinitely while the
+stocked store drains at the exact consumption rate. Mirrored owners take
+`player.population` from the city records (as `FUN_0047f740` reads `+0x220`)
+and both invented growth approximations stay off for them.
+
+Remaining smaller divergence: the gold slope (Rust ≈ +0.3/s vs the original's
+≈ +0.03/s at clock 255/640) suggests the building-maintenance side still
+undercounts operating costs; and the city *event block* (rand-gated
+`FUN_0047b540` immigration enqueue, `FUN_0047f510` house upgrades, the
+`+0x1e0` re-arm) is not yet ported — it only matters once houses are below
+capacity or satisfaction moves, which the current comparisons don't exercise.
+
+Wine stability note: the original dies within ~5 minutes of entering Exile on
+this setup even with zero winedbg attaches (reproduced twice; crash-log run
+pending) — trajectory captures should snapshot early and often.
 
 Caveat for long captures: each winedbg attach is one-shot-ish — after a few
 attach/detach cycles this Wine build sometimes takes the game down. Space
