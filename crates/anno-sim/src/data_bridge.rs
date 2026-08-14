@@ -3187,6 +3187,29 @@ pub fn traders_from_ships(
             t.source_kind6_target_descriptor_payload =
                 Some(s.source_kind6_target_descriptor_payload());
             t.source_cargo_slots = s.cargo_slots;
+            // Decode the authored cargo into the typed hold. The packed
+            // low byte uses the ship-cargo id space (2 = tools, 7 = wood,
+            // 4 = food — the only ids in the shipping corpus,
+            // live-verified against the original's hold UI); bits 8..=21
+            // carry the 1/32-good quantity.
+            for &slot in &s.cargo_slots {
+                if slot == 0 {
+                    continue;
+                }
+                let good = match slot & 0xff {
+                    2 => Good::Tools,
+                    7 => Good::Wood,
+                    4 => Good::Food,
+                    _ => continue,
+                };
+                let quantity = (((slot >> 8) & 0x3fff) / 32) as u16;
+                if quantity > 0 {
+                    // Authored cargo is stored per source slot and may
+                    // exceed the config-derived total capacity clamp the
+                    // interactive `load` applies; take it as shipped.
+                    t.load_unchecked(good, quantity);
+                }
+            }
             t.source_target_approach_radius = cargo_config.target_approach_radius_for(class);
             t
         })

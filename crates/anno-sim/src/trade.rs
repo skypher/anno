@@ -414,6 +414,20 @@ impl TradeShip {
         loaded
     }
 
+    /// Add goods to cargo without the capacity clamp — for authored
+    /// scenario cargo, which the source stores per hold slot.
+    pub fn load_unchecked(&mut self, good: Good, amount: u16) {
+        if amount == 0 {
+            return;
+        }
+        if let Some(entry) = self.cargo.iter_mut().find(|(g, _)| *g == good) {
+            entry.1 += amount;
+        } else {
+            self.cargo.push((good, amount));
+        }
+        self.cargo_total += amount;
+    }
+
     /// Remove goods from cargo. Returns amount actually unloaded.
     pub fn unload(&mut self, good: Good, amount: u16) -> u16 {
         if let Some(entry) = self.cargo.iter_mut().find(|(g, _)| *g == good) {
