@@ -6042,6 +6042,50 @@ impl Simulation {
                 b.house_tier += 1;
             }
         }
+        // Operating costs accrue per static map root, mirroring the city
+        // `+0x1d8` accumulator: every constructed building with a compiled
+        // `Kosten` charges its active cost, including the Kontor, markets,
+        // and infrastructure buildings that never become production
+        // instances. The owner is the root's city (map-owner selector →
+        // city record), like `FUN_0047f450` crediting the cost against the
+        // building's city. The source charges only completed construction
+        // (instance flag 0x10); production roots with an in-progress
+        // instance are excluded the same way. Validated against the live
+        // original's per-city accumulators on Exile.
+        let under_construction: std::collections::HashSet<(u8, u16, u16)> = self
+            .buildings
+            .iter()
+            .filter(|building| building.active && !building.is_built())
+            .map(|building| (building.island_id, building.tile_x, building.tile_y))
+            .collect();
+        for root in &self.source_static_map_roots {
+            if root.source_operating_cost == 0 {
+                continue;
+            }
+            // The root table stores one entry per footprint cell sharing
+            // the same command anchor — charge the anchor cell only.
+            if (root.x, root.y) != (root.source_command_anchor_x, root.source_command_anchor_y) {
+                continue;
+            }
+            if under_construction.contains(&(
+                root.island,
+                u16::from(root.x),
+                u16::from(root.y),
+            )) {
+                continue;
+            }
+            let Some(owner) = self
+                .source_cities
+                .slot_for_root(root.island, root.source_map_owner_slot)
+                .and_then(|slot| self.source_cities.record(slot))
+                .map(|city| usize::from(city.owner_slot))
+            else {
+                continue;
+            };
+            if let Some(total) = maintenance.get_mut(owner) {
+                *total = total.saturating_add(u32::from(root.source_operating_cost));
+            }
+        }
         for b in &self.buildings {
             if !b.active || !b.is_built() {
                 continue;
@@ -6052,8 +6096,6 @@ impl Simulation {
             }
             let def_id = b.def_id as usize;
             if def_id < self.building_defs.len() {
-                let cost = self.building_defs[def_id].maintenance_cost as u32;
-                maintenance[owner] = maintenance[owner].saturating_add(cost);
                 let kind = self.building_defs[def_id].kind.as_str();
                 let pk = self.building_defs[def_id].prod_kind.as_str();
                 if kind == "WOHN" || pk == "WOHN" {
@@ -14451,60 +14493,55 @@ mod tests {
 
     #[test]
     fn building_maintenance_aggregates_per_player() {
-        use crate::building::{BuildingDef, BuildingInstance};
-        use crate::types::{Good, ProductionType};
+        // Operating costs charge per static map root against the root's
+        // city owner, replaying the city `+0x1d8` accumulator
+        // (`FUN_0047f450` / `FUN_00463140` active `Kosten`).
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
         sim.players.push(Player::new_ai(1, 0));
-        let mk_def = |maint: u16| BuildingDef {
-            id: 0,
-            category: 0,
-            width: 1,
-            height: 1,
-            production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(),
-            prod_kind: "HANDWERK".into(),
-            radius: 0,
-            output_good: Good::Tools,
-            input_good_1: Good::None,
-            input_good_2: Good::None,
-            output_rate: 0,
-            input_1_rate: 0,
-            input_2_rate: 0,
-            storage_capacity: 50,
-            cycle_time_ms: 1000,
-            cost_gold: 0,
-            cost_tools: 0,
-            cost_wood: 0,
-            cost_bricks: 0,
-            maintenance_cost: maint,
-            native: false,
-            min_tier: 0,
-            max_no_input_ticks: 6,
-            can_dry_up: false,
-            wegspeed: [100; 4],
-            has_door: false,
-            upgradeable: false,
-            max_energy: 0,
-            ore_deposit: crate::building::OreDeposit::None,
-            pirate_owned: false,
-            defensive_cannons: 0,
-            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
-            ruin_id: crate::building::NO_RUIN_ID,
-            required_fertility: None,
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(crate::data_bridge::SourceCityRecord {
+                island_id: 0,
+                source_owner: 0,
+                owner_slot: 0,
+                ..Default::default()
+            }),
+        ));
+        assert!(sim.source_cities.set_record(
+            1,
+            Some(crate::data_bridge::SourceCityRecord {
+                island_id: 1,
+                source_owner: 0,
+                owner_slot: 1,
+                ..Default::default()
+            }),
+        ));
+        let mk_root = |island: u8, x: u8, y: u8, cost: u16| {
+            crate::source_cell::SourceMapCellState::new_static(
+                island,
+                x,
+                y,
+                &anno_formats::cod::BuildingDef {
+                    kind: "GEBAEUDE".into(),
+                    source_operating_costs: (cost, 0),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap()
         };
-        sim.building_defs.push(mk_def(5)); // def 0 cost 5
-        sim.building_defs.push(mk_def(8)); // def 1 cost 8
-                                           // Player 0: 2× def0 + 1× def1 → 5+5+8 = 18
-        sim.buildings.push(BuildingInstance::new(0, 0, 0, 0, 0));
-        sim.buildings.push(BuildingInstance::new(0, 0, 1, 1, 0));
-        sim.buildings.push(BuildingInstance::new(1, 0, 2, 2, 0));
-        // Player 1: 1× def1 → 8
-        sim.buildings.push(BuildingInstance::new(1, 0, 3, 3, 1));
-        // Make all "built" so they count.
-        for b in &mut sim.buildings {
-            b.construction_ms_remaining = 0;
-        }
+        // Player 0: costs 5 + 5 + 8 = 18; a non-anchor footprint cell of
+        // the third root must not double charge.
+        sim.source_static_map_roots.push(mk_root(0, 0, 0, 5));
+        sim.source_static_map_roots.push(mk_root(0, 1, 1, 5));
+        sim.source_static_map_roots.push(mk_root(0, 2, 2, 8));
+        let mut spill = mk_root(0, 3, 2, 8);
+        spill.source_command_anchor_x = 2;
+        spill.source_command_anchor_y = 2;
+        sim.source_static_map_roots.push(spill);
+        // Player 1: one cost-8 root on its own island.
+        sim.source_static_map_roots.push(mk_root(1, 3, 3, 8));
         sim.tick_population();
         assert_eq!(sim.players[0].building_maintenance, 18);
         assert_eq!(sim.players[1].building_maintenance, 8);
@@ -14512,55 +14549,43 @@ mod tests {
 
     #[test]
     fn unfinished_buildings_do_not_pay_maintenance() {
-        use crate::building::{BuildingDef, BuildingInstance};
-        use crate::types::{Good, ProductionType};
+        // The source adds a building's cost only once construction
+        // completes (instance flag 0x10); a root whose production
+        // instance is still building charges nothing.
+        use crate::building::BuildingInstance;
         let mut sim = Simulation::new();
         sim.players.push(Player::new_human(0));
-        sim.building_defs.push(BuildingDef {
-            id: 0,
-            category: 0,
-            width: 1,
-            height: 1,
-            production_type: ProductionType::Craft,
-            kind: "GEBAEUDE".into(),
-            prod_kind: "HANDWERK".into(),
-            radius: 0,
-            output_good: Good::Tools,
-            input_good_1: Good::None,
-            input_good_2: Good::None,
-            output_rate: 0,
-            input_1_rate: 0,
-            input_2_rate: 0,
-            storage_capacity: 0,
-            cycle_time_ms: 1000,
-            cost_gold: 0,
-            cost_tools: 0,
-            cost_wood: 0,
-            cost_bricks: 0,
-            maintenance_cost: 7,
-            native: false,
-            min_tier: 0,
-            max_no_input_ticks: 6,
-            can_dry_up: false,
-            wegspeed: [100; 4],
-            has_door: false,
-            upgradeable: false,
-            max_energy: 0,
-            ore_deposit: crate::building::OreDeposit::None,
-            pirate_owned: false,
-            defensive_cannons: 0,
-            max_brand_damage_ticks: crate::building::DEFAULT_MAX_BRAND_DAMAGE_TICKS,
-            ruin_id: crate::building::NO_RUIN_ID,
-            required_fertility: None,
-        });
-        // One under construction, one finished.
-        let mut bb = BuildingInstance::new(0, 0, 0, 0, 0);
-        bb.construction_ms_total = 5_000;
-        bb.construction_ms_remaining = 5_000;
-        sim.buildings.push(bb);
-        sim.buildings.push(BuildingInstance::new(0, 0, 1, 1, 0));
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(crate::data_bridge::SourceCityRecord {
+                island_id: 0,
+                source_owner: 0,
+                owner_slot: 0,
+                ..Default::default()
+            }),
+        ));
+        let root = crate::source_cell::SourceMapCellState::new_static(
+            0,
+            0,
+            0,
+            &anno_formats::cod::BuildingDef {
+                kind: "GEBAEUDE".into(),
+                source_operating_costs: (7, 0),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        sim.source_static_map_roots.push(root);
+        sim.building_defs.push(crate::building::BuildingDef::default());
+        let mut building = BuildingInstance::new(0, 0, 0, 0, 0);
+        building.construction_ms_total = 5_000;
+        building.construction_ms_remaining = 5_000;
+        sim.buildings.push(building);
         sim.tick_population();
-        // Only the finished building should be counted.
+        assert_eq!(sim.players[0].building_maintenance, 0);
+        sim.buildings[0].construction_ms_remaining = 0;
+        sim.tick_population();
         assert_eq!(sim.players[0].building_maintenance, 7);
     }
 

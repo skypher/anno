@@ -364,12 +364,31 @@ stocked store drains at the exact consumption rate. Mirrored owners take
 `player.population` from the city records (as `FUN_0047f740` reads `+0x220`)
 and both invented growth approximations stay off for them.
 
-Remaining smaller divergence: the gold slope (Rust ≈ +0.3/s vs the original's
-≈ +0.03/s at clock 255/640) suggests the building-maintenance side still
-undercounts operating costs; and the city *event block* (rand-gated
-`FUN_0047b540` immigration enqueue, `FUN_0047f510` house upgrades, the
-`+0x1e0` re-arm) is not yet ported — it only matters once houses are below
-capacity or satisfaction moves, which the current comparisons don't exercise.
+**Gold-slope divergence RESOLVED (two stacked errors).** First, the clock
+units: `DAT_005b6040` is a **100-ms tick** counter (incremented in
+`FUN_00489670` as `accumulator / 100`), so the original's `@clock 255/640`
+readings were 25.5 s/64 s of unpaused sim — the "+0.03/s" figure divided by
+ten times too much wall time. (The counter also freezes while the game is
+paused even though the 10-second subsystem dispatchers keep running, which is
+why headless captures can read `clock 0` with live accumulators — align
+captures by cycle-derived state or host timestamps, not this clock.) Second,
+the real remaining gap was **operating costs**: the live human city's
+`+0x1d8` accumulator reads **210** vs the Rust's 145. The costs come from the
+cod's `Kosten: <active>, <stopped>` property (compiled to def
+`+0x2c`/`+0x2a`, `1602_exe.c:67140-67148`; constants `KOST_WENIG = 5` …
+`KOST_WERFT_2 = 150`), which the Rust had approximated with a community
+table that also missed every non-production building (Kontor, markets,
+tavern, chapel, well…). Maintenance now accrues per static map root from the
+compiled active `Kosten` — the Rust human city charges exactly **210** and
+nets **+4 gold per economy tick ≈ +0.4/s, matching the original's +0.42/s**
+between its two live readings. (AI cities read slightly higher live because
+their AI had already constructed more buildings.)
+
+Remaining unported growth-chain piece: the city *event block* (rand-gated
+`FUN_0047b540` immigration enqueue, the `FUN_0047a020` pending-wave
+processor, `FUN_0047f510` marketplace upgrades, the `+0x1e0` re-arm). All of
+its population gates need ≥ 200-300 residents, so it is a verified no-op on
+Exile's 156 — port it when a larger-city comparison scenario is exercised.
 
 ### Promotion pipeline agreement (post-SIEDLER fixes)
 

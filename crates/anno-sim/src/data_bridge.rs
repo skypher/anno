@@ -2099,54 +2099,19 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
     let cost_wood = prop_int("Holz").max(0) as u16;
     let cost_bricks = prop_int("Ziegel").max(0) as u16;
 
-    // Per-building maintenance cost. RE: anno-capsu.netlify.app
-    // /1602/production_efficiency.html lists the per-building
-    // maintenance "cost" for every production building. The COD
-    // doesn't store it as a field — it's looked up by building
-    // type at runtime — so we map by output_good first, then fall
-    // back to a prod-kind default.
+    // Per-building operating cost: the compiled `Kosten: <active>,
+    // <stopped>` pair at definition `+0x2c`/`+0x2a`
+    // (`1602_exe.c:67140-67148`), selected by `FUN_00463140` for the city
+    // maintenance accumulator `+0x1d8`. The active cost applies while the
+    // building runs; definitions without the property (terrain, houses,
+    // roads) cost nothing — which also preserves the earlier
+    // terrain-maintenance fix without a category special case. Replaces
+    // the previous community-appendix approximation table. Validated
+    // against the live original's per-city `+0x1d8` accumulators on
+    // Exile (210/195/255/160/250/10/0 across the seven cities).
     let prod_kind_str = prop("ProdKind");
     use crate::types::Good;
-    let maintenance: u16 = match output_good {
-        // Food chain.
-        Good::Food => match prod_kind_str {
-            "FISCHEREI" | "JAGDHAUS" => 5,
-            _ => 5, // Bakery / Butcher per appendix
-        },
-        Good::Flour => 5,                // Windmill
-        Good::Grain | Good::Cattle => 5, // Plantation farms
-        Good::Cotton | Good::Wool => 10, // Wool/cotton farms
-        // Heavy industry.
-        Good::Cannons => 60,
-        Good::Muskets => 45,
-        Good::Swords => 30,
-        Good::Iron => 25,
-        Good::Tools => 25,
-        Good::Ore => 60,
-        Good::Gold => 60,
-        Good::Jewelry => 45,
-        // Cloth chain.
-        Good::Cloth => 20, // Weaving mill / weaver / tailor
-        Good::Clothing => 20,
-        // Plantations.
-        Good::Sugar | Good::Tobacco | Good::Spices | Good::Cocoa => 5,
-        Good::Wood => 5, // Forester
-        Good::Stone | Good::Bricks => 25,
-        // Drinks.
-        Good::Alcohol => 15, // Distillery
-        Good::Grapes => 35,  // Winery
-        Good::TobaccoProducts => 25,
-        Good::WildGame => 5,
-        Good::Silk => 20,
-        Good::Fish => 5,
-        // Non-production buildings (markets etc.) — fall through.
-        _ => match prod_kind_str {
-            "HANDWERK" => 5,
-            "ROHSTOFF" | "PLANTAGE" | "STEINBRUCH" | "BERGWERK" | "JAGDHAUS" | "FISCHEREI" => 3,
-            "WEIDETIER" | "ROHSTWACHS" => 2,
-            _ => 0,
-        },
-    };
+    let maintenance: u16 = cod_building.source_operating_costs.0;
 
     // Resolve Radius property (may be a number or a constant name)
     let radius_raw = prop("Radius");
@@ -2196,20 +2161,6 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         "WOHNUNG" => ProductionType::Residence,
         _ => ProductionType::Craft,
     };
-
-    // Natural terrain / nature (category 0: WALD forests, FELS ore rocks,
-    // beaches, water, pasture animals) are auto-placed map features, not
-    // player-constructed buildings, and accrue NO operating cost in the
-    // original: the source adds a building's operating cost to the city cost
-    // accumulator only when the instance's flag 0x10 is set (FUN_0047f6b0 /
-    // FUN_00463140 reading def+0x2a); terrain has no such flag. The per-type
-    // maintenance table above is an approximation that wrongly charged forests
-    // (WALD -> Wood -> 5) and ore rocks (FELS -> Ore -> 60), making the Rust
-    // economy run a deficit the original does not (validated against the live
-    // original on Exile: excluding terrain flips the human city from a per-tick
-    // loss to the flat/positive trajectory the original shows — see
-    // docs/original-capture.md). Zero it for terrain to match.
-    let maintenance = if category == 0 { 0 } else { maintenance };
 
     BuildingDef {
         id: cod_building.nummer as u16,

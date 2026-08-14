@@ -197,6 +197,12 @@ pub struct BuildingDef {
     /// Compiled `Figuranz` at definition offset `+0x3e`, the number of
     /// simultaneous type-11 transfer figures admitted by `FUN_0044ad50`.
     pub source_transfer_figure_limit: u8,
+    /// Compiled `Kosten: <active>, <stopped>` operating costs at definition
+    /// `+0x2c`/`+0x2a` (`1602_exe.c:67140-67148`). `FUN_00463140` selects by
+    /// the building's activity for the city maintenance accumulator
+    /// `+0x1d8`; definitions without the property (terrain, houses) cost
+    /// nothing.
+    pub source_operating_costs: (u16, u16),
     /// Source `NoShotFlg` bit consumed by `FUN_0046f6d0` when it constructs
     /// the ship-route obstacle overlay.
     pub no_shot: bool,
@@ -238,6 +244,7 @@ impl Default for BuildingDef {
             source_damage_threshold: 0,
             source_transfer_radius: 0,
             source_transfer_figure_limit: 0,
+            source_operating_costs: (0, 0),
             no_shot: false,
             ruinenr: 255,
             properties: HashMap::new(),
@@ -472,6 +479,26 @@ impl CodFile {
                                 current.source_transfer_radius = Self::eval(&constants, value)
                                     .clamp(0, i32::from(u8::MAX))
                                     as u8;
+                            } else if key == "Kosten" {
+                                // `Kosten: <active>, <stopped>` operating
+                                // costs; the haeuser loader stores the pair
+                                // at compiled definition `+0x2c`/`+0x2a`
+                                // (`1602_exe.c:67140-67148`), read back by
+                                // `FUN_00463140(def, active)` for the city
+                                // maintenance accumulator `+0x1d8`.
+                                let mut parts = value.split(',').map(str::trim);
+                                let active = parts
+                                    .next()
+                                    .map(|part| Self::eval(&constants, part))
+                                    .unwrap_or(0);
+                                let stopped = parts
+                                    .next()
+                                    .map(|part| Self::eval(&constants, part))
+                                    .unwrap_or(0);
+                                current.source_operating_costs = (
+                                    active.clamp(0, i32::from(u16::MAX)) as u16,
+                                    stopped.clamp(0, i32::from(u16::MAX)) as u16,
+                                );
                             } else if key == "Figuranz" {
                                 current.source_transfer_figure_limit = Self::eval(&constants, value)
                                     .clamp(0, i32::from(u8::MAX))
@@ -520,6 +547,15 @@ impl CodFile {
                     building_by_nummer.insert(current.nummer, current.clone());
                     buildings.push(current.clone());
                 }
+                // The original pre-fills every definition slot from the
+                // `@Nummer: 0` template (`ObjFill: 0,MAXHAUS`) before the
+                // per-block overrides apply, so sparse properties reset
+                // between blocks rather than inheriting from the previous
+                // definition. This parser carries `current` forward; reset
+                // the sparse `Kosten` pair (56 blocks set it, the template
+                // leaves it zero) so e.g. forests don't inherit the
+                // preceding workshop's operating cost.
+                current.source_operating_costs = (0, 0);
                 if let Some(delta) = val_str.strip_prefix('+') {
                     current.nummer += Self::eval(&constants, delta.trim());
                 } else {

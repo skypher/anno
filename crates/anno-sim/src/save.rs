@@ -264,7 +264,10 @@ use std::path::Path;
 ///       demand/supply accumulators, per-slot fulfillment bytes and
 ///       histories, and the worst-slot byte — the exact per-city
 ///       consumption cycle's state.
-pub const SAVE_VERSION: u32 = 139;
+/// v140: static map roots retain the compiled active `Kosten` operating
+///       cost; per-player maintenance accrues from roots (city `+0x1d8`
+///       semantics) instead of production instances.
+pub const SAVE_VERSION: u32 = 140;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -917,6 +920,7 @@ mod tests {
                 source_variant: 8,
                 source_map_owner_slot: 6,
                 source_transfer_figure_limit: 2,
+                source_operating_cost: 0,
                 source_transfer_radius: 16,
                 source_transfer_figure: crate::source_cell::SourceTransferFigure::Karren,
                 ruin_id: 4,
@@ -1352,6 +1356,7 @@ mod tests {
                 source_variant: 8,
                 source_map_owner_slot: 6,
                 source_transfer_figure_limit: 2,
+                source_operating_cost: 0,
                 source_transfer_radius: 16,
                 source_transfer_figure: crate::source_cell::SourceTransferFigure::Karren,
                 ruin_id: 4,

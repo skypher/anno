@@ -130,6 +130,12 @@ pub struct SourceMapCellState {
     /// admits this many type-11 transfer figures at this source root.
     #[serde(default)]
     pub source_transfer_figure_limit: u8,
+    /// Compiled active `Kosten` at definition offset `+0x2c`. The city
+    /// maintenance accumulator `+0x1d8` (`FUN_0047f450`/`FUN_00463140`)
+    /// charges this per constructed building; terrain and houses carry no
+    /// `Kosten` property and cost nothing.
+    #[serde(default)]
+    pub source_operating_cost: u16,
     /// Compiled `Radius` at definition offset `+0x20`. Type-8/type-11 event
     /// routing uses this square search radius in `FUN_0045c8b0`.
     #[serde(default)]
@@ -364,6 +370,7 @@ impl SourceMapCellState {
             source_variant: 0,
             source_map_owner_slot: 0,
             source_transfer_figure_limit: definition.source_transfer_figure_limit,
+            source_operating_cost: definition.source_operating_costs.0,
             source_transfer_radius: definition.source_transfer_radius,
             source_transfer_figure: SourceTransferFigure::from_definition(definition),
             ruin_id: definition.ruinenr.clamp(0, 255) as u8,
@@ -1190,6 +1197,7 @@ mod tests {
         let definition = BuildingDef {
             kind: "MARKT".into(),
             source_transfer_figure_limit: 2,
+            source_operating_costs: (0, 0),
             source_transfer_radius: 16,
             source_scheduler_interval: 7,
             ..Default::default()

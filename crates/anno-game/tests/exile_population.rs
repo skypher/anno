@@ -25,6 +25,25 @@ fn load_exile() -> Option<(anno_sim::simulation::Simulation, anno_formats::cod::
 }
 
 #[test]
+fn exile_operating_costs_match_the_live_city_accumulator() {
+    // The live original's human-city maintenance accumulator (`+0x1d8`,
+    // read via winedbg at +30 s) is exactly 210 and the native city 10;
+    // the AI cities read 160/195/255/250 but their live AI had already
+    // constructed additional buildings, so only a lower bound holds.
+    let Some((mut sim, _cod)) = load_exile() else {
+        println!("Skipping test: data corpus not found");
+        return;
+    };
+    for _ in 0..200 {
+        sim.tick(100);
+    }
+    assert_eq!(sim.players[0].building_maintenance, 210);
+    assert_eq!(sim.players[5].building_maintenance, 10, "native city");
+    assert!(sim.players[1].building_maintenance >= 400); // live 450 after AI builds
+    assert!(sim.players[3].building_maintenance >= 350); // live 410 after AI builds
+}
+
+#[test]
 fn exile_house_coverage_scan_reproduces_authored_flags() {
     // The scenario's SIEDLER records are frozen output of the editor's
     // own `FUN_00482120` coverage scan (predating the authored well, so

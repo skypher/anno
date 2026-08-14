@@ -63,7 +63,9 @@ for slot in range(12):
     pops = [u32(base + 0x220 + t*4) for t in range(5)]
     sats = [u8(base + 0x248 + t) for t in range(5)]
     taxes = [u8(base + 0x24d + t) for t in range(5)]
-    print(f"city[{slot}] island={island} owner={owner} pop={pops} sat={sats} tax={taxes}")
+    maint = u32(base + 0x1d8)      # FUN_0047f6b0 building operating costs
+    military = u32(base + 0x1dc)   # military upkeep (added for state-0 owners)
+    print(f"city[{slot}] island={island} owner={owner} pop={pops} sat={sats} tax={taxes} maint={maint} mil={military}")
     stocks = []
     for w, name in WARES.items():
         rec = base + 0x24 + w * 0x0c
