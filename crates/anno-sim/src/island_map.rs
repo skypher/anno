@@ -1573,6 +1573,9 @@ impl IslandMap {
     /// A tile is "coastal" if it's walkable AND at least one of its
     /// 4-neighbours is out of bounds — i.e. it sits on the perimeter of
     /// the island's walkable region. Fisheries can only go on coastal tiles.
+    /// True for a walkable tile bordering the sea: a 4-neighbor that is
+    /// open water (no map cell), a shoreline kind (MEER/BRANDUNG/STRAND
+    /// family, codes 19..=28, or PIER 30), or beyond the island bounds.
     pub fn is_coastal(&self, x: i32, y: i32) -> bool {
         if !self.is_walkable(x, y) {
             return false;
@@ -1582,6 +1585,12 @@ impl IslandMap {
             let ny = y + dy;
             if nx < 0 || ny < 0 || nx >= self.width as i32 || ny >= self.height as i32 {
                 return true;
+            }
+            let index = ny as usize * self.width as usize + nx as usize;
+            match self.source_map_kind_cells.get(index) {
+                Some(None) => return true,
+                Some(Some(cell)) if matches!(cell.kind_code, 19..=28 | 30) => return true,
+                _ => {}
             }
         }
         false
