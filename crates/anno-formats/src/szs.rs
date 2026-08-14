@@ -2163,6 +2163,30 @@ impl SzsFile {
         })
     }
 
+    /// Parse a stock-island file (`Nord\litNN.SCP` etc.): an `INSEL3` or
+    /// `INSEL4` header chunk (num/width/height in its first three bytes)
+    /// plus a plain `INSELHAUS` tile chunk. `FUN_00469770` loads exactly
+    /// this pair when a scenario island ships without inline tiles; the
+    /// path is formatted by `FUN_00469690` as
+    /// `<base><climate><size><NN>.SCP`. Returns `(width, height, tiles)`.
+    pub fn parse_stock_island(data: &[u8]) -> Option<(u8, u8, Vec<IslandTile>)> {
+        let file = Self::parse(data).ok()?;
+        let head = file
+            .chunks
+            .iter()
+            .find(|c| matches!(c.name.as_str(), "INSEL3" | "INSEL4" | "INSEL5"))?;
+        if head.data.len() < 3 {
+            return None;
+        }
+        let (width, height) = (head.data[1], head.data[2]);
+        let tiles = file
+            .chunks
+            .iter()
+            .find(|c| c.name == "INSELHAUS")
+            .map(|c| Self::parse_inselhaus(&c.data))?;
+        Some((width, height, tiles))
+    }
+
     fn parse_inselhaus(data: &[u8]) -> Vec<IslandTile> {
         let record_size = 8;
         let count = data.len() / record_size;

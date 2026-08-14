@@ -14,6 +14,95 @@ use anno_sim::player::Player;
 use anno_sim::simulation::Simulation;
 use anno_sim::warehouse::Warehouse;
 
+/// Instantiate stock islands for `INSEL5`-only records: scenario islands
+/// that ship without inline tiles load a library island at scenario start.
+/// The original formats `<base><climate><size><NN>.SCP` (`FUN_00469690`;
+/// climate dirs `Nord\`/`Sued\` by map half, size prefixes by family) and
+/// loads its INSELHAUS (`FUN_00469770`), picking a random file each
+/// playthrough. This port picks **deterministically** from `seed` and the
+/// island number so scripted playthroughs replay identically, and rolls
+/// the all-sentinel fertility slots with climate-appropriate crops (the
+/// original also randomizes these at instantiation; its exact
+/// distribution is not yet recovered).
+///
+/// `map_height` bounds the north/south split; the shipping maps are
+/// 500×350 world tiles.
+pub fn instantiate_stock_islands(szs: &mut SzsFile, data_dir: &std::path::Path, seed: u32) {
+    use anno_formats::szs::Fertility;
+    const MAP_HEIGHT: u16 = 350;
+    for island in &mut szs.islands {
+        if !island.tiles.is_empty() {
+            continue;
+        }
+        let prefix = match (island.width, island.height) {
+            (30, 30) => "lit",
+            (40, 40) => "mit",
+            (50, 52) => "med",
+            (70, 60) | (100, 90) => "big",
+            _ => "lar",
+        };
+        let southern = island.y_pos + u16::from(island.height) / 2 >= MAP_HEIGHT / 2;
+        let climate_dir = if southern { "SUED" } else { "NORD" };
+        let dir = data_dir.join(climate_dir);
+        let mut candidates: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| {
+                                let lower = name.to_ascii_lowercase();
+                                lower.starts_with(prefix) && lower.ends_with(".scp")
+                            })
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        candidates.sort();
+        if candidates.is_empty() {
+            continue;
+        }
+        let pick = (seed as usize)
+            .wrapping_mul(31)
+            .wrapping_add(usize::from(island.number))
+            % candidates.len();
+        // Rotate from the seeded pick until a candidate parses at the
+        // expected dimensions (a few library files are mislabeled or use
+        // odd sizes).
+        let Some(tiles) = (0..candidates.len()).find_map(|offset| {
+            let path = &candidates[(pick + offset) % candidates.len()];
+            let data = std::fs::read(path).ok()?;
+            let (width, height, tiles) = SzsFile::parse_stock_island(&data)?;
+            (width == island.width && height == island.height).then_some(tiles)
+        }) else {
+            continue;
+        };
+        island.tiles = tiles;
+        // Roll the sentinel fertility slots with climate-appropriate
+        // crops so the mission economy is playable; two crops per
+        // island, seeded like the file pick.
+        if island.fertilities.iter().all(|&f| f == 7) {
+            let pool: &[u8] = if southern {
+                &[
+                    Fertility::Tobacco as u8,
+                    Fertility::Spices as u8,
+                    Fertility::Sugarcane as u8,
+                    Fertility::Cotton as u8,
+                    Fertility::Cocoa as u8,
+                ]
+            } else {
+                &[Fertility::Grain as u8, Fertility::Vines as u8]
+            };
+            let first = pool[pick % pool.len()];
+            let second = pool[(pick + 1 + seed as usize) % pool.len()];
+            island.fertilities[0] = first;
+            island.fertilities[1] = second;
+        }
+    }
+}
+
 /// Build the same `Simulation` the game binary runs: [`init_simulation`]
 /// plus the figuren.cod-derived carrier, city-cart, civilian, and ship-cargo
 /// configuration the game's main() applies before its first tick. Headless

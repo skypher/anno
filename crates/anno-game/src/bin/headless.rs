@@ -196,7 +196,9 @@ fn main() {
         }
     };
     let szs_data = std::fs::read(&opts.scenario).expect("failed to read scenario");
-    let szs = anno_formats::szs::SzsFile::parse(&szs_data).expect("failed to parse scenario");
+    let mut szs =
+        anno_formats::szs::SzsFile::parse(&szs_data).expect("failed to parse scenario");
+    anno_game::scenario::instantiate_stock_islands(&mut szs, &opts.data_dir, opts.seed);
 
     let mut sim = anno_game::scenario::build_simulation(&szs, &cod, &defs, &figures);
     sim.seed_source_rand(opts.seed);

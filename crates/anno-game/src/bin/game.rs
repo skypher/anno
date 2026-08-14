@@ -1154,7 +1154,9 @@ fn main() {
     });
 
     let szs_data = std::fs::read(&scenario_path).expect("Failed to read scenario");
-    let szs = SzsFile::parse(&szs_data).expect("Failed to parse scenario");
+    let mut szs = SzsFile::parse(&szs_data).expect("Failed to parse scenario");
+    anno_game::scenario::instantiate_stock_islands(&mut szs, std::path::Path::new("extracted"), 1);
+    let szs = szs;
     let scenario_name = std::path::Path::new(&scenario_path)
         .file_stem()
         .unwrap_or_default()
