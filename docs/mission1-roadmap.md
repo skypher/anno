@@ -274,7 +274,26 @@ forester with no trees. Ware slot is `0x2d + crop bit`.
     just cloth: the fishery and hunter are the only food sources before
     STUFE_1A.
 
-- **Stage 4 (after).** The maturation timer `FUN_0047ca80` (`:88970`).
-  Without it a harvested cell never regrows, so even a working forester
-  strips its woodland and stalls permanently — and a newly placed field
-  tile never ripens at all, which is what plantation agriculture needs.
+- **Stage 4 (in progress).** The colony is self-sustaining and carting,
+  but the first scaled run **starved to death**: population climbed to 46
+  (`[22, 24]` at minute 60), then collapsed to zero by minute 100.
+
+  The cause is a real constraint, not a bug. At minute 120, with nobody
+  left to eat, both fisheries still read `raw=0 / fill=0` with their
+  workers stuck in `Searching` — they had exhausted their fishing
+  grounds. The driver had sited them with only **5 and 7 ripe FISCHE
+  cells in range**. A trip harvests 3 cells, and a sea cell takes 450 s
+  to ripen (`Interval: 450`, `AnimAnz: 6`, bucket 5), so sustained output
+  is about one unit per minute per fishery — against 46 inhabitants.
+
+  Two lessons for the driver. Harvester siting must weight *sustained*
+  yield, i.e. ripe cells in range divided by the regrowth period, not the
+  instantaneous count. And expansion has to be paced against the food
+  stock rather than built out in one burst; the real game paces it the
+  same way.
+
+  Note the satisfaction readout is not the signal here: group 0 has no
+  demanded luxury wares, so its denominator is zero and the group
+  satisfaction short-circuits to `0x80` even while the city starves. The
+  starvation path runs through the separate food-fulfilment byte
+  (`city+0x255`) that gates growth and demotion.
