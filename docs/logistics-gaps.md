@@ -243,15 +243,13 @@ reads as zero to withdrawal (`:87442-87444`). `FUN_0047aac0` returns the
 | d | `Warehouse::deposit` caps at `default_capacity`, not at city capacity, so every ship unload, free-trader exchange and salvage is under-capped once a second market exists. ~15 call sites. |
 | e | No `0x20` floor on free space or available stock. |
 
-OPEN, and blocking (b): the authored property behind `def+0x6a` bit 7 is
-unidentified — no instruction encodes `+0x6a` as a disp8 anywhere in `.text`
-except the `0x004089eb` test, so it is assembled in a register. Functionally it
-marks a kind-7/8 root that is *not* a storage root (`FUN_0047f510` `:91061`
-searches for it when releasing a settlement; `FUN_00481450` case 3 gates a
-pirate branch on it), so native and pirate village markers are the likely
-referent. **Do not guess** — dump `def+0x6a` for the seven MARKT/KONTOR records
-first. Leaving it out only over-counts on native islands, which is the safer
-error.
+**RESOLVED** (was open): `def+0x6a` bit 7 is **`Destroyflg`** — loader cascade
+`:66892`, write `:66913-66915`, authored only on `RUINE` and `STRANDRUINE`
+records in haeuser.cod. So the exclusion reads "a kind-7/8 root that is a ruin
+is not a storage root", which is why `FUN_0047f510` (`:91061`) uses the same bit
+to find burnt-out marketplaces to reap and `FUN_00479ca0` (`:86842`) uses it to
+refuse to afflict a ruin. Native and pirate village markers were the wrong
+guess. See `docs/hazard-block.md` §3.
 
 Relevant to lockstep: `FUN_0047a960`/`FUN_0047a9b0` (`:87376-87406`) do not
 write the store directly — they post a kind-0x12 message addressed to the city.

@@ -48,11 +48,17 @@ and `DAT_00562da8` (u8 counters, 3-bit). Bucket *i* fires every
 takes 160 calls.
 
 **Persistence.** The `"TIMERS"` chunk (`:94964-94984`, 0x298 bytes)
-saves `DAT_00562da8` and `DAT_0054a2f4` but **not the table**, which is
-rebuilt on load by `FUN_00481450` case 10 while replaying INSELHAUS
-commands; each phase counter is re-derived from the tile's bits 15..18,
-which are saved in the command word's bits 2..5 (`FUN_004631b0`,
-`:69010`).
+saves `DAT_00562da8` and `DAT_0054a2f4`.
+
+**Correction:** an earlier draft of this file said the table itself is not
+saved. `"TIMERS"` does not save it, but `FUN_00485c20` (`:94867-94911`)
+saves the whole table as the **`"ROHWACHS2"`** chunk — 8 bytes per live
+entry, island-filtered. The table is *also* reconstructible on load by
+`FUN_00481450` case 10 while replaying INSELHAUS commands, with each phase
+counter re-derived from the tile's bits 15..18 (saved in the command
+word's bits 2..5, `FUN_004631b0`, `:69010`), so a port that rebuilds
+rather than loads `ROHWACHS2` stays consistent — but it must not claim the
+original discards the state.
 
 ## 2. Arming, and where the bucket comes from
 
