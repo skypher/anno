@@ -498,19 +498,38 @@ fn main() {
     // huts hold 2 and settler houses 6, so 100 inhabitants needs far more
     // than the opening four. Expand the core once wood is flowing, and add a
     // second food and cloth line to carry the larger population.
-    println!("--- stage 4: expanding the colony ---");
-    build_on_resource(&mut sim, &mut used, 270, 57, "fishery1");
+    // Expansion is paced against the food stock rather than built out in one
+    // burst. The first attempt placed twenty huts at once and the colony
+    // starved at 46 inhabitants: a harvest cell is finite now, and a fishery's
+    // sustained yield is its ripe cells divided by the 450 s a sea cell takes
+    // to ripen — so houses have to wait for the food line, not the other way
+    // round. A player paces it the same way.
+    println!("--- stage 4: expanding the colony, paced on food ---");
     build_on_resource(&mut sim, &mut used, 402, 53, "forester1");
     build_on_resource(&mut sim, &mut used, 412, 52, "sheep2");
     build(&mut sim, &mut used, 388, "weaver1");
-    for n in 4..24 {
-        build(&mut sim, &mut used, 414, &format!("hut{n}"));
-    }
-    site_report(&sim);
+    let mut huts = 4;
+    let mut fisheries = 1;
     for minute in 41..=120u32 {
         for _ in 0..600 {
             sim.tick(100);
             sim.drain_source_kind13_replacements(&cod);
+        }
+        let food = sim
+            .warehouses
+            .iter()
+            .find(|w| w.island_id == 10 && w.owner == 0)
+            .map(|w| w.stock(Good::Food))
+            .unwrap_or(0);
+        // Below a comfortable buffer, buy food capacity before housing.
+        if food < 25 && fisheries < 6 {
+            if build_on_resource(&mut sim, &mut used, 270, 57, &format!("fishery{fisheries}")) {
+                fisheries += 1;
+            }
+        } else if food >= 25 && huts < 40 {
+            if build(&mut sim, &mut used, 414, &format!("hut{huts}")) {
+                huts += 1;
+            }
         }
         report(&sim, format!("min {minute}"));
         if minute % 20 == 0 {
