@@ -129,23 +129,142 @@ fn main() {
         }
         placed
     };
+    // A harvester only works if its raw resource lies inside its own Radius:
+    // the worker searches the static map roots for ripe (kind 9) cells whose
+    // output ware matches the building's `Rohstoff`. Island 10 carries 559
+    // BAUM (ware 53), 627 GRAS (52) and 585 FISCHE (57) cells, but none of
+    // them next to the founding beach — siting by "nearest free tile" gives a
+    // forester with no trees. Pick the spot that maximises matching cells in
+    // range while staying inside the Kontor's radius-16 coverage.
+    let build_on_resource = |sim: &mut anno_sim::simulation::Simulation,
+                             used: &mut Vec<(i32, i32, u8, u8)>,
+                             def_index: u16,
+                             ware: u8,
+                             label: &str| {
+        let def = &defs[def_index as usize];
+        let (w, h) = (def.width, def.height);
+        let radius = i32::from(def.radius).max(1);
+        let cells: Vec<(i32, i32)> = sim
+            .source_static_map_roots
+            .iter()
+            .filter(|c| {
+                c.island == 10
+                    && c.source_production_kind_code == 9
+                    && c.source_output_ware_slot == ware
+            })
+            .map(|c| (i32::from(c.x), i32::from(c.y)))
+            .collect();
+        let map = &sim.island_maps[mi];
+        let mut best: Option<(usize, (i32, i32))> = None;
+        for y in 2..island.height as i32 - i32::from(h) - 2 {
+            for x in 2..island.width as i32 - i32::from(w) - 2 {
+                let free = (0..i32::from(h))
+                    .all(|dy| (0..i32::from(w)).all(|dx| map.is_walkable(x + dx, y + dy)))
+                    && !used.iter().any(|&(ux, uy, uw, uh)| {
+                        x < ux + i32::from(uw)
+                            && ux < x + i32::from(w)
+                            && y < uy + i32::from(uh)
+                            && uy < y + i32::from(h)
+                    });
+                if !free {
+                    continue;
+                }
+                // The worker's search grid is a circle of the building's
+                // compiled `Radius` (`FUN_00404d70` rows), not a box, so rank
+                // sites by cells actually inside that circle.
+                let n = cells
+                    .iter()
+                    .filter(|&&(cx, cy)| {
+                        let (dx, dy) = (cx - x, cy - y);
+                        dx * dx + dy * dy <= radius * radius
+                    })
+                    .count();
+                if n > 0 && best.is_none_or(|(bn, _)| n > bn) {
+                    best = Some((n, (x, y)));
+                }
+            }
+        }
+        let Some((n, (x, y))) = best else {
+            println!("no {label} site with ware {ware} in range");
+            return false;
+        };
+        let placed = anno_game::game_commands::apply_game_command(
+            sim,
+            &szs.islands,
+            &cod,
+            &defs,
+            &Command::PlaceBuilding {
+                player: 0,
+                island: 10,
+                tile_x: x as u16,
+                tile_y: y as u16,
+                def_index,
+                orientation: 0,
+            },
+        );
+        println!("build {label} at ({x},{y}) with {n} ware-{ware} cells in range: {placed}");
+        if placed {
+            used.push((x, y, w, h));
+        }
+        placed
+    };
+
     // Build order is bounded by the ship's 50 wood: the forester is the only
     // wood source and costs none, so it goes up first, then food, then the
     // civic core, then houses, then the cloth chain. Every def here carries
     // `Bauinfra: INFRA_NIX` and is placeable under the campaign's `0x3` mask.
-    build(&mut sim, &mut used, 402, "forester"); //  0 wood,  2 tools
-    build(&mut sim, &mut used, 270, "fishery"); //  5 wood,  3 tools
-    build(&mut sim, &mut used, 403, "hunter"); //  2 wood,  2 tools
+    // Ware slots are `0x2d + bit`: 52 GRAS, 53 BAUM, 57 FISCHE.
+    build_on_resource(&mut sim, &mut used, 402, 53, "forester"); //  0 wood, 2 tools
+    build_on_resource(&mut sim, &mut used, 270, 57, "fishery"); //   5 wood, 3 tools
     build(&mut sim, &mut used, 468, "market"); // 10 wood,  4 tools
     build(&mut sim, &mut used, 463, "chapel"); //  5 wood,  2 tools
     for n in 0..4 {
         build(&mut sim, &mut used, 414, &format!("hut{n}")); // 3 wood each
     }
     // Cloth needs no fertility and no rung: two sheep farms feed one weaver
-    // (the hut consumes 2 Wool per Cloth).
-    build(&mut sim, &mut used, 412, "sheep0"); //  4 wood,  2 tools
-    build(&mut sim, &mut used, 412, "sheep1"); //  4 wood,  2 tools
+    // (the hut consumes 2 Wool per Cloth). The farms graze ripe GRAS cells.
+    build_on_resource(&mut sim, &mut used, 412, 52, "sheep0"); //  4 wood, 2 tools
+    build_on_resource(&mut sim, &mut used, 412, 52, "sheep1"); //  4 wood, 2 tools
     build(&mut sim, &mut used, 388, "weaver"); //  6 wood,  3 tools
+
+    // Per-producer live cell state: is it scheduled, is raw material arriving,
+    // is finished stock piling up locally instead of reaching the warehouse?
+    let cell_report = |sim: &anno_sim::simulation::Simulation| {
+        for cell in sim
+            .source_map_cell_states
+            .iter()
+            .filter(|c| c.island == 10 && (1..=6).contains(&c.source_production_kind_code))
+        {
+            println!(
+                "  cell ({},{}) prodkind={} act={} raw={} work={} fill={} cap={} sched={} blocked={}",
+                cell.x,
+                cell.y,
+                cell.source_production_kind_code,
+                cell.activity,
+                cell.raw_material_stock,
+                cell.work_material_stock,
+                cell.storage_fill,
+                cell.storage_animation_capacity,
+                cell.scheduler_enabled,
+                cell.scheduler_blocked,
+            );
+        }
+        let mut routes: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for figure in sim
+            .figures
+            .iter()
+            .filter(|f| f.is_active() && f.origin_island == 10)
+        {
+            *routes
+                .entry(format!(
+                    "{:?}/good{}",
+                    figure.source_worker_route, figure.carried_good
+                ))
+                .or_default() += 1;
+        }
+        println!("  worker figures on island 10: {routes:?}");
+    };
 
     // Which buildings are still owed materials / still under construction?
     let site_report = |sim: &anno_sim::simulation::Simulation| {
@@ -203,6 +322,7 @@ fn main() {
         report(&sim, format!("min {minute}"));
         if minute == 1 || minute == 10 {
             site_report(&sim);
+            cell_report(&sim);
         }
     }
 
