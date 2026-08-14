@@ -22,7 +22,7 @@ fn main() {
             .unwrap_or("?");
         let line = format!(
             "{index:4} id={:5} {name:24} kind={:10} prod={:12} out={:?}x{} in1={:?}x{} in2={:?}x{} \
-             size={}x{} tier={} gold={} wood={} tools={} bricks={} maint={} radius={}",
+             size={}x{} infra={} gold={} wood={} tools={} bricks={} maint={} radius={}",
             def.id,
             def.kind,
             def.prod_kind,
@@ -34,7 +34,7 @@ fn main() {
             def.input_2_rate,
             def.width,
             def.height,
-            def.min_tier,
+            def.bauinfra,
             def.cost_gold,
             def.cost_wood,
             def.cost_tools,

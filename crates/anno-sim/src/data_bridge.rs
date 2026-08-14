@@ -2027,29 +2027,183 @@ fn rohstoff_to_fertility_matches_audit_pairs() {
 #[test]
 fn parse_bauinfra_matches_haeuser_cod_ladder() {
     // Aliases from haeuser.cod's `BESONDERE INFRASTRUKTUR
-    // MARKPUNKTE` block, paired with the PopTier index they
-    // resolve to (digit - 1 of the STUFE rung).
+    // MARKPUNKTE` block, paired with the `INFRA_*` constant id the
+    // exe's `0x00499d30` name table assigns to the rung they
+    // substitute for.
     let cases: &[(&str, u8)] = &[
-        ("INFRA_KONTOR_1", 1), // Settler  (= INFRA_STUFE_2B)
-        ("INFRA_BURG_1", 1),   // Settler  (= INFRA_STUFE_2G)
-        ("INFRA_WACHTURM", 1), // Settler  (= INFRA_STUFE_2G)
-        ("INFRA_KONTOR_2", 2), // Citizen  (= INFRA_STUFE_3A)
-        ("INFRA_KANON", 2),    // Citizen  (= INFRA_STUFE_3E)
-        ("INFRA_KONTOR_3", 3), // Merchant (= INFRA_STUFE_4A)
-        ("INFRA_BURG_2", 3),   // Merchant (= INFRA_STUFE_4B)
-        ("INFRA_MUSKETE", 3),  // Merchant (= INFRA_STUFE_4B)
-        ("INFRA_BURG_3", 4),   // Aristo   (= INFRA_STUFE_5B)
-        // Direct STUFE tokens.
-        ("INFRA_STUFE_1A", 0),
-        ("INFRA_STUFE_5A", 4),
+        ("INFRA_KONTOR_1", 17), // = INFRA_STUFE_2B
+        ("INFRA_BURG_1", 23),   // = INFRA_STUFE_2G
+        ("INFRA_WACHTURM", 23), // = INFRA_STUFE_2G
+        ("INFRA_KONTOR_2", 22), // = INFRA_STUFE_3A
+        ("INFRA_KANON", 27),    // = INFRA_STUFE_3E
+        ("INFRA_KONTOR_3", 29), // = INFRA_STUFE_4A
+        ("INFRA_BURG_2", 30),   // = INFRA_STUFE_4B
+        ("INFRA_MUSKETE", 30),  // = INFRA_STUFE_4B
+        ("INFRA_BURG_3", 32),   // = INFRA_STUFE_5B
+        // Direct STUFE tokens. Note 5A/5B: haeuser.cod declares 5B
+        // first, but the exe's hardcoded table numbers 5A = 31.
+        ("INFRA_STUFE_1A", 15),
+        ("INFRA_STUFE_5A", 31),
+        ("INFRA_STUFE_5B", 32),
+        // Absent / unknown token → INFRA_NIX, always buildable.
         ("", 0),
-        // Cultural-building tags (no marker-table alias defined).
-        ("INFRA_KIRCHE", 0),
-        ("INFRA_SCHULE", 0),
+        ("INFRA_NOT_A_REAL_TAG", 0),
+        // Cultural-building tags are ordinary rungs too: they gate
+        // the church / school themselves.
+        ("INFRA_KIRCHE", 5),
+        ("INFRA_SCHULE", 3),
     ];
     for (tok, want) in cases {
         let got = parse_bauinfra(tok);
         assert_eq!(got, *want, "parse_bauinfra({tok:?}) = {got}, want {want}");
+    }
+}
+
+/// The unlock sweep at the tail of `FUN_0047f8a0`
+/// (`1602_exe.c:91520-91581`).
+#[cfg(test)]
+#[test]
+fn source_city_unlock_sweep_matches_the_source_ladder() {
+    const MARKT: u32 = 1 << 0;
+    const KAPELLE: u32 = 1 << 1;
+    const STUFE_1A: u32 = 1 << 14; // id 15
+    const STUFE_2A: u32 = 1 << 15; // id 16
+    const STUFE_5B: u32 = 1 << 31; // id 32
+
+    // INFRA_MARKT and INFRA_KAPELLE are absent from haeuser.cod, so
+    // their `(BGruppe, Minwohn)` stays `(0, 0)` and `0 >= 0` grants
+    // them on the very first sweep of an empty city.
+    let empty = source_city_unlock_sweep(&[0; 5], 0);
+    assert_eq!(empty & MARKT, MARKT, "marketplace unlocks immediately");
+    assert_eq!(empty & KAPELLE, KAPELLE, "chapel unlocks immediately");
+    assert_eq!(empty, MARKT | KAPELLE, "nothing else unlocks at zero pop");
+
+    // INFRA_STUFE_1A is `(BGruppe 0, Minwohn 30)`: the boundary is
+    // `Minwohn <= cum[0]`, so 29 pioneers is short and 30 is enough.
+    assert_eq!(source_city_unlock_sweep(&[29, 0, 0, 0, 0], 0) & STUFE_1A, 0);
+    assert_eq!(
+        source_city_unlock_sweep(&[30, 0, 0, 0, 0], 0) & STUFE_1A,
+        STUFE_1A,
+    );
+    // 30 pioneers alone must NOT reach a BGruppe-1 rung: `cum[1]` is
+    // still 0 because the sum runs upward, not downward.
+    assert_eq!(source_city_unlock_sweep(&[30, 0, 0, 0, 0], 0) & STUFE_2A, 0);
+
+    // The sum is cumulative from the top: 600 aristocrats satisfy
+    // `cum[k] = 600` for every k, so every rung whose Minwohn <= 600
+    // unlocks at once — including all the BGruppe-0/1/2/3 ones.
+    let aristo = source_city_unlock_sweep(&[0, 0, 0, 0, 600], 0);
+    assert_eq!(aristo & STUFE_5B, STUFE_5B, "STUFE_5B (BGruppe 4, 600)");
+    assert_eq!(aristo & STUFE_1A, STUFE_1A, "lower BGruppe-0 rung too");
+    for (id, (_, minwohn)) in BAUINFRA_LADDER.iter().enumerate().skip(1) {
+        let bit = 1u32 << (id - 1);
+        let want = u32::from(*minwohn) <= 600;
+        assert_eq!(
+            aristo & bit != 0,
+            want,
+            "id {id} ({}) Minwohn {minwohn} against 600 cumulative",
+            INFRA_NAMES[id],
+        );
+    }
+
+    // Grants are permanent: the sweep only ORs. A fully-set mask
+    // survives an empty city untouched.
+    assert_eq!(source_city_unlock_sweep(&[0; 5], u32::MAX), u32::MAX);
+    // …and a previously-earned rung is not revoked when the
+    // population that earned it is gone.
+    let earned = source_city_unlock_sweep(&[30, 0, 0, 0, 0], 0);
+    assert_eq!(
+        source_city_unlock_sweep(&[0; 5], earned) & STUFE_1A,
+        STUFE_1A,
+    );
+}
+
+/// Tripwire: [`BAUINFRA_LADDER`] must reproduce the `Objekt: BAUINFRA`
+/// block of the shipped `haeuser.cod`. The file is byte-negated on
+/// disk (`decrypted = (-encrypted) & 0xFF`), so decrypt it here and
+/// parse the block textually rather than trusting the transcription.
+/// Self-skips without the data corpus.
+#[cfg(test)]
+#[test]
+fn bauinfra_ladder_matches_shipped_haeuser_cod() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let Ok(raw) = std::fs::read(root.join("extracted/haeuser.cod")) else {
+        println!("Skipping test: data corpus not found");
+        return;
+    };
+    let text: String = raw
+        .iter()
+        .map(|&b| char::from(b.wrapping_neg()))
+        .collect::<String>();
+
+    // Walk `Objekt: BAUINFRA` … `EndObj;` collecting the
+    // Nummer/BGruppe/Minwohn triples in declaration order. The
+    // separator between key and value is arbitrary whitespace.
+    let after_objekt = text
+        .match_indices("Objekt:")
+        .map(|(i, m)| &text[i + m.len()..])
+        .find(|rest| rest.trim_start().starts_with("BAUINFRA"))
+        .expect("BAUINFRA block present");
+    let block = after_objekt
+        .split_once("EndObj;")
+        .expect("block terminator")
+        .0;
+
+    let field = |line: &str, key: &str| -> Option<String> {
+        let line = line.split(';').next().unwrap_or(line); // strip comment
+        let (name, value) = line.split_once(':')?;
+        (name.trim() == key).then(|| value.trim().to_string())
+    };
+
+    let mut declared: Vec<(String, u8, u16)> = Vec::new();
+    let (mut name, mut bgruppe) = (None::<String>, None::<u8>);
+    for line in block.lines() {
+        if let Some(v) = field(line, "Nummer") {
+            name = Some(v);
+        } else if let Some(v) = field(line, "BGruppe") {
+            bgruppe = v.parse().ok();
+        } else if let Some(v) = field(line, "Minwohn") {
+            let minwohn: u16 = v.parse().expect("numeric Minwohn");
+            declared.push((
+                name.take().expect("Nummer precedes Minwohn"),
+                bgruppe.take().expect("BGruppe precedes Minwohn"),
+                minwohn,
+            ));
+        }
+    }
+
+    // Every rung the file declares must land on its exe id with the
+    // authored pair.
+    assert_eq!(declared.len(), 30, "haeuser.cod declares 30 BAUINFRA rungs");
+    for (name, bgruppe, minwohn) in &declared {
+        let id = parse_bauinfra(name);
+        assert_ne!(id, 0, "{name} is not a known INFRA_* constant");
+        assert_eq!(
+            BAUINFRA_LADDER[usize::from(id)],
+            (*bgruppe, *minwohn),
+            "{name} (id {id})",
+        );
+    }
+
+    // Conversely, the only ids the file does NOT declare are
+    // INFRA_NIX / INFRA_MARKT / INFRA_KAPELLE, and those must stay
+    // `(0, 0)` — that zero threshold is what makes the marketplace
+    // and chapel unlock on a settlement's first sweep.
+    let names: Vec<&str> = declared.iter().map(|(n, _, _)| n.as_str()).collect();
+    for (id, name) in INFRA_NAMES.iter().enumerate() {
+        if names.contains(name) {
+            continue;
+        }
+        assert!(
+            matches!(id, 0 | 1 | 2),
+            "{name} (id {id}) missing from haeuser.cod",
+        );
+        assert_eq!(BAUINFRA_LADDER[id], (0, 0), "{name} keeps the zero pair");
     }
 }
 
@@ -2190,7 +2344,7 @@ fn convert_building_def(cod_building: &CodBuilding) -> BuildingDef {
         cost_bricks,
         maintenance_cost: maintenance,
         native: prop("Nativflg") == "1",
-        min_tier: parse_bauinfra(prop("Bauinfra")),
+        bauinfra: parse_bauinfra(prop("Bauinfra")),
         max_no_input_ticks: {
             let v = prop_int("Maxnorohst");
             if v > 0 {
@@ -2266,62 +2420,139 @@ fn rohstoff_to_fertility(name: &str) -> Option<anno_formats::szs::Fertility> {
     })
 }
 
-/// Map a `Bauinfra` token from haeuser.cod to a population tier
-/// requirement (0..=4, matching PopTier). Tier 0 = no requirement.
+/// The `INFRA_*` constant names in engine id order (0..=32).
 ///
-/// `INFRA_STUFE_NX` uses N as the tier digit (1..5 → Pioneer..
-/// Aristocrat); the letter suffix groups variants within a tier.
+/// RE: the `.data` pointer table at `0x00499d30`, walked by
+/// `1602_exe.c:66461-66466` — `FUN_004020d0(*ppuVar12, iVar3, 0)`
+/// registers each name as COD constant `0, 1, 2, …` until the cursor
+/// reaches `0x499db4`, i.e. exactly 33 entries. The id numbering is
+/// therefore hardcoded in the executable and is *not* the order the
+/// `Objekt: BAUINFRA` block declares them in haeuser.cod — the shipped
+/// file lists `INFRA_STUFE_5B` ahead of `INFRA_STUFE_5A`, while the exe
+/// numbers `5A = 31` and `5B = 32`.
 ///
-/// Aliases like `INFRA_BURG_1`, `INFRA_KONTOR_1`, `INFRA_KANON`,
-/// etc. are direct-substitution constants defined at the top of
-/// haeuser.cod (`BESONDERE INFRASTRUKTUR MARKPUNKTE` block).
-/// Their tier values come straight from that ladder, NOT from
-/// general-knowledge guesses:
+/// Id 0 (`INFRA_NIX`) marks "no requirement". Ids 1/2 (`INFRA_MARKT`,
+/// `INFRA_KAPELLE`) exist only in the exe; haeuser.cod never declares
+/// them.
+pub const INFRA_NAMES: [&str; 33] = [
+    "INFRA_NIX",
+    "INFRA_MARKT",
+    "INFRA_KAPELLE",
+    "INFRA_SCHULE",
+    "INFRA_WIRT",
+    "INFRA_KIRCHE",
+    "INFRA_BADE",
+    "INFRA_THEATER",
+    "INFRA_HOCHSCHULE",
+    "INFRA_ARZT",
+    "INFRA_GALGEN",
+    "INFRA_SCHLOSS",
+    "INFRA_KATHETRALE",
+    "INFRA_TRIUMPH",
+    "INFRA_DENKMAL",
+    "INFRA_STUFE_1A",
+    "INFRA_STUFE_2A",
+    "INFRA_STUFE_2B",
+    "INFRA_STUFE_2C",
+    "INFRA_STUFE_2D",
+    "INFRA_STUFE_2E",
+    "INFRA_STUFE_2F",
+    "INFRA_STUFE_3A",
+    "INFRA_STUFE_2G",
+    "INFRA_STUFE_3B",
+    "INFRA_STUFE_3C",
+    "INFRA_STUFE_3D",
+    "INFRA_STUFE_3E",
+    "INFRA_STUFE_3F",
+    "INFRA_STUFE_4A",
+    "INFRA_STUFE_4B",
+    "INFRA_STUFE_5A",
+    "INFRA_STUFE_5B",
+];
+
+/// The `(BGruppe, Minwohn)` unlock threshold for each `INFRA_*` id —
+/// the runtime table `DAT_0061fbc0`, stride 4, laid out as
+/// `struct { u8 bgruppe; u8 pad; u16 minwohn; }` and indexed by the
+/// [`INFRA_NAMES`] id.
 ///
-///   INFRA_BURG_1   = INFRA_STUFE_2G  (Settler)
-///   INFRA_WACHTURM = INFRA_STUFE_2G  (Settler)
-///   INFRA_KONTOR_1 = INFRA_STUFE_2B  (Settler)
-///   INFRA_KONTOR_2 = INFRA_STUFE_3A  (Citizen)
-///   INFRA_KANON    = INFRA_STUFE_3E  (Citizen)
-///   INFRA_KONTOR_3 = INFRA_STUFE_4A  (Merchant)
-///   INFRA_BURG_2   = INFRA_STUFE_4B  (Merchant)
-///   INFRA_MUSKETE  = INFRA_STUFE_4B  (Merchant)
-///   INFRA_BURG_3   = INFRA_STUFE_5B  (Aristocrat)
+/// RE: haeuser.cod's `Objekt: BAUINFRA` block authors it. The loader
+/// stores `BGruppe` into `(&DAT_0061fbc0)[id * 4]` at
+/// `1602_exe.c:67114` and `Minwohn` into `*(u16 *)(&DAT_0061fbc2 +
+/// id * 4)` at `1602_exe.c:67295`. `FUN_0047f8a0`'s unlock sweep
+/// (`1602_exe.c:91520-91581`) reads the pair back through the cursor
+/// `local_2c = &DAT_0061fbc4` (id 1) advancing by 4 per rung.
 ///
-/// Cultural-building tags (INFRA_KIRCHE, INFRA_SCHULE, INFRA_ARZT,
-/// INFRA_BADE, INFRA_THEATER, INFRA_TRIUMPH, INFRA_DENKMAL,
-/// INFRA_HOCHSCHULE, INFRA_KATHETRALE, INFRA_SCHLOSS,
-/// INFRA_GALGEN, INFRA_WIRT) appear on the cultural BUILDINGS
-/// themselves (church, school, doctor, etc.) — not as Bauinfra
-/// requirements on residences. Audit confirmed by
-/// `cargo run --example audit_bauinfra_tags`: every Kind=HQ
-/// (residence-like) entry uses INFRA_STUFE_* or INFRA_KONTOR_*
-/// tags, never a cultural tag. The cultural tags identify which
-/// building IS the cultural one, and the runtime tier
-/// progression checks for an active such building on the island
-/// (a check we haven't traced to a specific binary function).
-/// As a Bauinfra-on-residence tier gate, these return 0.
-fn parse_bauinfra(token: &str) -> u8 {
+/// Id 0 (`INFRA_NIX`) is never consulted: `FUN_0042d530` returns
+/// "buildable" before it would index. Ids 1/2 (`INFRA_MARKT`,
+/// `INFRA_KAPELLE`) are absent from haeuser.cod, so they keep the
+/// zero-initialised `(0, 0)` and the first sweep of any city grants
+/// them unconditionally — which is why the marketplace and the chapel
+/// are available from the start even in scenarios that author an empty
+/// unlock mask.
+pub const BAUINFRA_LADDER: [(u8, u16); 33] = [
+    (0, 0),     // 0  INFRA_NIX        (never consulted)
+    (0, 0),     // 1  INFRA_MARKT      (not in haeuser.cod)
+    (0, 0),     // 2  INFRA_KAPELLE    (not in haeuser.cod)
+    (1, 100),   // 3  INFRA_SCHULE
+    (1, 50),    // 4  INFRA_WIRT
+    (2, 150),   // 5  INFRA_KIRCHE
+    (2, 210),   // 6  INFRA_BADE
+    (3, 300),   // 7  INFRA_THEATER
+    (3, 250),   // 8  INFRA_HOCHSCHULE
+    (2, 50),    // 9  INFRA_ARZT
+    (2, 100),   // 10 INFRA_GALGEN
+    (4, 1500),  // 11 INFRA_SCHLOSS
+    (4, 2500),  // 12 INFRA_KATHETRALE
+    (4, 25000), // 13 INFRA_TRIUMPH
+    (4, 25000), // 14 INFRA_DENKMAL
+    (0, 30),    // 15 INFRA_STUFE_1A   Rinderfarm
+    (1, 15),    // 16 INFRA_STUFE_2A   Steinmetz, Pflasterstrassen, Brunnen
+    (1, 30),    // 17 INFRA_STUFE_2B   Kontor_1, Holzmauern
+    (1, 40),    // 18 INFRA_STUFE_2C   Plantage_1 (Gewuerze/Wein/Zucker)
+    (1, 75),    // 19 INFRA_STUFE_2D   Getreidefarm, Mueller, Baecker
+    (1, 100),   // 20 INFRA_STUFE_2E   Werkzeugschmiede
+    (1, 120),   // 21 INFRA_STUFE_2F   Erzmine_1, Erzschmelze, Werft_1
+    (2, 100),   // 22 INFRA_STUFE_3A   Kontor_2
+    (1, 200),   // 23 INFRA_STUFE_2G   Burg_1, Schwertbauer, Wachturm
+    (2, 150),   // 24 INFRA_STUFE_3B   Goldmine
+    (2, 200),   // 25 INFRA_STUFE_3C   Plantage_2 (Baumwolle/Kakao), Schneider
+    (2, 300),   // 26 INFRA_STUFE_3D   unused by any building
+    (2, 400),   // 27 INFRA_STUFE_3E   Kanonen
+    (2, 450),   // 28 INFRA_STUFE_3F   grosse Erzmine
+    (3, 250),   // 29 INFRA_STUFE_4A   Kontor_3, Goldschmied, Verzierungen
+    (3, 400),   // 30 INFRA_STUFE_4B   Burg_2, Musketenbauer
+    (3, 500),   // 31 INFRA_STUFE_5A   grosse Werft
+    (4, 600),   // 32 INFRA_STUFE_5B   Burg_3
+];
+
+/// Resolve a haeuser.cod `Bauinfra:` token to its `INFRA_*` constant id
+/// (0..=32) — the single byte the original compiles into the HAUS
+/// record at `+0x2f` (`1602_exe.c:67083`) and that `FUN_0042d530`
+/// (`1602_exe.c:33209`) turns into the unlock bit `1 << (id - 1)`.
+///
+/// An absent or unrecognised token is `INFRA_NIX` (0) = always
+/// buildable, matching the zero-initialised definition template.
+///
+/// The `BESONDERE INFRASTRUKTUR MARKPUNKTE` block of haeuser.cod
+/// defines plain `NAME = NAME` substitution aliases which the COD
+/// tokenizer resolves before the value ever reaches the field, so they
+/// are folded in here via [`resolve_infra_alias`].
+pub fn parse_bauinfra(token: &str) -> u8 {
     if token.is_empty() {
         return 0;
     }
     let resolved = resolve_infra_alias(token).unwrap_or(token);
-    if let Some(rest) = resolved.strip_prefix("INFRA_STUFE_") {
-        // First char is the tier digit (1..5 → Pioneer..Aristocrat).
-        if let Some(c) = rest.chars().next() {
-            if let Some(d) = c.to_digit(10) {
-                return (d.saturating_sub(1).min(4)) as u8;
-            }
-        }
-    }
-    0
+    INFRA_NAMES
+        .iter()
+        .position(|name| *name == resolved)
+        .unwrap_or(0) as u8
 }
 
-/// Substitute the INFRASTRUKTUR-MARKPUNKTE aliases (BURG / KONTOR /
-/// WACHTURM / MUSKETE / KANON) for their STUFE rungs. Returns
-/// `None` for tokens that aren't in the alias table (the caller
-/// then keeps the original token, which is itself an INFRA_STUFE_*
-/// rung if the parser is supposed to succeed).
+/// Substitute the `BESONDERE INFRASTRUKTUR MARKPUNKTE` aliases (BURG /
+/// KONTOR / WACHTURM / MUSKETE / KANON) for the `INFRA_STUFE_*` rung
+/// they are declared equal to in haeuser.cod. Returns `None` for tokens
+/// that aren't aliases; the caller then keeps the original token, which
+/// is itself an `INFRA_*` constant name if the parse is to succeed.
 fn resolve_infra_alias(token: &str) -> Option<&'static str> {
     Some(match token {
         "INFRA_BURG_1" => "INFRA_STUFE_2G",
@@ -2335,6 +2566,45 @@ fn resolve_infra_alias(token: &str) -> Option<&'static str> {
         "INFRA_KANON" => "INFRA_STUFE_3E",
         _ => return None,
     })
+}
+
+/// One city's building-unlock sweep, ported from the tail of
+/// `FUN_0047f8a0` @ `0x0047f8a0` (`1602_exe.c:91520-91581`, machine
+/// code `0x0047fee4..0x00480010`). Returns the owning player's updated
+/// 32-bit unlock mask (`player + 0x6c`, `DAT_005b76ec`).
+///
+/// The source walks INFRA ids `1..=0x20` with the table cursor
+/// `local_2c` starting at `&DAT_0061fbc4`, skips any bit already set,
+/// and grants `1 << (id - 1)` as soon as
+/// `Minwohn <= cum[BGruppe]`. Grants are queued as command `0x3d/0x39`
+/// carrying `mask | bit` and applied at `1602_exe.c:84932`; bits are
+/// never cleared anywhere in the binary, so unlocks are permanent even
+/// if the city later shrinks or is lost.
+///
+/// `cum` is the *cumulative* population built at
+/// `1602_exe.c:91396-91402`: `cum[4] = pop[4]` and
+/// `cum[k] = pop[k] + cum[k + 1]` for `k = 3..0`. A rung's `Minwohn`
+/// therefore counts residents of its `BGruppe` **and every tier above
+/// it** — 600 aristocrats alone satisfy every rung in the table whose
+/// threshold they clear, including the `BGruppe: 0` ones.
+pub fn source_city_unlock_sweep(tier_population: &[u32; 5], mask: u32) -> u32 {
+    let mut cumulative = [0u32; 5];
+    cumulative[4] = tier_population[4];
+    for tier in (0..4).rev() {
+        cumulative[tier] = tier_population[tier].saturating_add(cumulative[tier + 1]);
+    }
+    let mut mask = mask;
+    for id in 1..=32u8 {
+        let bit = 1u32 << (id - 1);
+        if mask & bit != 0 {
+            continue;
+        }
+        let (bgruppe, minwohn) = BAUINFRA_LADDER[usize::from(id)];
+        if cumulative[usize::from(bgruppe)] >= u32::from(minwohn) {
+            mask |= bit;
+        }
+    }
+    mask
 }
 
 /// Load all building definitions from a parsed COD file.
@@ -5309,7 +5579,7 @@ mod tests {
                 cost_bricks: 0,
                 maintenance_cost: 0,
                 native: false,
-                min_tier: 0,
+                bauinfra: 0,
                 max_no_input_ticks: 6,
                 can_dry_up: false,
                 wegspeed: [100; 4],

@@ -381,6 +381,14 @@ pub fn init_simulation(
         };
         if let Some(init) = init {
             p.gold = init.starting_gold;
+            // Initial building-unlock bitmask: `FUN_00478160`
+            // (`1602_exe.c:85423`) copies the PLAYER4 slot's `+0x34`
+            // dword verbatim into the runtime player record at `+0x6c`
+            // (`DAT_005b76ec`). Campaign starts author `0x0000_0003`
+            // — INFRA_MARKT | INFRA_KAPELLE — and the reserved
+            // trader / native / pirate slots author `0xFFFF_FFFF`
+            // (everything unlocked); we copy either verbatim.
+            p.unlock_mask = init.slot_u32_0x34;
         }
         sim.players.push(p);
 

@@ -98,6 +98,23 @@ pub struct Player {
 
     /// AI personality index.
     pub ai_personality: u8,
+
+    /// 32-bit building-unlock bitmask — the runtime player field at
+    /// `+0x6c` (`DAT_005b76ec`, player stride 0xA0).
+    ///
+    /// Bit `1 << (bauinfra - 1)` says the owner may place buildings
+    /// carrying that `INFRA_*` id; `FUN_0042d530`
+    /// (`1602_exe.c:33209-33265`) is the placement gate. Bits are set
+    /// by the per-city sweep at the tail of `FUN_0047f8a0`
+    /// (`1602_exe.c:91520-91581`) once the city's cumulative
+    /// population clears the rung's `(BGruppe, Minwohn)` threshold,
+    /// and are never cleared again.
+    ///
+    /// Seeded from the scenario's PLAYER4 slot dword at `+0x34`, which
+    /// `FUN_00478160` (`1602_exe.c:85423`) copies straight into
+    /// `player + 0x6c`.
+    #[serde(default)]
+    pub unlock_mask: u32,
 }
 
 impl Player {
@@ -120,6 +137,9 @@ impl Player {
             total_population: 0,
             bankruptcy_ticks: 0,
             ai_personality: 0,
+            // No rung unlocked until the scenario's PLAYER4 slot
+            // seeds one or a city sweep grants one.
+            unlock_mask: 0,
         }
     }
 

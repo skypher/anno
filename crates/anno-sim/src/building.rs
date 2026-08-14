@@ -101,14 +101,19 @@ pub struct BuildingDef {
     /// Used to gate civilian spawning, friendly-faction trade UI,
     /// and the manual sec. 7.5/8.6 native-trade behaviour.
     pub native: bool,
-    /// Required infrastructure level. RE: haeuser.cod `Bauinfra`
-    /// field whose values follow `INFRA_STUFE_<tier><letter>`
-    /// (`STUFE_1A` → Pioneer, `_2*` → Settler, `_3*` → Citizen,
-    /// `_4*` → Merchant, `_5*` → Aristocrat). Special tags
-    /// (`INFRA_BURG_*`, `INFRA_KONTOR_*`, `INFRA_WACHTURM`,
-    /// `INFRA_MUSKETE`, `INFRA_KANON`) gate upgrade chains.
-    /// `min_tier = 0` → no infrastructure requirement.
-    pub min_tier: u8,
+    /// `INFRA_*` constant id (0..=32) from haeuser.cod's `Bauinfra`
+    /// field — the byte the original compiles into the HAUS record at
+    /// `+0x2f` (`1602_exe.c:67083`).
+    ///
+    /// This is *not* a population tier. `FUN_0042d530`
+    /// (`1602_exe.c:33209`) tests bit `1 << (bauinfra - 1)` of the
+    /// owning player's 32-bit unlock mask at `player + 0x6c`;
+    /// `bauinfra == 0` (`INFRA_NIX`) means always buildable. The bits
+    /// are granted by the per-city sweep in `FUN_0047f8a0`
+    /// (`1602_exe.c:91520-91581`) — see
+    /// [`crate::data_bridge::source_city_unlock_sweep`] and
+    /// [`crate::data_bridge::BAUINFRA_LADDER`].
+    pub bauinfra: u8,
     /// Maximum consecutive production cycles a building will run
     /// without input materials before going idle. RE: haeuser.cod
     /// `Maxnorohst` field. Distribution in haeuser.cod (12× value
@@ -207,7 +212,7 @@ impl Default for BuildingDef {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],

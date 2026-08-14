@@ -32,11 +32,13 @@ pub enum PlaceOutcome {
     NotCoastal,
     NoIslandMap,
     NoBuildingSelected,
-    /// Bauinfra gate: player's highest-populated tier is below the
-    /// building's `min_tier` (manual sec. 6.7.1).
-    WrongTier {
-        needed: u8,
-        have: u8,
+    /// Bauinfra gate: the owner's 32-bit unlock mask (`player + 0x6c`)
+    /// does not carry bit `1 << (infra - 1)`. RE `FUN_0042d530`
+    /// (`1602_exe.c:33209-33265`). `infra` is the definition's
+    /// `INFRA_*` constant id — index it into
+    /// `data_bridge::INFRA_NAMES` / `BAUINFRA_LADDER` to report it.
+    NotUnlocked {
+        infra: u8,
     },
 }
 
@@ -149,20 +151,32 @@ pub fn place_building(
             have: sim.players.get(owner_idx).map(|p| p.gold).unwrap_or(0),
         };
     }
-    // Bauinfra gate: building requires the player to have at
-    // least `min_tier` population in the matching tier or
-    // higher. Manual sec. 6.7.1: civilization-level governs
-    // which buildings unlock.
-    if def.min_tier > 0 && owner_idx < sim.players.len() {
-        let p = &sim.players[owner_idx];
-        let highest = (0..p.population.len() as u8)
-            .filter(|&t| p.population[t as usize] > 0)
-            .max()
+    // Building-unlock gate, `FUN_0042d530` @ 0x0042d530
+    // (`1602_exe.c:33209-33265`): a definition whose `Bauinfra` byte
+    // is 0 (`INFRA_NIX`) is always buildable; otherwise the owner's
+    // 32-bit unlock mask at `player + 0x6c` must carry bit
+    // `1 << (bauinfra - 1)`. Those bits are granted by the per-city
+    // sweep in `FUN_0047f8a0` as the settlement grows.
+    //
+    // Two source behaviours are deliberately not reproduced:
+    //   * the "no military" game option (`DAT_005b706c & 0x200`) ANDs
+    //     the mask with 0x5BBFFFFF before the test — we do not model
+    //     game options yet;
+    //   * ids 11..=14 (SCHLOSS / KATHETRALE / TRIUMPH / DENKMAL) add
+    //     unique-monument side conditions on player counters at
+    //     `+0x87`, `+0x88`, `+0x8a`/`+0x8c` and `+0x8e`/`+0x90` which
+    //     this simulation does not model, so they fall through to the
+    //     plain mask test below.
+    if def.bauinfra > 0 {
+        let mask = sim
+            .players
+            .get(owner_idx)
+            .map(|p| p.unlock_mask)
             .unwrap_or(0);
-        if highest < def.min_tier {
-            return PlaceOutcome::WrongTier {
-                needed: def.min_tier,
-                have: highest,
+        let bit = 1u32 << (u32::from(def.bauinfra) - 1);
+        if mask & bit == 0 {
+            return PlaceOutcome::NotUnlocked {
+                infra: def.bauinfra,
             };
         }
     }

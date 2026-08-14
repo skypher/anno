@@ -4089,6 +4089,21 @@ impl Simulation {
                 if let Some(record) = self.source_cities.record_mut(slot) {
                     *record = city;
                 }
+                // Building-unlock sweep, the tail of the same
+                // `FUN_0047f8a0` city pass (`1602_exe.c:91520-91581`).
+                // It walks INFRA ids 1..=32 and grants each rung the
+                // city's *cumulative* population clears to the city's
+                // OWNING player — permanently. Sharing the
+                // `city_satisfaction_allowed` arm matches the source
+                // gate, which reaches this block only for owner state
+                // 0 (human) or 0xc (active AI).
+                let owner = usize::from(city.owner_slot);
+                if let Some(player) = self.players.get_mut(owner) {
+                    player.unlock_mask = crate::data_bridge::source_city_unlock_sweep(
+                        &city.tier_population,
+                        player.unlock_mask,
+                    );
+                }
             }
             if self.source_city_kind12_dispatch_allows(city) {
                 self.spawn_source_kind12_figures(city);
@@ -9643,6 +9658,50 @@ mod tests {
         assert_eq!(replacement.command.dynamic_object_owner, 3);
     }
 
+    /// The city dispatcher must carry `FUN_0047f8a0`'s unlock sweep
+    /// (`1602_exe.c:91520-91581`) into the city owner's `+0x6c` mask.
+    #[test]
+    fn source_city_dispatch_grants_unlock_bits_to_the_city_owner() {
+        const MARKT_KAPELLE: u32 = 0b11;
+        const STUFE_1A: u32 = 1 << 14; // INFRA id 15, (BGruppe 0, 30)
+
+        let mut sim = Simulation::new();
+        sim.players.push(Player::new_human(0));
+        sim.players.push(Player::new_ai(1, 0));
+        sim.source_kind4_dispatch.active_player_slot = 0;
+        assert!(sim.source_cities.set_record(
+            0,
+            Some(SourceCityRecord {
+                island_id: 2,
+                source_owner: 0,
+                owner_slot: 0,
+                tier_population: [29, 0, 0, 0, 0],
+                ..SourceCityRecord::default()
+            })
+        ));
+        // The dispatcher skips a record whose phase already matches, so
+        // the sweep only runs once the 10 s phase counter rolls over.
+        // Park the round-robin cursor on slot 0 so the single step
+        // visits our record.
+        sim.source_city_dispatch_cursor = 0;
+        sim.tick_source_city_dispatch(10_000);
+        assert_eq!(
+            sim.players[0].unlock_mask, MARKT_KAPELLE,
+            "29 pioneers is one short of INFRA_STUFE_1A",
+        );
+
+        sim.source_cities.record_mut(0).unwrap().tier_population[0] = 30;
+        sim.source_city_dispatch_cursor = 0;
+        sim.tick_source_city_dispatch(10_000);
+        assert_eq!(
+            sim.players[0].unlock_mask & STUFE_1A,
+            STUFE_1A,
+            "30 pioneers grants INFRA_STUFE_1A",
+        );
+        // Grants go to the OWNING player only.
+        assert_eq!(sim.players[1].unlock_mask, 0);
+    }
+
     #[test]
     fn source_dynamic_figure_loader_enforces_source_category_tables() {
         let mut sim = Simulation::new();
@@ -12847,7 +12906,7 @@ mod tests {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
@@ -13010,7 +13069,7 @@ mod tests {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: true,
             wegspeed: [100; 4],
@@ -13093,7 +13152,7 @@ mod tests {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: true,
             wegspeed: [100; 4],
@@ -13278,7 +13337,7 @@ mod tests {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
@@ -13427,7 +13486,7 @@ mod tests {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
@@ -13493,7 +13552,7 @@ mod tests {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
@@ -13703,7 +13762,7 @@ mod tests {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
@@ -13766,7 +13825,7 @@ mod tests {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
@@ -14528,7 +14587,7 @@ mod tests {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
@@ -15182,7 +15241,7 @@ mod tests {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],

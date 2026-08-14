@@ -2454,7 +2454,21 @@ fn main() {
                                     // Silent — common case while
                                     // dragging across mixed terrain.
                                 }
-                                PlaceOutcome::WrongTier { needed, have } => {
+                                PlaceOutcome::NotUnlocked { infra } => {
+                                    // Name the rung and quote its
+                                    // `DAT_0061fbc0` threshold — the
+                                    // cumulative residents of that
+                                    // BGruppe and every tier above it
+                                    // the settlement still needs.
+                                    let idx = usize::from(infra);
+                                    let name = data_bridge::INFRA_NAMES
+                                        .get(idx)
+                                        .copied()
+                                        .unwrap_or("INFRA_?");
+                                    let (group, minwohn) = data_bridge::BAUINFRA_LADDER
+                                        .get(idx)
+                                        .copied()
+                                        .unwrap_or((0, 0));
                                     let tier_name = |t: u8| match t {
                                         0 => "Pioneer",
                                         1 => "Settler",
@@ -2464,9 +2478,9 @@ fn main() {
                                     };
                                     save_banner = Some((
                                         format!(
-                                            "build FAILED: needs {} tier (you're at {})",
-                                            tier_name(needed),
-                                            tier_name(have),
+                                            "build FAILED: {name} locked (needs {minwohn} \
+                                             {}+ residents)",
+                                            tier_name(group),
                                         ),
                                         std::time::Instant::now(),
                                     ));
@@ -5519,7 +5533,7 @@ mod tests {
             cost_bricks: 0,
             maintenance_cost: 0,
             native: false,
-            min_tier: 0,
+            bauinfra: 0,
             max_no_input_ticks: 6,
             can_dry_up: false,
             wegspeed: [100; 4],
