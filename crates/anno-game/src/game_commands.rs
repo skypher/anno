@@ -177,11 +177,24 @@ pub fn place_building(
     let source_definition_offset = (cod_b.source_id - anno_formats::szs::INSELHAUS_SOURCE_ID_BASE)
         .try_into()
         .ok();
-    let source_map_owner_slot = islands[current_island]
-        .tiles
-        .iter()
-        .find(|tile| tile.x as i32 == tile_x && tile.y as i32 == tile_y)
-        .map(|tile| tile.source_owner())
+    // Player construction belongs to the player's city on this island:
+    // the original stamps the city selector into the claimed tiles, and
+    // the kind-13 dispatch resolves a record's city through exactly this
+    // selector. Scenario ground tiles on pristine stock islands carry no
+    // ownership, so prefer the live city record over the tile bits.
+    let source_map_owner_slot = sim
+        .source_cities
+        .active_records()
+        .into_iter()
+        .find(|city| city.island_id == island_number && city.owner_slot == owner)
+        .map(|city| city.source_owner)
+        .or_else(|| {
+            islands[current_island]
+                .tiles
+                .iter()
+                .find(|tile| tile.x as i32 == tile_x && tile.y as i32 == tile_y)
+                .map(|tile| tile.source_owner())
+        })
         .unwrap_or(7);
     let source_random_seed = (sim.next_source_rand() & 0x1f) as u8;
     for dy in 0..bld_h as u8 {

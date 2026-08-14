@@ -6204,12 +6204,39 @@ impl Simulation {
                     .count() as u32
             })
             .collect();
+        let active_ships_for: Vec<u32> = (0..self.players.len())
+            .map(|owner| {
+                self.trade_ships
+                    .iter()
+                    .filter(|ship| ship.active && ship.owner as usize == owner)
+                    .count() as u32
+                    + self
+                        .military_units
+                        .iter()
+                        .filter(|unit| {
+                            unit.is_alive()
+                                && unit.owner as usize == owner
+                                && matches!(
+                                    unit.unit_type,
+                                    crate::combat::UnitType::SmallWarship
+                                        | crate::combat::UnitType::LargeWarship
+                                        | crate::combat::UnitType::PirateShip
+                                )
+                        })
+                        .count() as u32
+            })
+            .collect();
         for (i, p) in self.players.iter_mut().enumerate() {
             if matches!(p.state, PlayerState::Empty | PlayerState::Defeated) {
                 continue;
             }
             let bankrupt_too_long = p.is_game_over();
-            let no_economy = active_kontors_for[i] == 0 && p.population.iter().all(|n| *n == 0);
+            // A player with no Kontor and no residents but a ship still
+            // afloat can found anew — mission starts open exactly this
+            // way. Defeat needs the fleet gone too.
+            let no_economy = active_kontors_for[i] == 0
+                && p.population.iter().all(|n| *n == 0)
+                && active_ships_for[i] == 0;
             if bankrupt_too_long || no_economy {
                 p.state = PlayerState::Defeated;
                 self.event_log
