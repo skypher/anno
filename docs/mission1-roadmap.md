@@ -5,6 +5,32 @@ campaign's first mission, **"Halfway there"** (`New Horizons0.szs` — the
 campaign titles in text.cod `[KAMPAGNE]` map onto the `New Horizons*` /
 `On His Majesty's Service*` / … scenario families in arc order).
 
+## Reference documents
+
+Driving the mission surfaced three subsystems large enough to need their
+own RE write-ups. Each is an implementation spec — read it rather than
+re-deriving from the decompilation:
+
+- **`docs/growth-timer.md`** — raw-resource maturation and regrowth. The
+  timer table, the 32 bucket clocks, the load-time rewrite of `+0x3a`
+  that turns `Interval`/`AnimAnz` into a bucket index, the sweep, and
+  harvest re-enrolment. Also lists four pre-existing defects it sits on,
+  the largest being that the harvest transition never fires with real
+  data — so island forest is currently an *infinite* resource.
+- **`docs/logistics-gaps.md`** — the founded Kontor's missing live cell
+  record (which is why a new colony dispatches no city carts at all), the
+  type-8 carrier radius bound, the path-grid architecture, the
+  `Randwachs` layer, city-store capacity, and the buildable-area gate.
+- **`docs/hazard-block.md`** — fire, plague and the vagrant spawn, staged
+  by when each becomes reachable.
+
+The hazard document carries one finding that bears directly on this
+mission: **at ~100 pioneers the fire branch is live at 15.5 % per event
+cycle**, roughly one building lost every seven minutes per city. A
+flawless playthrough has to survive that, so it is not optional polish.
+The useful boundary is 80 tier-0 inhabitants — below that (and below 250
+settlers) the entire fire section draws no RNG at all.
+
 ## The mission
 
 - Human (slot 0) starts with **one ship, no settlement**: the LargeTrader
