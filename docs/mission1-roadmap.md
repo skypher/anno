@@ -173,8 +173,17 @@ alone, the entire pioneer → settler step is reachable on the home island
 with t0 buildings.
 
 Alcohol is the first good that needs a rung *and* a crop: STUFE_2C opens
-at 40 settler-and-above, and the raw material is Sugarcane or Vines.
-Which islands carry those awaits the corrected crop-flag table above.
+at 40 settler-and-above, and the raw material is Sugarcane or Vines —
+neither on the home island at any strength, which is the gate that forces
+the second settlement.
+
+A harvester also has to be **sited on its raw resource**. The worker
+searches the static map roots for ripe (kind 9) cells whose output ware
+matches the building's `Rohstoff`, inside the building's compiled
+`Radius` measured as a circle (`FUN_00404d70` rows). Island 10 carries
+559 BAUM (ware 53), 627 GRAS (52) and 585 FISCHE (57) cells, none near
+the west-coast founding anchor — so "nearest free tile" siting gives a
+forester with no trees. Ware slot is `0x2d + crop bit`.
 
 ## Stage status
 
@@ -186,43 +195,60 @@ Which islands carry those awaits the corrected crop-flag table above.
   starts, charged ~194 gold), then settlers accumulate while a tier-2
   reservation opens. This confirms the promotion gate is supply-driven,
   not time-driven: the stage-1 plateau at `sat[1] = 0` was faithful.
-- **Stage 3 (blocked).** The injection is gone and the driver now places
-  the real t0 buildings — forester, fishery, hunter, market, chapel, four
-  huts, two sheep farms, weaving hut — in a wood-bounded order (the
-  forester first, since it is the only wood source and costs no wood).
-  All twelve place and complete with no construction stall, and **nothing
-  produces**: food, wool, wood and cloth stay flat at zero.
+- **Stage 3 (partly done).** The injection is gone and the driver places
+  the real t0 buildings — forester, fishery, market, chapel, four huts,
+  two sheep farms, weaving hut — in a wood-bounded order, the forester
+  first since it is the only wood source and costs no wood. All of them
+  place and complete with no construction stall.
 
-  An audit of the whole chain found five stacked P0 defects, and no
-  subset of them yields a partial result that could be measured:
+  The first run produced **nothing at all**: food, wool, wood and cloth
+  flat at zero. An audit found six stacked defects, no subset of which
+  yields a partial result that could be measured, all now fixed
+  (`c778115`):
 
-  1. Live map-cell records are admitted on the **outer** `HAUS Kind:`
+  1. Live map-cell records were admitted on the **outer** `HAUS Kind:`
      (`+0x04`) instead of the nested `HAUS_PRODTYP Kind:` (`+0x1c`) that
-     `FUN_00481450` switches on (`1602_exe.c:92650-92695`). Every real
-     production building is outer `Kind: GEBAEUDE`, so none gets a live
-     record; they fall through to a legacy path whose efficiency is 0.
-  2. The type-11 city-cart supplier filter tests the outer kind; the
+     `FUN_00481450` switches on (`1602_exe.c:92790-92892`). Every real
+     production building is outer `Kind: GEBAEUDE`, so none got a live
+     record; they fell through to a legacy path whose efficiency is 0.
+  2. The type-11 city-cart supplier filter tested the outer kind; the
      original has no kind test and scores by the `Ware` byte
-     (`FUN_004717b0`, `:80580-80586`). No cart can collect from anything.
-  3. The type-8 workshop-carrier filter has the same fault; the correct
+     (`FUN_004717b0`, `:80580-80586`). No cart could collect anything.
+  3. The type-8 workshop-carrier filter had the same fault; the correct
      predicate is `Ware == requested || Ware == ALLWARE` (`:80352-80353`).
-  4. The harvest worker's delivery amount is discarded — the port
-     implements only the idle-cooldown tail of `FUN_0047d940` and never
-     credits the raw buffer (`:89797-89807`), so the production rate
-     `min(128, (stock<<7)/Rohmenge)` is permanently zero.
-  5. Field tiles are not modelled, and the crop maturation timer
-     `FUN_0047ca80` (`:88970`) is unported — so a placed field never
-     ripens, and a harvested one never regrows.
+  4. The harvest worker's delivery was discarded — only the idle-cooldown
+     tail of `FUN_0047d940` was ported, never the buffer credit
+     (`:89797-89807`), so the rate `min(128, (stock<<7)/Rohmenge)` was
+     permanently zero. Note `def+0x23` is `Workstoff`, not the raw ware.
+  5. `Maxlager`, `Prodmenge`, `Rohmenge`, `Workmenge`, `Interval`,
+     `Maxnorohst`, `LagAniFlg` and `Randwachs` are authored inside
+     `Objekt: HAUS_PRODTYP`, but the COD parser ran its typed handlers
+     only at the top level of a block, so **all 500 definitions carried
+     zero**. `Maxlager == 0` fails the activity guard before anything
+     else matters — the highest-leverage item of the six.
+  6. A `"MARKT" => 7, "KONTOR" => 8` outer-kind fallback existed only to
+     prop up mislabelled test fixtures.
 
-  Items 1-4 are in flight. The forester is the one chain that can be
-  proven this round: it harvests the forest every stock island already
-  ships (INSELHAUS ids 1303-1324), so it needs no fields — though item 5
-  still caps it at one unit per tree until the timer lands.
+  A forester now runs the full chain on island 10: raw buffer 32 →
+  storage 320 (its cap) → output 10 (`Maxlager`). Two things still stop
+  the *mission* flow from getting there, both open:
 
-- **Stage 4 (after).** The early cloth chain needs more than the P0 round:
-  the sheep farm is prod kind 4 (`WEIDETIER`, `Rohstoff: GRAS`), and no
-  stock island ships ripe grass, so it needs player-placed pasture tiles
-  (records `Id 22701` growing / `22702` ripe, no withered variant), the
-  maturation timer, and a `SCHAF` grazing-figure path that does not exist
-  in Rust at all — `source_plantation_worker_definition` knows only
-  MAEHER / STEINKLOPFER / HOLZFAELLER / PFLUECKER / PFLUECKER2.
+  - **Harvest candidates are rejected once a Kontor exists.**
+    `admits_plantation_worker_path` requires
+    `cell.source_map_owner_slot == worker_owner`, but wild resource cells
+    are all slot 7 while founding stamps the player's buildings with the
+    city selector 0. The same forester at the same tile produces with no
+    Kontor and never harvests with one. Commit `e4e9282` — which made
+    `place_building` prefer the city record over the tile's owner bits —
+    is the likely cause and is under review.
+  - **Nested kinds 4, 5 and 6 spawn no worker figures**, so the sheep
+    farm, hunter and fishery never harvest even though island 10 carries
+    627 ripe GRAS and 585 FISCHE cells. (An earlier claim that no stock
+    island ships ripe grass was wrong.) This blocks *all* t0 food, not
+    just cloth: the fishery and hunter are the only food sources before
+    STUFE_1A.
+
+- **Stage 4 (after).** The maturation timer `FUN_0047ca80` (`:88970`).
+  Without it a harvested cell never regrows, so even a working forester
+  strips its woodland and stalls permanently — and a newly placed field
+  tile never ripens at all, which is what plantation agriculture needs.
