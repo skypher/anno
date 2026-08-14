@@ -276,6 +276,40 @@ pub fn place_building(
     if def.kind == "HQ" {
         let _ = sim.allocate_source_dynamic_map_object_for_building(building_index);
     }
+    // `FUN_00478b90`: installing a kind-0x0d object (WOHNUNG/PLATZ)
+    // creates its runtime kind-13 record with the 0x40 initial amount
+    // (one resident) and the definition's BGruppe.
+    if cod_b.source_production_kind_code() == Some(13) {
+        sim.source_kind13_locations
+            .insert(anno_sim::data_bridge::SourceKind13Location {
+                island_id: island_number,
+                tile_x: tile_x as u8,
+                tile_y: tile_y as u8,
+                orientation: orient,
+                variant: 0,
+                source_owner: source_map_owner_slot,
+                phase: 0,
+                state_bits: 0,
+                population_group: cod_b.source_population_group().unwrap_or(0),
+                amount: 0x40,
+                lifecycle_flags: 0,
+            });
+        // The created default resident joins the city ledger, the way
+        // the SIEDLER loader's subtraction step implies the install
+        // path added it.
+        let group = usize::from(cod_b.source_population_group().unwrap_or(0)).min(4);
+        let city_slot = (0..anno_sim::data_bridge::SourceCityTable::slot_count()).find(|&slot| {
+            sim.source_cities
+                .record(slot)
+                .is_some_and(|city| city.island_id == island_number && city.owner_slot == owner)
+        });
+        if let Some(city) = city_slot.and_then(|slot| sim.source_cities.record_mut(slot)) {
+            city.tier_population[group] = city.tier_population[group].wrapping_add(1);
+        }
+    }
+    // The source sets the island's construction dirty flags, which the
+    // next `FUN_00482120` pass consumes; rescan coverage right away.
+    sim.refresh_source_house_infrastructure(island_number);
     PlaceOutcome::Placed
 }
 
