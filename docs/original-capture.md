@@ -384,11 +384,41 @@ nets **+4 gold per economy tick ≈ +0.4/s, matching the original's +0.42/s**
 between its two live readings. (AI cities read slightly higher live because
 their AI had already constructed more buildings.)
 
-Remaining unported growth-chain piece: the city *event block* (rand-gated
-`FUN_0047b540` immigration enqueue, the `FUN_0047a020` pending-wave
-processor, `FUN_0047f510` marketplace upgrades, the `+0x1e0` re-arm). All of
-its population gates need ≥ 200-300 residents, so it is a verified no-op on
-Exile's 156 — port it when a larger-city comparison scenario is exercised.
+Remaining unported growth-chain piece: the city *event block* (the rand-gated
+`FUN_0047b540` / `FUN_0047b710` / `FUN_0047b850` triple at `1602_exe.c`
+`:91455-91517`, the `FUN_0047a020` pending-wave processor, `FUN_0047f510`
+marketplace upgrades, the `+0x1e0` re-arm).
+
+**Correction (2026-08-14):** this block is the city *hazard* block, not a
+growth block, and `FUN_0047b540` is **not** an "immigration enqueue" — an
+earlier label here was wrong. None of the three routines creates a
+residence. They enumerate *existing* kind-13 records for the island + city
+slot and pick one at random:
+
+- `FUN_0047b540` (`:88160`) ignites a **fire** on a tier-0/1 house
+  (`FUN_00479ca0(.., 2, 0x19)`); on expiry the affliction tick demolishes
+  the building via `FUN_0046a8c0`.
+- `FUN_0047b850` (`:88323`) starts a **plague** in a tier-2+ house at
+  ≥ half occupancy (`FUN_00479ca0(.., 1, 0x14)`); it spreads within radius
+  4 and clears harmlessly on expiry.
+- `FUN_0047b710` (`:88259`) spawns a short-lived **decorative pedestrian**
+  (mobile class `0x0f`, self-destructs after 49 wander steps) at an
+  existing house — no economic side effects.
+
+Kind-13 records are created in exactly one place, `FUN_00478b90` (`:85886`)
+via the `FUN_00481450` case-`0xd` tile registrar, i.e. only from build
+commands and map load. **The player places every residence by hand**; the
+engine only grows the inhabitants inside them. So no house-spawn port is
+needed to reach a population goal.
+
+The "all gates need ≥ 200-300 residents" claim holds for the plague (≥ 200
+Settler-and-above, and only when the city has no other active affliction)
+and the pedestrian (≥ 300 Citizen-and-above), but **not** for the fire,
+which arms at **≥ 80 tier-0 inhabitants** with a 15.5 % per-cycle roll. A
+pioneer-heavy 100-inhabitant city therefore reaches it. Fire cannot help a
+population goal — it only destroys — but it perturbs the RNG stream, as
+does the unconditional re-arm `city[0x1e0] = now + (60 + (rand() & 7)) * 10`
+that costs one `rand()` per city per event cycle regardless of the gates.
 
 ### Promotion pipeline agreement (post-SIEDLER fixes)
 
@@ -439,9 +469,9 @@ wrong, and the warehouse-coverage radius has been corrected to 16.
 Exile's settlers still cannot mature to citizens — the scenario has no
 school or college — so the promotion reservation pends indefinitely,
 matching the live original. The remaining growth-chain gaps are the
-rand-gated event block itself (`FUN_0047b540` immigration enqueue and the
-`FUN_0047a020` pending-wave processor, which matter once houses sit below
-capacity) and the `FUN_0047f510` marketplace-upgrade scan.
+rand-gated hazard block itself (`FUN_0047b540` fire ignition and the
+`FUN_0047a020` affliction tick, which matter once a city passes 80 tier-0
+inhabitants) and the `FUN_0047f510` marketplace-upgrade scan.
 
 Wine stability note: the original dies within ~5 minutes of entering Exile on
 this setup even with zero winedbg attaches (reproduced three times; the crash
