@@ -677,6 +677,87 @@ fn compute_path_to_stop(
     }
 }
 
+/// Compute a direct ocean path for a player-ordered sail (the right-click
+/// move flow for an unrouted trader). Reuses the route-leg path machinery
+/// against an arbitrary world target. Returns `true` when a path is ready
+/// or the ship is already there.
+pub fn compute_direct_sail_path(
+    ship: &mut TradeShip,
+    target_x: i32,
+    target_y: i32,
+    ocean_map: Option<&crate::ocean_map::OceanMap>,
+) -> bool {
+    ship.path.clear();
+    ship.path_idx = 0;
+    let Some(ocean) = ocean_map else {
+        // Assetless tests: teleport-free direct line is not modeled; fail.
+        return false;
+    };
+    let target_descriptor = SourceTargetDescriptor::from_world_coordinate(target_x, target_y);
+    ship.source_target_descriptor = target_descriptor;
+    let Some(start) = ocean.nearest_navigable(ship.world_x, ship.world_y) else {
+        return false;
+    };
+    let path = if ocean.has_source_ship_route_grid() {
+        let Some(target_descriptor) = target_descriptor else {
+            return false;
+        };
+        ocean.find_source_ship_path_in_window_for_target_descriptor(
+            start,
+            target_descriptor,
+            ship.source_route_window,
+        )
+    } else {
+        let Some(goal) = ocean.nearest_navigable(target_x, target_y) else {
+            return false;
+        };
+        if start == goal {
+            ship.state = ShipState::Idle;
+            return true;
+        }
+        crate::ocean_map::find_ocean_path(ocean, start, goal)
+    };
+    match path {
+        Some(path) if path.is_empty() => {
+            ship.state = ShipState::Idle;
+            true
+        }
+        Some(path) => {
+            ship.path = path;
+            ship.path_idx = 0;
+            ship.state = ShipState::Sailing;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Advance one unrouted ship along its direct-sail path. Same per-tick
+/// stepping as the route Sailing branch; on arrival the ship docks Idle.
+pub fn tick_direct_sail(ship: &mut TradeShip) {
+    if !ship.active || ship.state != ShipState::Sailing || ship.path.is_empty() {
+        return;
+    }
+    let steps = ship.speed as usize;
+    let prev_x = ship.world_x;
+    let prev_y = ship.world_y;
+    for _ in 0..steps {
+        if ship.path_idx >= ship.path.len() {
+            break;
+        }
+        let (nx, ny) = ship.path[ship.path_idx];
+        ship.world_x = nx;
+        ship.world_y = ny;
+        ship.path_idx += 1;
+    }
+    ship.heading = compass_heading(ship.world_x - prev_x, ship.world_y - prev_y, ship.heading);
+    if ship.path_idx >= ship.path.len() {
+        ship.path.clear();
+        ship.path_idx = 0;
+        ship.state = ShipState::Idle;
+    }
+}
+
 /// Free trader AI: finds profitable trades between warehouses.
 /// Returns a trade action if one is found.
 pub fn free_trader_find_trade(

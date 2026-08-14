@@ -160,6 +160,15 @@ pub enum Command {
         tile_x: u16,
         tile_y: u16,
     },
+    /// Order one player-owned trade ship to sail to a world coordinate —
+    /// the right-click move flow for an unrouted trader. The ship follows
+    /// a computed ocean path and docks Idle on arrival.
+    SailShip {
+        player: u8,
+        ship_index: u32,
+        world_x: i32,
+        world_y: i32,
+    },
     /// Issue a move order to one military unit, mirroring the right-click
     /// order flow: source-backed units route through their island's
     /// source-world coordinates and kind-4 occupant record; plain units

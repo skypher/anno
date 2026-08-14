@@ -2786,6 +2786,18 @@ pub fn source_kind13_locations_from_scenario(
 ) -> SourceKind13LocationTable {
     let mut locations = SourceKind13LocationTable::default();
 
+    // Islands whose authored kind-13 list ships in SIEDLER records are
+    // restored from those records alone: the source's SIEDLER loader
+    // overwrites the INSELHAUS-created defaults (subtracting the created
+    // residents from the city first — the `0x484054` step), so tile-scan
+    // insertion would add phantom records the original does not have
+    // (e.g. New Horizons0's plaza tiles produced four group-3 residents
+    // per AI island that wrapped the city populations negative).
+    let siedler_islands: std::collections::HashSet<u8> = szs
+        .settler_houses
+        .iter()
+        .map(|house| house.island_id)
+        .collect();
     for island in &szs.islands {
         for tile in &island.tiles {
             let Some(definition) = cod.building_by_source_id(tile.source_id()) else {
@@ -2802,6 +2814,9 @@ pub fn source_kind13_locations_from_scenario(
 
             locations.remove_roots_in_footprint(island.number, tile.x, tile.y, width, height);
             if definition.source_kind_code() != Some(13) {
+                continue;
+            }
+            if siedler_islands.contains(&island.number) {
                 continue;
             }
             locations.insert(SourceKind13Location {

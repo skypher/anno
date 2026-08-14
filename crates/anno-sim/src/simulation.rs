@@ -6413,6 +6413,10 @@ impl Simulation {
                 if owner < self.players.len() {
                     self.players[owner].gold += gold;
                 }
+            } else {
+                // Unrouted ships advance along player-ordered direct-sail
+                // paths (`Command::SailShip`).
+                trade::tick_direct_sail(&mut self.trade_ships[ship_idx]);
             }
         }
         self.tick_free_traders();
@@ -9021,6 +9025,30 @@ impl Simulation {
             // synthesize source map commands; the game layer applies them
             // via `anno_game::game_commands::apply_game_command`.
             Command::PlaceBuilding { .. } | Command::DemolishBuilding { .. } => false,
+            Command::SailShip {
+                player,
+                ship_index,
+                world_x,
+                world_y,
+            } => {
+                let ocean = self.ocean_map.take();
+                let ok = match self.trade_ships.get_mut(ship_index as usize) {
+                    Some(ship)
+                        if ship.active
+                            && ship.owner == player
+                            && ship.route_id == crate::data_bridge::UNROUTED_TRADER_ROUTE_ID =>
+                    {
+                        trade::compute_direct_sail_path(ship, world_x, world_y, ocean.as_ref())
+                    }
+                    _ => false,
+                };
+                self.ocean_map = ocean;
+                if ok {
+                    self.event_log
+                        .push(format!("[sail] ship #{ship_index} → ({world_x},{world_y})"));
+                }
+                ok
+            }
             Command::MoveUnit {
                 player,
                 unit_index,

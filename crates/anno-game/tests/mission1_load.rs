@@ -83,3 +83,65 @@ fn verena_spawns_with_the_authored_starting_cargo() {
     assert_eq!(verena.cargo_amount(Good::Wood), 50);
     assert_eq!(verena.cargo_amount(Good::Food), 20);
 }
+
+#[test]
+fn verena_sails_to_a_free_island_on_command() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let (Ok(szs_data), Ok(cod_data)) = (
+        std::fs::read(root.join("extracted/Szenes/New Horizons0.szs")),
+        std::fs::read(root.join("extracted/haeuser.cod")),
+    ) else {
+        println!("Skipping test: data corpus not found");
+        return;
+    };
+    let mut szs = anno_formats::szs::SzsFile::parse(&szs_data).unwrap();
+    anno_game::scenario::instantiate_stock_islands(&mut szs, &root.join("extracted"), 1);
+    let cod = anno_formats::cod::CodFile::parse(&cod_data).unwrap();
+    let defs = anno_sim::data_bridge::load_building_defs(&cod);
+    let figures = std::fs::read(root.join("extracted/figuren.cod"))
+        .map(|bytes| anno_formats::figuren::FiguresFile::parse(&bytes))
+        .unwrap_or_else(|_| anno_formats::figuren::FiguresFile {
+            constants: Default::default(),
+            figures: Vec::new(),
+        });
+    let mut sim = anno_game::scenario::build_simulation(&szs, &cod, &defs, &figures);
+    sim.seed_source_rand(1);
+    let ship_index = sim
+        .trade_ships
+        .iter()
+        .position(|ship| ship.name == "Verena")
+        .expect("Verena spawns") as u32;
+    let start = (
+        sim.trade_ships[ship_index as usize].world_x,
+        sim.trade_ships[ship_index as usize].world_y,
+    );
+    // Island 10 sits at (201,231) 50x52; aim just off its west coast.
+    let target = (198i32, 255i32);
+    assert!(sim.apply_command(&anno_sim::commands::Command::SailShip {
+        player: 0,
+        ship_index,
+        world_x: target.0,
+        world_y: target.1,
+    }));
+    let mut dist = i32::MAX;
+    for _ in 0..3_000 {
+        sim.tick(100);
+        let ship = &sim.trade_ships[ship_index as usize];
+        dist = (ship.world_x - target.0).abs() + (ship.world_y - target.1).abs();
+        if dist < 12 {
+            break;
+        }
+    }
+    let ship = &sim.trade_ships[ship_index as usize];
+    assert!(
+        dist < 12,
+        "Verena should approach the target: start {start:?}, now ({}, {}), dist {dist}",
+        ship.world_x,
+        ship.world_y
+    );
+}
