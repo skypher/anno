@@ -72,38 +72,109 @@ Missing, in dependency order:
 
 ## The colony plan (2026-08-14)
 
-`examples/probe_islands` reports the rolled fertilities of the twelve
-free islands for the driver's fixed seed (1). The AI holds islands 0 and
-1 (100×90, Tobacco); the rest are settleable:
+> **RETRACTED — the island fertility table that stood here was wrong.**
+> It came from `Island::fertilities`, which parsed `INSEL5[0x0C..0x14]`.
+> Those eight bytes are the **per-settlement owner array** (7 = unsettled),
+> not crop fertilities — the save writer `FUN_00468740`
+> (`1602_exe.c:72890-72897`) copies them from runtime `island+0xac`. The
+> "93 % of slots read 7" observation that made the sentinel look plausible
+> was simply every unsettled settlement slot.
+>
+> Real fertility is the u32 crop bitmask at `INSEL5[0x5C..0x60]` → runtime
+> `island+0x5c` (`:72847`), tested as
+> `island+0x5c & (1 << (ware - 0x2d))` (`FUN_0046b0a0` / `FUN_0046aff0`,
+> `:74674`). The repo already parses it correctly as
+> `IslandSourceResourceState::crop_flags`; the fertility API just never
+> used it. Spot values read off the real mask: islands 4 and 7 carry
+> full-strength cotton (`0x1191`), island 10 is **Cocoa** (`0x11c1`), and
+> a baseline `0x1181` (Grain / Grass / Wood / Fish) is present everywhere.
+>
+> Two further findings came out of the fix. The original **never rolls
+> fertility on stock-island instantiation**: `FUN_00469770` (`:73780-73810`)
+> keeps the scenario's authored mask when the island's climate byte
+> (`INSEL5[0x64]`) matches the map half — which it always does in shipping
+> content — and otherwise resets it to bare `0x1181`. The only synthesis
+> site in the whole executable is the editor's random-island path
+> (`:44273`). And `INSEL5[0x64]` is itself a **half-strength fertility
+> channel**: `FUN_0046aff0:74676-74684` yields `0x40` (rather than `0x80`)
+> for Tobacco/Sugarcane/Vines in the north and Spices/Cotton/Cocoa in the
+> south even when the mask bit is clear. Half-strength feeds a per-tile
+> dither, so it means "grows on some tiles", not "refused".
 
-| island | size | fertilities |
-| --- | --- | --- |
-| 2, 6, 14 | 40×40 / 30×30 | Vines, Vines |
-| 3, 5 | 40×40 | Grain, Grain |
-| 4 | 40×40 | Tobacco, Sugarcane |
-| 7 | 40×40 | Cotton, Tobacco |
-| 8 | 50×52 | Vines, Vines |
-| 9 | 50×52 | Tobacco, Sugarcane |
-| 10 | 50×52 | Spices, Cotton |
-| 11 | 30×30 | Sugarcane, Cocoa |
-| 13 | 30×30 | Cocoa, Spices |
+The real authored fertilities, read off the shipped INSEL5 records. Bit
+index is `ware - 0x2d`; `0x1181` (Grain + Grass + Wood + Fish) is present
+on every island. The AI holds 0 and 1; there is no island 12.
+
+| isl | size | clim | full strength | half strength |
+| --- | --- | --- | --- | --- |
+| 0 | 100×90 | S | Spices, Cotton, Cocoa | — |
+| 1 | 100×90 | N | Tobacco, Vines | Sugarcane |
+| 2 | 40×40 | N | **Sugarcane** | Tobacco, Vines |
+| 3 | 40×40 | N | — | Tobacco, Sugarcane, Vines |
+| 4 | 40×40 | S | Cotton | Spices, Cocoa |
+| 5 | 40×40 | N | Tobacco | Sugarcane, Vines |
+| 6 | 40×40 | N | Tobacco | Sugarcane, Vines |
+| 7 | 40×40 | S | Cotton | Spices, Cocoa |
+| 8 | 50×52 | N | **Vines** | Tobacco, Sugarcane |
+| 9 | 50×52 | S | Spices | Cotton, Cocoa |
+| 10 | 50×52 | S | **Cocoa** | Spices, Cotton |
+| 11 | 30×30 | S | — | Spices, Cotton, Cocoa |
+| 13 | 30×30 | S | — | Spices, Cotton, Cocoa |
+| 14 | 30×30 | N | — | Tobacco, Sugarcane, Vines |
 
 The demand ladder needs Food, TobaccoProducts, Spices, Cocoa, Alcohol,
 Cloth, Clothing and Jewelry, so no single island can finish the mission —
-which is the authored point of the scenario. The driver's colony plan:
+which is the authored point of the scenario. Reading the ladder against
+the table:
 
-- **Island 10 (home).** Spices for the citizen tier; Cotton →
-  Baumwollplantage (`Ware: WOLLE`) → Webstube (`Ware: STOFFE,
-  Rohstoff: WOLLE`) for cloth. Both goods the settler tier demands are
-  therefore local except alcohol.
-- **Island 9 or 11 (second colony).** Sugarcane → Rumbrennerei
-  (`Ware: ALKOHOL, Rohstoff: ZUCKER`) for alcohol, plus Tobacco (9) or
-  Cocoa (11) for the higher tiers. A northern Vines island (2/6/8/14)
-  is the alternative alcohol source via the Weinanbau-Plantage
-  (`Ware: ALKOHOL, Rohstoff: WEINTRAUBEN`).
+- **Cocoa** is on the home island (10) at full strength — convenient, and
+  the largest free island in the scenario shares that size with 9 and 8.
+- **Spices** at full strength is island 9 (50×52, south).
+- **Tobacco** at full strength is island 5 or 6 (40×40, north).
+- **Alcohol** is the awkward one. Full-strength Vines exist only on island
+  8 (50×52, north) and full-strength Sugarcane only on island 2 (40×40,
+  far north at (36,20)) — the home island has neither, at any strength,
+  because Sugarcane and Vines are northern crops and island 10 is
+  southern. Half-strength is not an escape here.
+- **Cloth** needs no fertility (sheep farm on grass, which every island
+  has) and **Clothing** is the tailor at STUFE_3C.
+- **Jewelry** needs gold ore, which is not in the crop mask at all — ore
+  rides separate 8-byte INSEL5 records. Islands 0, 1, 11, 13 and 14 carry
+  ware `0x02` (iron); island 0 also carries `0x03`. Whether `0x03` is the
+  gold deposit is not yet confirmed — open question for the endgame.
 
-Alcohol is thus the first good that forces a second settlement — the
-gate the driver hits right after pioneers mature.
+So the mission's authored shape is: settle island 10, then take a northern
+island for alcohol, then a southern one for spices and a northern one for
+tobacco.
+
+Once the BAUINFRA ladder landed the early chains became unambiguous. What
+matters is a building's `Bauinfra` rung, not its fertility: the fertility
+crops are mostly *late*. Def indices and rungs from `examples/dump_defs`:
+
+| def | building | output | rung | available |
+| --- | --- | --- | --- | --- |
+| 270 | fishery | Food | NIX | t0 |
+| 403 | hunter's hut | Food | NIX | t0 |
+| 402 | forester | Wood | NIX | t0 |
+| 412 | sheep farm | Wool | NIX | t0 |
+| 388 | weaving hut | Cloth ← 2 Wool | NIX | t0 |
+| 386 | butcher | Food ← 2 Meat | STUFE_1A | 30 total |
+| 390 | rum distillery | Alcohol ← 2 Sugar | STUFE_2C | 40 settler+ |
+| 409 | vineyard | Alcohol ← 4 Grapes | STUFE_2C | 40 settler+ |
+| 385 | bakery | Food ← 2 Flour | STUFE_2D | 75 settler+ |
+| 405 | cotton plantation | Wool ← Cotton | STUFE_3C | 200 citizen+ |
+| 387 | tailor | Clothing ← Cloth | STUFE_3C | 200 citizen+ |
+
+So the **cloth chain needs no fertility and no rung at all**: sheep farm →
+weaving hut, both placeable from tick 0. The cotton plantation is a
+*later, denser* wool source, not the early one — an earlier draft of this
+plan had that backwards. Since group-1 satisfaction saturates on cloth
+alone, the entire pioneer → settler step is reachable on the home island
+with t0 buildings.
+
+Alcohol is the first good that needs a rung *and* a crop: STUFE_2C opens
+at 40 settler-and-above, and the raw material is Sugarcane or Vines.
+Which islands carry those awaits the corrected crop-flag table above.
 
 ## Stage status
 
@@ -115,6 +186,43 @@ gate the driver hits right after pioneers mature.
   starts, charged ~194 gold), then settlers accumulate while a tier-2
   reservation opens. This confirms the promotion gate is supply-driven,
   not time-driven: the stage-1 plateau at `sat[1] = 0` was faithful.
-- **Stage 3 (next).** Replace the injection with the real chains above,
-  which first requires the build-availability ladder and the
-  haeuser.cod template-inheritance fix.
+- **Stage 3 (blocked).** The injection is gone and the driver now places
+  the real t0 buildings — forester, fishery, hunter, market, chapel, four
+  huts, two sheep farms, weaving hut — in a wood-bounded order (the
+  forester first, since it is the only wood source and costs no wood).
+  All twelve place and complete with no construction stall, and **nothing
+  produces**: food, wool, wood and cloth stay flat at zero.
+
+  An audit of the whole chain found five stacked P0 defects, and no
+  subset of them yields a partial result that could be measured:
+
+  1. Live map-cell records are admitted on the **outer** `HAUS Kind:`
+     (`+0x04`) instead of the nested `HAUS_PRODTYP Kind:` (`+0x1c`) that
+     `FUN_00481450` switches on (`1602_exe.c:92650-92695`). Every real
+     production building is outer `Kind: GEBAEUDE`, so none gets a live
+     record; they fall through to a legacy path whose efficiency is 0.
+  2. The type-11 city-cart supplier filter tests the outer kind; the
+     original has no kind test and scores by the `Ware` byte
+     (`FUN_004717b0`, `:80580-80586`). No cart can collect from anything.
+  3. The type-8 workshop-carrier filter has the same fault; the correct
+     predicate is `Ware == requested || Ware == ALLWARE` (`:80352-80353`).
+  4. The harvest worker's delivery amount is discarded — the port
+     implements only the idle-cooldown tail of `FUN_0047d940` and never
+     credits the raw buffer (`:89797-89807`), so the production rate
+     `min(128, (stock<<7)/Rohmenge)` is permanently zero.
+  5. Field tiles are not modelled, and the crop maturation timer
+     `FUN_0047ca80` (`:88970`) is unported — so a placed field never
+     ripens, and a harvested one never regrows.
+
+  Items 1-4 are in flight. The forester is the one chain that can be
+  proven this round: it harvests the forest every stock island already
+  ships (INSELHAUS ids 1303-1324), so it needs no fields — though item 5
+  still caps it at one unit per tree until the timer lands.
+
+- **Stage 4 (after).** The early cloth chain needs more than the P0 round:
+  the sheep farm is prod kind 4 (`WEIDETIER`, `Rohstoff: GRAS`), and no
+  stock island ships ripe grass, so it needs player-placed pasture tiles
+  (records `Id 22701` growing / `22702` ripe, no withered variant), the
+  maturation timer, and a `SCHAF` grazing-figure path that does not exist
+  in Rust at all — `source_plantation_worker_definition` knows only
+  MAEHER / STEINKLOPFER / HOLZFAELLER / PFLUECKER / PFLUECKER2.

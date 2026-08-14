@@ -47,6 +47,11 @@ pub const AUTOSAVE_INTERVAL_MS: u32 = 599_999;
 pub const SOURCE_VISIBLE_ISLAND_SLOTS: usize = 0x32;
 /// `FUN_00456d00` enters its no-target branch after this many source ticks.
 const SOURCE_KIND4_IDLE_TARGET_DELAY_TICKS: u32 = 20;
+/// Amount a type-12 plantation worker carries home from one harvested map
+/// cell, in the source 1/32-good fixed point. `FUN_00471c50` returns this
+/// constant from every successful target search (`1602_exe.c:80682`), and
+/// `FUN_0045b200` stores it at figure `+0x28` (`1602_exe.c:62990`).
+pub const SOURCE_PLANTATION_HARVEST_AMOUNT: u16 = 0x20;
 
 /// The generic shared-table route bytes at `+0x124` and their `+0x02`
 /// cursor. Dynamic category-one through -three figures own this state even
@@ -5403,6 +5408,12 @@ impl Simulation {
         self.source_static_map_roots[target_index].source_resource_reserved = true;
         self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
         let figure = &mut self.figures[figure_index];
+        // `sVar6 = FUN_00471c50(...); *(short *)(param_1 + 0x28) = sVar6;`
+        // (`1602_exe.c:62988-62990`). The search returns `0x20` — one whole
+        // good in the source 1/32 fixed point — for every accepted target
+        // (`local_2c = 0x20`, `1602_exe.c:80682`), so one harvested tile is
+        // worth exactly one raw unit at the root.
+        figure.cargo_fixed = SOURCE_PLANTATION_HARVEST_AMOUNT;
         figure.target_x = route.position.0;
         figure.target_y = route.position.1;
         figure.supplier_x = route.position.0 as u16;
@@ -7805,7 +7816,7 @@ impl Simulation {
                                     ActionType::CarryingGoods if should_despawn => {
                                         if let Some(state) =
                                             self.source_map_cell_states.iter_mut().find(|state| {
-                                                state.kind_code == supplier_kind
+                                                state.source_production_kind_code == supplier_kind
                                                     && state.matches(
                                                         origin.0,
                                                         supplier_target.0,
@@ -7837,7 +7848,7 @@ impl Simulation {
                                             .source_map_cell_states
                                             .iter_mut()
                                             .find(|state| {
-                                                state.kind_code == supplier_kind
+                                                state.source_production_kind_code == supplier_kind
                                                     && state.matches(
                                                         origin.0,
                                                         supplier_target.0,
@@ -7877,7 +7888,7 @@ impl Simulation {
                                                 .source_map_cell_states
                                                 .iter_mut()
                                                 .find(|state| {
-                                                    state.kind_code == supplier_kind
+                                                    state.source_production_kind_code == supplier_kind
                                                         && state.matches(
                                                             origin.0,
                                                             supplier_target.0,
@@ -7951,7 +7962,10 @@ impl Simulation {
                                                             )
                                                     })
                                                 {
-                                                    state.accept_market_transfer(delivered_fixed);
+                                                    state.complete_source_delivery(
+                                                        figure.carried_good,
+                                                        delivered_fixed,
+                                                    );
                                                     self.source_map_cell_revision = self
                                                         .source_map_cell_revision
                                                         .wrapping_add(1);
@@ -8025,7 +8039,7 @@ impl Simulation {
                                                 .source_map_cell_states
                                                 .iter_mut()
                                                 .find(|state| {
-                                                    state.kind_code == supplier_kind
+                                                    state.source_production_kind_code == supplier_kind
                                                         && state.matches(
                                                             island,
                                                             supplier_target.0,
@@ -8111,7 +8125,7 @@ impl Simulation {
                                                 self.source_map_cell_states
                                                     .iter_mut()
                                                     .find(|state| {
-                                                        state.kind_code == supplier_kind
+                                                        state.source_production_kind_code == supplier_kind
                                                             && state.matches(
                                                                 island,
                                                                 supplier_target.0,
@@ -8190,7 +8204,7 @@ impl Simulation {
                                                     .source_map_cell_states
                                                     .iter_mut()
                                                     .find(|state| {
-                                                        state.kind_code == supplier_kind
+                                                        state.source_production_kind_code == supplier_kind
                                                             && state.matches(
                                                                 island,
                                                                 supplier_target.0,
@@ -8339,6 +8353,11 @@ impl Simulation {
                                 SourceWorkerRoute::Searching => {}
                                 SourceWorkerRoute::Harvesting => {}
                                 SourceWorkerRoute::Returning => {
+                                    // `FUN_0045b200` forwards the worker's
+                                    // ware (`figure + 0x2a`) and the amount
+                                    // its target search stored at
+                                    // `figure + 0x28` to `FUN_0047d940`
+                                    // (`1602_exe.c:62885-62889`).
                                     if let Some(state) =
                                         self.source_map_cell_states.iter_mut().find(|state| {
                                             state.matches(
@@ -8348,11 +8367,18 @@ impl Simulation {
                                             )
                                         })
                                     {
-                                        if state.complete_zero_amount_source_delivery() {
+                                        if state
+                                            .complete_source_delivery(
+                                                figure.carried_good,
+                                                figure.cargo_fixed,
+                                            )
+                                            .credited_here()
+                                        {
                                             self.source_map_cell_revision =
                                                 self.source_map_cell_revision.wrapping_add(1);
                                         }
                                     }
+                                    figure.cargo_fixed = 0;
                                     despawn_indices.push(idx);
                                 }
                                 SourceWorkerRoute::ReturningSearch => {}
@@ -11253,7 +11279,8 @@ mod tests {
                 source_motion: combat::SourceGenericMotion::default(),
             });
         let definition = anno_formats::cod::BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             size: (2, 3),
             source_damage_threshold: 4,
             ruinenr: 4,
@@ -11331,7 +11358,8 @@ mod tests {
     #[test]
     fn source_root_removal_clears_selector_and_static_inventories_once() {
         let definition = anno_formats::cod::BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             ..Default::default()
         };
         let state =
@@ -11352,7 +11380,8 @@ mod tests {
     #[test]
     fn source_footprint_removal_erases_every_overwritten_static_cell() {
         let definition = anno_formats::cod::BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             ..Default::default()
         };
         let first =
@@ -11373,7 +11402,8 @@ mod tests {
     #[test]
     fn static_map_write_expands_oriented_footprint_and_replaces_destination_cells() {
         let definition = anno_formats::cod::BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             size: (2, 3),
             ..Default::default()
         };
@@ -11910,7 +11940,7 @@ mod tests {
         use std::collections::HashMap;
 
         let cod_building = CodBuilding {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
             source_production_amount: 16,
             source_raw_material_amount: 64,
             storage_animation_capacity: 160,
@@ -11990,7 +12020,7 @@ mod tests {
         sim.buildings.push(supplier);
 
         let transfer_root = CodBuilding {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
             storage_animation_capacity: 64,
             source_raw_material_amount: 64,
             properties: [
@@ -12001,7 +12031,8 @@ mod tests {
             ..Default::default()
         };
         let supplier_root = CodBuilding {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             storage_animation_capacity: 320,
             ..Default::default()
         };
@@ -12179,7 +12210,8 @@ mod tests {
             ..Default::default()
         };
         let workshop = CodBuilding {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             storage_animation_capacity: 320,
             ..Default::default()
         };
@@ -12242,7 +12274,8 @@ mod tests {
         supplier.output_stock = 3;
         sim.buildings.push(supplier);
         let source_definition = CodBuilding {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             ..Default::default()
         };
         sim.source_map_cell_states
@@ -12309,7 +12342,8 @@ mod tests {
             ..Default::default()
         };
         let workshop = CodBuilding {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             storage_animation_capacity: 320,
             ..Default::default()
         };
@@ -15832,7 +15866,8 @@ mod tests {
             5,
             7,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 size: (3, 2),
                 source_transfer_figure_limit: 2,
                 source_transfer_radius: 16,

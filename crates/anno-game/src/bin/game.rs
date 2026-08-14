@@ -35,9 +35,7 @@
 //!   Escape: quit (or close panels / cancel modes / resume pause)
 
 use anno_audio::engine::AudioEngine;
-use anno_game::game_commands::{
-    can_place_building, demolish_building, missing_required_fertility, PlaceOutcome,
-};
+use anno_game::game_commands::{can_place_building, demolish_building, PlaceOutcome};
 use anno_game::scenario::init_simulation;
 use anno_formats::cod::CodFile;
 use anno_formats::col::parse_col;
@@ -2431,15 +2429,6 @@ fn main() {
                                 PlaceOutcome::NotEnoughGold { need, have } => {
                                     save_banner = Some((
                                         format!("Not enough gold (need {need}, have {have})"),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                                PlaceOutcome::MissingFertility { required } => {
-                                    save_banner = Some((
-                                        format!(
-                                            "build FAILED: needs {} fertility",
-                                            fertility_label(required),
-                                        ),
                                         std::time::Instant::now(),
                                     ));
                                 }
@@ -5713,10 +5702,14 @@ mod tests {
             random_seed: 0,
             dynamic_object_owner: 0,
         };
-        let building = |kind: &str, anim_time| anno_formats::cod::BuildingDef {
+        // `(outer HAUS Kind, nested HAUS_PRODTYP Kind)` pairs taken from
+        // haeuser.cod. Only the nested kind selects a draw branch
+        // (`1602_exe.c:98270-98300`); the outer label is along for the ride.
+        let building = |kind: &str, prod_kind: &str, anim_time| anno_formats::cod::BuildingDef {
             source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 3,
             gfx: 100,
             kind: kind.into(),
+            properties: [("ProdKind".into(), prod_kind.into())].into(),
             anim_anz: 4,
             anim_add: 3,
             anim_frame: 2,
@@ -5736,11 +5729,31 @@ mod tests {
                 },
             )
         };
-        assert_eq!(render(building("HANDWERK", 0)), vec![(0, 0, 0, 112)]);
-        assert_eq!(render(building("MARKT", 0)), vec![(0, 0, 0, 112)]);
-        assert_eq!(render(building("WALD", 0)), vec![(0, 0, 0, 121)]);
-        assert_eq!(render(building("WALD", 100)), vec![(0, 0, 0, 115)]);
-        assert_eq!(render(building("HQ", 0)), vec![(0, 0, 0, 115)]);
+        // Production kinds 1 through 8 start their cleared record at frame 0.
+        assert_eq!(
+            render(building("GEBAEUDE", "HANDWERK", 0)),
+            vec![(0, 0, 0, 112)]
+        );
+        assert_eq!(
+            render(building("GEBAEUDE", "MARKT", 0)),
+            vec![(0, 0, 0, 112)]
+        );
+        assert_eq!(render(building("HQ", "KONTOR", 0)), vec![(0, 0, 0, 112)]);
+        // Production kind 10 takes the packed-variant branch while `anim_time`
+        // is zero and the ordinary `variant + AnimFrame` branch otherwise.
+        assert_eq!(
+            render(building("BODEN", "ROHSTWACHS", 0)),
+            vec![(0, 0, 0, 121)]
+        );
+        assert_eq!(
+            render(building("BODEN", "ROHSTWACHS", 100)),
+            vec![(0, 0, 0, 115)]
+        );
+        // Everything else, houses included, uses `variant + AnimFrame`.
+        assert_eq!(
+            render(building("GEBAEUDE", "WOHNUNG", 0)),
+            vec![(0, 0, 0, 115)]
+        );
     }
 
     #[test]
@@ -5754,10 +5767,15 @@ mod tests {
             random_seed: 0,
             dynamic_object_owner: 0,
         };
-        let definition = |kind: &str| anno_formats::cod::BuildingDef {
+        // Shaped like haeuser.cod: every producer carries outer
+        // `Kind: GEBAEUDE` and puts its production label in the nested
+        // `HAUS_PRODTYP Kind`, which `FUN_00481450` reads at definition
+        // offset `+0x1c` to decide whether a live cell record exists.
+        let definition = |prod_kind: &str| anno_formats::cod::BuildingDef {
             source_id: anno_formats::szs::INSELHAUS_SOURCE_ID_BASE + 3,
             gfx: 100,
-            kind: kind.into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), prod_kind.into())].into(),
             anim_anz: 3,
             anim_add: 4,
             ..Default::default()
@@ -6542,21 +6560,20 @@ mod tests {
     }
 
     #[test]
-    fn placement_fertility_gate_uses_insel5_not_y_climate() {
+    fn island_fertility_reads_the_insel5_crop_mask_not_the_y_climate() {
         use anno_formats::szs::Fertility;
 
-        let tobacco_def = test_building_def(Some(Fertility::Tobacco));
+        // Fertility is authored per island in the `INSEL5[0x5C]` crop
+        // bitmask (`FUN_0046b0a0`, `1602_exe.c:74701`). Which map half
+        // an island sits in only chooses the `Nord\`/`Sued\` terrain
+        // library it loads (`FUN_00469690`, `1602_exe.c:73731`) — it
+        // never implies a crop.
         let south_barren = test_island(450, [7; 8]);
         let north_tobacco = test_island(10, [1, 7, 7, 7, 7, 7, 7, 7]);
 
-        assert_eq!(
-            missing_required_fertility(&tobacco_def, &south_barren),
-            Some(Fertility::Tobacco),
-        );
-        assert_eq!(
-            missing_required_fertility(&tobacco_def, &north_tobacco),
-            None
-        );
+        assert!(!south_barren.has_fertility(Fertility::Tobacco));
+        assert!(north_tobacco.has_fertility(Fertility::Tobacco));
+        assert_eq!(north_tobacco.crop_flags(), 1 << 1);
     }
 
     #[test]
@@ -6564,6 +6581,7 @@ mod tests {
         let island = test_island(0, [1, 6, 7, 7, 7, 7, 7, 7]);
 
         assert_eq!(fertility_list_label(&island), "Tobacco, Cocoa");
+        assert_eq!(fertility_list_label(&test_island(0, [7; 8])), "none");
     }
 
     #[test]
@@ -7924,8 +7942,12 @@ fn source_command_frame_selector(
     packed_variant: u8,
     state: Option<&anno_sim::source_cell::SourceMapCellState>,
 ) -> i32 {
+    // The STADTFLD draw loop switches on the nested `HAUS_PRODTYP Kind` at
+    // definition offset `+0x1c` (`switch(*(undefined4 *)(iVar4 + 0x1c))`,
+    // `1602_exe.c:98270-98300`), the same selector that decides whether a
+    // live cell record exists at all.
     if let Some(state) = state {
-        match definition.source_kind_code() {
+        match definition.source_production_kind_code() {
             Some(1..=6) if definition.storage_animation => {
                 return state.storage_frame_selector(definition.anim_anz);
             }
@@ -7945,7 +7967,7 @@ fn source_command_initial_frame_selector(
     definition: &anno_formats::cod::BuildingDef,
     packed_variant: u8,
 ) -> i32 {
-    match definition.source_kind_code() {
+    match definition.source_production_kind_code() {
         Some(1..=8) => 0,
         Some(10) if definition.anim_time == 0 => i32::from(packed_variant),
         _ => i32::from(packed_variant) + definition.anim_frame,

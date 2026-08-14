@@ -24,30 +24,55 @@ pub struct Chunk {
     pub data: Vec<u8>,
 }
 
-/// One of the seven climate-dependent crop fertilities the
-/// engine recognises. Values match the order of the
-/// `[ROHST]` section in `editor.cod` and are echoed by the
-/// `[ROHSTFELD]` (raw-resource field) section:
+/// One of the seven crop fertilities an island can carry.
 ///
-///   0 = Grain      (KORN)
-///   1 = Tobacco    (TABAK)
-///   2 = Spices     (GEWUERZE)
-///   3 = Sugarcane  (ZUCKER / ZUCKERROHR)
-///   4 = Cotton     (BAUMWOLLE)
-///   5 = Vines      (WEIN)
-///   6 = Cocoa      (KAKAO)
+/// **The only place the executable stores island fertility is the
+/// u32 crop bitmask at `INSEL5[0x5C..0x60]` → runtime `island+0x5c`**
+/// (installed by the `INSEL5` loader, saved back by `FUN_00468740`,
+/// `1602_exe.c:72847`). Both readers test it as
+/// `island[0x5c] & (1 << (ware - 0x2d))`:
 ///
-/// 7 is the sentinel "grazing land / no special crop"
-/// (matches editor.cod's "Grazing land" entry at the same
-/// position). 93% of fertility slots in shipping content
-/// carry 7, leaving 0..=6 to mark which one or two specific
-/// crops a fertile island supports.
+///   * `FUN_0046aff0` (`1602_exe.c:74674`) — the 0/0x40/0x80 source
+///     strength; a set bit is full strength (0x80).
+///   * `FUN_0046b0a0` (`1602_exe.c:74701`) — the boolean
+///     "does this island carry ware X".
 ///
-/// `[ROHSTFELD]` extends this ladder past 7 with non-crop
-/// resource markers — 8 = Forest, 9 = Stones, 10 = Ore,
-/// 11 = Wild game, 12 = Fishing grounds — but no shipping
-/// `.szs` carries a fertility byte > 7, so we treat them as
-/// the sentinel here and leave them for future RE.
+/// The bit index is therefore `ware - 0x2d`, and the ware ids come
+/// straight from the executable's `Ware:` registration table (see
+/// [`crate::cod::source_ware_slot`]):
+///
+/// | bit | mask     | ware | token       | meaning                |
+/// |-----|----------|------|-------------|------------------------|
+/// | 0   | `0x0001` | 0x2d | GETREIDE    | `Fertility::Grain`     |
+/// | 1   | `0x0002` | 0x2e | TABAKBAUM   | `Fertility::Tobacco`   |
+/// | 2   | `0x0004` | 0x2f | GEWUERZBAUM | `Fertility::Spices`    |
+/// | 3   | `0x0008` | 0x30 | ZUCKERROHR  | `Fertility::Sugarcane` |
+/// | 4   | `0x0010` | 0x31 | BAUMWOLLE   | `Fertility::Cotton`    |
+/// | 5   | `0x0020` | 0x32 | WEINTRAUBEN | `Fertility::Vines`     |
+/// | 6   | `0x0040` | 0x33 | KAKAOBAUM   | `Fertility::Cocoa`     |
+/// | 7   | `0x0080` | 0x34 | GRAS        | grazing land           |
+/// | 8   | `0x0100` | 0x35 | BAUM        | forest                 |
+/// | 9   | `0x0200` | 0x36 | STEINE      | stone                  |
+/// | 10  | `0x0400` | 0x37 | ERZE        | ore                    |
+/// | 11  | `0x0800` | 0x38 | WILD        | wild game              |
+/// | 12  | `0x1000` | 0x39 | FISCHE      | fishing grounds        |
+/// | 13  | `0x2000` | 0x3a | SCHATZ      | treasure               |
+///
+/// Bits 7..=13 are terrain/raw-resource markers rather than crops, so
+/// they have no `Fertility` variant; the source system consumes them
+/// through [`IslandSourceResourceState::resource_strength`]. Every
+/// shipping island carries at least `0x1181` (bits 0/7/8/12 —
+/// grain, grass, forest, fish), and the runtime forces that same
+/// baseline on for stock islands (`1602_exe.c:44273`, `:73788`).
+///
+/// The discriminants deliberately equal the bit index, so
+/// `ware == 0x2d + fertility as u8`.
+///
+/// Historic note: this enum used to be documented as decoding the
+/// eight bytes at `INSEL5[0x0C..0x14]`. Those bytes are **not**
+/// fertility — they are the per-settlement owner slots (see
+/// [`SzsFile::island_settlement_owner_slots`]), which is why ~93% of
+/// them read 7 ("unsettled") in a corpus survey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Fertility {
@@ -60,10 +85,20 @@ pub enum Fertility {
     Cocoa = 6,
 }
 
+/// Crop-mask bits the `INSEL5` loader forces on for every island:
+/// GETREIDE | GRAS | BAUM | FISCHE (`1602_exe.c:44273`, `:73788`).
+pub const CROP_FLAGS_BASELINE: u32 = 0x1181;
+
+/// Sentinel stored in an unused [`Island::fertilities`] slot.
+/// Distinct from the identically-valued "unsettled" marker in the
+/// settlement-owner array — they are unrelated fields that merely
+/// happen to share the value 7.
+pub const FERTILITY_SLOT_EMPTY: u8 = 7;
+
 impl Fertility {
-    /// Decode a raw INSEL5 fertility byte. Returns `None` for
-    /// the sentinel value 7 (grazing land / no crop) and any
-    /// out-of-range value.
+    /// Decode one [`Island::fertilities`] slot value, i.e. a crop-mask
+    /// bit index. Returns `None` for [`FERTILITY_SLOT_EMPTY`] (an
+    /// unused slot) and for the non-crop bits 7..=13.
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
             0 => Some(Fertility::Grain),
@@ -76,6 +111,63 @@ impl Fertility {
             _ => None,
         }
     }
+
+    /// The `Ware:` id this fertility is tested under, i.e. the
+    /// `param_2` `FUN_0046b0a0` receives: `0x2d + bit`.
+    pub const fn ware(self) -> u8 {
+        0x2d + self as u8
+    }
+
+    /// Inverse of [`Fertility::ware`]. `None` for ware ids outside
+    /// the seven crops (including the GRAS/BAUM/STEINE/ERZE/WILD/
+    /// FISCHE/SCHATZ terrain markers that share the bitmask).
+    pub const fn from_ware(ware: u8) -> Option<Self> {
+        if ware < 0x2d {
+            return None;
+        }
+        Self::from_crop_bit(ware - 0x2d)
+    }
+
+    /// Decode a crop-mask bit index (`ware - 0x2d`).
+    pub const fn from_crop_bit(bit: u8) -> Option<Self> {
+        Some(match bit {
+            0 => Fertility::Grain,
+            1 => Fertility::Tobacco,
+            2 => Fertility::Spices,
+            3 => Fertility::Sugarcane,
+            4 => Fertility::Cotton,
+            5 => Fertility::Vines,
+            6 => Fertility::Cocoa,
+            _ => return None,
+        })
+    }
+
+    /// Every crop set in a `island+0x5c` bitmask, in bit order.
+    pub fn from_crop_flags(mask: u32) -> impl Iterator<Item = Fertility> {
+        (0..7_u8)
+            .filter(move |bit| mask & (1 << bit) != 0)
+            .map(|bit| Fertility::from_crop_bit(bit).expect("bits 0..7 are the seven crops"))
+    }
+
+    /// Project a `island+0x5c` bitmask onto the eight-slot
+    /// [`Island::fertilities`] array: the crops in bit order, then
+    /// [`FERTILITY_SLOT_EMPTY`] padding.
+    pub fn crop_flags_to_slots(mask: u32) -> [u8; 8] {
+        let mut slots = [FERTILITY_SLOT_EMPTY; 8];
+        for (slot, fertility) in slots.iter_mut().zip(Fertility::from_crop_flags(mask)) {
+            *slot = fertility as u8;
+        }
+        slots
+    }
+
+    /// Inverse of [`Fertility::crop_flags_to_slots`], restricted to
+    /// the seven crop bits.
+    pub fn slots_to_crop_flags(slots: [u8; 8]) -> u32 {
+        slots
+            .iter()
+            .filter_map(|&slot| Fertility::from_byte(slot))
+            .fold(0, |mask, fertility| mask | 1 << (fertility as u8))
+    }
 }
 
 /// Island metadata from an INSEL5 chunk.
@@ -86,17 +178,26 @@ pub struct Island {
     pub height: u8,
     pub x_pos: u16,
     pub y_pos: u16,
-    /// Eight fertility bytes at INSEL5 offsets 0x0C..0x14.
-    /// The mapping is pinned by the `[ROHST]` section of
-    /// `editor.cod`: 0=Grain, 1=Tobacco, 2=Spices,
-    /// 3=Sugarcane, 4=Cotton, 5=Vines, 6=Cocoa, 7=Grazing
-    /// land (sentinel "no specific crop here").
+    /// The island's crop fertilities, decoded from the u32 crop
+    /// bitmask at `INSEL5[0x5C..0x60]` → runtime `island+0x5c`
+    /// (`1602_exe.c:72847`), which is the *only* place the
+    /// executable stores fertility. Each entry is a crop-mask bit
+    /// index (`ware - 0x2d`) in bit order; unused slots hold
+    /// [`FERTILITY_SLOT_EMPTY`]. Decode with
+    /// [`Fertility::from_byte`], or use
+    /// [`Island::active_fertilities`].
     ///
-    /// 93% of bytes are 7 across 546 islands; most islands
-    /// fill one or two slots with 0..=6 to flag specific
-    /// fertilities. Use `Fertility::from_byte` to decode each
-    /// entry into the typed enum (returning `None` for the
-    /// sentinel).
+    /// Only the seven crop bits (0..=6) land here. The full
+    /// fourteen-bit mask — which also carries the GRAS / BAUM /
+    /// STEINE / ERZE / WILD / FISCHE / SCHATZ terrain markers — is
+    /// available as [`IslandSourceResourceState::crop_flags`] via
+    /// [`SzsFile::island_source_resource_state`]; re-encode just the
+    /// crop half with [`Island::crop_flags`].
+    ///
+    /// **Not** `INSEL5[0x0C..0x14]`. Those eight bytes are the
+    /// per-settlement owner slots, exposed as
+    /// [`SzsFile::island_settlement_owner_slots`]; parsing them as
+    /// fertility was a long-standing defect in this port.
     pub fertilities: [u8; 8],
     pub tiles: Vec<IslandTile>,
     /// Optional city info from the matching `STADT4` chunk that
@@ -202,15 +303,35 @@ impl IslandSourceResourceState {
 }
 
 impl Island {
-    /// Active (non-sentinel) fertilities decoded into the
-    /// typed enum. Yields at most 8 entries; preserves the
-    /// slot order so callers can correlate with the binary's
-    /// internal indexing.
+    /// The crops this island carries, i.e. every ware in
+    /// `0x2d..=0x33` for which `FUN_0046b0a0` (`1602_exe.c:74701`)
+    /// answers true. Derived from the `INSEL5[0x5C]` crop bitmask;
+    /// yields at most seven entries in bit order.
+    ///
+    /// Note that every shipping island authors at least
+    /// [`CROP_FLAGS_BASELINE`], so `Grain` is essentially universal —
+    /// the interesting entries are the extra crop (or crops) an
+    /// island adds on top.
     pub fn active_fertilities(&self) -> Vec<Fertility> {
         self.fertilities
             .iter()
             .filter_map(|&b| Fertility::from_byte(b))
             .collect()
+    }
+
+    /// The crop half of the `INSEL5[0x5C]` bitmask re-encoded from
+    /// [`Island::fertilities`] — bits 0..=6 only. The terrain bits
+    /// (GRAS/BAUM/STEINE/ERZE/WILD/FISCHE/SCHATZ) are not carried on
+    /// `Island`; read the whole word from
+    /// [`SzsFile::island_source_resource_state`] when you need them.
+    pub fn crop_flags(&self) -> u32 {
+        Fertility::slots_to_crop_flags(self.fertilities)
+    }
+
+    /// True when `FUN_0046b0a0` would answer true for `fertility`'s
+    /// ware on this island.
+    pub fn has_fertility(&self, fertility: Fertility) -> bool {
+        self.crop_flags() & (1 << (fertility as u8)) != 0
     }
 }
 
@@ -1543,6 +1664,47 @@ fn write_chunk(out: &mut Vec<u8>, name: &str, body: &[u8]) {
 }
 
 impl SzsFile {
+    /// The eight per-settlement owner slots at `INSEL5[0x0C..0x14]`,
+    /// mirroring runtime `island+0xac`.
+    ///
+    /// `FUN_00468740` (`1602_exe.c:72888-72897`) walks the eight
+    /// settlement pointers at runtime `island+0xac` (`param_1 + 0x2b`
+    /// as `undefined4*`) and writes, for each slot,
+    ///
+    /// ```text
+    /// puVar4[slot + 0xc] = (*ptr == 0) ? 7 : *(byte *)(*ptr + 0x1a);
+    /// ```
+    ///
+    /// so the byte is the settlement's owning player slot, and **7
+    /// means "no settlement in this slot"**. `FUN_0046b100`
+    /// (`1602_exe.c:74717`) counts the same eight pointers to get an
+    /// island's settlement count, and `FUN_0040e620`
+    /// (`1602_exe.c:12030`) skips records whose owner byte is 7 before
+    /// indexing the player table — the same "unsettled" sentinel.
+    ///
+    /// This array carries **no fertility information whatsoever**;
+    /// fertility is the crop bitmask at `INSEL5[0x5C..0x60]` (see
+    /// [`Fertility`] and [`Island::fertilities`]). A corpus survey
+    /// finding ~93% sevens here was counting empty settlement slots.
+    pub fn island_settlement_owner_slots(&self, island_index: usize) -> [u8; 8] {
+        self.chunks
+            .iter()
+            .filter(|chunk| chunk.name == "INSEL5" && chunk.data.len() >= 8)
+            .nth(island_index)
+            .and_then(|chunk| chunk.data.get(0x0c..0x14))
+            .map(|bytes| bytes.try_into().expect("slice size"))
+            .unwrap_or([7; 8])
+    }
+
+    /// Number of settled settlement slots on `island_index`, i.e. the
+    /// serialized form of `FUN_0046b100` (`1602_exe.c:74717`).
+    pub fn island_settlement_count(&self, island_index: usize) -> usize {
+        self.island_settlement_owner_slots(island_index)
+            .iter()
+            .filter(|&&slot| slot != 7)
+            .count()
+    }
+
     /// Return the u16 installed at island-runtime offset `+0x18` by the
     /// `INSEL5` loader at `0x00469d60`. The loader overwrites the serialized
     /// word at `0x62` for widths through `0x6e` before copying it into the
@@ -2108,10 +2270,22 @@ impl SzsFile {
     }
 
     fn parse_insel5(data: &[u8]) -> Island {
-        let mut fertilities = [0x07u8; 8];
-        if data.len() >= 0x14 {
-            fertilities.copy_from_slice(&data[0x0C..0x14]);
-        }
+        // Fertility lives in the u32 crop bitmask at 0x5C..0x60
+        // (runtime `island+0x5c`, written back by `FUN_00468740` at
+        // `1602_exe.c:72847` and tested by `FUN_0046aff0` /
+        // `FUN_0046b0a0` as `& (1 << (ware - 0x2d))`). The raw mask is
+        // stored without the loader's `| 0x1181`, so editor-generated
+        // short records decode to "no crops" instead of a phantom
+        // baseline; see `IslandSourceResourceState::resource_strength`,
+        // which applies the OR at read time.
+        //
+        // 0x0C..0x14 is the settlement-owner slot array, *not*
+        // fertility — see `SzsFile::island_settlement_owner_slots`.
+        let crop_flags = data
+            .get(0x5c..0x60)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("slice size")))
+            .unwrap_or(0);
+        let fertilities = Fertility::crop_flags_to_slots(crop_flags);
         Island {
             number: data[0],
             width: data[1],
@@ -4035,20 +4209,96 @@ mod tests {
     }
 
     #[test]
-    fn fertility_byte_maps_to_editor_cod_rohst_order() {
-        // editor.cod's [ROHST] section pins the order:
-        //   Grain / Tobacco / Spices / Sugarcane / Cotton /
-        //   Vines / Cocoa / Grazing land
-        assert_eq!(Fertility::from_byte(0), Some(Fertility::Grain));
-        assert_eq!(Fertility::from_byte(1), Some(Fertility::Tobacco));
-        assert_eq!(Fertility::from_byte(2), Some(Fertility::Spices));
-        assert_eq!(Fertility::from_byte(3), Some(Fertility::Sugarcane));
-        assert_eq!(Fertility::from_byte(4), Some(Fertility::Cotton));
-        assert_eq!(Fertility::from_byte(5), Some(Fertility::Vines));
-        assert_eq!(Fertility::from_byte(6), Some(Fertility::Cocoa));
-        // 7 = sentinel, 8+ = invalid → None
-        assert_eq!(Fertility::from_byte(7), None);
-        assert_eq!(Fertility::from_byte(8), None);
+    fn fertility_bits_match_the_ware_ids_fun_0046b0a0_tests() {
+        // `FUN_0046b0a0` (`1602_exe.c:74701`) tests
+        // `island[0x5c] & (1 << (ware - 0x2d))` for wares 0x2d..=0x3a,
+        // so bit index == ware - 0x2d. The ware ids come from the
+        // executable's `Ware:` registration table.
+        for (ware, token, expected) in [
+            (0x2d_u8, "GETREIDE", Some(Fertility::Grain)),
+            (0x2e, "TABAKBAUM", Some(Fertility::Tobacco)),
+            (0x2f, "GEWUERZBAUM", Some(Fertility::Spices)),
+            (0x30, "ZUCKERROHR", Some(Fertility::Sugarcane)),
+            (0x31, "BAUMWOLLE", Some(Fertility::Cotton)),
+            (0x32, "WEINTRAUBEN", Some(Fertility::Vines)),
+            (0x33, "KAKAOBAUM", Some(Fertility::Cocoa)),
+            // Terrain markers share the mask but are not crops.
+            (0x34, "GRAS", None),
+            (0x35, "BAUM", None),
+            (0x36, "STEINE", None),
+            (0x37, "ERZE", None),
+            (0x38, "WILD", None),
+            (0x39, "FISCHE", None),
+            (0x3a, "SCHATZ", None),
+        ] {
+            assert_eq!(
+                crate::cod::source_ware_slot(token),
+                Some(ware),
+                "{token} ware id"
+            );
+            assert_eq!(Fertility::from_ware(ware), expected, "{token} → fertility");
+            assert_eq!(Fertility::from_byte(ware - 0x2d), expected, "{token} → bit");
+            if let Some(fertility) = expected {
+                assert_eq!(fertility.ware(), ware);
+            }
+        }
+    }
+
+    #[test]
+    fn crop_flags_round_trip_through_the_fertility_slot_array() {
+        // 0x1191 = baseline (grain/grass/forest/fish) plus cotton;
+        // only the crop half survives the eight-slot projection.
+        let slots = Fertility::crop_flags_to_slots(0x1191);
+        assert_eq!(slots, [0, 4, 7, 7, 7, 7, 7, 7]);
+        assert_eq!(Fertility::slots_to_crop_flags(slots), 0x0011);
+        assert_eq!(
+            Fertility::from_crop_flags(0x1191).collect::<Vec<_>>(),
+            vec![Fertility::Grain, Fertility::Cotton]
+        );
+        // A zero mask (short editor record) means "no crops at all".
+        assert_eq!(Fertility::crop_flags_to_slots(0), [7; 8]);
+        assert_eq!(
+            Fertility::from_crop_flags(CROP_FLAGS_BASELINE).collect::<Vec<_>>(),
+            vec![Fertility::Grain]
+        );
+    }
+
+    #[test]
+    fn insel5_fertility_comes_from_the_crop_mask_not_the_owner_slots() {
+        let mut body = vec![0_u8; 0x74];
+        body[0] = 4;
+        body[1] = 12;
+        body[2] = 10;
+        // Settlement-owner slots (`FUN_00468740`, `1602_exe.c:72888`):
+        // two settled slots owned by players 1 and 3, six unsettled.
+        body[0x0c] = 1;
+        body[0x0d] = 3;
+        body[0x0e..0x14].fill(7);
+        // Crop mask: baseline + cocoa.
+        body[0x5c..0x60].copy_from_slice(&(CROP_FLAGS_BASELINE | 1 << 6).to_le_bytes());
+
+        let mut bytes = Vec::new();
+        write_chunk(&mut bytes, "INSEL5", &body);
+        let parsed = SzsFile::parse(&bytes).expect("parse");
+        let island = &parsed.islands[0];
+
+        // The owner bytes must not leak into fertility: naively
+        // decoding 0x0C..0x14 would have reported Tobacco + Sugarcane.
+        assert_eq!(
+            island.active_fertilities(),
+            vec![Fertility::Grain, Fertility::Cocoa]
+        );
+        assert!(island.has_fertility(Fertility::Cocoa));
+        assert!(!island.has_fertility(Fertility::Tobacco));
+        assert!(!island.has_fertility(Fertility::Sugarcane));
+        assert_eq!(island.crop_flags(), 0x41);
+
+        // ...and the owner bytes are still reachable under their real name.
+        assert_eq!(
+            parsed.island_settlement_owner_slots(0),
+            [1, 3, 7, 7, 7, 7, 7, 7]
+        );
+        assert_eq!(parsed.island_settlement_count(0), 2);
     }
 
     #[test]
@@ -4132,10 +4382,10 @@ mod tests {
 
     #[test]
     fn insel5_extracts_fertility_map() {
-        // Atoll has 35 islands with varied fertility patterns.
-        // The audit shows most islands carry the no-fertility
-        // sentinel `[07; 8]` while a handful encode 1-2 active
-        // fertility slots.
+        // Atoll authors 34 islands. Every one carries at least the
+        // 0x1181 baseline in its crop mask, so `Grain` is universal;
+        // the mask's interesting half is the extra crop some islands
+        // add (Atoll #4 = 0x11d5 → spices + cotton + cocoa).
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -4150,27 +4400,75 @@ mod tests {
             }
         };
         let szs = SzsFile::parse(&data).expect("parse Atoll");
-        // At least one island has the all-default `[07; 8]`
-        // pattern, and at least one has a non-default slot.
-        let any_default = szs.islands.iter().any(|i| i.fertilities == [7; 8]);
-        let any_active = szs
-            .islands
-            .iter()
-            .any(|i| i.fertilities.iter().any(|&v| v != 7));
+        for index in 0..szs.islands.len() {
+            let mask = szs.island_source_resource_state(index).crop_flags;
+            assert_eq!(
+                mask & CROP_FLAGS_BASELINE,
+                CROP_FLAGS_BASELINE,
+                "island {index}: shipping islands author the 0x1181 baseline"
+            );
+            // The `Island` projection keeps exactly the crop bits.
+            assert_eq!(szs.islands[index].crop_flags(), mask & 0x7f);
+            assert!(szs.islands[index].has_fertility(Fertility::Grain));
+        }
+        // At least one island is baseline-only (grain and nothing
+        // else) and at least one adds a specialty crop.
         assert!(
-            any_default,
-            "Atoll should include at least one fertility-free island"
+            szs.islands
+                .iter()
+                .any(|i| i.active_fertilities() == vec![Fertility::Grain]),
+            "Atoll should include at least one baseline-only island"
         );
         assert!(
-            any_active,
-            "Atoll should include at least one fertile island"
+            szs.islands.iter().any(|i| i.active_fertilities().len() > 1),
+            "Atoll should include at least one specialty-crop island"
         );
-        // No fertility byte should exceed 7 (the binary's value
-        // range is 0..=7 with 7 being the no-fertility sentinel).
+        // Fertility slots only ever hold crop bit indices or the
+        // empty-slot sentinel.
         for i in &szs.islands {
             for &b in &i.fertilities {
-                assert!(b <= 7, "fertility byte must be in 0..=7, got {b}");
+                assert!(b <= 7, "fertility slot must be in 0..=7, got {b}");
             }
+        }
+    }
+
+    #[test]
+    fn insel5_settlement_owner_slots_track_settled_towns() {
+        // Atoll island 0 is settled by two players; its INSEL5
+        // 0x0C..0x14 array reads [3, 6, 7, 7, 7, 7, 7, 7] — player
+        // slots 3 and 6, then six "unsettled" sevens. Island 8 is
+        // free, so all eight slots read 7.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("extracted/Szenes/Atoll.szs");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Skipping: {path:?} not found");
+                return;
+            }
+        };
+        let szs = SzsFile::parse(&data).expect("parse Atoll");
+        assert_eq!(
+            szs.island_settlement_owner_slots(0),
+            [3, 6, 7, 7, 7, 7, 7, 7]
+        );
+        assert_eq!(szs.island_settlement_count(0), 2);
+        assert_eq!(szs.island_settlement_owner_slots(8), [7; 8]);
+        assert_eq!(szs.island_settlement_count(8), 0);
+        // Every slot is a player index (0..=7) or the sentinel, and
+        // the settled slots always come first.
+        for index in 0..szs.islands.len() {
+            let slots = szs.island_settlement_owner_slots(index);
+            assert!(slots.iter().all(|&s| s <= 7), "island {index}: {slots:?}");
+            let settled = szs.island_settlement_count(index);
+            assert!(
+                slots[..settled].iter().all(|&s| s != 7),
+                "island {index}: settled slots are packed at the front"
+            );
         }
     }
 

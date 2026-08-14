@@ -275,6 +275,20 @@ impl BuildingDef {
             .and_then(source_ware_slot)
     }
 
+    /// Compiled `Workstoff` selector at definition offset `+0x23`.
+    /// `FUN_0047daf0` requests this ware whenever the work buffer
+    /// (`+0x08`) rather than the raw buffer is the scarcer input
+    /// (`1602_exe.c:90000-90010`), and `FUN_0047d940` compares an arriving
+    /// delivery against it to choose which buffer to credit
+    /// (`1602_exe.c:89797-89807`).
+    pub fn source_work_material_ware_slot(&self) -> Option<u8> {
+        self.properties
+            .get("Workstoff")
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .and_then(source_ware_slot)
+    }
+
     /// Compiled figure definition passed by plantation production kind 2 to
     /// `FUN_00446ca0` through `FUN_0044b7e0`.
     pub fn source_plantation_worker_definition(&self) -> Option<u8> {
@@ -411,6 +425,68 @@ impl CodFile {
         raw.iter().map(|&b| char::from(b)).collect()
     }
 
+    /// Write the compiled production scalars that haeuser.cod authors inside
+    /// `Objekt: HAUS_PRODTYP` rather than at the top level of a `@Nummer:`
+    /// block.
+    ///
+    /// The executable keeps one flat runtime record per definition:
+    /// `FUN_00460750` stores `Maxlager` at `+0x30`, `Prodmenge` at `+0x24`,
+    /// `Rohmenge` at `+0x26`, `Workmenge` at `+0x28`, `Maxnorohst` at `+0x36`,
+    /// `Interval` at `+0x3a`, `Randwachs` at `+0x40` and the `Anicontflg` /
+    /// `LagAniFlg` bits at `+0x47`, and its parser has no notion of these
+    /// fields belonging to a nested object. Every producer in the shipped file
+    /// authors them nested — the forester's `Maxlager: 10` / `Interval: 8` /
+    /// `Rohmenge: 1` all sit inside its `HAUS_PRODTYP` — and the `@Nummer: 0`
+    /// default block that `ObjFill: 0,MAXHAUS` copies into every slot does the
+    /// same for `Rohmenge: 1`, `Prodmenge: 1`, `Maxlager: 4`, `Maxnorohst: 5`
+    /// and `Randwachs: 100`.
+    ///
+    /// Reading them only at the top level left `source_scheduler_activity`
+    /// dividing by a zero `Rohmenge` and comparing `storage_fill` against a
+    /// zero `Maxlager`, which pins every producer's activity at 0.
+    fn apply_nested_production_scalar(
+        current: &mut BuildingDef,
+        constants: &HashMap<String, i32>,
+        key: &str,
+        value: &str,
+    ) {
+        match key {
+            "Maxlager" => {
+                let authored = Self::eval(constants, value).clamp(0, 0x7ff);
+                current.storage_animation_capacity = (authored as u16) << 5;
+            }
+            "Prodmenge" => {
+                current.source_production_amount = Self::eval_scaled_32(constants, value);
+            }
+            "Rohmenge" => {
+                current.source_raw_material_amount = Self::eval_scaled_32(constants, value);
+            }
+            "Workmenge" => {
+                current.source_work_material_amount = Self::eval_scaled_32(constants, value);
+            }
+            "Maxnorohst" => {
+                current.source_max_no_raw_material_count =
+                    Self::eval(constants, value).clamp(0, i32::from(u16::MAX)) as u16;
+            }
+            "Interval" => {
+                current.source_scheduler_interval =
+                    Self::eval(constants, value).clamp(0, i32::from(u16::MAX)) as u16;
+            }
+            "Randwachs" => {
+                let authored = Self::eval(constants, value).max(0) as u32;
+                current.source_resource_growth_factor =
+                    ((authored.saturating_mul(128) / 100).min(u32::from(u8::MAX))) as u8;
+            }
+            "Anicontflg" => {
+                current.animation_continues = Self::eval(constants, value) & 1 != 0;
+            }
+            "LagAniFlg" => {
+                current.storage_animation = Self::eval(constants, value) & 1 != 0;
+            }
+            _ => {}
+        }
+    }
+
     fn parse_text(text: &str) -> Result<CodFile, CodError> {
         let mut constants: HashMap<String, i32> = HashMap::new();
         // Builtin constants the executable's constant table supplies before it
@@ -510,6 +586,12 @@ impl CodFile {
                                     .clamp(0, i32::from(u8::MAX))
                                     as u8;
                             }
+                            Self::apply_nested_production_scalar(
+                                &mut current,
+                                &constants,
+                                key,
+                                value,
+                            );
                             // Avoid overwriting the outer Kind with the inner Kind
                             let storage_key = if key == "Kind" {
                                 "ProdKind".to_string()
@@ -1289,11 +1371,49 @@ mod tests {
                 .all(|building| building.anim_frame == 0),
             "the shipped haeuser.cod corpus keeps AnimFrame at its inherited zero phase"
         );
-        assert!(
+        // Superseded expectation: "the shipped haeuser.cod corpus declares no
+        // LagAniFlg definitions" (`all(|b| !b.storage_animation)`). It only
+        // held because `LagAniFlg` is authored inside `Objekt: HAUS_PRODTYP`
+        // and the parser read the key at the top level only. The file does
+        // declare it, on the Steinbruch (`Id: 20513`) and the forester
+        // (`Id: 22001`).
+        assert_eq!(
             cod.buildings
                 .iter()
-                .all(|building| !building.storage_animation),
-            "the shipped haeuser.cod corpus declares no LagAniFlg definitions"
+                .filter(|building| building.storage_animation)
+                .count(),
+            2,
+            "LagAniFlg is authored inside Objekt: HAUS_PRODTYP on two definitions"
+        );
+        // The compiled production scalars live in the same nested object. The
+        // forester authors `Maxlager: 10` / `Interval: 8` / `Rohmenge: 1` and
+        // inherits `Prodmenge: 1` from the `@Nummer: 0` default block.
+        let forester = cod
+            .buildings
+            .iter()
+            .find(|building| building.properties.get("Id").is_some_and(|id| id == "22001"))
+            .expect("forester source definition");
+        assert_eq!(forester.storage_animation_capacity, 320);
+        assert_eq!(forester.source_scheduler_interval, 8);
+        assert_eq!(forester.source_raw_material_amount, 32);
+        assert_eq!(forester.source_production_amount, 32);
+        assert_eq!(forester.source_max_no_raw_material_count, 8);
+        // The iron smelter is the stock two-input producer: `Rohstoff:
+        // EISENERZ` with `Workstoff: HOLZ` and a nested `Workmenge: 1`.
+        let smelter = cod
+            .buildings
+            .iter()
+            .find(|building| building.properties.get("Id").is_some_and(|id| id == "20521"))
+            .expect("iron smelter source definition");
+        assert_eq!(smelter.source_work_material_amount, 32);
+        assert_eq!(smelter.source_raw_resource_ware_slot(), Some(0x02));
+        assert_eq!(smelter.source_work_material_ware_slot(), Some(0x17));
+        assert!(
+            cod.buildings.iter().any(|building| building
+                .source_production_kind_code()
+                .is_some_and(|kind| matches!(kind, 1..=8))
+                && building.source_raw_material_amount != 0),
+            "producers keep the nested Rohmenge the source scheduler divides by"
         );
         let market = cod
             .buildings

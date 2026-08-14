@@ -3,7 +3,7 @@
 //! scenario authors. Self-skips without the data corpus.
 
 use anno_formats::szs::{Island, SzsFile};
-use anno_game::game_commands::{PlaceOutcome, can_place_building, missing_required_fertility};
+use anno_game::game_commands::{PlaceOutcome, can_place_building};
 use anno_sim::building::BuildingDef;
 use anno_sim::data_bridge::{BAUINFRA_LADDER, INFRA_NAMES, SourceCityRecord, SourceCityTable};
 use anno_sim::simulation::Simulation;
@@ -62,18 +62,19 @@ fn def_index(defs: &[BuildingDef], pick: impl Fn(&BuildingDef) -> bool) -> usize
 }
 
 /// First tile on `island` where the non-unlock placement gates
-/// (footprint walkability, required fertility, fishery coastline) all
-/// pass, so the only thing `place_building` can still object to is the
-/// unlock mask.
+/// (footprint walkability, fishery coastline) all pass, so the only
+/// thing `place_building` can still object to is the unlock mask.
+///
+/// Fertility is deliberately not consulted: the original's only
+/// placement refusal is `FUN_0042d530` (`1602_exe.c:33210-33265`),
+/// which reads the player's Bauinfra mask and never touches the
+/// island.
 fn free_tile(
     sim: &Simulation,
     island: &Island,
     def: &BuildingDef,
     skip: &[(i32, i32)],
 ) -> Option<(i32, i32)> {
-    if missing_required_fertility(def, island).is_some() {
-        return None;
-    }
     let map = sim
         .island_maps
         .iter()

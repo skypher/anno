@@ -2927,10 +2927,11 @@ fn source_map_roots_from_scenario(
                 }
             }
 
+            // `FUN_00481450` allocates the live `FUN_0047cbf0` record from the
+            // nested `HAUS_PRODTYP Kind` at definition offset `+0x1c`
+            // (`1602_exe.c:92790-92892`), never from the outer `HAUS Kind`.
             if !include_all_static_kinds
-                && !matches!(definition.source_kind_code(), Some(1..=8 | 30))
-                && !matches!(definition.source_production_kind_code(), Some(7 | 8 | 30))
-                && !static_state.is_some_and(SourceMapCellState::is_type12_plantation_root)
+                && !static_state.is_some_and(SourceMapCellState::allocates_source_scheduler_record)
             {
                 continue;
             }
@@ -3883,13 +3884,15 @@ mod tests {
             buildings: vec![
                 CodBuilding {
                     source_id: base + 1,
-                    kind: "HANDWERK".into(),
+                    kind: "GEBAEUDE".into(),
+                    properties: [("ProdKind".into(), "HANDWERK".into())].into(),
                     size: (1, 1),
                     ..Default::default()
                 },
                 CodBuilding {
                     source_id: base + 2,
-                    kind: "MARKT".into(),
+                    kind: "GEBAEUDE".into(),
+                    properties: [("ProdKind".into(), "MARKT".into())].into(),
                     size: (1, 1),
                     ..Default::default()
                 },
@@ -4243,7 +4246,8 @@ mod tests {
             buildings: vec![
                 CodBuilding {
                     source_id: base + 1,
-                    kind: "HANDWERK".into(),
+                    kind: "GEBAEUDE".into(),
+                    properties: [("ProdKind".into(), "HANDWERK".into())].into(),
                     size: (2, 2),
                     ..Default::default()
                 },
@@ -4319,7 +4323,8 @@ mod tests {
                 },
                 CodBuilding {
                     source_id: base + 2,
-                    kind: "HANDWERK".into(),
+                    kind: "GEBAEUDE".into(),
+                    properties: [("ProdKind".into(), "HANDWERK".into())].into(),
                     size: (1, 1),
                     ..Default::default()
                 },

@@ -32,16 +32,49 @@ fn new_horizons0_instantiates_all_stock_islands() {
         assert_eq!(a.tiles.len(), b.tiles.len());
         assert_eq!(a.fertilities, b.fertilities);
     }
-    // The human's mission needs southern crops reachable: at least one
-    // free island must roll tobacco/spices/cocoa territory.
-    let southern_crops = szs
+
+    // Fertility is authored in each island's `INSEL5[0x5C]` crop mask
+    // and must survive instantiation untouched — `FUN_00469770`
+    // (`1602_exe.c:73780-73810`) preserves `island+0x5c` whenever the
+    // climate byte matches, and never randomises it. These are the
+    // real masks New Horizons0 ships.
+    let authored: Vec<(u8, u32)> = szs
         .islands
         .iter()
-        .filter(|island| island.city.is_none())
-        .flat_map(|island| island.fertilities)
-        .filter(|f| matches!(f, 1 | 2 | 6))
-        .count();
-    assert!(southern_crops > 0, "no southern crops rolled");
+        .map(|island| (island.number, island.crop_flags()))
+        .collect();
+    assert_eq!(
+        authored,
+        vec![
+            (0, 0x55),  // grain, spices, cotton, cocoa (STADT4, owner slot 1)
+            (1, 0x23),  // grain, tobacco, vines (STADT4, owner slot 1)
+            (2, 0x09),  // grain, sugarcane
+            (3, 0x01),  // grain only
+            (4, 0x11),  // grain, cotton
+            (5, 0x03),  // grain, tobacco
+            (6, 0x03),  // grain, tobacco
+            (7, 0x11),  // grain, cotton
+            (8, 0x21),  // grain, vines
+            (9, 0x05),  // grain, spices
+            (10, 0x41), // grain, cocoa
+            (11, 0x01), // grain only
+            (13, 0x01), // grain only
+            (14, 0x01), // grain only
+        ],
+        "New Horizons0's authored crop masks"
+    );
+
+    // The mission needs the southern chains reachable on a free
+    // island: tobacco, spices and cocoa are all authored.
+    use anno_formats::szs::Fertility;
+    for crop in [Fertility::Tobacco, Fertility::Spices, Fertility::Cocoa] {
+        assert!(
+            szs.islands
+                .iter()
+                .any(|island| island.city.is_none() && island.has_fertility(crop)),
+            "no free island carries {crop:?}"
+        );
+    }
 }
 
 #[test]

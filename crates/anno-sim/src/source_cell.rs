@@ -33,6 +33,44 @@ pub enum SourceType8TransferInput {
     WorkMaterial,
 }
 
+/// Which record `FUN_0047d940` credited for one completed delivery.
+///
+/// The executable returns only 0 or 1, and it returns 0 for the kind-7 MARKT
+/// branch even though that branch does advance the selector accumulator (case
+/// 7 falls through into `case 8: return 0`, `1602_exe.c:89771-89778`). This
+/// enum keeps the branch identity instead of that return value, because the
+/// caller has to know which buffer moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceDeliveryOutcome {
+    /// Production kind 8 (`KONTOR`): the record is left unchanged.
+    Rejected,
+    /// Credited to the raw buffer `+0x0a`, consumed by compiled `Rohmenge`.
+    RawMaterial,
+    /// Credited to the work buffer `+0x08`, consumed by compiled `Workmenge`.
+    WorkMaterial,
+    /// Credited to the kind-7 MARKT selector accumulator `+0x10`.
+    MarketAccumulator,
+    /// Production kind 14 keeps its two buffers in the 18-byte `FUN_00478e70`
+    /// record (`+0x0a` for the `Workstoff` match, `+0x0c` otherwise), which
+    /// this state does not model.
+    MapObjectRecord { work_material: bool },
+    /// Production kind 15 (`MILITAR`) credits the ware-indexed weapon store of
+    /// the 48-byte `FUN_004797f0` record at this slot index.
+    MilitaryStore { store_slot: u8 },
+}
+
+impl SourceDeliveryOutcome {
+    /// True when the amount landed in this record rather than in one of the
+    /// other record types the executable keeps for kinds 14 and 15.
+    #[inline]
+    pub const fn credited_here(self) -> bool {
+        matches!(
+            self,
+            Self::RawMaterial | Self::WorkMaterial | Self::MarketAccumulator
+        )
+    }
+}
+
 /// Definition selected by `FUN_0047c830` when a type-12 plantation worker
 /// harvests a raw-resource map cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +257,13 @@ pub struct SourceMapCellState {
     /// `FUN_0047daf0` gives this raw-resource ware to `FUN_0044b7e0`.
     #[serde(default)]
     pub source_raw_resource_ware_slot: u8,
+    /// Compiled `Workstoff` selector at definition offset `+0x23`. This is
+    /// the ware whose deliveries `FUN_0047d940` credits to the work buffer
+    /// `+0x08`; every other ware lands in the raw buffer `+0x0a`
+    /// (`1602_exe.c:89797-89807`). `FUN_0047daf0` likewise requests this
+    /// selector when the work ratio is the scarcer of the two.
+    #[serde(default)]
+    pub source_work_material_ware_slot: u8,
     /// Compiled definition byte `+0xa9` for `ROHSTWACHS` records. The source
     /// uses this associated resource selector instead of their `NOWARE` byte
     /// when evaluating `FUN_0046f920` traversal and `FUN_004684a0` regrowth.
@@ -321,15 +366,32 @@ impl SourceMapCellState {
     }
 
     /// Construct the source roots that own scheduler or transfer dispatch.
-    /// Besides the outer selector kinds retained by `FUN_00481fc0`, this
-    /// includes nested production-kind-2 plantations, whose worker event is
-    /// allocated through `FUN_0044b7e0` from the source command root.
     pub fn new(island: u8, x: u8, y: u8, definition: &BuildingDef, phase: u8) -> Option<Self> {
         let state = Self::new_static(island, x, y, definition, phase)?;
-        (matches!(state.kind_code, 1..=8 | 30)
-            || state.is_type11_transfer_root()
-            || state.is_type12_plantation_root())
-        .then_some(state)
+        state.allocates_source_scheduler_record().then_some(state)
+    }
+
+    /// `FUN_00481450` decides which placed tile receives a live 20-byte
+    /// `FUN_0047cbf0` record. It switches on the **nested** `HAUS_PRODTYP
+    /// Kind` at definition offset `+0x1c` (`1602_exe.c:92790-92892`), not on
+    /// the outer `HAUS Kind` at `+0x04`: cases 1 through 8 are HANDWERK,
+    /// PLANTAGE, BERGWERK, WEIDETIER, JAGDHAUS, FISCHEREI, MARKT and KONTOR,
+    /// and case `0x1e` follows the same allocation. Production kind 10 goes to
+    /// `FUN_00481f50`, 13 to `FUN_00479f70`, 14 to `FUN_00478c70`, and 15 to
+    /// `FUN_00481d50`, each of which keeps a different record type.
+    ///
+    /// Every stock production building in haeuser.cod carries outer
+    /// `Kind: GEBAEUDE` (code 14) or another terrain-shaped label such as
+    /// `HQ` or `STRANDHAUS`, so testing the outer kind here admitted roads,
+    /// walls and towers while excluding every real producer.
+    ///
+    /// `FUN_00481450` cases `0x11..=0x1b` — the WIRT/KAPELLE/KIRCHE/BADEHAUS/
+    /// THEATER/KLINIK/SCHULE/HOCHSCHULE/GALGEN/BRUNNEN/SCHLOSS service
+    /// buildings — also allocate a record; they are not admitted here because
+    /// no part of this port schedules them yet.
+    #[inline]
+    pub const fn allocates_source_scheduler_record(self) -> bool {
+        matches!(self.source_production_kind_code, 1..=8 | 30)
     }
 
     /// Construct terminal metadata for any compiled static map root. Unlike
@@ -343,18 +405,10 @@ impl SourceMapCellState {
         phase: u8,
     ) -> Option<Self> {
         let kind_code = definition.source_kind_code()?;
-        let source_production_kind_code =
-            definition
-                .source_production_kind_code()
-                .unwrap_or(match definition.kind.as_str() {
-                    // Unit fixtures and hand-built fallback roots may use the
-                    // production label as the outer kind. Authored city roots
-                    // carry the nested `ProdKind` above; unrelated outer kinds,
-                    // including PIER, retain the compiled default zero.
-                    "MARKT" => 7,
-                    "KONTOR" => 8,
-                    _ => 0,
-                });
+        // Compiled definition offset `+0x1c`. `ObjFill: 0,MAXHAUS` pre-fills
+        // every slot from a `@Nummer: 0` block whose `HAUS_PRODTYP Kind` is
+        // `UNUSED`, so an absent nested kind compiles to zero.
+        let source_production_kind_code = definition.source_production_kind_code().unwrap_or(0);
         Some(Self {
             island,
             x,
@@ -398,6 +452,9 @@ impl SourceMapCellState {
             source_output_ware_slot: definition.source_ware_slot().unwrap_or_default(),
             source_raw_resource_ware_slot: definition
                 .source_raw_resource_ware_slot()
+                .unwrap_or_default(),
+            source_work_material_ware_slot: definition
+                .source_work_material_ware_slot()
                 .unwrap_or_default(),
             source_growth_resource_ware_slot: 0,
             source_resource_is_dry: definition
@@ -842,34 +899,69 @@ impl SourceMapCellState {
             / i32::from(self.storage_animation_capacity)
     }
 
-    /// Apply the kind-7 branch of `FUN_0047d940`: a completed transfer to a
-    /// MARKT command root advances its selector accumulator by the accepted
-    /// source-unit amount.
-    pub fn accept_market_transfer(&mut self, amount: u16) -> bool {
-        if self.source_production_kind_code != 7 || amount == 0 {
-            return false;
-        }
-        self.progress = self.progress.wrapping_add(amount);
-        true
-    }
-
-    /// Replay the ordinary-source zero-amount completion in `FUN_0047d940`.
-    /// The function first adds the delivered amount to an input buffer (a
-    /// no-op here), then clears an idle root's cooldown after subtracting it
-    /// from source u16 `+0x12`. The executable switches on compiled nested
-    /// production kind `+0x1c`, so kinds 7, 8, 14, and 15 take distinct
-    /// source-record branches and leave this record unchanged.
-    pub fn complete_zero_amount_source_delivery(&mut self) -> bool {
+    /// Replay `FUN_0047d940` (`1602_exe.c:89760-89845`) for one delivery of
+    /// `amount` source units of `ware_slot` arriving at this command root.
+    /// `amount` is in the source 1/32-good fixed point: a type-12 plantation
+    /// worker carries exactly `0x20`, the value `FUN_00471c50` returns from a
+    /// successful target search and `FUN_0045b200` stores at figure `+0x28`
+    /// (`1602_exe.c:62988-62990`, `:80682`).
+    ///
+    /// The executable switches on the compiled nested production kind at
+    /// definition offset `+0x1c`:
+    ///
+    /// * `default` (`:89776-89790`) credits the work buffer `+0x08` when the
+    ///   delivered ware equals the definition's `Workstoff` byte `+0x23` and
+    ///   the raw buffer `+0x0a` otherwise, then clears an idle root's
+    ///   cooldown after subtracting it from the production timer `+0x12`.
+    /// * case 7 (`:89771-89775`) advances a MARKT root's selector
+    ///   accumulator `+0x10` and falls through to case 8.
+    /// * case 8 (`:89776`) returns 0 without touching the record.
+    /// * case `0xe` (`:89791-89800`) and case `0xf` (`:89801-89814`) credit
+    ///   the `FUN_00478e70` and `FUN_004797f0` records instead. Those are
+    ///   different record types which this 20-byte `FUN_0047cbf0` state does
+    ///   not model, and [`Self::allocates_source_scheduler_record`] never
+    ///   builds a live root for either kind, so the two branches are reported
+    ///   rather than applied.
+    pub fn complete_source_delivery(
+        &mut self,
+        ware_slot: u8,
+        amount: u16,
+    ) -> SourceDeliveryOutcome {
         match self.source_production_kind_code {
-            7 | 8 | 14 | 15 => false,
+            7 => {
+                self.progress = self.progress.wrapping_add(amount);
+                SourceDeliveryOutcome::MarketAccumulator
+            }
+            8 => SourceDeliveryOutcome::Rejected,
+            14 => SourceDeliveryOutcome::MapObjectRecord {
+                work_material: ware_slot == self.source_work_material_ware_slot,
+            },
+            // `psVar1 = (short *)(iVar2 + -0x10 + param_4 * 2)`. The record
+            // pointer returned by `FUN_004797f0` sits `0x10` bytes above the
+            // store array, so the slot index is `ware - 0x0b`: the barracks
+            // hold SCHWERTER, MUSKETEN and KANONEN, which `1602_exe.c:90216`
+            // reads back as `*(ushort *)(rec + 6 + (ware - 0xb) * 2)`.
+            15 => SourceDeliveryOutcome::MilitaryStore {
+                store_slot: ware_slot.wrapping_sub(0x0b),
+            },
             _ => {
+                let work_material = ware_slot == self.source_work_material_ware_slot;
+                if work_material {
+                    self.work_material_stock = self.work_material_stock.wrapping_add(amount);
+                } else {
+                    self.raw_material_stock = self.raw_material_stock.wrapping_add(amount);
+                }
                 if self.activity == 0 {
                     self.source_production_time = self
                         .source_production_time
                         .wrapping_sub(self.scheduler_cooldown);
                     self.scheduler_cooldown = 0;
                 }
-                true
+                if work_material {
+                    SourceDeliveryOutcome::WorkMaterial
+                } else {
+                    SourceDeliveryOutcome::RawMaterial
+                }
             }
         }
     }
@@ -987,14 +1079,27 @@ pub fn source_kind6_map_hit_strength(raw_strength: u16) -> u16 {
 mod tests {
     use super::*;
 
-    fn definition() -> BuildingDef {
+    /// Shaped like every real producer in haeuser.cod: the outer `HAUS Kind`
+    /// is `GEBAEUDE` and the production label lives in the nested
+    /// `HAUS_PRODTYP Kind`, which the parser exposes as `ProdKind`. Putting a
+    /// production label in the outer kind, as these fixtures used to, is a
+    /// shape the shipped data never has.
+    fn production_definition(prod_kind: &str) -> BuildingDef {
         BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
             anim_anz: 4,
             anim_frame: 3,
-            properties: [("Ware".into(), "WERKZEUG".into())].into(),
+            properties: [
+                ("ProdKind".into(), prod_kind.into()),
+                ("Ware".into(), "WERKZEUG".into()),
+            ]
+            .into(),
             ..Default::default()
         }
+    }
+
+    fn definition() -> BuildingDef {
+        production_definition("HANDWERK")
     }
 
     #[test]
@@ -1043,31 +1148,218 @@ mod tests {
         assert_eq!(state.activity, 0);
     }
 
+    /// The ordinary branch of `FUN_0047d940` (`1602_exe.c:89776-89790`) both
+    /// credits a buffer and clears an idle root's cooldown. The superseded
+    /// `complete_zero_amount_source_delivery` only ever ran the cooldown tail,
+    /// so its expectation was `scheduler_cooldown == 0 && production_time ==
+    /// 37` with both stock buffers left at 0; the amount is now credited too.
     #[test]
-    fn zero_amount_delivery_updates_only_the_ordinary_source_record_branch() {
+    fn ordinary_delivery_credits_a_buffer_and_clears_the_idle_cooldown() {
         let mut ordinary = SourceMapCellState::new(0, 0, 0, &definition(), 0).unwrap();
         ordinary.scheduler_cooldown = 11;
         ordinary.source_production_time = 48;
-        assert!(ordinary.complete_zero_amount_source_delivery());
+        assert_eq!(
+            ordinary.complete_source_delivery(0x35, 0x20),
+            SourceDeliveryOutcome::RawMaterial
+        );
+        assert_eq!(ordinary.raw_material_stock, 0x20);
+        assert_eq!(ordinary.work_material_stock, 0);
         assert_eq!(ordinary.scheduler_cooldown, 0);
         assert_eq!(ordinary.source_production_time, 37);
+    }
 
-        let mut special = SourceMapCellState::new(
+    /// `if (*(byte *)(iVar2 + 0x23) == param_4)` selects the work buffer
+    /// `+0x08`; every other ware falls to the raw buffer `+0x0a`
+    /// (`1602_exe.c:89781-89787`). The iron smelter is the stock example:
+    /// `Rohstoff: EISENERZ` with `Workstoff: HOLZ`.
+    #[test]
+    fn delivery_picks_the_buffer_by_the_definition_workstoff_byte() {
+        let mut smelter = SourceMapCellState::new(
             0,
             0,
             0,
             &BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [
+                    ("ProdKind".into(), "HANDWERK".into()),
+                    ("Ware".into(), "EISEN".into()),
+                    ("Rohstoff".into(), "EISENERZ".into()),
+                    ("Workstoff".into(), "HOLZ".into()),
+                ]
+                .into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
-        special.scheduler_cooldown = 11;
-        special.source_production_time = 48;
-        assert!(!special.complete_zero_amount_source_delivery());
-        assert_eq!(special.scheduler_cooldown, 11);
-        assert_eq!(special.source_production_time, 48);
+        assert_eq!(smelter.source_work_material_ware_slot, 0x17);
+        assert_eq!(smelter.source_raw_resource_ware_slot, 0x02);
+
+        // HOLZ matches `Workstoff` -> work buffer `+0x08`.
+        assert_eq!(
+            smelter.complete_source_delivery(0x17, 0x20),
+            SourceDeliveryOutcome::WorkMaterial
+        );
+        assert_eq!(smelter.work_material_stock, 0x20);
+        assert_eq!(smelter.raw_material_stock, 0);
+
+        // EISENERZ does not -> raw buffer `+0x0a`.
+        assert_eq!(
+            smelter.complete_source_delivery(0x02, 0x40),
+            SourceDeliveryOutcome::RawMaterial
+        );
+        assert_eq!(smelter.work_material_stock, 0x20);
+        assert_eq!(smelter.raw_material_stock, 0x40);
+    }
+
+    /// A busy root (`+0x0e != 0`) jumps straight to the dirty-flag tail and
+    /// keeps its cooldown (`goto LAB_0047da94`, `1602_exe.c:89788`).
+    #[test]
+    fn busy_root_keeps_its_cooldown_but_still_takes_the_delivery() {
+        let mut busy = SourceMapCellState::new(0, 0, 0, &definition(), 0).unwrap();
+        busy.activity = 96;
+        busy.scheduler_cooldown = 11;
+        busy.source_production_time = 48;
+        assert_eq!(
+            busy.complete_source_delivery(0x35, 0x20),
+            SourceDeliveryOutcome::RawMaterial
+        );
+        assert_eq!(busy.raw_material_stock, 0x20);
+        assert_eq!(busy.scheduler_cooldown, 11);
+        assert_eq!(busy.source_production_time, 48);
+    }
+
+    /// Case 8 (`KONTOR`) returns 0 with the record untouched, and case 7
+    /// (`MARKT`) advances only the selector accumulator `+0x10` before falling
+    /// through into it (`1602_exe.c:89771-89778`).
+    #[test]
+    fn market_and_kontor_take_the_dedicated_branches() {
+        let mut market =
+            SourceMapCellState::new(0, 0, 0, &production_definition("MARKT"), 0).unwrap();
+        market.scheduler_cooldown = 11;
+        market.source_production_time = 48;
+        assert_eq!(
+            market.complete_source_delivery(0x17, 0x20),
+            SourceDeliveryOutcome::MarketAccumulator
+        );
+        assert_eq!(market.progress, 0x20);
+        assert_eq!(market.raw_material_stock, 0);
+        assert_eq!(market.work_material_stock, 0);
+        assert_eq!(market.scheduler_cooldown, 11);
+        assert_eq!(market.source_production_time, 48);
+
+        let mut kontor =
+            SourceMapCellState::new(0, 0, 0, &production_definition("KONTOR"), 0).unwrap();
+        kontor.scheduler_cooldown = 11;
+        kontor.source_production_time = 48;
+        assert_eq!(
+            kontor.complete_source_delivery(0x17, 0x20),
+            SourceDeliveryOutcome::Rejected
+        );
+        assert!(!kontor.complete_source_delivery(0x17, 0x20).credited_here());
+        assert_eq!(kontor.progress, 0);
+        assert_eq!(kontor.raw_material_stock, 0);
+        assert_eq!(kontor.work_material_stock, 0);
+        assert_eq!(kontor.scheduler_cooldown, 11);
+        assert_eq!(kontor.source_production_time, 48);
+    }
+
+    /// Cases `0xe` and `0xf` credit records this 20-byte state does not hold.
+    /// The kind-15 store index follows `iVar2 + -0x10 + param_4 * 2`, which
+    /// `1602_exe.c:90216` reads back as `rec + 6 + (ware - 0x0b) * 2`: the
+    /// barracks hold SCHWERTER (`0x0b`), MUSKETEN (`0x0c`) and KANONEN
+    /// (`0x0d`) in slots 0, 1 and 2.
+    #[test]
+    fn map_object_and_military_kinds_report_their_own_record() {
+        let military = BuildingDef {
+            kind: "GEBAEUDE".into(),
+            properties: [
+                ("ProdKind".into(), "MILITAR".into()),
+                ("Ware".into(), "NOWARE".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        // `FUN_00481450` case 0xf routes production kind 15 to
+        // `FUN_00481d50`, never to a `FUN_0047cbf0` record, so no live root
+        // exists for it; only the static view retains the state.
+        assert!(SourceMapCellState::new(0, 0, 0, &military, 0).is_none());
+        let mut state = SourceMapCellState::new_static(0, 0, 0, &military, 0).unwrap();
+        assert_eq!(state.source_production_kind_code, 15);
+        assert_eq!(
+            state.complete_source_delivery(0x0c, 0x20),
+            SourceDeliveryOutcome::MilitaryStore { store_slot: 1 }
+        );
+        assert!(!state.complete_source_delivery(0x0c, 0x20).credited_here());
+        assert_eq!(state.raw_material_stock, 0);
+        assert_eq!(state.work_material_stock, 0);
+        assert_eq!(state.progress, 0);
+
+        let mut kind14 = SourceMapCellState::new_static(
+            0,
+            0,
+            0,
+            &BuildingDef {
+                kind: "GEBAEUDE".into(),
+                properties: [
+                    ("ProdKind".into(), "GEBAEUDE".into()),
+                    ("Workstoff".into(), "HOLZ".into()),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(kind14.source_production_kind_code, 14);
+        assert_eq!(
+            kind14.complete_source_delivery(0x17, 0x20),
+            SourceDeliveryOutcome::MapObjectRecord {
+                work_material: true
+            }
+        );
+        assert_eq!(
+            kind14.complete_source_delivery(0x02, 0x20),
+            SourceDeliveryOutcome::MapObjectRecord {
+                work_material: false
+            }
+        );
+        assert_eq!(kind14.raw_material_stock, 0);
+        assert_eq!(kind14.work_material_stock, 0);
+    }
+
+    /// One harvested tile is `0x20`, which drives the scheduler straight to
+    /// full activity for a `Rohmenge: 1` root and yields exactly one whole
+    /// good of output.
+    #[test]
+    fn one_harvest_unit_produces_one_whole_good_at_the_forester() {
+        let forester = BuildingDef {
+            kind: "GEBAEUDE".into(),
+            source_production_amount: 32,
+            source_raw_material_amount: 32,
+            storage_animation_capacity: 320,
+            properties: [
+                ("ProdKind".into(), "PLANTAGE".into()),
+                ("Ware".into(), "HOLZ".into()),
+                ("Rohstoff".into(), "BAUM".into()),
+                ("Figurnr".into(), "HOLZFAELLER".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mut root = SourceMapCellState::new(0, 0, 0, &forester, 0).unwrap();
+        assert_eq!(root.source_scheduler_activity(), 0);
+        assert_eq!(
+            root.complete_source_delivery(0x35, 0x20),
+            SourceDeliveryOutcome::RawMaterial
+        );
+        assert_eq!(root.raw_material_stock, 0x20);
+        assert_eq!(root.source_scheduler_activity(), 128);
+        root.advance_source_scheduler();
+        assert_eq!(root.activity, 128);
+        root.advance_source_scheduler();
+        assert_eq!(root.raw_material_stock, 0);
+        assert_eq!(root.storage_fill, 32);
     }
 
     #[test]
@@ -1077,7 +1369,8 @@ mod tests {
             2,
             3,
             &BuildingDef {
-                kind: "HANDWERK".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "HANDWERK".into())].into(),
                 storage_animation_capacity: 128,
                 source_max_no_raw_material_count: 9,
                 ..Default::default()
@@ -1117,7 +1410,7 @@ mod tests {
             2,
             3,
             &BuildingDef {
-                kind: "HANDWERK".into(),
+                kind: "GEBAEUDE".into(),
                 storage_animation_capacity: 64,
                 properties: [("ProdKind".into(), "HANDWERK".into())].into(),
                 ..Default::default()
@@ -1139,7 +1432,7 @@ mod tests {
     #[test]
     fn type8_transfer_selector_admits_raw_at_the_inclusive_two_batch_boundary() {
         let definition = BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
             storage_animation_capacity: 320,
             source_raw_material_amount: 64,
             properties: [
@@ -1163,7 +1456,7 @@ mod tests {
     #[test]
     fn type8_transfer_selector_uses_the_lower_eligible_fixed_point_input_ratio() {
         let definition = BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
             storage_animation_capacity: 320,
             source_raw_material_amount: 64,
             source_work_material_amount: 64,
@@ -1195,7 +1488,8 @@ mod tests {
     #[test]
     fn source_root_retains_compiled_figuranz_for_type11_admission() {
         let definition = BuildingDef {
-            kind: "MARKT".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "MARKT".into())].into(),
             source_transfer_figure_limit: 2,
             source_operating_costs: (0, 0),
             source_transfer_radius: 16,
@@ -1226,8 +1520,12 @@ mod tests {
     #[test]
     fn source_root_retains_compiled_figurnr_for_type11_figure_selection() {
         let definition = BuildingDef {
-            kind: "KONTOR".into(),
-            properties: [("Figurnr".into(), "TRAEGER2".into())].into(),
+            kind: "GEBAEUDE".into(),
+            properties: [
+                ("ProdKind".into(), "KONTOR".into()),
+                ("Figurnr".into(), "TRAEGER2".into()),
+            ]
+            .into(),
             ..Default::default()
         };
 
@@ -1261,7 +1559,8 @@ mod tests {
     #[test]
     fn definition_indices_follow_fun_00463b10_oriented_write_order() {
         let definition = BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             gfx: 100,
             size: (2, 3),
             ..Default::default()
@@ -1294,7 +1593,8 @@ mod tests {
     #[test]
     fn retains_the_compiled_category_six_damage_threshold() {
         let definition = BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             source_damage_threshold: 1_600,
             ..Default::default()
         };
@@ -1310,7 +1610,8 @@ mod tests {
     #[test]
     fn category_six_map_hits_use_scaled_strength_and_reset_after_threshold() {
         let definition = BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             source_damage_threshold: 4,
             ..Default::default()
         };
@@ -1326,7 +1627,8 @@ mod tests {
     #[test]
     fn terminal_replacement_draw_count_follows_source_footprint_branch() {
         let definition = BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             size: (2, 3),
             ruinenr: 4,
             ..Default::default()
@@ -1365,7 +1667,8 @@ mod tests {
                 0,
                 0,
                 &BuildingDef {
-                    kind: "MARKT".into(),
+                    kind: "GEBAEUDE".into(),
+                    properties: [("ProdKind".into(), "MARKT".into())].into(),
                     ..Default::default()
                 },
                 0,
@@ -1384,7 +1687,8 @@ mod tests {
                 3,
                 5,
                 &BuildingDef {
-                    kind: "HANDWERK".into(),
+                    kind: "GEBAEUDE".into(),
+                    properties: [("ProdKind".into(), "HANDWERK".into())].into(),
                     storage_animation_capacity: 320,
                     ..Default::default()
                 },
@@ -1411,7 +1715,8 @@ mod tests {
                 3,
                 5,
                 &BuildingDef {
-                    kind: "HANDWERK".into(),
+                    kind: "GEBAEUDE".into(),
+                    properties: [("ProdKind".into(), "HANDWERK".into())].into(),
                     storage_animation_capacity: 320,
                     ..Default::default()
                 },
@@ -1434,7 +1739,8 @@ mod tests {
                 3,
                 5,
                 &BuildingDef {
-                    kind: "HANDWERK".into(),
+                    kind: "GEBAEUDE".into(),
+                    properties: [("ProdKind".into(), "HANDWERK".into())].into(),
                     storage_animation_capacity: 320,
                     ..Default::default()
                 },
@@ -1453,7 +1759,8 @@ mod tests {
             0,
             0,
             &BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 ..Default::default()
             },
             0,
@@ -1464,23 +1771,36 @@ mod tests {
             1,
             0,
             &BuildingDef {
-                kind: "HANDWERK".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "HANDWERK".into())].into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
 
-        assert!(market.accept_market_transfer(32));
+        // Superseded expectation: `accept_market_transfer` returned true for
+        // the MARKT root and false for the workshop, leaving the workshop
+        // untouched. `FUN_0047d940` does not silently drop the workshop's
+        // amount; it credits the raw buffer instead.
+        assert_eq!(
+            market.complete_source_delivery(0x16, 32),
+            SourceDeliveryOutcome::MarketAccumulator
+        );
         assert_eq!(market.progress, 32);
-        assert!(!workshop.accept_market_transfer(32));
+        assert_eq!(
+            workshop.complete_source_delivery(0x16, 32),
+            SourceDeliveryOutcome::RawMaterial
+        );
         assert_eq!(workshop.progress, 0);
+        assert_eq!(workshop.raw_material_stock, 32);
     }
 
     #[test]
     fn storage_fill_uses_source_maxlager_scale_and_rounding() {
         let definition = BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             storage_animation: true,
             storage_animation_capacity: 160,
             ..Default::default()
@@ -1495,12 +1815,16 @@ mod tests {
     #[test]
     fn scheduler_uses_source_fixed_point_stock_and_progress_updates() {
         let definition = BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
             storage_animation_capacity: 320,
             source_production_amount: 32,
             source_raw_material_amount: 64,
             source_work_material_amount: 32,
-            properties: [("Ware".into(), "WERKZEUG".into())].into(),
+            properties: [
+                ("ProdKind".into(), "HANDWERK".into()),
+                ("Ware".into(), "WERKZEUG".into()),
+            ]
+            .into(),
             ..Default::default()
         };
         let mut state = SourceMapCellState {
@@ -1530,7 +1854,8 @@ mod tests {
     #[test]
     fn scheduler_requires_a_nonzero_compiled_ware_selector() {
         let inactive_definition = BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             source_raw_material_amount: 64,
             ..Default::default()
         };
@@ -1542,7 +1867,11 @@ mod tests {
         assert_eq!(inactive.source_scheduler_activity(), 0);
 
         let zero_capacity_definition = BuildingDef {
-            properties: [("Ware".into(), "WERKZEUG".into())].into(),
+            properties: [
+                ("ProdKind".into(), "HANDWERK".into()),
+                ("Ware".into(), "WERKZEUG".into()),
+            ]
+            .into(),
             ..inactive_definition
         };
         let mut zero_capacity = SourceMapCellState {
@@ -1710,7 +2039,8 @@ mod tests {
     #[test]
     fn scheduler_idles_below_source_half_activity_threshold() {
         let definition = BuildingDef {
-            kind: "HANDWERK".into(),
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "HANDWERK".into())].into(),
             source_production_amount: 32,
             source_raw_material_amount: 64,
             ..Default::default()

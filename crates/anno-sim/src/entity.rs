@@ -162,8 +162,11 @@ pub struct Figure {
     pub target_x: i32,
     pub target_y: i32,
 
-    /// Source command-root kind selected as an in-flight carrier's supplier.
-    /// `0` means this figure has no source-routed supplier.
+    /// Nested `HAUS_PRODTYP Kind` (definition offset `+0x1c`) of the source
+    /// command root selected as an in-flight carrier's supplier. `0` means
+    /// this figure has no source-routed supplier. `FUN_0047d810` uses the
+    /// same selector to choose between the owner's city store (kinds 7, 8 and
+    /// `0x1e`) and the root's own `+0x0c` storage (`1602_exe.c:89700-89703`).
     #[serde(default)]
     pub destination_kind: u8,
 

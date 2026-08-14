@@ -16,19 +16,41 @@ use anno_sim::warehouse::Warehouse;
 
 /// Instantiate stock islands for `INSEL5`-only records: scenario islands
 /// that ship without inline tiles load a library island at scenario start.
-/// The original formats `<base><climate><size><NN>.SCP` (`FUN_00469690`;
-/// climate dirs `Nord\`/`Sued\` by map half, size prefixes by family) and
-/// loads its INSELHAUS (`FUN_00469770`), picking a random file each
-/// playthrough. This port picks **deterministically** from `seed` and the
-/// island number so scripted playthroughs replay identically, and rolls
-/// the all-sentinel fertility slots with climate-appropriate crops (the
-/// original also randomizes these at instantiation; its exact
-/// distribution is not yet recovered).
+/// The original formats `<base><climate><size><NN>.SCP` (`FUN_00469690`,
+/// `1602_exe.c:73731`; climate dirs `Nord\`/`Sued\` by map half, size
+/// prefixes by family) and loads its INSELHAUS (`FUN_00469770`,
+/// `1602_exe.c:73766`), picking a random file each playthrough. This port
+/// picks **deterministically** from `seed` and the island number so
+/// scripted playthroughs replay identically.
 ///
-/// `map_height` bounds the north/south split; the shipping maps are
+/// Fertility is *not* touched here, and the original does not roll it
+/// either. `FUN_00469770` only ever preserves or resets the crop mask:
+///
+/// ```text
+/// if (*(byte *)(param_1 + 7) == param_2) { local_210 = param_1[0x17]; }  // keep island+0x5c
+/// else                                    { local_210 = 0x1181; }        // bare baseline
+/// ...
+/// param_1[0x17] = local_210;                                             // island+0x5c
+/// ```
+///
+/// (`1602_exe.c:73780-73788`, `:73810`). `param_2` is the climate index
+/// that also picks the `Nord\`/`Sued\` directory, and it is stored at
+/// runtime `island+0x1c` — the same byte the scenario authors at
+/// `INSEL5[0x64]`. Since a scenario's climate byte always matches the map
+/// half its island sits in, the authored crop mask survives instantiation
+/// verbatim. The one place the executable synthesises a mask is the
+/// editor's "drop a random island" path, which writes the bare baseline
+/// (`island+0x5c = 0x1181`, `1602_exe.c:44273`) and no crops at all.
+///
+/// Every shipping scenario authors real crop masks in its INSEL5 records
+/// (New Horizons0 spreads sugarcane, cotton, tobacco, vines, spices and
+/// cocoa across its twelve free islands), so there is nothing to
+/// synthesise: `SzsFile::parse` already decodes them into
+/// `Island::fertilities`.
+///
+/// `MAP_HEIGHT` bounds the north/south split; the shipping maps are
 /// 500×350 world tiles.
 pub fn instantiate_stock_islands(szs: &mut SzsFile, data_dir: &std::path::Path, seed: u32) {
-    use anno_formats::szs::Fertility;
     const MAP_HEIGHT: u16 = 350;
     for island in &mut szs.islands {
         if !island.tiles.is_empty() {
@@ -80,26 +102,6 @@ pub fn instantiate_stock_islands(szs: &mut SzsFile, data_dir: &std::path::Path, 
             continue;
         };
         island.tiles = tiles;
-        // Roll the sentinel fertility slots with climate-appropriate
-        // crops so the mission economy is playable; two crops per
-        // island, seeded like the file pick.
-        if island.fertilities.iter().all(|&f| f == 7) {
-            let pool: &[u8] = if southern {
-                &[
-                    Fertility::Tobacco as u8,
-                    Fertility::Spices as u8,
-                    Fertility::Sugarcane as u8,
-                    Fertility::Cotton as u8,
-                    Fertility::Cocoa as u8,
-                ]
-            } else {
-                &[Fertility::Grain as u8, Fertility::Vines as u8]
-            };
-            let first = pool[pick % pool.len()];
-            let second = pool[(pick + 1 + seed as usize) % pool.len()];
-            island.fertilities[0] = first;
-            island.fertilities[1] = second;
-        }
     }
 }
 

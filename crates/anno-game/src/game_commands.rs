@@ -12,7 +12,6 @@ use anno_formats::cod::CodFile;
 use anno_formats::szs::Island;
 use anno_sim::building::{BuildingDef, BuildingInstance};
 use anno_sim::commands::Command;
-use anno_sim::data_bridge;
 use anno_sim::island_map::IslandMap;
 use anno_sim::simulation::Simulation;
 use anno_sim::types::Good;
@@ -26,9 +25,6 @@ pub enum PlaceOutcome {
         have: i32,
     },
     BlockedByTerrain,
-    MissingFertility {
-        required: anno_formats::szs::Fertility,
-    },
     NotCoastal,
     NoIslandMap,
     NoBuildingSelected,
@@ -70,19 +66,26 @@ pub fn can_place_building(
     true
 }
 
-pub fn missing_required_fertility(
-    def: &BuildingDef,
-    island: &Island,
-) -> Option<anno_formats::szs::Fertility> {
-    let required = def.required_fertility?;
-    (!data_bridge::island_can_host_building(def, island)).then_some(required)
-}
-
 /// Attempt to place building definition `def_index` at `(tile_x, tile_y)`
 /// on `current_island` for `owner`. Mirrors the original click-place flow:
-/// fertility gate, fishery coast gate, walkability, gold cost, materials
-/// trickle. Side-effecting helper used by the game's click handler, its
-/// drag-place loop, and command replay.
+/// fishery coast gate, walkability, gold cost, Bauinfra unlock mask,
+/// materials trickle. Side-effecting helper used by the game's click
+/// handler, its drag-place loop, and command replay.
+///
+/// Note that fertility is deliberately **not** a placement gate. The
+/// original's only refusal is the Bauinfra unlock test `FUN_0042d530`
+/// (`1602_exe.c:33210-33265`), which reads the player record and never
+/// touches the island. Fertility instead feeds the placement-time
+/// grow-vs-wither roll in the build applier (`1602_exe.c:7754-7760`):
+///
+/// ```text
+/// if ((piVar4[7] == 10) && (FUN_004684a0(map, def+0xa9, x, y) == 0)) piVar4 = piVar4 + 0x44;
+/// ```
+///
+/// `int*` `+0x44` is `+0x110` bytes, i.e. two definition records on — the
+/// withered "DOERR" variant. So placing a cocoa plantation on a
+/// cocoa-free island succeeds; the crop simply never thrives. Modelling
+/// that variant swap is still outstanding.
 #[allow(clippy::too_many_arguments)]
 pub fn place_building(
     sim: &mut Simulation,
@@ -110,11 +113,6 @@ pub fn place_building(
         .island_maps
         .iter()
         .position(|m| m.island_id == island_number);
-
-    let isl = &islands[current_island];
-    if let Some(required) = missing_required_fertility(def, isl) {
-        return PlaceOutcome::MissingFertility { required };
-    }
 
     // Fishery coast gate.
     if def.output_good == Good::Fish {

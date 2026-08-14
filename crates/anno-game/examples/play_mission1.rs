@@ -22,9 +22,17 @@ fn main() {
     sim.seed_source_rand(1);
 
     // --- Stage 1a: sail to island 10 and found ---
-    let ship = sim.trade_ships.iter().position(|s| s.name == "Verena").unwrap() as u32;
+    let ship = sim
+        .trade_ships
+        .iter()
+        .position(|s| s.name == "Verena")
+        .unwrap() as u32;
     let island = szs.islands.iter().find(|i| i.number == 10).unwrap().clone();
-    let mi = sim.island_maps.iter().position(|m| m.island_id == 10).unwrap();
+    let mi = sim
+        .island_maps
+        .iter()
+        .position(|m| m.island_id == 10)
+        .unwrap();
     // Prefer a west-coast anchor with land around it (skip the corner).
     let anchor = (2..island.height as i32 - 2)
         .flat_map(|y| (2..island.width as i32 - 2).map(move |x| (x, y)))
@@ -68,27 +76,35 @@ fn main() {
     assert!(ok);
 
     // --- Stage 1b: place market, chapel, huts on free land ---
-    let find_spot = |sim: &anno_sim::simulation::Simulation, w: u8, h: u8, used: &[(i32, i32, u8, u8)]| {
-        let map = &sim.island_maps[mi];
-        // Stay inside the Kontor/market service radius (16) so houses
-        // keep coverage: order candidates by distance from the anchor.
-        let mut candidates: Vec<(i32, i32)> = (2..island.height as i32 - i32::from(h) - 2)
-            .flat_map(|y| (2..island.width as i32 - i32::from(w) - 2).map(move |x| (x, y)))
-            .collect();
-        candidates.sort_by_key(|&(x, y)| (x - anchor.0).abs() + (y - anchor.1).abs());
-        candidates
-            .into_iter()
-            .find(|&(x, y)| {
-                (0..i32::from(h)).all(|dy| (0..i32::from(w)).all(|dx| map.is_walkable(x + dx, y + dy)))
+    let find_spot =
+        |sim: &anno_sim::simulation::Simulation, w: u8, h: u8, used: &[(i32, i32, u8, u8)]| {
+            let map = &sim.island_maps[mi];
+            // Stay inside the Kontor/market service radius (16) so houses
+            // keep coverage: order candidates by distance from the anchor.
+            let mut candidates: Vec<(i32, i32)> = (2..island.height as i32 - i32::from(h) - 2)
+                .flat_map(|y| (2..island.width as i32 - i32::from(w) - 2).map(move |x| (x, y)))
+                .collect();
+            candidates.sort_by_key(|&(x, y)| (x - anchor.0).abs() + (y - anchor.1).abs());
+            candidates.into_iter().find(|&(x, y)| {
+                (0..i32::from(h))
+                    .all(|dy| (0..i32::from(w)).all(|dx| map.is_walkable(x + dx, y + dy)))
                     && !used.iter().any(|&(ux, uy, uw, uh)| {
-                        x < ux + i32::from(uw) && ux < x + i32::from(w)
-                            && y < uy + i32::from(uh) && uy < y + i32::from(h)
+                        x < ux + i32::from(uw)
+                            && ux < x + i32::from(w)
+                            && y < uy + i32::from(uh)
+                            && uy < y + i32::from(h)
                     })
             })
-    };
+        };
     let mut used: Vec<(i32, i32, u8, u8)> = Vec::new();
-    let build = |sim: &mut anno_sim::simulation::Simulation, used: &mut Vec<(i32, i32, u8, u8)>, def_index: u16, label: &str| {
-        let (w, h) = (defs[def_index as usize].width, defs[def_index as usize].height);
+    let build = |sim: &mut anno_sim::simulation::Simulation,
+                 used: &mut Vec<(i32, i32, u8, u8)>,
+                 def_index: u16,
+                 label: &str| {
+        let (w, h) = (
+            defs[def_index as usize].width,
+            defs[def_index as usize].height,
+        );
         let Some((x, y)) = find_spot(sim, w, h, used) else {
             println!("no spot for {label}");
             return false;
@@ -113,11 +129,45 @@ fn main() {
         }
         placed
     };
-    build(&mut sim, &mut used, 468, "market");
-    build(&mut sim, &mut used, 463, "chapel");
-    for n in 0..10 {
-        build(&mut sim, &mut used, 414, &format!("hut{n}"));
+    // Build order is bounded by the ship's 50 wood: the forester is the only
+    // wood source and costs none, so it goes up first, then food, then the
+    // civic core, then houses, then the cloth chain. Every def here carries
+    // `Bauinfra: INFRA_NIX` and is placeable under the campaign's `0x3` mask.
+    build(&mut sim, &mut used, 402, "forester"); //  0 wood,  2 tools
+    build(&mut sim, &mut used, 270, "fishery"); //  5 wood,  3 tools
+    build(&mut sim, &mut used, 403, "hunter"); //  2 wood,  2 tools
+    build(&mut sim, &mut used, 468, "market"); // 10 wood,  4 tools
+    build(&mut sim, &mut used, 463, "chapel"); //  5 wood,  2 tools
+    for n in 0..4 {
+        build(&mut sim, &mut used, 414, &format!("hut{n}")); // 3 wood each
     }
+    // Cloth needs no fertility and no rung: two sheep farms feed one weaver
+    // (the hut consumes 2 Wool per Cloth).
+    build(&mut sim, &mut used, 412, "sheep0"); //  4 wood,  2 tools
+    build(&mut sim, &mut used, 412, "sheep1"); //  4 wood,  2 tools
+    build(&mut sim, &mut used, 388, "weaver"); //  6 wood,  3 tools
+
+    // Which buildings are still owed materials / still under construction?
+    let site_report = |sim: &anno_sim::simulation::Simulation| {
+        for b in sim
+            .buildings
+            .iter()
+            .filter(|b| b.island_id == 10 && b.owner == 0)
+        {
+            if b.construction_ms_remaining > 0 || b.wood_needed > 0 || b.tools_needed > 0 {
+                println!(
+                    "  site def={} at ({},{}) build_ms={} owes wood={} tools={} bricks={}",
+                    b.def_id,
+                    b.tile_x,
+                    b.tile_y,
+                    b.construction_ms_remaining,
+                    b.wood_needed,
+                    b.tools_needed,
+                    b.bricks_needed,
+                );
+            }
+        }
+    };
 
     // --- Stage 1c: run 10 minutes of sim and report ---
     let report = |sim: &anno_sim::simulation::Simulation, label: String| {
@@ -133,15 +183,16 @@ fn main() {
             .find(|w| w.island_id == 10 && w.owner == 0)
             .unwrap();
         println!(
-            "{label}: pop={:?} sat={:?} food={} cloth={} alc={} resv={:?} blocked={} gold={}",
+            "{label}: pop={:?} sat={:?} food={} wool={} cloth={} wood={} resv={:?} gold={} unlock={:#x}",
             city.tier_population,
             city.satisfaction_by_group,
             wh.stock(Good::Food),
+            wh.stock(Good::Wool),
             wh.stock(Good::Cloth),
-            wh.stock(Good::Alcohol),
+            wh.stock(Good::Wood),
             city.promotion_reservations,
-            city.promotion_blocked,
             sim.players[0].gold,
+            sim.players[0].unlock_mask,
         );
     };
     for minute in 1..=10u32 {
@@ -150,27 +201,18 @@ fn main() {
             sim.drain_source_kind13_replacements(&cod);
         }
         report(&sim, format!("min {minute}"));
+        if minute == 1 || minute == 10 {
+            site_report(&sim);
+        }
     }
 
-    // --- Stage 2: supply the settler-tier goods and watch promotion ---
-    // Cloth and alcohol are what tier 1 demands (weights 8 and 6). The real
-    // chain is sheep farm -> weaving hut and a vineyard; this stage injects
-    // the goods directly so the promotion gate itself can be isolated from
-    // the production chain, which stage 3 will build for real.
-    println!("--- stage 2: supplying cloth + alcohol ---");
-    for minute in 11..=40u32 {
-        if let Some(wh) = sim
-            .warehouses
-            .iter_mut()
-            .find(|w| w.island_id == 10 && w.owner == 0)
-        {
-            for good in [Good::Cloth, Good::Alcohol, Good::Food] {
-                let have = wh.stock(good);
-                if have < 40 {
-                    wh.deposit(good, 40 - have);
-                }
-            }
-        }
+    // --- Stage 3: run the real chains ---
+    // Nothing is injected any more. Stage 2 proved the promotion gate is
+    // supply-driven by feeding the warehouse directly; this stage makes the
+    // colony earn its own cloth through sheep farm -> weaving hut, which is
+    // enough on its own because group-1 satisfaction saturates on cloth.
+    println!("--- stage 3: colony produces its own cloth ---");
+    for minute in 11..=60u32 {
         for _ in 0..600 {
             sim.tick(100);
             sim.drain_source_kind13_replacements(&cod);

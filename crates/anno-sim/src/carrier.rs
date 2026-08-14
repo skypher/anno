@@ -416,6 +416,32 @@ fn carrier_request_for_source_input(
     })
 }
 
+/// `FUN_00471380`'s type-8 supplier admission test (`1602_exe.c:80352-80353`):
+///
+/// ```c
+/// if (((*(byte *)(uVar4 + 0x21) == param_8) ||
+///     ((param_8 != 0 && (*(byte *)(uVar4 + 0x21) == 1)))) && ...
+/// ```
+///
+/// The candidate tile's compiled `Ware` byte (definition offset `+0x21`) must
+/// equal the requested ware, or be `ALLWARE` (1) for any non-`NOWARE` request.
+/// `ALLWARE` is what every KONTOR and MARKT declares, which is how a workshop
+/// carrier reaches warehouse stock. The executable applies no map-kind test
+/// here at all.
+///
+/// The comparison runs through `good_for_source_ware_slot`, the same forward
+/// table that derives a supplier's `Good` from its compiled byte, because
+/// `Good::source_ware_slot` maps slot `0x07` from `Cattle` rather than from
+/// the `Meat` that `FLEISCH` parses to; going the other way would silently
+/// reject every butcher.
+fn source_supplier_ware_admits(candidate_ware_slot: u8, requested_good: Good) -> bool {
+    if requested_good == Good::None {
+        return candidate_ware_slot == 0;
+    }
+    candidate_ware_slot == 1
+        || crate::data_bridge::good_for_source_ware_slot(candidate_ware_slot) == requested_good
+}
+
 /// Run FUN_00471380's first-reservable type-8 supplier search. The callback
 /// accepts the first same-owner root whose requested input has at least half
 /// a TRAEGER load available, reserving up to the full fixed-point load.
@@ -439,7 +465,9 @@ fn select_carrier_source_wave(
     let mut grid = map.carrier_path_grid();
 
     for candidate in source_cells.iter().copied() {
-        if candidate.island != island || !matches!(candidate.kind_code, 1..=8) {
+        if candidate.island != island
+            || !source_supplier_ware_admits(candidate.source_output_ware_slot, requested_good)
+        {
             continue;
         }
         let Some(supplier) = suppliers.iter().copied().find(|supplier| {
@@ -476,7 +504,10 @@ fn select_carrier_source_wave(
                                 && supplier.y == u16::from(candidate.y)
                         })?;
                         let within_footprint = candidate.island == island
-                            && matches!(candidate.kind_code, 1..=8)
+                            && source_supplier_ware_admits(
+                                candidate.source_output_ware_slot,
+                                requested_good,
+                            )
                             && position.0 >= i32::from(candidate.x)
                             && position.1 >= i32::from(candidate.y)
                             && position.0
@@ -627,14 +658,19 @@ fn try_spawn_carrier_for_request(
         }) else {
             continue;
         };
+        // `FUN_0047d810` picks the backing store from the nested production
+        // kind at definition offset `+0x1c`: `if ((6 < uVar4) && ((uVar4 < 9
+        // || (uVar4 == 0x1e))))` reserves from the owner's city store, and
+        // every other kind reserves from the root's own `+0x0c` storage
+        // (`1602_exe.c:89700-89722`).
         let valid_storage = match supplier.storage {
             CarrierSupplierStorage::SourceRoot => {
-                !matches!(cell.kind_code, 7 | 8)
+                !cell.is_type11_transfer_root()
                     && cell.storage_fill.saturating_sub(cell.reserved_storage)
                         >= request.amount.saturating_mul(SOURCE_STORAGE_UNIT)
             }
             CarrierSupplierStorage::Warehouse(warehouse_idx) => {
-                matches!(cell.kind_code, 7 | 8)
+                cell.is_type11_transfer_root()
                     && warehouses.get(warehouse_idx).is_some_and(|warehouse| {
                         warehouse
                             .stock(request.good)
@@ -699,7 +735,10 @@ fn try_spawn_carrier_for_request(
     carrier.tile_y = i32::from(building.tile_y);
     carrier.target_x = reached.0;
     carrier.target_y = reached.1;
-    carrier.destination_kind = supplier.kind_code;
+    // `FUN_0047d810` and the arrival handlers key the backing store off the
+    // nested production kind at definition offset `+0x1c`
+    // (`1602_exe.c:89700-89703`), never the outer `HAUS Kind`.
+    carrier.destination_kind = supplier.source_production_kind_code;
     carrier.supplier_x = u16::from(supplier.x);
     carrier.supplier_y = u16::from(supplier.y);
     carrier.carried_good = request.good as u8;
@@ -749,11 +788,12 @@ fn select_city_cart_source_wave(
         grid.block_outside_rect(window_origin, window_size, window_size);
     }
 
+    // `FUN_004717b0` applies no map-kind test to a candidate producer
+    // (`1602_exe.c:80578-80586`): it indexes the city eligibility table by the
+    // candidate's compiled `Ware` byte and scores it `fill * 128 / Maxlager`,
+    // both of which the acceptance callback below already replays.
     for candidate in source_cells.iter().copied() {
-        if candidate.island != island
-            || candidate.source_map_owner_slot != map_owner_slot
-            || !matches!(candidate.kind_code, 1..=6)
-        {
+        if candidate.island != island || candidate.source_map_owner_slot != map_owner_slot {
             continue;
         }
         if source_radius != 0
@@ -797,7 +837,6 @@ fn select_city_cart_source_wave(
                 })?;
                 let within_footprint = candidate.island == island
                     && candidate.source_map_owner_slot == map_owner_slot
-                    && matches!(candidate.kind_code, 1..=6)
                     && position.0 >= i32::from(candidate.x)
                     && position.1 >= i32::from(candidate.y)
                     && position.0
@@ -959,7 +998,7 @@ pub fn try_spawn_city_cart(
     cart.tile_y = start.1;
     cart.target_x = reached.0;
     cart.target_y = reached.1;
-    cart.destination_kind = state.kind_code;
+    cart.destination_kind = state.source_production_kind_code;
     cart.supplier_x = supplier.x;
     cart.supplier_y = supplier.y;
     cart.origin_island = origin.island;
@@ -1301,15 +1340,21 @@ mod tests {
         }
     }
 
-    fn supplier_state(x: u8, y: u8, fill: u16) -> SourceMapCellState {
+    /// A producer root shaped the way haeuser.cod ships one: outer
+    /// `Kind: GEBAEUDE` with the production label in the nested
+    /// `HAUS_PRODTYP Kind`, and the produced `Ware` that `FUN_00471380`
+    /// matches against a workshop's request (`1602_exe.c:80352-80353`).
+    fn supplier_state(x: u8, y: u8, fill: u16, good: Good) -> SourceMapCellState {
         SourceMapCellState {
             storage_fill: fill,
+            source_output_ware_slot: good.source_ware_slot().unwrap(),
             ..SourceMapCellState::new(
                 0,
                 x,
                 y,
                 &anno_formats::cod::BuildingDef {
-                    kind: "HANDWERK".into(),
+                    kind: "GEBAEUDE".into(),
+                    properties: [("ProdKind".into(), "HANDWERK".into())].into(),
                     ..Default::default()
                 },
                 0,
@@ -1436,7 +1481,10 @@ mod tests {
                 source_footprint: (1, 1),
             },
         ];
-        let mut states = vec![supplier_state(4, 4, 128), supplier_state(20, 20, 128)];
+        let mut states = vec![
+            supplier_state(4, 4, 128, Good::Iron),
+            supplier_state(20, 20, 128, Good::Iron),
+        ];
 
         let carrier = try_spawn_carrier(
             &consumer,
@@ -1487,7 +1535,10 @@ mod tests {
                 source_footprint: (1, 1),
             },
         ];
-        let mut states = vec![supplier_state(4, 4, 128), supplier_state(8, 5, 128)];
+        let mut states = vec![
+            supplier_state(4, 4, 128, Good::Wood),
+            supplier_state(8, 5, 128, Good::Iron),
+        ];
 
         assert!(try_spawn_carrier(
             &consumer,
@@ -1515,7 +1566,7 @@ mod tests {
             source_path_class: 32,
             source_footprint: (1, 1),
         };
-        let mut states = [supplier_state(4, 0, 96)];
+        let mut states = [supplier_state(4, 0, 96, Good::Iron)];
 
         let carrier = try_spawn_carrier(
             &consumer,
@@ -1549,7 +1600,7 @@ mod tests {
             source_path_class: 32,
             source_footprint: (1, 1),
         };
-        let mut states = [supplier_state(4, 0, 65)];
+        let mut states = [supplier_state(4, 0, 65, Good::Iron)];
 
         let carrier = try_spawn_carrier(
             &consumer,
@@ -1581,7 +1632,7 @@ mod tests {
             source_path_class: 32,
             source_footprint: (1, 1),
         };
-        let mut states = [supplier_state(4, 0, 32)];
+        let mut states = [supplier_state(4, 0, 32, Good::Iron)];
 
         assert!(try_spawn_carrier(
             &consumer,
@@ -1610,7 +1661,7 @@ mod tests {
             source_path_class: 32,
             source_footprint: (2, 1),
         };
-        let mut states = [supplier_state(3, 0, 128)];
+        let mut states = [supplier_state(3, 0, 128, Good::Iron)];
         let mut map = IslandMap::new_open(0, 5, 1);
         map.set_walkable(2, 0, false);
 
@@ -1645,7 +1696,7 @@ mod tests {
             source_path_class: 32,
             source_footprint: (2, 1),
         };
-        let mut states = [supplier_state(1, 1, 128)];
+        let mut states = [supplier_state(1, 1, 128, Good::Iron)];
 
         let carrier = try_spawn_carrier(
             &consumer,
@@ -1677,17 +1728,27 @@ mod tests {
             source_path_class: 0,
             source_footprint: (1, 1),
         }];
-        let mut states = vec![SourceMapCellState::new(
-            0,
-            4,
-            4,
-            &anno_formats::cod::BuildingDef {
-                kind: "KONTOR".into(),
-                ..Default::default()
-            },
-            0,
-        )
-        .unwrap()];
+        let mut states = vec![
+            SourceMapCellState::new(
+                0,
+                4,
+                4,
+                &anno_formats::cod::BuildingDef {
+                    kind: "GEBAEUDE".into(),
+                    // Every KONTOR in haeuser.cod declares `Ware: ALLWARE`,
+                    // which is the `def+0x21 == 1` half of `FUN_00471380`'s
+                    // supplier test (`1602_exe.c:80352-80353`).
+                    properties: [
+                        ("ProdKind".into(), "KONTOR".into()),
+                        ("Ware".into(), "ALLWARE".into()),
+                    ]
+                    .into(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap(),
+        ];
 
         let mut warehouses = [Warehouse::new(0, 0, 4, 4)];
         warehouses[0].deposit(Good::Iron, 4);
@@ -1821,15 +1882,16 @@ mod tests {
             0,
             0,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
-        let mut lower = supplier_state(2, 0, 128);
+        let mut lower = supplier_state(2, 0, 128, Good::Cloth);
         lower.storage_animation_capacity = 320;
-        let mut higher = supplier_state(4, 0, 192);
+        let mut higher = supplier_state(4, 0, 192, Good::Cloth);
         higher.storage_animation_capacity = 320;
         let suppliers = [
             CarrierSupplier {
@@ -1889,16 +1951,17 @@ mod tests {
             0,
             0,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 source_transfer_radius: 2,
                 ..Default::default()
             },
             0,
         )
         .unwrap();
-        let mut near = supplier_state(2, 0, 128);
+        let mut near = supplier_state(2, 0, 128, Good::Cloth);
         near.storage_animation_capacity = 320;
-        let mut far = supplier_state(4, 0, 192);
+        let mut far = supplier_state(4, 0, 192, Good::Cloth);
         far.storage_animation_capacity = 320;
         let suppliers = [
             CarrierSupplier {
@@ -1948,14 +2011,15 @@ mod tests {
             0,
             0,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
         origin.source_map_owner_slot = 2;
-        let mut source = supplier_state(2, 0, 192);
+        let mut source = supplier_state(2, 0, 192, Good::Cloth);
         source.storage_animation_capacity = 320;
         source.source_map_owner_slot = 3;
         let supplier = CarrierSupplier {
@@ -1988,14 +2052,15 @@ mod tests {
             0,
             0,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
         origin.source_map_owner_slot = 2;
-        let mut source = supplier_state(2, 0, 192);
+        let mut source = supplier_state(2, 0, 192, Good::Cloth);
         source.storage_animation_capacity = 320;
         source.source_map_owner_slot = 2;
         let supplier = CarrierSupplier {
@@ -2031,13 +2096,14 @@ mod tests {
             0,
             0,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
-        let mut source = supplier_state(2, 0, 65);
+        let mut source = supplier_state(2, 0, 65, Good::Cloth);
         source.storage_animation_capacity = 320;
         let supplier = CarrierSupplier {
             island: 0,
@@ -2076,13 +2142,14 @@ mod tests {
             0,
             0,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
-        let mut source = supplier_state(2, 0, 192);
+        let mut source = supplier_state(2, 0, 192, Good::Cloth);
         source.storage_animation_capacity = 320;
         let suppliers = [CarrierSupplier {
             island: 0,
@@ -2119,15 +2186,16 @@ mod tests {
             0,
             0,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
-        let mut ordinary = supplier_state(2, 0, 192);
+        let mut ordinary = supplier_state(2, 0, 192, Good::Bricks);
         ordinary.storage_animation_capacity = 320;
-        let mut priority = supplier_state(4, 0, 256);
+        let mut priority = supplier_state(4, 0, 256, Good::Cloth);
         priority.storage_animation_capacity = 320;
         let suppliers = [
             CarrierSupplier {
@@ -2180,15 +2248,16 @@ mod tests {
             2,
             2,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
-        let mut west = supplier_state(1, 2, 128);
+        let mut west = supplier_state(1, 2, 128, Good::Cloth);
         west.storage_animation_capacity = 320;
-        let mut east = supplier_state(3, 2, 128);
+        let mut east = supplier_state(3, 2, 128, Good::Alcohol);
         east.storage_animation_capacity = 320;
         let suppliers = [
             CarrierSupplier {
@@ -2239,13 +2308,14 @@ mod tests {
             0,
             0,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
-        let mut source = supplier_state(4, 0, 128);
+        let mut source = supplier_state(4, 0, 128, Good::Cloth);
         source.storage_animation_capacity = 320;
         let supplier = CarrierSupplier {
             island: 0,
@@ -2283,15 +2353,16 @@ mod tests {
             2,
             2,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
-        let mut source = supplier_state(1, 1, 128);
+        let mut source = supplier_state(1, 1, 128, Good::Cloth);
         source.storage_animation_capacity = 320;
-        let mut north = supplier_state(2, 0, 128);
+        let mut north = supplier_state(2, 0, 128, Good::Alcohol);
         north.storage_animation_capacity = 320;
         let suppliers = [
             CarrierSupplier {
@@ -2343,15 +2414,16 @@ mod tests {
             2,
             2,
             &anno_formats::cod::BuildingDef {
-                kind: "MARKT".into(),
+                kind: "GEBAEUDE".into(),
+                properties: [("ProdKind".into(), "MARKT".into())].into(),
                 ..Default::default()
             },
             0,
         )
         .unwrap();
-        let mut west = supplier_state(1, 1, 128);
+        let mut west = supplier_state(1, 1, 128, Good::Cloth);
         west.storage_animation_capacity = 320;
-        let mut east = supplier_state(2, 1, 128);
+        let mut east = supplier_state(2, 1, 128, Good::Alcohol);
         east.storage_animation_capacity = 320;
         let suppliers = [
             CarrierSupplier {

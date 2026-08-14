@@ -101,34 +101,39 @@ fn main() {
     println!("byte 0x03 distribution: {byte3_dist:?}");
 
     // Identify the 6 outliers with byte 0x03 == 2.
-    println!("byte 0x03 == 2 outliers (scenario, island number, fertility row):");
+    println!("byte 0x03 == 2 outliers (scenario, island number, settlement owners):");
     for (scen, body) in &all_bodies {
         if body.len() < 4 || body[3] != 2 { continue; }
-        let mut fert = [0u8; 8];
+        let mut owners = [7u8; 8];
         if body.len() >= 0x14 {
-            fert.copy_from_slice(&body[0x0C..0x14]);
+            owners.copy_from_slice(&body[0x0C..0x14]);
         }
-        println!("  {scen}: island #{}, fertilities {:?}", body[0], fert);
+        println!("  {scen}: island #{}, owner slots {:?}", body[0], owners);
     }
     println!();
 
-    // Cross-tab byte 0x0C..0x13 — looks like an 8-byte
-    // per-island fertility/resource map.
-    let mut fertility_value_dist: std::collections::BTreeMap<u8, u32> = Default::default();
-    let mut fertility_pattern_dist: std::collections::BTreeMap<[u8; 8], u32> = Default::default();
+    // Cross-tab bytes 0x0C..0x14: the eight per-settlement OWNER
+    // slots (runtime `island+0xac`), written by `FUN_00468740`
+    // (`1602_exe.c:72888-72897`) as the owning player slot, or 7
+    // when the settlement pointer is null. The ~93% sevens this
+    // audit reports are unsettled slots, NOT a crop distribution —
+    // fertility is the u32 crop bitmask at 0x5C..0x60, cross-tabbed
+    // by the 0x5C/0x5D histograms above.
+    let mut owner_value_dist: std::collections::BTreeMap<u8, u32> = Default::default();
+    let mut owner_pattern_dist: std::collections::BTreeMap<[u8; 8], u32> = Default::default();
     for (_, body) in &all_bodies {
         if body.len() < 0x14 { continue; }
         let mut row = [0u8; 8];
         row.copy_from_slice(&body[0x0C..0x14]);
-        *fertility_pattern_dist.entry(row).or_default() += 1;
+        *owner_pattern_dist.entry(row).or_default() += 1;
         for &b in &row {
-            *fertility_value_dist.entry(b).or_default() += 1;
+            *owner_value_dist.entry(b).or_default() += 1;
         }
     }
-    println!("\nbytes 0x0C..0x14 (candidate fertility map) value distribution:");
-    println!("  per-byte values: {fertility_value_dist:?}");
+    println!("\nbytes 0x0C..0x14 (settlement owner slots, 7 = unsettled) value distribution:");
+    println!("  per-byte values: {owner_value_dist:?}");
     println!("  most common 8-byte patterns:");
-    let mut sorted: Vec<_> = fertility_pattern_dist.iter().collect();
+    let mut sorted: Vec<_> = owner_pattern_dist.iter().collect();
     sorted.sort_by_key(|&(_, c)| std::cmp::Reverse(*c));
     for (pattern, count) in sorted.iter().take(15) {
         let pretty: Vec<String> = pattern.iter().map(|b| format!("{:02X}", b)).collect();
