@@ -372,8 +372,25 @@ undercounts operating costs; and the city *event block* (rand-gated
 capacity or satisfaction moves, which the current comparisons don't exercise.
 
 Wine stability note: the original dies within ~5 minutes of entering Exile on
-this setup even with zero winedbg attaches (reproduced twice; crash-log run
-pending) — trajectory captures should snapshot early and often.
+this setup even with zero winedbg attaches (reproduced three times; the crash
+log shows `wine: Unhandled page fault on read access to FFF210EC` — a wild
+computed pointer, timing/RNG dependent, likely aggravated by the absent ALSA
+device). Trajectory captures should snapshot early and often.
+
+#### Live trajectory point (+150 s into Exile)
+
+One clean mid-run read before the Wine crash (2026-08-14): human city
+population still exactly `[0, 156, 0, 0, 0]` — **flat, house-bounded**,
+confirming the SIEDLER-seeded Rust behavior. Store drains inside the exact
+consumption band (NAHRUNG 800 → 727, STOFFE 509 → 444), production deposits
+run (HOLZ 982 → 1142, ZIEGEL 982 → 1110), and — notably — the original is
+already **upgrading houses**: demand slots for TABAKWAREN/GEWUERZE light up at
+315 via promotion reservations (GEWUERZE starving at fulfillment 0 since the
+store has none). So the `FUN_0047f510`/event-block house-upgrade path shifts
+the tier mix (and tax income) even at constant total population — it is the
+next port target, not merely a below-capacity concern. Also learned:
+`DAT_005b6040` read 0 throughout while cycles clearly ran — it is not a
+wall-time game clock; use host timestamps as the time axis for captures.
 
 Caveat for long captures: each winedbg attach is one-shot-ish — after a few
 attach/detach cycles this Wine build sometimes takes the game down. Space
