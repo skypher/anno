@@ -386,10 +386,15 @@ pub struct Ship {
     pub heading_byte: u8,
     /// Up to 7 packed cargo entries at record offsets 0x175, 0x17D, 0x185,
     /// 0x18D, 0x195, 0x19D, 0x1A5 (stride 8; the trailing byte of each 8-byte
-    /// group is zero). `FUN_00448120` decodes the low byte as the source ware,
-    /// bits `8..=21` as its exact 1/32-good quantity, and bits `22..=31` as
-    /// entry metadata. The raw array remains available because source special
-    /// wares are not all represented by the local `Good` enum.
+    /// group is zero). The low byte selects the good in a ship-cargo id
+    /// space distinct from the ware registry: across the whole shipping
+    /// corpus only ids 2, 7, and 4 appear, and the live original's ship
+    /// hold UI (Tutorial0's Seehind, screenshotted 2026-08-14) shows them
+    /// as **2 = tools (WERKZEUG), 7 = wood (HOLZ), 4 = food (NAHRUNG)** —
+    /// the classic starting loadout (30/30/25 in Tutorial0, 50+10/50/20 on
+    /// New Horizons0's Verena). Bits `8..=21` carry the exact 1/32-good
+    /// quantity. An earlier note derived "iron ore/meat/wool" by reading
+    /// the ids against the building-ware registry; that was wrong.
     pub cargo_slots: [u32; 7],
 }
 
@@ -4386,9 +4391,10 @@ mod tests {
     fn ship4_cargo_slots_carry_three_loaded_entries_in_tutorial0() {
         // Tutorial0 starts the player with one ship loaded with three
         // goods. The packed u32 cargo entries at offset 0x175 are
-        // 0x0003C002, 0x0003C007, 0x00032004. `FUN_00448120` decodes their
-        // low byte as ware (0x02 iron ore, 0x07 meat, 0x04 wool) and bits
-        // 8..=21 as the 1/32-good quantity (960, 960, 800 = 30/30/25 goods).
+        // 0x0003C002, 0x0003C007, 0x00032004: ship-cargo ids 2/7/4 =
+        // tools/wood/food (live-verified against the original's ship hold
+        // UI) and bits 8..=21 as the 1/32-good quantity (960, 960, 800 =
+        // the classic 30 tools / 30 wood / 25 food).
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
