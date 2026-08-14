@@ -275,6 +275,7 @@ pub fn place_building(
         state.set_footprint(footprint_width, footprint_height);
         state.set_source_command(command);
         state.configure_terminal_replacement(cod);
+        state.configure_source_resource_records(cod, cod_b);
         Some(state)
     });
     let source_static_root = instance.source_placement_command.and_then(|command| {
@@ -293,6 +294,11 @@ pub fn place_building(
         state.set_footprint(footprint_width, footprint_height);
         state.set_source_command(command);
         state.configure_terminal_replacement(cod);
+        state.configure_source_resource_records(cod, cod_b);
+        // `FUN_00481450` case 10 (`1602_exe.c:92837-92842`) arms any newly
+        // placed production-kind-10 tile — a player-planted plantation field
+        // is exactly that — with `def[0x3a] + param_7 % 3`.
+        state.arm_placed_source_growth_timer(sim.source_growth_bucket_phase);
         Some(state)
     });
     sim.buildings.push(instance);
@@ -641,6 +647,8 @@ pub fn found_kontor(
         state.set_footprint(cod_b.size.0, cod_b.size.1);
         state.set_source_command(command);
         state.configure_terminal_replacement(cod);
+        state.configure_source_resource_records(cod, cod_b);
+        state.arm_placed_source_growth_timer(sim.source_growth_bucket_phase);
         sim.replace_source_static_map_footprint(state);
     }
     sim.buildings.push(instance);

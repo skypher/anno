@@ -54,8 +54,19 @@ pub const CIVILIAN_COUNT: u8 = 8;
 
 /// First definition-order index selected by the source kind-12 allocator.
 pub const KIND12_FIRST_INDEX: u8 = CIVILIAN_FIRST_INDEX;
-/// Number of consecutive civilian and worker definitions selected by kind 12.
-pub const KIND12_FIGURE_COUNT: u8 = 13;
+/// Number of consecutive definitions resolved through this table.
+///
+/// `FUN_0044b140`'s kind-12 rows only ever select `0x5d..=0x64`, but the
+/// nested-production worker allocators reached from `FUN_0047daf0` pass the
+/// next four `figuren.cod` definitions as well: `JAEGER` (kind 5, never
+/// dispatched), `FISCHER` (kind 6 `FUN_0044b9a0`), and `RIND` / `SCHAF`
+/// (kind 4 `FUN_0044bb40`). They share the same runtime definition array, so
+/// their sprite, cadence, speed and `Maxtrag` lookups live here too.
+pub const KIND12_FIGURE_COUNT: u8 = 17;
+/// Definitions after the civilians that render from `MAEHER.BSH`
+/// (`Blocknr: 4`): the five plantation workers plus `JAEGER` and `FISCHER`.
+/// `RIND` and `SCHAF` carry `Blocknr: 5` and are deliberately excluded.
+pub const KIND12_MAEHER_BLOCK_COUNT: u8 = 7;
 pub const KIND12_FIGURE_NAMES: [&str; KIND12_FIGURE_COUNT as usize] = [
     "ADELWEIBL",
     "ADEL",
@@ -70,6 +81,10 @@ pub const KIND12_FIGURE_NAMES: [&str; KIND12_FIGURE_COUNT as usize] = [
     "HOLZFAELLER",
     "PFLUECKER",
     "PFLUECKER2",
+    "JAEGER",
+    "FISCHER",
+    "RIND",
+    "SCHAF",
 ];
 
 /// Sprite base for civilians inside `TRAEGER.BSH` — `GFXZIVIL` resolves
@@ -88,10 +103,11 @@ pub const SPRITES_PER_VARIANT: u16 = 64;
 pub const CIVILIAN_WALK_ANIM_SPEEDS_MS: [u16; CIVILIAN_VARIANT_COUNT] =
     [85, 85, 105, 85, 85, 100, 85, 85];
 
-const KIND12_WALK_ANIM_SPEEDS_MS: [u16; KIND12_FIGURE_COUNT as usize] =
-    [85, 85, 105, 85, 85, 100, 85, 85, 85, 85, 85, 85, 85];
+const KIND12_WALK_ANIM_SPEEDS_MS: [u16; KIND12_FIGURE_COUNT as usize] = [
+    85, 85, 105, 85, 85, 100, 85, 85, 85, 85, 85, 85, 85, 85, 85, 110, 75,
+];
 const KIND12_MOVEMENT_SPEEDS: [u16; KIND12_FIGURE_COUNT as usize] = [
-    200, 230, 160, 200, 220, 200, 250, 200, 220, 220, 220, 220, 220,
+    200, 230, 160, 200, 220, 200, 250, 200, 220, 220, 220, 220, 220, 220, 320, 170, 200,
 ];
 const KIND12_SPRITE_BASES: [u16; KIND12_FIGURE_COUNT as usize] = [
     GFX_ZIVIL_BASE,
@@ -107,7 +123,19 @@ const KIND12_SPRITE_BASES: [u16; KIND12_FIGURE_COUNT as usize] = [
     224,
     608,
     1120,
+    800,
+    960,
+    0,
+    112,
 ];
+/// Authored `Maxtrag`, in whole goods. `FUN_0045b490` and `FUN_0045ba60`
+/// compare the worker record's accumulated `+0x28` amount against the figure
+/// definition's `+0x36` before deciding whether to select another resource
+/// cell or walk home, so a fisher takes three cells per trip, a cow three and
+/// a sheep four. The plantation workers author no `Maxtrag` at all, which is
+/// why `FUN_0045afd0` never re-searches: it harvests exactly one cell.
+const KIND12_MAX_LOADS: [u16; KIND12_FIGURE_COUNT as usize] =
+    [4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 3, 3, 4];
 
 /// Resolve the kind-12 figure definition selected after `FUN_0044b140`
 /// reaches a type-3 route target.
@@ -160,6 +188,7 @@ pub struct CivilianConfig {
     pub frames_per_dir: u8,
     pub frame_speeds_ms: [u16; KIND12_FIGURE_COUNT as usize],
     pub movement_speeds: [u16; KIND12_FIGURE_COUNT as usize],
+    pub max_loads: [u16; KIND12_FIGURE_COUNT as usize],
 }
 
 impl Default for CivilianConfig {
@@ -169,6 +198,7 @@ impl Default for CivilianConfig {
             frames_per_dir: 8,
             frame_speeds_ms: KIND12_WALK_ANIM_SPEEDS_MS,
             movement_speeds: KIND12_MOVEMENT_SPEEDS,
+            max_loads: KIND12_MAX_LOADS,
         }
     }
 }
@@ -203,8 +233,20 @@ impl CivilianConfig {
                     config.movement_speeds[idx] = speed;
                 }
             }
+            config.max_loads[idx] = u16::try_from(def.max_load()).unwrap_or(0);
         }
         config
+    }
+
+    /// Authored `Maxtrag` for a source figure definition, in whole goods.
+    /// Absent (`0`) keeps a worker to the single-cell `FUN_0045afd0` trip.
+    pub fn max_load_for_definition(&self, definition: u8) -> u16 {
+        definition
+            .checked_sub(KIND12_FIRST_INDEX)
+            .filter(|&idx| idx < KIND12_FIGURE_COUNT)
+            .map(usize::from)
+            .map(|idx| self.max_loads[idx])
+            .unwrap_or(0)
     }
 
     /// Resolved BSH sprite base for a source kind-12 definition.
@@ -265,10 +307,13 @@ impl CivilianConfig {
 
     /// Kind-12 also selects five plantation-worker figures. They share the
     /// type-3 route state machine but render from `MAEHER.BSH`, not
-    /// `TRAEGER.BSH`.
+    /// `TRAEGER.BSH`. `JAEGER` and `FISCHER` sit in the same `Blocknr: 4`
+    /// block; the kind-4 grazers `RIND` and `SCHAF` do not, so they stay out
+    /// of this predicate rather than resolving to a wrong sprite.
     pub fn is_worker(&self, fig: &Figure) -> bool {
         fig.action == ActionType::Walking
-            && (CIVILIAN_FIRST_INDEX + CIVILIAN_COUNT..KIND12_FIRST_INDEX + KIND12_FIGURE_COUNT)
+            && (CIVILIAN_FIRST_INDEX + CIVILIAN_COUNT
+                ..CIVILIAN_FIRST_INDEX + CIVILIAN_COUNT + KIND12_MAEHER_BLOCK_COUNT)
                 .contains(&fig.sprite_set)
     }
 
@@ -297,7 +342,7 @@ pub fn is_kind12(fig: &Figure) -> bool {
 /// Whether a kind-12 definition renders from `MAEHER.BSH`.
 pub const fn source_kind12_is_worker(definition: u8) -> bool {
     definition >= CIVILIAN_FIRST_INDEX + CIVILIAN_COUNT
-        && definition < KIND12_FIRST_INDEX + KIND12_FIGURE_COUNT
+        && definition < CIVILIAN_FIRST_INDEX + CIVILIAN_COUNT + KIND12_MAEHER_BLOCK_COUNT
 }
 
 #[cfg(test)]

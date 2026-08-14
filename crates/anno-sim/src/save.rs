@@ -12,7 +12,7 @@ use crate::data_bridge::{
 use crate::entity::Figure;
 use crate::player::Player;
 use crate::simulation::Simulation;
-use crate::source_cell::SourceMapCellState;
+use crate::source_cell::{SourceMapCellState, SOURCE_GROWTH_BUCKET_COUNT};
 use crate::source_route::SourceDynamicMapObject;
 use crate::trade::{TradeRoute, TradeShip};
 use crate::warehouse::Warehouse;
@@ -267,7 +267,14 @@ use std::path::Path;
 /// v140: static map roots retain the compiled active `Kosten` operating
 ///       cost; per-player maintenance accrues from roots (city `+0x1d8`
 ///       semantics) instead of production instances.
-pub const SAVE_VERSION: u32 = 140;
+/// v141: raw-resource growth timer. The two 32-entry bucket clocks
+///       `DAT_0054a2f4` / `DAT_00562da8` persist — the original saves them
+///       in its `"TIMERS"` chunk (`1602_exe.c:94964-94984`) — and static map
+///       roots carry their compiled record group plus the per-cell
+///       `DAT_00562dc8` entry (bucket, counter snapshot, growth phase,
+///       placement jitter). The table itself is not saved by the original
+///       either; it is rebuilt from tile state on load.
+pub const SAVE_VERSION: u32 = 141;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -361,6 +368,21 @@ pub struct SaveState {
     pub trade_ships: Vec<TradeShip>,
     #[serde(default)]
     pub objectives: crate::objectives::ObjectiveSet,
+    /// `DAT_0054a2f4` and `DAT_00562da8`, the growth-timer bucket clocks. The
+    /// original saves both in its 0x298-byte `"TIMERS"` chunk and rebuilds the
+    /// entry table itself from tile state, so only these two arrays are state.
+    #[serde(default = "default_source_growth_bucket_elapsed_ms")]
+    pub source_growth_bucket_elapsed_ms: [u32; SOURCE_GROWTH_BUCKET_COUNT],
+    #[serde(default = "default_source_growth_bucket_phase")]
+    pub source_growth_bucket_phase: [u8; SOURCE_GROWTH_BUCKET_COUNT],
+}
+
+fn default_source_growth_bucket_elapsed_ms() -> [u32; SOURCE_GROWTH_BUCKET_COUNT] {
+    [0; SOURCE_GROWTH_BUCKET_COUNT]
+}
+
+fn default_source_growth_bucket_phase() -> [u8; SOURCE_GROWTH_BUCKET_COUNT] {
+    [0; SOURCE_GROWTH_BUCKET_COUNT]
 }
 
 #[derive(Debug)]
@@ -465,6 +487,8 @@ impl Simulation {
             trade_routes: self.trade_routes.clone(),
             trade_ships: self.trade_ships.clone(),
             objectives: self.objectives.clone(),
+            source_growth_bucket_elapsed_ms: self.source_growth_bucket_elapsed_ms,
+            source_growth_bucket_phase: self.source_growth_bucket_phase,
         }
     }
 
@@ -545,6 +569,8 @@ impl Simulation {
         self.trade_routes = s.trade_routes;
         self.trade_ships = s.trade_ships;
         self.objectives = s.objectives;
+        self.source_growth_bucket_elapsed_ms = s.source_growth_bucket_elapsed_ms;
+        self.source_growth_bucket_phase = s.source_growth_bucket_phase;
     }
 }
 
@@ -699,6 +725,8 @@ mod tests {
             trade_routes: vec![],
             trade_ships: vec![],
             objectives: Default::default(),
+            source_growth_bucket_elapsed_ms: [0; SOURCE_GROWTH_BUCKET_COUNT],
+            source_growth_bucket_phase: [0; SOURCE_GROWTH_BUCKET_COUNT],
         };
         let payload = bincode::serialize(&state).unwrap();
         let mut buf = Vec::with_capacity(SAVE_MAGIC.len() + payload.len());
@@ -963,6 +991,13 @@ mod tests {
                 animation_continues: true,
                 kind_code: 7,
                 source_production_kind_code: 7,
+                source_definition_record: 51,
+                source_resource_records: None,
+                source_growth_enrolled: false,
+                source_growth_bucket: 0,
+                source_growth_phase_seen: 0,
+                source_growth_phase: 0,
+                source_placement_variant: 17,
             });
         let mut static_root = sim.source_map_cell_states[0];
         static_root.x = 14;
@@ -1400,6 +1435,13 @@ mod tests {
                 animation_continues: true,
                 kind_code: 7,
                 source_production_kind_code: 7,
+                source_definition_record: 51,
+                source_resource_records: None,
+                source_growth_enrolled: false,
+                source_growth_bucket: 0,
+                source_growth_phase_seen: 0,
+                source_growth_phase: 0,
+                source_placement_variant: 17,
             }]
         );
         assert_eq!(sim2.source_map_cell_states[0].market_frame_selector(4), 3);

@@ -90,17 +90,15 @@ fn stock_producers_get_a_live_source_cell_record() {
     }
 }
 
-/// The whole chain: place a forester in stock woodland, run it, and require
-/// the harvested trees to reach the root's raw buffer and then its output.
+/// Place a forester in the densest stock woodland the scenario ships and hand
+/// its construction site the materials no carrier can deliver yet. Returns the
+/// simulation, the island number, the building index, the live source-cell
+/// index of the root, and the anchor.
 ///
-/// The stall after the woodland in range is exhausted is the unported crop
-/// maturation timer `FUN_0047ca80`, so this asserts that output rises, not
-/// that it is sustained.
-#[test]
-fn a_forester_in_stock_woodland_produces_wood() {
-    let Some(corpus) = load_corpus() else {
-        return;
-    };
+/// Construction supply is a separate subsystem from the production chain under
+/// test: the scenario starts the human without a warehouse on this island, so
+/// no carrier can bring the two tools the site needs.
+fn forester_in_stock_woodland(corpus: &Corpus) -> (anno_sim::simulation::Simulation, u8, usize, usize, (i32, i32)) {
     let mut sim = anno_game::scenario::build_simulation(
         &corpus.szs,
         &corpus.cod,
@@ -191,10 +189,6 @@ fn a_forester_in_stock_woodland_produces_wood() {
     let (x, y) = placed.expect("a forester fits somewhere in the woodland");
 
     let building_index = sim.buildings.len() - 1;
-    // The scenario starts the human without a warehouse on this island, so no
-    // carrier can deliver the two tools the site needs. Construction is a
-    // separate subsystem from the production chain under test; hand the site
-    // its materials rather than modelling a supply run.
     sim.buildings[building_index].wood_needed = 0;
     sim.buildings[building_index].tools_needed = 0;
     sim.buildings[building_index].bricks_needed = 0;
@@ -208,6 +202,19 @@ fn a_forester_in_stock_woodland_produces_wood() {
         .position(|state| state.matches(island_number, x as u16, y as u16))
         .expect("the placed forester owns a live source cell record");
     assert!(sim.source_map_cell_states[root_index].is_type12_plantation_root());
+
+    (sim, island_number, building_index, root_index, (x, y))
+}
+
+/// The whole chain: place a forester in stock woodland, run it, and require
+/// the harvested trees to reach the root's raw buffer and then its output.
+#[test]
+fn a_forester_in_stock_woodland_produces_wood() {
+    let Some(corpus) = load_corpus() else {
+        return;
+    };
+    let (mut sim, _island, building_index, root_index, _anchor) =
+        forester_in_stock_woodland(&corpus);
 
     let mut peak_raw = 0;
     let mut peak_fill = 0;
@@ -239,5 +246,194 @@ fn a_forester_in_stock_woodland_produces_wood() {
     assert!(
         peak_output >= 2,
         "the forester produced {peak_output} whole wood (raw peak {peak_raw}, fill peak {peak_fill})"
+    );
+}
+
+/// The growth timer round trip on shipped data: a forester must **deplete**
+/// its woodland and that woodland must then grow back.
+///
+/// `FUN_0047c830` rewrites each harvested `Ware: BAUM` tile to its
+/// `ROHSTWACHS` record and enrols it in the `FUN_0047ca80` table; forest is
+/// `Interval: 900`, `AnimAnz: 5`, so `FUN_00462d50` compiles it into bucket 20
+/// — a 180 000 ms clock — and the tile needs five rollovers, 900 s, before the
+/// sweep writes the ripe record's `Gfx` back and frees the slot.
+///
+/// Before this timer existed the harvest transition never fired at all (it
+/// guarded on the outer map kind, which is `WALD`, not `ROHSTOFF`), so stock
+/// woodland was an infinite resource and this test's first half could not fail.
+#[test]
+fn a_forester_depletes_and_regrows_its_woodland() {
+    let Some(corpus) = load_corpus() else {
+        return;
+    };
+    let (mut sim, island, building_index, _root, _anchor) = forester_in_stock_woodland(&corpus);
+
+    let ripe_trees = |sim: &anno_sim::simulation::Simulation| -> HashSet<(u8, u8)> {
+        sim.source_static_map_roots
+            .iter()
+            .filter(|cell| {
+                cell.island == island
+                    && cell.source_production_kind_code == 9
+                    && cell.source_output_ware_slot == BAUM
+            })
+            .map(|cell| (cell.x, cell.y))
+            .collect()
+    };
+    let growing_cells = |sim: &anno_sim::simulation::Simulation| -> HashSet<(u8, u8)> {
+        sim.source_static_map_roots
+            .iter()
+            .filter(|cell| {
+                cell.island == island
+                    && cell.source_production_kind_code == 10
+                    && cell.source_growth_resource_ware_slot == BAUM
+            })
+            .map(|cell| (cell.x, cell.y))
+            .collect()
+    };
+
+    let initial_ripe = ripe_trees(&sim);
+    assert!(
+        growing_cells(&sim).is_empty(),
+        "natural terrain ships ripe and is not enrolled at load"
+    );
+
+    // Phase one: harvest until several trees have gone over to their
+    // `ROHSTWACHS` record. One `sim.tick(200)` is one `FUN_00489670` sub-step
+    // at speed 1.
+    let mut depleted_output = 0;
+    let mut steps_to_deplete = 0;
+    for step in 0..2_500 {
+        sim.tick(200);
+        depleted_output = sim.buildings[building_index].output_stock;
+        steps_to_deplete = step + 1;
+        if depleted_output >= 2 && growing_cells(&sim).len() >= 3 {
+            break;
+        }
+    }
+    let harvested = growing_cells(&sim);
+    let ripe_after_deplete = ripe_trees(&sim);
+
+    println!(
+        "island {island}: {} ripe BAUM cells at load, {} after {steps_to_deplete} sub-steps, \
+         {} growing, {depleted_output} whole wood",
+        initial_ripe.len(),
+        ripe_after_deplete.len(),
+        harvested.len()
+    );
+
+    assert!(
+        !harvested.is_empty(),
+        "no woodland cell ever left the ripe ROHSTOFF record: the harvest \
+         transition still does not fire on shipped data"
+    );
+    assert!(
+        ripe_after_deplete.len() + harvested.len() == initial_ripe.len(),
+        "every cell that left the ripe set must be accounted for as growing: \
+         {} ripe at load, {} ripe now, {} growing",
+        initial_ripe.len(),
+        ripe_after_deplete.len(),
+        harvested.len()
+    );
+    assert!(
+        ripe_after_deplete.len() < initial_ripe.len(),
+        "the woodland did not deplete: {} ripe cells before, {} after",
+        initial_ripe.len(),
+        ripe_after_deplete.len()
+    );
+    assert!(
+        depleted_output >= 2,
+        "the forester produced {depleted_output} whole wood while depleting"
+    );
+
+    let owner = sim
+        .source_static_map_roots
+        .iter()
+        .find(|cell| harvested.contains(&(cell.x, cell.y)) && cell.island == island)
+        .expect("a harvested cell")
+        .source_map_owner_slot;
+    for cell in sim
+        .source_static_map_roots
+        .iter()
+        .filter(|cell| harvested.contains(&(cell.x, cell.y)) && cell.island == island)
+    {
+        assert!(
+            initial_ripe.contains(&(cell.x, cell.y)),
+            "every growing cell must be one of the load-time ripe trees"
+        );
+        assert!(
+            cell.source_growth_enrolled,
+            "a harvested cell must own a `FUN_0047c760` growth-table entry"
+        );
+        assert_eq!(
+            cell.source_growth_bucket, 20,
+            "forest is Interval 900 over AnimAnz 5 -> 180 000 ms per phase -> bucket 20"
+        );
+        // "stop yielding": the cell is still walkable for the worker — kind 10
+        // resolves its `+0xa9` selector — but it is no longer a target.
+        assert!(cell.admits_plantation_worker_path(owner, BAUM));
+        assert!(!cell.is_plantation_worker_target(owner, BAUM));
+    }
+
+    // Phase two: those five bucket-20 rollovers are 900 s of simulated time,
+    // 4 500 sub-steps of a full New Horizons0 world. The timer runs for real —
+    // `tick_source_growth_timers` still compares its own accumulator against
+    // the 180 000 ms period, still rolls its own three-bit counter, and the
+    // sweep still needs up to 160 calls to reach an entry — but the clock is
+    // fed 1 200 ms per sub-step instead of 200 so the test does not spend
+    // fifteen minutes on wall clock.
+    // `growth_bucket_clocks_fire_at_their_own_periods` covers the untouched
+    // clock arithmetic.
+    //
+    // The 6x factor is deliberately mild. `DAT_00562da8` is a three-bit
+    // counter compared against a per-entry snapshot, so an entry whose bucket
+    // rolls a multiple of eight times between two sweep visits is skipped
+    // entirely. In the original that cannot happen — the fastest bucket is
+    // 40 s and a full sweep is 160 sub-steps, about 32 s — and at 1 200 ms per
+    // sub-step a rollover still takes 150 sub-steps, roughly one per sweep.
+    const FOREST_BUCKET: usize = 20;
+    let mut seen_ripe_again: HashSet<(u8, u8)> = HashSet::new();
+    let mut regrown_output = depleted_output;
+    let mut steps_to_regrow = 0;
+    for step in 0..2_000 {
+        sim.source_growth_bucket_elapsed_ms[FOREST_BUCKET] += 1_000;
+        sim.tick(200);
+        steps_to_regrow = step + 1;
+        for cell in sim.source_static_map_roots.iter() {
+            if cell.island == island
+                && cell.source_production_kind_code == 9
+                && cell.source_output_ware_slot == BAUM
+                && harvested.contains(&(cell.x, cell.y))
+            {
+                seen_ripe_again.insert((cell.x, cell.y));
+            }
+        }
+        regrown_output = regrown_output.max(sim.buildings[building_index].output_stock);
+        if seen_ripe_again.len() == harvested.len() && regrown_output > depleted_output {
+            break;
+        }
+    }
+
+    println!(
+        "after {steps_to_regrow} more sub-steps: {}/{} harvested cells ripened again, \
+         {depleted_output} -> {regrown_output} whole wood",
+        seen_ripe_again.len(),
+        harvested.len()
+    );
+
+    assert!(
+        !seen_ripe_again.is_empty(),
+        "no harvested cell ever ripened again: the growth timer never promoted it"
+    );
+    assert_eq!(
+        seen_ripe_again.len(),
+        harvested.len(),
+        "only {}/{} harvested cells ripened again",
+        seen_ripe_again.len(),
+        harvested.len()
+    );
+    assert!(
+        regrown_output > depleted_output,
+        "the forester never resumed producing: {depleted_output} wood before regrowth, \
+         {regrown_output} after"
     );
 }

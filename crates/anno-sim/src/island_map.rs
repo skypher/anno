@@ -33,6 +33,59 @@ struct SourceCivilianPathCell {
     path_class: u8,
 }
 
+/// A dense view of the live static map cells that fall inside one path-grid
+/// window.
+///
+/// The executable indexes its live cell array directly; the port keeps a flat
+/// `Vec` of every command root on every island, so a naive per-cell
+/// `iter().rev().find(..)` costs one full scan of tens of thousands of records
+/// for each of the window's cells. This clips once and preserves the same
+/// last-writer-wins order the reversed scan had.
+struct SourceStaticCellWindow<'a> {
+    origin: (i32, i32),
+    width: usize,
+    height: usize,
+    cells: Vec<Option<&'a SourceMapCellState>>,
+}
+
+impl<'a> SourceStaticCellWindow<'a> {
+    fn new(
+        island_id: u8,
+        static_cells: &'a [SourceMapCellState],
+        origin: (i32, i32),
+        width: usize,
+        height: usize,
+    ) -> Self {
+        let mut window = Self {
+            origin,
+            width,
+            height,
+            cells: vec![None; width.saturating_mul(height)],
+        };
+        for state in static_cells {
+            if state.island != island_id {
+                continue;
+            }
+            let (x, y) = (i32::from(state.x), i32::from(state.y));
+            if let Some(index) = window.index((x, y)) {
+                window.cells[index] = Some(state);
+            }
+        }
+        window
+    }
+
+    fn index(&self, position: (i32, i32)) -> Option<usize> {
+        let dx = position.0.checked_sub(self.origin.0)?;
+        let dy = position.1.checked_sub(self.origin.1)?;
+        (dx >= 0 && dy >= 0 && (dx as usize) < self.width && (dy as usize) < self.height)
+            .then(|| dy as usize * self.width + dx as usize)
+    }
+
+    fn get(&self, position: (i32, i32)) -> Option<&'a SourceMapCellState> {
+        self.cells[self.index(position)?]
+    }
+}
+
 /// Compiled outer kind retained for every INSELHAUS footprint cell. Unlike
 /// the civilian route overlay, this exists even when the definition has no
 /// type-3 path class, because `FUN_00467940` only inspects map kinds.
@@ -1146,6 +1199,40 @@ impl IslandMap {
         raw_resource_ware_slot: u8,
         static_cells: &[SourceMapCellState],
     ) -> SourcePathGrid {
+        self.source_worker_path_grid(
+            center,
+            root,
+            footprint,
+            radius,
+            source_owner,
+            raw_resource_ware_slot,
+            static_cells,
+            0,
+        )
+    }
+
+    /// The same `FUN_0046f920` overlay with the movement class selected by the
+    /// calling route builder.
+    ///
+    /// `FUN_0045b200` passes `param_7 = 0` for a production-kind-2 worker
+    /// (`1602_exe.c:62983`), so its metadata comes from compiled `Wegspeed[0]`.
+    /// The production-kind-4 grazer's builder `FUN_0045bcc0` passes
+    /// `param_7 = 3` (`1602_exe.c:63432`) and therefore walks the same land
+    /// grid weighted by the *civilian* `Wegspeed[3]` class instead. The
+    /// admission predicate — fixed terrain, or an owner-and-`Ware` match — is
+    /// shared, because both builders call the same overlay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn source_worker_path_grid(
+        &self,
+        center: (i32, i32),
+        root: (i32, i32),
+        footprint: (u8, u8),
+        radius: u8,
+        source_owner: u8,
+        raw_resource_ware_slot: u8,
+        static_cells: &[SourceMapCellState],
+        movement_class: u8,
+    ) -> SourcePathGrid {
         let radius_usize = usize::from(radius);
         let radius = i32::from(radius);
         let width = usize::from(footprint.0.max(1)).saturating_add(radius.max(0) as usize * 2);
@@ -1153,18 +1240,26 @@ impl IslandMap {
         let origin = (center.0 - radius, center.1 - radius);
         let mut grid = SourcePathGrid::new(origin, width, height);
 
+        let window =
+            SourceStaticCellWindow::new(self.island_id, static_cells, origin, width, height);
         for y in origin.1..origin.1 + height as i32 {
             for x in origin.0..origin.0 + width as i32 {
                 grid.mark_direction_blocker((x, y));
-                if let Some(static_cell) = static_cells.iter().rev().find(|state| {
-                    state.island == self.island_id
-                        && i32::from(state.x) == x
-                        && i32::from(state.y) == y
-                }) {
+                if let Some(static_cell) = window.get((x, y)) {
                     if static_cell
                         .admits_plantation_worker_path(source_owner, raw_resource_ware_slot)
                     {
-                        grid.set_traversable_cell((x, y), static_cell.source_path_class);
+                        // The live cell record only retains `Wegspeed[0]`;
+                        // the other three classes stay on the compiled
+                        // definition, which the static overlay still holds.
+                        let path_class = if movement_class == 0 {
+                            static_cell.source_path_class
+                        } else {
+                            self.civilian_path_cell((x, y))
+                                .map(|cell| cell.path_class)
+                                .unwrap_or(static_cell.source_path_class)
+                        };
+                        grid.set_traversable_cell((x, y), path_class);
                     }
                     continue;
                 }
@@ -1175,7 +1270,12 @@ impl IslandMap {
                 let matching_raw_resource =
                     cell.owner == source_owner && cell.source_ware_slot == raw_resource_ware_slot;
                 if fixed_terrain || matching_raw_resource {
-                    grid.set_traversable_cell((x, y), cell.plantation_path_class);
+                    let path_class = if movement_class == 0 {
+                        cell.plantation_path_class
+                    } else {
+                        cell.path_class
+                    };
+                    grid.set_traversable_cell((x, y), path_class);
                 }
             }
         }
@@ -1187,6 +1287,116 @@ impl IslandMap {
         ) {
             grid.set_target_region_metadata(target, 0x28);
         }
+        let _ = grid.block_outside_source_radius_mask(
+            radius_usize,
+            usize::from(footprint.0.max(1)),
+            usize::from(footprint.1.max(1)),
+        );
+        grid
+    }
+
+    /// Rebuild the production-kind-6 fishery grid made by `FUN_0046fb50`
+    /// (`1602_exe.c:78842`). This is a **water** overlay, not the land grid
+    /// with a flag, and its admission rules have nothing in common with
+    /// `FUN_0046f920`:
+    ///
+    /// * every cell starts traversable at cost `0` with the fixed path class
+    ///   `0x20`, and only the `default:` arm writes the `0xc` blocked cost;
+    /// * outer kind `0x13` (`MEER`) stays traversable and becomes a target
+    ///   when its nested kind is `9` (`ROHSTOFF`), its `Ware` matches the
+    ///   fishery's `Rohstoff`, and the live `0x20000000` reservation bit is
+    ///   clear;
+    /// * outer kinds `0x14` (`BRANDUNG`) and `0x16` (`MUENDUNG`) are blocked
+    ///   only when their own map direction equals `(root direction + 1) & 3`;
+    /// * outer kind `0x15` (`BRANDECK`) is always traversable but never a
+    ///   target; everything else — land, beach, the fishery's own pier — is
+    ///   blocked.
+    ///
+    /// There is no settlement-slot comparison anywhere in the function, so a
+    /// fishery harvests any `FISCHE` cell in range whether or not the water
+    /// or the fishery has been claimed into a settlement.
+    ///
+    /// `FUN_0045b730` then reopens the root footprint and the single water
+    /// cell the pier faces through two `FUN_004710b0` calls
+    /// (`1602_exe.c:63196-63223`), which is what lets the worker leave the
+    /// blocked land tile it starts on.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fishery_worker_path_grid(
+        &self,
+        center: (i32, i32),
+        root: (i32, i32),
+        footprint: (u8, u8),
+        radius: u8,
+        root_direction: u8,
+        raw_resource_ware_slot: u8,
+        static_cells: &[SourceMapCellState],
+    ) -> SourcePathGrid {
+        const WATER_PATH_CLASS: u8 = 0x20;
+        const ROOT_PATH_CLASS: u8 = 0x28;
+
+        let radius_usize = usize::from(radius);
+        let radius = i32::from(radius);
+        let width = usize::from(footprint.0.max(1)).saturating_add(radius.max(0) as usize * 2);
+        let height = usize::from(footprint.1.max(1)).saturating_add(radius.max(0) as usize * 2);
+        let origin = (center.0 - radius, center.1 - radius);
+        let mut grid = SourcePathGrid::new(origin, width, height);
+        let blocked_direction = root_direction.wrapping_add(1) & 3;
+        let window =
+            SourceStaticCellWindow::new(self.island_id, static_cells, origin, width, height);
+
+        for y in origin.1..origin.1 + height as i32 {
+            for x in origin.0..origin.0 + width as i32 {
+                let position = (x, y);
+                let Some(kind_cell) = self.source_map_kind_cell(position) else {
+                    // `FUN_0046fb50` clips its scan to the island's own cell
+                    // array and pre-fills the *whole* window with cost `0` and
+                    // class `0x20`, so a window that overhangs the island
+                    // leaves open water behind — the opposite of the land grid
+                    // `FUN_0046f920`, whose pre-fill is the `0xc` blocked cost.
+                    grid.set_traversable_cell(position, WATER_PATH_CLASS);
+                    continue;
+                };
+                match kind_cell.kind_code {
+                    19 => {
+                        grid.set_traversable_cell(position, WATER_PATH_CLASS);
+                        let target = window.get(position).is_some_and(|state| {
+                            state.source_production_kind_code == 9
+                                && state.source_output_ware_slot == raw_resource_ware_slot
+                                && !state.source_resource_reserved
+                        });
+                        if target {
+                            grid.set_metadata(position, WATER_PATH_CLASS | 0x80);
+                        }
+                    }
+                    20 | 22 if kind_cell.map_direction != blocked_direction => {
+                        grid.set_traversable_cell(position, WATER_PATH_CLASS);
+                    }
+                    21 => {
+                        grid.set_traversable_cell(position, WATER_PATH_CLASS);
+                    }
+                    _ => {
+                        grid.mark_direction_blocker(position);
+                    }
+                }
+            }
+        }
+
+        if let Some(target) = SourcePathTargetRect::new(
+            root,
+            usize::from(footprint.0.max(1)),
+            usize::from(footprint.1.max(1)),
+        ) {
+            grid.set_target_region_metadata(target, ROOT_PATH_CLASS);
+        }
+        // The second `FUN_004710b0` opens the one cell the root's compiled
+        // orientation faces, so a pier reaches its own water.
+        let (face_x, face_y) = match root_direction & 3 {
+            0 => (root.0, root.1 + 1),
+            1 => (root.0 - 1, root.1),
+            2 => (root.0, root.1 - 1),
+            _ => (root.0 + 1, root.1),
+        };
+        grid.set_traversable_cell((face_x, face_y), ROOT_PATH_CLASS);
         let _ = grid.block_outside_source_radius_mask(
             radius_usize,
             usize::from(footprint.0.max(1)),
@@ -1215,6 +1425,8 @@ impl IslandMap {
 
         let origin = (center.0 - RADIUS, center.1 - RADIUS);
         let mut grid = SourcePathGrid::new(origin, GRID_SIDE, GRID_SIDE);
+        let window =
+            SourceStaticCellWindow::new(self.island_id, static_cells, origin, GRID_SIDE, GRID_SIDE);
 
         for y in origin.1..=origin.1 + RADIUS * 2 {
             for x in origin.0..=origin.0 + RADIUS * 2 {
@@ -1223,11 +1435,7 @@ impl IslandMap {
 
                 let civilian_cell = self.civilian_path_cell(position);
                 let kind3_center_cell = civilian_cell.is_some_and(|cell| cell.kind3_center_cell);
-                if let Some(static_cell) = static_cells.iter().rev().find(|state| {
-                    state.island == self.island_id
-                        && i32::from(state.x) == x
-                        && i32::from(state.y) == y
-                }) {
+                if let Some(static_cell) = window.get(position) {
                     let normalized_ware_slot = static_cell.plantation_path_resource_ware_slot();
                     let traversable =
                         source_plantation_path_kind_always_walkable(static_cell.kind_code)
@@ -1887,6 +2095,103 @@ fn source_controller_city_construction_record(
 mod tests {
     use super::*;
     use anno_formats::szs::IslandTile;
+
+    /// `FUN_0046fb50` (`1602_exe.c:78842`) is a water overlay whose arms have
+    /// nothing in common with the land grid `FUN_0046f920`: everything starts
+    /// traversable at the fixed `0x20` class, `MEER` can become a target, the
+    /// two direction-gated shore kinds block only against the root's own
+    /// facing, `BRANDECK` is always open, and every other kind is blocked.
+    #[test]
+    fn fishery_water_grid_follows_the_source_kind_switch() {
+        const FISCHE: u8 = 0x39;
+        let mut map = IslandMap::new_open(1, 20, 20);
+        let index = |x: usize, y: usize| y * 20 + x;
+        let kind = |kind_code: u8, map_direction: u8| {
+            Some(SourceMapKindCell {
+                kind_code,
+                kind3_center_cell: false,
+                map_owner: 3,
+                ware_slot: 0,
+                map_direction,
+            })
+        };
+        // Sea everywhere, with the pier's own beach tile under the root.
+        for cell in map.source_map_kind_cells.iter_mut() {
+            *cell = kind(19, 0);
+        }
+        map.source_map_kind_cells[index(5, 5)] = kind(23, 0);
+        // Plain ground, a direction-gated shore pair and a `BRANDECK`.
+        map.source_map_kind_cells[index(4, 4)] = kind(11, 0);
+        map.source_map_kind_cells[index(6, 4)] = kind(20, 1);
+        map.source_map_kind_cells[index(7, 4)] = kind(20, 2);
+        map.source_map_kind_cells[index(8, 4)] = kind(22, 1);
+        map.source_map_kind_cells[index(3, 4)] = kind(21, 1);
+
+        let fish = |x: u8, y: u8, reserved: bool| SourceMapCellState {
+            island: 1,
+            x,
+            y,
+            kind_code: 19,
+            source_production_kind_code: 9,
+            source_output_ware_slot: FISCHE,
+            source_resource_reserved: reserved,
+            source_map_owner_slot: 4,
+            ..SourceMapCellState::default()
+        };
+        // A ripe cell, a reserved one, and one whose ware does not match.
+        let statics = vec![
+            fish(5, 7, false),
+            fish(5, 8, true),
+            SourceMapCellState {
+                source_output_ware_slot: 0x35,
+                ..fish(6, 7, false)
+            },
+        ];
+
+        // 1x1 root at (5, 5), compiled `Radius: 5`, facing direction 0.
+        let grid = map.fishery_worker_path_grid((5, 5), (5, 5), (1, 1), 5, 0, FISCHE, &statics);
+
+        assert_eq!(grid.metadata((5, 5)), Some(0x28), "root footprint reopened");
+        assert_eq!(grid.metadata((5, 6)), Some(0x28), "the faced water cell");
+        assert_eq!(grid.metadata((5, 9)), Some(0x20), "plain MEER stays open");
+        assert_eq!(grid.metadata((5, 7)), Some(0xa0), "ripe FISCHE is a target");
+        assert_eq!(
+            grid.metadata((5, 8)),
+            Some(0x20),
+            "the 0x20000000 reservation bit clears the target bit"
+        );
+        assert_eq!(
+            grid.metadata((6, 7)),
+            Some(0x20),
+            "a MEER cell carrying another Ware is passable but not a target"
+        );
+        assert_eq!(grid.metadata((4, 4)), Some(0), "land takes the default arm");
+        assert_eq!(
+            grid.metadata((6, 4)),
+            Some(0),
+            "kind 0x14 blocks when its direction is (root + 1) & 3"
+        );
+        assert_eq!(
+            grid.metadata((7, 4)),
+            Some(0x20),
+            "kind 0x14 with any other direction stays open"
+        );
+        assert_eq!(
+            grid.metadata((8, 4)),
+            Some(0),
+            "kind 0x16 shares the direction gate"
+        );
+        assert_eq!(
+            grid.metadata((3, 4)),
+            Some(0x20),
+            "kind 0x15 is always open and never a target"
+        );
+
+        // The settlement selector is absent from the whole function: the
+        // fish carry slot 4 and the water slot 3, and both still resolve.
+        let claimed = map.fishery_worker_path_grid((5, 5), (5, 5), (1, 1), 5, 0, FISCHE, &statics);
+        assert_eq!(claimed.metadata((5, 7)), Some(0xa0));
+    }
 
     #[test]
     fn from_island_resolves_tile_id_as_cod_source_id() {

@@ -83,6 +83,59 @@ pub enum SourceResourceHarvestTransition {
     Drought,
 }
 
+/// Number of parallel growth clocks kept by the source. `FUN_0047ca80`
+/// advances `DAT_0054a2f4[i]` (accumulator) and `DAT_00562da8[i]` (three-bit
+/// counter) for `i` in `0..32`; bucket `i` fires every `40000 + 7000*i` ms,
+/// i.e. 40 000 through 257 000.
+pub const SOURCE_GROWTH_BUCKET_COUNT: usize = 32;
+
+/// Period of one growth bucket, in milliseconds.
+#[inline]
+pub const fn source_growth_bucket_period_ms(bucket: usize) -> u32 {
+    40_000 + 7_000 * (bucket as u32)
+}
+
+/// One compiled 0x88-byte definition record of a raw-resource group, holding
+/// exactly the fields the growth pipeline reads out of it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceResourceRecord {
+    /// `@Nummer` slot. The compiled table is 0x88-byte records in this order,
+    /// so `record ± 1` is the source's `def ± 0x88` step.
+    pub record: i32,
+    /// Compiled `Gfx` at definition offset `+0x84`, which the transition
+    /// writers move into the tile's low 13 bits. `FUN_0047ca80` reaches the
+    /// *next* record's copy as `def+0x10c`.
+    pub gfx: u16,
+    /// Compiled `AnimAnz` at `+0x78`: the number of bucket rollovers this
+    /// record needs before the sweep promotes the tile.
+    pub anim_count: u8,
+    /// Value compiled into `+0x3a`. On a production-kind-10 record
+    /// `FUN_00462d50` has already rewritten the authored `Interval` into a
+    /// bucket index; every other record still holds the raw `Interval`, which
+    /// `FUN_0047c760` clamps to 31 when it is used as a bucket.
+    pub bucket: u8,
+    /// `AnimTime` at `+0x70` equals `TIMENEVER`, registered as **0**
+    /// (`1602_exe.c:44507`, `:66370`). Only then are tile bits 15..=18 free to
+    /// carry the growth phase; the sea resource (`AnimTime: 130`) animates
+    /// with those bits and never receives a phase write.
+    pub writes_phase_bits: bool,
+}
+
+/// The compiled record group a raw-resource map cell moves through:
+/// `[HAUSWACHS, HAUSFERT, DOERR]`, adjacent 0x88-byte records in `@Nummer`
+/// order. Only the seven crops are triples — haeuser.cod contains exactly
+/// seven `Doerrflg: 1` records; pasture, forest, palms and the sea resource
+/// are pairs with no withered entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceResourceRecordLink {
+    /// `ripe - 1`: the `ROHSTWACHS` growth record.
+    pub growth: SourceResourceRecord,
+    /// The `ROHSTOFF` record a plantation worker can harvest.
+    pub ripe: SourceResourceRecord,
+    /// `ripe + 1` when that record carries `Doerrflg`.
+    pub dry: Option<SourceResourceRecord>,
+}
+
 const SOURCE_RESOURCE_GROWTH_MASKS: [[bool; 32]; 5] = [
     [
         false, false, true, false, false, false, false, false, false, false, false, false, false,
@@ -288,8 +341,16 @@ pub struct SourceMapCellState {
     #[serde(default)]
     pub source_path_class: u8,
     /// Compiled `Randwachs` at definition offset `+0x40`, in the source's
-    /// 128-scale. `FUN_004684a0` combines it with the island's live resource
-    /// strength when `FUN_0047c830` replaces a harvested raw-resource cell.
+    /// 128-scale.
+    ///
+    /// `FUN_004684a0` does **not** read this off the resource cell — it reads
+    /// it off whatever record occupies the same coordinate in the base terrain
+    /// layer `param_1[0x2bf]`, this port's `source_static_map_backing_cells`.
+    /// That is the layer the property is authored on: `ObjFill: 0,MAXHAUS`
+    /// gives every slot `Randwachs: 100` and only the desert markers override
+    /// it (25 / 40 / 50 / 75), while no crop, forest or pasture record authors
+    /// it at all. Reading a resource cell's own copy was right by accident on
+    /// ordinary ground — both are 128 — and wrong on desert.
     #[serde(default)]
     pub source_resource_growth_factor: u8,
     /// Compiled `Maxenergy` at definition offset `+0x64`. The deferred
@@ -324,6 +385,44 @@ pub struct SourceMapCellState {
     /// type-11 allocator, independently of the outer map kind above.
     #[serde(default)]
     pub source_production_kind_code: u8,
+    /// `@Nummer` slot of the compiled record this cell currently shows. The
+    /// runtime table is 0x88-byte records in this order, so every `def ± 0x88`
+    /// step in the resource pipeline is `record ± 1` here.
+    #[serde(default)]
+    pub source_definition_record: i32,
+    /// The `[ROHSTWACHS, ROHSTOFF, DOERR]` record group this cell belongs to,
+    /// resolved once from haeuser.cod. Present only on raw-resource cells.
+    #[serde(default)]
+    pub source_resource_records: Option<SourceResourceRecordLink>,
+    /// This cell owns a live entry in the source growth table `DAT_00562dc8`.
+    ///
+    /// The executable keeps that as a 32860-slot open-addressed hash table
+    /// keyed by `((island & 7) * 0x40 + (x & 0x3f)) * 0x40 + (y & 0x3f)`, with
+    /// a 92-slot linear probe window. It is **not** saved: `FUN_00481450` case
+    /// 10 rebuilds it from tile state while replaying INSELHAUS commands, so
+    /// per-cell fields hold the same information. The one behaviour this does
+    /// not reproduce is `FUN_0047c760`'s failure mode — when every slot in a
+    /// cell's probe window is taken the insert **silently does nothing** and
+    /// that tile never grows. Here enrolment always succeeds.
+    #[serde(default)]
+    pub source_growth_enrolled: bool,
+    /// Table byte 3: which of the 32 bucket clocks this entry follows.
+    #[serde(default)]
+    pub source_growth_bucket: u8,
+    /// Table byte 4: the snapshot of `DAT_00562da8[bucket]` taken at the last
+    /// visit. The sweep advances the entry only when the counter has moved.
+    #[serde(default)]
+    pub source_growth_phase_seen: u8,
+    /// Table byte 5: completed growth phases, seeded from the tile's bits
+    /// 15..=18 at enrolment and written back into them on every visit.
+    #[serde(default)]
+    pub source_growth_phase: u8,
+    /// The command word's bits 17..=21, which `FUN_004631b0` filled with one
+    /// `rand() & 0x1F` at command construction and the save persists. It is
+    /// the sole RNG input to the growth pipeline: `FUN_00481450` case 10 arms
+    /// a newly placed kind-10 tile with `def[0x3a] + param_7 % 3`.
+    #[serde(default)]
+    pub source_placement_variant: u8,
 }
 
 impl SourceMapCellState {
@@ -499,6 +598,13 @@ impl SourceMapCellState {
             animation_continues: definition.animation_continues,
             kind_code,
             source_production_kind_code,
+            source_definition_record: definition.nummer,
+            source_resource_records: None,
+            source_growth_enrolled: false,
+            source_growth_bucket: 0,
+            source_growth_phase_seen: 0,
+            source_growth_phase: 0,
+            source_placement_variant: 0,
         })
     }
 
@@ -530,76 +636,267 @@ impl SourceMapCellState {
             && self.source_plantation_worker_definition != 0
     }
 
-    /// Model the state written by `FUN_0047c830` after a type-12 worker
-    /// harvests this kind-9 cell. Both adjacent authored records inherit the
-    /// preceding `ROHSTWACHS` definition's `WALD` map kind and `NOWARE`
-    /// selector; only their definition index distinguishes regrowth from dry.
+    /// Resolve the compiled record group this cell belongs to and record the
+    /// slot it currently occupies. Every `def ± 0x88` step the resource
+    /// pipeline takes is resolved through this group, never through `Gfx ± 1`.
+    pub fn configure_source_resource_records(&mut self, cod: &CodFile, definition: &BuildingDef) {
+        self.source_definition_record = definition.nummer;
+        self.source_resource_records = source_resource_record_link(cod, definition);
+    }
+
+    /// The record this cell currently shows, selected the way the executable
+    /// selects it: by dereferencing the tile's `Gfx` through the definition
+    /// table and reading `+0x1c` / `Doerrflg`.
+    #[inline]
+    pub fn current_source_resource_record(self) -> Option<SourceResourceRecord> {
+        let link = self.source_resource_records?;
+        Some(
+            match (self.source_production_kind_code, self.source_resource_is_dry) {
+                (10, true) => link.dry?,
+                (10, false) => link.growth,
+                _ => link.ripe,
+            },
+        )
+    }
+
+    /// Replay `FUN_0047c760` (`1602_exe.c:88815`): clamp the bucket to 31,
+    /// snapshot that bucket's current counter, and seed the phase byte from
+    /// the tile's live bits 15..=18. The whole routine `0x47c760-0x47c80b`
+    /// contains no `rand()` call, so arming never perturbs the RNG stream.
+    pub fn arm_source_growth_timer(
+        &mut self,
+        bucket: u8,
+        bucket_phases: [u8; SOURCE_GROWTH_BUCKET_COUNT],
+    ) {
+        let bucket = bucket.min(31);
+        self.source_growth_bucket = bucket;
+        self.source_growth_phase_seen = bucket_phases[usize::from(bucket)];
+        self.source_growth_phase = self.source_variant & 0x0f;
+        self.source_growth_enrolled = true;
+    }
+
+    /// Arm a freshly placed production-kind-10 tile the way `FUN_00481450`
+    /// case 10 does (`1602_exe.c:92837-92842`): the record's own bucket plus
+    /// the command word's persisted `rand() & 0x1F` taken modulo three. This
+    /// is the only jitter anywhere in the pipeline; harvest re-enrolment and
+    /// the drought sweep arm with the plain `def[0x3a]`.
+    pub fn arm_placed_source_growth_timer(
+        &mut self,
+        bucket_phases: [u8; SOURCE_GROWTH_BUCKET_COUNT],
+    ) -> bool {
+        if self.source_production_kind_code != 10 || self.source_growth_enrolled {
+            return false;
+        }
+        let Some(record) = self.current_source_resource_record() else {
+            return false;
+        };
+        let jitter = self.source_placement_variant % 3;
+        self.arm_source_growth_timer(record.bucket.saturating_add(jitter), bucket_phases);
+        true
+    }
+
+    /// Move this cell onto one growth-side record: rewrite the tile's low 13
+    /// bits from that record's `Gfx`, clear the phase bits when the record
+    /// leaves them free, and re-enrol on that record's bucket.
+    ///
+    /// The outer map kind is deliberately left alone. A group's records all
+    /// carry the same outer `Kind` in the shipped data — `WALD` for crops,
+    /// forest and palms, `BODEN` for pasture, `MEER` for the sea resource —
+    /// and the executable never writes an outer kind anywhere: it re-derives
+    /// every definition field from the tile's `Gfx`. Forcing `kind_code = 10`
+    /// here used to demote ripe pasture out of `FUN_0046f920`'s always-
+    /// walkable terrain set.
+    fn enter_source_growth_record(
+        &mut self,
+        record: SourceResourceRecord,
+        dry: bool,
+        bucket_phases: [u8; SOURCE_GROWTH_BUCKET_COUNT],
+    ) {
+        self.source_definition_offset = record.gfx;
+        self.source_definition_record = record.record;
+        self.source_production_kind_code = 10;
+        if self.source_output_ware_slot != 0 {
+            self.source_growth_resource_ware_slot = self.source_output_ware_slot;
+        }
+        self.source_resource_is_dry = dry;
+        self.source_output_ware_slot = 0;
+        self.source_raw_resource_ware_slot = 0;
+        self.source_plantation_worker_definition = 0;
+        // `if (*(int *)(iVar4 + 0x70) == 0) { *puVar5 = uVar3 & 0xfff87fff; }`
+        if record.writes_phase_bits {
+            self.source_variant = 0;
+        }
+        self.arm_source_growth_timer(record.bucket, bucket_phases);
+    }
+
+    /// Model the state written by `FUN_0047c830` (`1602_exe.c:88874`) after a
+    /// type-12 worker harvests this cell.
+    ///
+    /// The gate is the **nested** production kind at definition offset `+0x1c`
+    /// (`if (*(int *)(iVar1 + 0x1c) == 9)`, `1602_exe.c:88888`), not the outer
+    /// map kind. With the shipped data a ripe crop is outer `WALD` (10) over
+    /// nested `ROHSTOFF` (9) and ripe pasture is outer `BODEN` (11), so the
+    /// superseded `self.kind_code != 9` guard never fired on real data and
+    /// island woodland was an infinite resource. Only a synthetic
+    /// `kind: "ROHSTOFF"` fixture matched it.
+    ///
+    /// The reservation bit 29 is cleared unconditionally, on the taken and the
+    /// untaken branch alike (`*puVar5 = uVar3 & 0xdfffffff`).
     pub fn replace_harvested_raw_resource(
         &mut self,
         transition: SourceResourceHarvestTransition,
+        bucket_phases: [u8; SOURCE_GROWTH_BUCKET_COUNT],
     ) -> bool {
-        if self.kind_code != 9 {
-            self.source_resource_reserved = false;
-            return false;
-        }
-        self.source_definition_offset = match transition {
-            SourceResourceHarvestTransition::Regrowth => {
-                self.source_definition_offset.saturating_sub(1)
-            }
-            SourceResourceHarvestTransition::Drought => {
-                self.source_definition_offset.saturating_add(1)
-            }
-        };
-        self.kind_code = 10;
-        self.source_production_kind_code = 10;
-        self.source_growth_resource_ware_slot = self.source_output_ware_slot;
-        self.source_resource_is_dry = transition == SourceResourceHarvestTransition::Drought;
-        self.source_output_ware_slot = 0;
-        self.source_raw_resource_ware_slot = 0;
-        self.source_plantation_worker_definition = 0;
+        let target = self.harvest_target_record(transition);
         self.source_resource_reserved = false;
+        let Some(target) = target else {
+            return false;
+        };
+        self.enter_source_growth_record(
+            target,
+            transition == SourceResourceHarvestTransition::Drought,
+            bucket_phases,
+        );
         true
     }
 
-    /// The raw-resource half of `FUN_0047c920`: an unclaimed kind-9 cell
-    /// moves one authored definition forward only when `FUN_004684a0` selects
-    /// the drought branch.
+    /// The raw-resource half of `FUN_0047c920` (`1602_exe.c:88924-88938`): an
+    /// unreserved nested-kind-9 cell moves to `def + 0x88` only when
+    /// `FUN_004684a0` selects the drought branch, and re-enrols on that
+    /// record's `+0x3a`.
     pub fn advance_raw_resource_to_drought(
         &mut self,
         transition: SourceResourceHarvestTransition,
+        bucket_phases: [u8; SOURCE_GROWTH_BUCKET_COUNT],
     ) -> bool {
-        if self.kind_code != 9
-            || self.source_resource_reserved
-            || transition != SourceResourceHarvestTransition::Drought
-        {
+        if self.source_resource_reserved || transition != SourceResourceHarvestTransition::Drought {
             return false;
         }
-        self.source_definition_offset = self.source_definition_offset.saturating_add(1);
-        self.kind_code = 10;
-        self.source_production_kind_code = 10;
-        self.source_growth_resource_ware_slot = self.source_output_ware_slot;
-        self.source_resource_is_dry = true;
-        self.source_output_ware_slot = 0;
-        self.source_raw_resource_ware_slot = 0;
-        self.source_plantation_worker_definition = 0;
+        let Some(target) = self.harvest_target_record(transition) else {
+            return false;
+        };
+        self.enter_source_growth_record(target, true, bucket_phases);
         true
     }
 
-    /// The dry-resource half of `FUN_0047c920`: the preceding authored raw
-    /// definition is restored when the source growth mask selects regrowth.
+    /// Both drought-side destinations of a nested-kind-9 cell: `def - 0x88`
+    /// for regrowth and `def + 0x88` for withering.
+    ///
+    /// A group with no authored `Doerrflg` record — pasture, forest, palms,
+    /// the sea resource — has no withering destination. The executable steps
+    /// to `ripe + 0x88` regardless and lands on the *next variant's* growth
+    /// record, a data hazard reachable only on drought islands (the drought
+    /// byte is zero on every New Horizons0 island). This declines the
+    /// transition instead of reproducing the corruption.
+    fn harvest_target_record(
+        self,
+        transition: SourceResourceHarvestTransition,
+    ) -> Option<SourceResourceRecord> {
+        if self.source_production_kind_code != 9 {
+            return None;
+        }
+        let link = self.source_resource_records?;
+        match transition {
+            SourceResourceHarvestTransition::Regrowth => Some(link.growth),
+            SourceResourceHarvestTransition::Drought => link.dry,
+        }
+    }
+
+    /// The dry-resource half of `FUN_0047c920` (`1602_exe.c:88940-88958`): the
+    /// preceding `ROHSTOFF` record is restored when the growth mask selects
+    /// regrowth. The gate is `def[0x1c] == 10 && (def[0x47] & 8) != 0`, again
+    /// the nested production kind rather than the outer map kind.
+    ///
+    /// The executable also re-enrols the restored tile, arming it with
+    /// `def-0xd6` — the ripe record's `+0x3a`, which `FUN_00462d50` never
+    /// rewrote, so it is a raw authored `Interval` clamped to a bucket. That
+    /// entry can never complete: the sweep only advances the phase byte for
+    /// production kind 10, so it sits in the table writing a frozen counter
+    /// into the ripe tile's frame bits until the slot is reused. This declines
+    /// to reproduce that leak. It is reachable only on drought islands, and
+    /// the drought byte is zero on every New Horizons0 island.
     pub fn restore_dry_resource(&mut self, transition: SourceResourceHarvestTransition) -> bool {
-        if self.kind_code != 10
+        if self.source_production_kind_code != 10
             || !self.source_resource_is_dry
             || transition != SourceResourceHarvestTransition::Regrowth
         {
             return false;
         }
-        self.source_definition_offset = self.source_definition_offset.saturating_sub(1);
-        self.kind_code = 9;
+        self.ripen_source_raw_resource()
+    }
+
+    /// Write the ripe `ROHSTOFF` record over this cell. `FUN_0047ca80` reaches
+    /// it as `def+0x10c` — the *next* record's `Gfx` — and leaves the phase
+    /// bits alone; only the low 13 bits move.
+    fn ripen_source_raw_resource(&mut self) -> bool {
+        let Some(link) = self.source_resource_records else {
+            return false;
+        };
+        self.source_definition_offset = link.ripe.gfx;
+        self.source_definition_record = link.ripe.record;
         self.source_production_kind_code = 9;
         self.source_output_ware_slot = self.source_growth_resource_ware_slot;
+        self.source_raw_resource_ware_slot = 0;
         self.source_resource_is_dry = false;
         true
+    }
+
+    /// Replay one `FUN_0047ca80` sweep visit of this cell's table entry
+    /// (`1602_exe.c:88998-89024`). Returns whether the tile word changed.
+    ///
+    /// ```text
+    /// if e[0] != 0xFF && counter[e[3]] != e[4] {
+    ///     e[4] = counter[e[3]]
+    ///     def = gfx_table[tile & 0x1FFF]
+    ///     if def[0x1c] == 10 && ++e[5] >= def[0x78] {
+    ///         if (def[0x47] & 8) == 0 { tile.gfx = def[0x10c] }   // not Doerrflg
+    ///         e[0] = 0xFF                                          // free, always
+    ///     } else if def[0x70] == 0 {
+    ///         tile = (tile & 0xFFF87FFF) | ((e[5] & 0xF) << 15)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The phase byte is incremented **only** for production kind 10
+    /// (`0x47cb5f` jumps past the `inc`), so a stale entry left on a
+    /// demolished tile keeps writing its frozen counter into that tile's frame
+    /// bits — the executable never removes an entry on demolition.
+    ///
+    /// `DAT_00562da8` is a three-bit counter compared against a per-entry
+    /// snapshot, so an entry whose bucket rolls an exact multiple of eight
+    /// times between two sweep visits would be skipped. That cannot happen at
+    /// the shipped rates: the fastest bucket is 40 s and a full sweep is 160
+    /// sub-steps, about 32 s of simulated time.
+    pub fn tick_source_growth_entry(
+        &mut self,
+        bucket_phases: [u8; SOURCE_GROWTH_BUCKET_COUNT],
+    ) -> bool {
+        if !self.source_growth_enrolled {
+            return false;
+        }
+        let counter = bucket_phases[usize::from(self.source_growth_bucket & 31)];
+        if counter == self.source_growth_phase_seen {
+            return false;
+        }
+        self.source_growth_phase_seen = counter;
+        let Some(record) = self.current_source_resource_record() else {
+            return false;
+        };
+        if self.source_production_kind_code == 10 {
+            self.source_growth_phase = self.source_growth_phase.wrapping_add(1);
+            if u32::from(record.anim_count) <= u32::from(self.source_growth_phase) {
+                let ripened = !self.source_resource_is_dry && self.ripen_source_raw_resource();
+                self.source_growth_enrolled = false;
+                return ripened;
+            }
+        }
+        if record.writes_phase_bits {
+            let phase = self.source_growth_phase & 0x0f;
+            let changed = self.source_variant != phase;
+            self.source_variant = phase;
+            return changed;
+        }
+        false
     }
 
     /// The scheduler reaches its transfer switch only when its newly written
@@ -743,6 +1040,10 @@ impl SourceMapCellState {
         self.source_orientation = command.orientation & 3;
         self.source_variant = command.variant & 0x0f;
         self.source_map_owner_slot = command.map_owner_slot & 7;
+        // Command-word bits 17..=21. `FUN_004631b0` filled them with one
+        // `rand() & 0x1F` when the command was constructed and the save
+        // persists them; `FUN_00481450` case 10 spends them as growth jitter.
+        self.source_placement_variant = command.random_seed & 0x1f;
     }
 
     /// Encode the root fields retained by the terminal map writer as an
@@ -1040,10 +1341,81 @@ impl SourceMapCellState {
     }
 }
 
-/// Replay `FUN_004684a0` and the branch around it in `FUN_0047c830` for one
-/// harvested raw-resource map cell. The source's two 128-scale divisions are
-/// truncating for the nonnegative resource values supplied by `FUN_0046aff0`.
-pub const fn source_resource_harvest_transition(
+/// Resolve the compiled `[ROHSTWACHS, ROHSTOFF, DOERR]` record group that
+/// `definition` belongs to, anchored on the ripe `ROHSTOFF` record.
+///
+/// The link is the 0x88-byte record stride, i.e. `@Nummer ± 1`. Adjacent
+/// records' `Gfx` values are not adjacent: a Weizen group runs `GFXROHST+0`
+/// (growth, which reserves its five `AnimAnz` sprite slots), `+5` (ripe) and
+/// `+48` (withered), so the gaps from the ripe record are `-5` and `+43`.
+///
+/// `RandAnz` / `RandAdd` deliberately play no part. Variant selection
+/// (`base + (rand() % RandAnz) * RandAdd * 0x88`) happens only in the planting
+/// and ruin paths (`1602_exe.c:88741`, `:69745`); forest is
+/// `RandAnz: 11, RandAdd: 2`, and the ±1 record step stays inside the selected
+/// variant's own pair.
+///
+/// A record whose neighbour is not the expected production kind yields no
+/// link. The shipped file has one such shape — the trailing `Rohstoffe-Wald
+/// Palmen` block authors ripe records with no preceding `ROHSTWACHS`, so the
+/// executable's unconditional `def - 0x88` would land on a pasture record.
+pub fn source_resource_record_link(
+    cod: &CodFile,
+    definition: &BuildingDef,
+) -> Option<SourceResourceRecordLink> {
+    let ripe_record = match definition.source_production_kind_code()? {
+        9 => definition.nummer,
+        10 if definition.source_resource_is_dry() => definition.nummer - 1,
+        10 => definition.nummer + 1,
+        _ => return None,
+    };
+    let ripe = cod.building_by_nummer(ripe_record)?;
+    let growth = cod.building_by_nummer(ripe_record - 1)?;
+    if ripe.source_production_kind_code() != Some(9)
+        || growth.source_production_kind_code() != Some(10)
+        || growth.source_resource_is_dry()
+    {
+        return None;
+    }
+    let dry = cod
+        .building_by_nummer(ripe_record + 1)
+        .filter(|dry| dry.source_production_kind_code() == Some(10) && dry.source_resource_is_dry());
+    Some(SourceResourceRecordLink {
+        growth: source_resource_record(growth),
+        ripe: source_resource_record(ripe),
+        dry: dry.map(source_resource_record),
+    })
+}
+
+fn source_resource_record(definition: &BuildingDef) -> SourceResourceRecord {
+    SourceResourceRecord {
+        record: definition.nummer,
+        gfx: u16::try_from(definition.gfx).unwrap_or(0),
+        anim_count: u8::try_from(definition.anim_anz).unwrap_or(u8::MAX),
+        // `FUN_00462d50` rewrote `+0x3a` into a bucket index for kind-10
+        // records only; every other record still holds its authored
+        // `Interval`, which `FUN_0047c760` clamps to 31 when used as a bucket.
+        bucket: definition
+            .source_growth_bucket()
+            .unwrap_or_else(|| definition.source_scheduler_interval.min(31) as u8),
+        writes_phase_bits: definition.anim_time == 0,
+    }
+}
+
+/// `FUN_0047c830`'s own branch around `FUN_004684a0` (`1602_exe.c:88891`):
+///
+/// ```text
+/// target = def - 0x88
+/// if (island[0x45] != 0 && FUN_004684a0(island, ware, x, y) == 0)
+///     target = def + 0x88
+/// ```
+///
+/// The drought byte `INSEL5[0x66]` -> `island+0x45` is zero on every New
+/// Horizons0 island, so a harvest there always regrows and the dither table is
+/// never consulted. This gate is deliberately *not* inside
+/// [`source_resource_harvest_transition`]: the placement path at
+/// `1602_exe.c:7755-7759` calls that function without it.
+pub const fn source_harvest_regrowth_transition(
     resource_strength: u8,
     growth_factor: u8,
     island_attenuation: u8,
@@ -1055,9 +1427,42 @@ pub const fn source_resource_harvest_transition(
     if island_attenuation == 0 {
         return SourceResourceHarvestTransition::Regrowth;
     }
+    source_resource_harvest_transition(
+        resource_strength,
+        growth_factor,
+        island_attenuation,
+        ware,
+        island,
+        x,
+        y,
+    )
+}
 
+/// Replay `FUN_004684a0` (`1602_exe.c:72690`) for one raw-resource map cell.
+/// The source's two 128-scale divisions are truncating for the nonnegative
+/// resource values supplied by `FUN_0046aff0`.
+///
+/// `growth_factor` is `Randwachs` read off the **base terrain layer**
+/// `param_1[0x2bf]`, not off the resource cell's own definition — see
+/// [`crate::simulation::Simulation::source_base_terrain_growth_factor`].
+///
+/// There is deliberately no `island_attenuation == 0 -> Regrowth` shortcut
+/// here. That gate belongs to the caller `FUN_0047c830`, which only consults
+/// this function at all when the island drought byte `+0x45` is nonzero
+/// (`1602_exe.c:88891`). The placement path at `1602_exe.c:7755-7759` calls it
+/// with no such gate, and there a zero result legitimately plants an already
+/// withered field.
+pub const fn source_resource_harvest_transition(
+    resource_strength: u8,
+    growth_factor: u8,
+    island_attenuation: u8,
+    ware: u8,
+    island: u8,
+    x: u16,
+    y: u16,
+) -> SourceResourceHarvestTransition {
     let grown = ((resource_strength as u16) * (growth_factor as u16)) >> 7;
-    let strength = if matches!(ware, 0x34 | 0x35 | 0x39) {
+    let strength = if island_attenuation == 0 || matches!(ware, 0x34 | 0x35 | 0x39) {
         grown
     } else {
         grown - (((island_attenuation as u16) * grown) >> 7)
@@ -1962,6 +2367,104 @@ mod tests {
         .is_plantation_worker_target(2, 0x34));
     }
 
+    /// The shipped Weizen record group, shaped exactly like haeuser.cod: three
+    /// consecutive `@Nummer` slots, outer `Kind: WALD` throughout, nested
+    /// `ROHSTWACHS` / `ROHSTOFF` / `ROHSTWACHS + Doerrflg`, `AnimAnz: 5`,
+    /// `AnimTime: TIMENEVER`, `Interval: 175`, and the `Gfx` values the file
+    /// actually authors — `GFXROHST+0`, `+5` and `+48`, i.e. 584 / 589 / 632.
+    fn weizen_group() -> CodFile {
+        let growth = BuildingDef {
+            nummer: 40,
+            kind: "WALD".into(),
+            gfx: 584,
+            anim_anz: 5,
+            anim_time: 0,
+            source_scheduler_interval: 175,
+            properties: [
+                ("ProdKind".into(), "ROHSTWACHS".into()),
+                ("Ware".into(), "NOWARE".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let ripe = BuildingDef {
+            nummer: 41,
+            gfx: 589,
+            anim_anz: 1,
+            source_scheduler_interval: 0,
+            properties: [
+                ("ProdKind".into(), "ROHSTOFF".into()),
+                ("Ware".into(), "GETREIDE".into()),
+                ("Rohstoff".into(), "NOWARE".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..growth.clone()
+        };
+        let dry = BuildingDef {
+            nummer: 42,
+            gfx: 632,
+            properties: [
+                ("ProdKind".into(), "ROHSTWACHS".into()),
+                ("Ware".into(), "NOWARE".into()),
+                ("Doerrflg".into(), "1".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..growth.clone()
+        };
+        CodFile {
+            constants: std::collections::HashMap::new(),
+            buildings: vec![growth, ripe, dry],
+        }
+    }
+
+    /// The shipped `IDWEIDE` pasture pair: outer `Kind: BODEN` on both records,
+    /// `AnimAnz: 1`, `Interval: 300`, and no `Doerrflg` third record.
+    fn pasture_group() -> CodFile {
+        let growth = BuildingDef {
+            nummer: 1,
+            kind: "BODEN".into(),
+            gfx: 4,
+            anim_anz: 1,
+            anim_time: 0,
+            source_scheduler_interval: 300,
+            properties: [
+                ("ProdKind".into(), "ROHSTWACHS".into()),
+                ("Ware".into(), "NOWARE".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let ripe = BuildingDef {
+            nummer: 2,
+            gfx: 44,
+            source_scheduler_interval: 0,
+            properties: [
+                ("ProdKind".into(), "ROHSTOFF".into()),
+                ("Ware".into(), "GRAS".into()),
+                ("Rohstoff".into(), "NOWARE".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..growth.clone()
+        };
+        CodFile {
+            constants: std::collections::HashMap::new(),
+            buildings: vec![growth, ripe],
+        }
+    }
+
+    fn linked_cell(cod: &CodFile, index: usize) -> SourceMapCellState {
+        let definition = &cod.buildings[index];
+        let mut cell = SourceMapCellState::new_static(1, 7, 9, definition, 0)
+            .expect("raw-resource record defines a static source cell");
+        cell.configure_source_resource_records(cod, definition);
+        cell
+    }
+
     #[test]
     fn plantation_root_and_harvest_replacement_keep_the_source_selectors() {
         let plantation = BuildingDef {
@@ -1979,21 +2482,23 @@ mod tests {
         assert_eq!(root.source_raw_resource_ware_slot, 0x2d);
         assert_eq!(root.source_plantation_worker_definition, 0x60);
 
-        let raw = BuildingDef {
-            kind: "ROHSTOFF".into(),
-            gfx: 100,
-            properties: [
-                ("Ware".into(), "GETREIDE".into()),
-                ("Wegspeed".into(), "145,120,170,100".into()),
-            ]
-            .into(),
-            ..Default::default()
-        };
-        let mut cell = SourceMapCellState::new_static(1, 7, 9, &raw, 0).unwrap();
+        // Superseded fixture: a synthetic `kind: "ROHSTOFF"` record with
+        // `gfx: 100`, expecting `source_definition_offset == 99` after the
+        // harvest. That outer kind never occurs in haeuser.cod; a ripe crop is
+        // outer `WALD` over nested `ROHSTOFF`, and the growth record is a whole
+        // 0x88-byte record back, five `Gfx` slots away.
+        let cod = weizen_group();
+        let mut cell = linked_cell(&cod, 1);
+        assert_eq!(cell.kind_code, 10);
+        assert_eq!(cell.source_production_kind_code, 9);
         assert_eq!(cell.source_path_class, 46);
         cell.source_resource_reserved = true;
-        assert!(cell.replace_harvested_raw_resource(SourceResourceHarvestTransition::Regrowth));
-        assert_eq!(cell.source_definition_offset, 99);
+        assert!(cell.replace_harvested_raw_resource(
+            SourceResourceHarvestTransition::Regrowth,
+            [0; SOURCE_GROWTH_BUCKET_COUNT],
+        ));
+        assert_eq!(cell.source_definition_offset, 584);
+        assert_eq!(cell.source_definition_record, 40);
         assert_eq!(cell.kind_code, 10);
         assert_eq!(cell.source_production_kind_code, 10);
         assert_eq!(cell.source_output_ware_slot, 0);
@@ -2002,37 +2507,315 @@ mod tests {
         assert!(cell.admits_plantation_worker_path(0, 0x2d));
         assert!(!cell.is_plantation_worker_target(0, 0x2d));
         assert!(!cell.source_resource_reserved);
+        assert!(cell.source_growth_enrolled);
+    }
+
+    /// `FUN_0047c830` gates on the **nested** production kind at `+0x1c`
+    /// (`1602_exe.c:88888`). Guarding on the outer map kind instead admitted
+    /// only a synthetic `kind: "ROHSTOFF"` fixture: with the shipped data a
+    /// ripe crop is outer `WALD` (10) and ripe pasture is outer `BODEN` (11),
+    /// so the transition never fired and island woodland never depleted.
+    #[test]
+    fn harvest_guard_uses_the_nested_production_kind_not_the_outer_map_kind() {
+        let crops = weizen_group();
+        let mut crop = linked_cell(&crops, 1);
+        assert_ne!(crop.kind_code, 9, "the outer kind is WALD, not ROHSTOFF");
+        assert!(crop.replace_harvested_raw_resource(
+            SourceResourceHarvestTransition::Regrowth,
+            [0; SOURCE_GROWTH_BUCKET_COUNT],
+        ));
+
+        let pastures = pasture_group();
+        let mut pasture = linked_cell(&pastures, 1);
+        assert_eq!(pasture.kind_code, 11);
+        assert!(pasture.replace_harvested_raw_resource(
+            SourceResourceHarvestTransition::Regrowth,
+            [0; SOURCE_GROWTH_BUCKET_COUNT],
+        ));
+        assert_eq!(pasture.source_definition_offset, 4);
+        // The executable writes only the tile's low 13 bits and re-derives
+        // every definition field from them, so a group's outer kind never
+        // changes. Forcing it to 10 dropped ripe pasture out of
+        // `FUN_0046f920`'s always-walkable terrain set.
+        assert_eq!(pasture.kind_code, 11);
+        assert!(source_plantation_path_kind_always_walkable(
+            pasture.kind_code
+        ));
+
+        // A growth record is not a harvest target; the gate rejects it.
+        let mut growing = linked_cell(&crops, 0);
+        assert!(!growing.replace_harvested_raw_resource(
+            SourceResourceHarvestTransition::Regrowth,
+            [0; SOURCE_GROWTH_BUCKET_COUNT],
+        ));
+    }
+
+    /// The harvest and sweep writers move a whole 0x88-byte record and read
+    /// *that* record's `Gfx`. Adjacent records' `Gfx` values are not adjacent:
+    /// Weizen's three records are `GFXROHST+0`, `+5` and `+48`, so from the
+    /// ripe record the real gaps are `-5` and `+43` — `gfx ± 1` is wrong.
+    #[test]
+    fn harvest_follows_the_record_stride_not_a_gfx_index() {
+        let cod = weizen_group();
+        let link = source_resource_record_link(&cod, &cod.buildings[1])
+            .expect("the Weizen group resolves from its ripe record");
+        assert_eq!((link.growth.record, link.growth.gfx), (40, 584));
+        assert_eq!((link.ripe.record, link.ripe.gfx), (41, 589));
+        assert_eq!(
+            link.dry.map(|dry| (dry.record, dry.gfx)),
+            Some((42, 632)),
+            "the third record is the authored Doerrflg field"
+        );
+        assert_eq!(link.ripe.gfx - link.growth.gfx, 5);
+        assert_eq!(link.dry.unwrap().gfx - link.ripe.gfx, 43);
+
+        // Every record of the group resolves the same triple.
+        for index in 0..3 {
+            assert_eq!(
+                source_resource_record_link(&cod, &cod.buildings[index]),
+                Some(link),
+                "record {index}"
+            );
+        }
+
+        // Pasture, forest, palms and the sea resource are pairs: haeuser.cod
+        // authors exactly seven `Doerrflg: 1` records, all of them crops.
+        let pastures = pasture_group();
+        let pair = source_resource_record_link(&pastures, &pastures.buildings[1])
+            .expect("the pasture pair resolves");
+        assert_eq!(pair.dry, None);
+
+        let mut cell = linked_cell(&pastures, 1);
+        assert!(!cell.advance_raw_resource_to_drought(
+            SourceResourceHarvestTransition::Drought,
+            [0; SOURCE_GROWTH_BUCKET_COUNT],
+        ));
+    }
+
+    /// `FUN_00462d50` (`1602_exe.c:68880-68889`) rewrites `Interval` at `+0x3a`
+    /// into a bucket index for every production-kind-10 record. Every row is
+    /// one of the shipped resource groups.
+    #[test]
+    fn growth_bucket_matches_every_shipped_resource_interval() {
+        let bucket = |interval: u16, anim_anz: i32| {
+            BuildingDef {
+                source_scheduler_interval: interval,
+                anim_anz,
+                properties: [("ProdKind".into(), "ROHSTWACHS".into())].into(),
+                ..Default::default()
+            }
+            .source_growth_bucket()
+        };
+
+        // record          | Interval | AnimAnz | per phase | bucket | period
+        assert_eq!(bucket(175, 5), Some(0)); // Weizen         35 000    40 000
+        assert_eq!(bucket(330, 5), Some(3)); // Baumwolle etc. 66 000    61 000
+        assert_eq!(bucket(300, 5), Some(2)); // Zuckerrohr     60 000    54 000
+        assert_eq!(bucket(900, 5), Some(20)); // Wald / Palmen 180 000  180 000
+        assert_eq!(bucket(450, 6), Some(5)); // Meereszeichen  75 000    75 000
+        assert_eq!(bucket(300, 1), Some(32)); // IDWEIDE      300 000  clamped
+        assert_eq!(bucket(200, 1), Some(22)); // IDBODEN      200 000  194 000
+
+        for (bucket_index, period) in [(0, 40_000), (3, 61_000), (20, 180_000), (31, 257_000)] {
+            assert_eq!(source_growth_bucket_period_ms(bucket_index), period);
+        }
+
+        // `FUN_0047c760` clamps the arming bucket to 31, so the 32 the
+        // `IDWEIDE` pasture derives lands on the 257 000 ms clock.
+        let mut pasture = linked_cell(&pasture_group(), 0);
+        pasture.arm_source_growth_timer(32, [0; SOURCE_GROWTH_BUCKET_COUNT]);
+        assert_eq!(pasture.source_growth_bucket, 31);
+
+        // Only production kind 10 has its `+0x3a` rewritten; the map-cell
+        // scheduler keeps reading the authored `Interval` on every other kind.
+        let ripe = &weizen_group().buildings[1].clone();
+        assert_eq!(ripe.source_growth_bucket(), None);
+        assert_eq!(
+            BuildingDef {
+                source_scheduler_interval: 8,
+                properties: [("ProdKind".into(), "PLANTAGE".into())].into(),
+                ..Default::default()
+            }
+            .source_growth_bucket(),
+            None
+        );
+    }
+
+    /// The sweep writes the phase into tile bits 15..=18 only when the record's
+    /// `AnimTime` is `TIMENEVER`, registered as 0 (`1602_exe.c:44507`,
+    /// `:66370`). The sea resource authors `AnimTime: 130` and animates with
+    /// those bits, so it counts to `AnimAnz` and promotes without ever
+    /// receiving a phase write.
+    #[test]
+    fn sweep_writes_phase_bits_only_when_anim_time_is_timenever() {
+        let mut phases = [0_u8; SOURCE_GROWTH_BUCKET_COUNT];
+        let mut crop = linked_cell(&weizen_group(), 0);
+        crop.source_growth_resource_ware_slot = 0x2d;
+        crop.arm_source_growth_timer(0, phases);
+        assert_eq!(crop.source_variant, 0);
+
+        phases[0] = 1;
+        assert!(crop.tick_source_growth_entry(phases));
+        assert_eq!(crop.source_growth_phase, 1);
+        assert_eq!(crop.source_variant, 1, "AnimTime == TIMENEVER");
+
+        let sea = {
+            let mut cod = weizen_group();
+            for building in &mut cod.buildings {
+                building.anim_time = 130;
+                building.anim_anz = 6;
+            }
+            cod
+        };
+        let mut fish = linked_cell(&sea, 0);
+        fish.source_growth_resource_ware_slot = 0x39;
+        fish.arm_source_growth_timer(5, phases);
+        phases[5] = 1;
+        assert!(!fish.tick_source_growth_entry(phases));
+        assert_eq!(fish.source_growth_phase, 1);
+        assert_eq!(fish.source_variant, 0, "AnimTime: 130 owns bits 15..=18");
+    }
+
+    /// The whole cycle: harvest enrols the cell on its growth record's bucket,
+    /// `AnimAnz` rollovers later the sweep writes the ripe record's `Gfx` and
+    /// frees the slot. A visit whose bucket counter has not moved does nothing.
+    #[test]
+    fn growth_timer_ripens_a_harvested_cell_after_anim_anz_rollovers() {
+        let cod = weizen_group();
+        let mut phases = [0_u8; SOURCE_GROWTH_BUCKET_COUNT];
+        let mut cell = linked_cell(&cod, 1);
+        assert!(cell.replace_harvested_raw_resource(
+            SourceResourceHarvestTransition::Regrowth,
+            phases,
+        ));
+        assert!(cell.source_growth_enrolled);
+        assert_eq!(cell.source_growth_bucket, 0, "Weizen is bucket 0");
+        assert_eq!(cell.source_growth_phase, 0);
+
+        // An unmoved counter is skipped: `counter[e[3]] != e[4]` fails.
+        assert!(!cell.tick_source_growth_entry(phases));
+        assert_eq!(cell.source_growth_phase, 0);
+
+        for phase in 1..5 {
+            phases[0] = (phases[0] + 1) & 7;
+            cell.tick_source_growth_entry(phases);
+            assert_eq!(cell.source_growth_phase, phase);
+            assert_eq!(cell.source_production_kind_code, 10, "still growing");
+        }
+
+        phases[0] = (phases[0] + 1) & 7;
+        assert!(cell.tick_source_growth_entry(phases));
+        assert_eq!(cell.source_definition_offset, 589);
+        assert_eq!(cell.source_definition_record, 41);
+        assert_eq!(cell.source_production_kind_code, 9);
+        assert_eq!(cell.source_output_ware_slot, 0x2d);
+        assert_eq!(cell.kind_code, 10, "outer WALD is never rewritten");
+        assert!(
+            !cell.source_growth_enrolled,
+            "`*PTR_DAT_0049aec0 = 0xff` frees the slot on promotion"
+        );
+        assert!(cell.is_plantation_worker_target(0, 0x2d));
+
+        // A withered field counts the same way but keeps its record:
+        // `if ((def[0x47] & 8) == 0)` skips the promotion write.
+        let mut dry = linked_cell(&cod, 2);
+        dry.source_growth_resource_ware_slot = 0x2d;
+        dry.arm_source_growth_timer(0, phases);
+        for _ in 0..5 {
+            phases[0] = (phases[0] + 1) & 7;
+            dry.tick_source_growth_entry(phases);
+        }
+        assert_eq!(dry.source_definition_offset, 632);
+        assert_eq!(dry.source_production_kind_code, 10);
+        assert!(!dry.source_growth_enrolled);
+    }
+
+    /// `FUN_00481450` case 10 (`1602_exe.c:92840`) arms a newly placed
+    /// production-kind-10 tile with `def[0x3a] + param_7 % 3`, where `param_7`
+    /// is the command word's bits 17..=21 — the one `rand() & 0x1F` that
+    /// `FUN_004631b0` drew when the command was built. Nothing else in the
+    /// pipeline jitters.
+    #[test]
+    fn placement_arming_adds_the_persisted_command_jitter() {
+        let cod = weizen_group();
+        let phases = [0_u8; SOURCE_GROWTH_BUCKET_COUNT];
+        for (seed, expected) in [(0, 0), (1, 1), (2, 2), (3, 0), (17, 2), (31, 1)] {
+            let mut cell = linked_cell(&cod, 0);
+            cell.set_source_command(crate::building::SourceBuildingCommand {
+                definition_offset: 584,
+                orientation: 0,
+                variant: 0,
+                metadata: 0,
+                map_owner_slot: 7,
+                random_seed: seed,
+                dynamic_object_owner: 0,
+            });
+            assert!(cell.arm_placed_source_growth_timer(phases));
+            assert_eq!(cell.source_growth_bucket, expected, "seed {seed}");
+            // Idempotent: an already-enrolled tile is not armed twice.
+            assert!(!cell.arm_placed_source_growth_timer(phases));
+        }
+
+        // Harvest re-enrolment takes the plain `def[0x3a]`, no jitter.
+        let mut ripe = linked_cell(&cod, 1);
+        ripe.source_placement_variant = 31;
+        assert!(ripe.replace_harvested_raw_resource(
+            SourceResourceHarvestTransition::Regrowth,
+            phases,
+        ));
+        assert_eq!(ripe.source_growth_bucket, 0);
+
+        // Only kind-10 tiles get a timer; natural ripe terrain is not enrolled
+        // at load and starts growing when a worker harvests it.
+        let mut natural = linked_cell(&cod, 1);
+        assert!(!natural.arm_placed_source_growth_timer(phases));
+        assert!(!natural.source_growth_enrolled);
     }
 
     #[test]
     fn resource_environment_moves_only_dry_kind10_cells_back_to_raw() {
-        let raw = BuildingDef {
-            kind: "ROHSTOFF".into(),
-            gfx: 100,
-            properties: [("Ware".into(), "GETREIDE".into())].into(),
-            ..Default::default()
-        };
-        let mut cell = SourceMapCellState::new_static(1, 7, 9, &raw, 0).unwrap();
-        cell.source_resource_growth_factor = 128;
-        assert!(cell.replace_harvested_raw_resource(SourceResourceHarvestTransition::Drought));
+        let cod = weizen_group();
+        let phases = [0_u8; SOURCE_GROWTH_BUCKET_COUNT];
+        // Superseded fixture: `kind: "ROHSTOFF"`, `gfx: 100`, expecting
+        // `101` withered and `100` restored. Real Weizen is 589 ripe, 632
+        // withered — `+43`, not `+1`.
+        let mut cell = linked_cell(&cod, 1);
+        assert!(cell.replace_harvested_raw_resource(
+            SourceResourceHarvestTransition::Drought,
+            phases,
+        ));
         assert!(cell.source_resource_is_dry);
+        assert_eq!(cell.source_definition_offset, 632);
         assert!(cell.restore_dry_resource(SourceResourceHarvestTransition::Regrowth));
-        assert_eq!(cell.source_definition_offset, 100);
-        assert_eq!(cell.kind_code, 9);
+        assert_eq!(cell.source_definition_offset, 589);
+        assert_eq!(cell.kind_code, 10);
         assert_eq!(cell.source_production_kind_code, 9);
         assert_eq!(cell.source_output_ware_slot, 0x2d);
         assert!(!cell.source_resource_is_dry);
 
-        assert!(cell.replace_harvested_raw_resource(SourceResourceHarvestTransition::Regrowth));
+        assert!(cell.replace_harvested_raw_resource(
+            SourceResourceHarvestTransition::Regrowth,
+            phases,
+        ));
         assert!(!cell.source_resource_is_dry);
         assert!(!cell.restore_dry_resource(SourceResourceHarvestTransition::Regrowth));
     }
 
+    /// `FUN_004684a0` itself has no attenuation shortcut — the gate is
+    /// `FUN_0047c830`'s `if (*(char *)((int)param_1 + 0x45) != '\0')`
+    /// (`1602_exe.c:88891`). The superseded expectation for the first case was
+    /// `Regrowth`, produced by an early return that belonged to the caller; the
+    /// dither table's band-0 bit for that cell is in fact clear.
     #[test]
     fn raw_resource_harvest_uses_the_fun_004684a0_masks_only_with_attenuation() {
         assert_eq!(
             source_resource_harvest_transition(0, 0, 0, 0x2d, 0, 0, 0),
-            SourceResourceHarvestTransition::Regrowth
+            SourceResourceHarvestTransition::Drought
+        );
+        assert_eq!(
+            source_harvest_regrowth_transition(0, 0, 0, 0x2d, 0, 0, 0),
+            SourceResourceHarvestTransition::Regrowth,
+            "a zero drought byte never reaches FUN_004684a0 from the harvest"
         );
         assert_eq!(
             source_resource_harvest_transition(128, 128, 128, 0x2d, 0, 0, 0),

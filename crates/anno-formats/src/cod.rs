@@ -289,8 +289,17 @@ impl BuildingDef {
             .and_then(source_ware_slot)
     }
 
-    /// Compiled figure definition passed by plantation production kind 2 to
-    /// `FUN_00446ca0` through `FUN_0044b7e0`.
+    /// Compiled figure definition at definition offset `+0x3c`, read by every
+    /// nested-production worker allocator reached from `FUN_0047daf0`'s
+    /// dispatch table at `0x47e258`: `FUN_0044b7e0` (kind 2 `PLANTAGE`),
+    /// `FUN_0044bb40` (kind 4 `WEIDETIER`) and `FUN_0044b9a0` (kind 6
+    /// `FISCHEREI`). Kind 5 (`JAGDHAUS`) never reaches an allocator, so its
+    /// `Figurnr: JAEGER` is compiled but unused; it is mapped here only so the
+    /// selector space stays contiguous.
+    ///
+    /// The numbers are `figuren.cod` definition order. `MAEHER` opens the
+    /// `Blocknr: 4` worker block at `0x60`, and `JAEGER`, `FISCHER`, `RIND`
+    /// and `SCHAF` follow `PFLUECKER2` in the shipped file without a gap.
     pub fn source_plantation_worker_definition(&self) -> Option<u8> {
         match self.properties.get("Figurnr").map(String::as_str) {
             Some("MAEHER") => Some(0x60),
@@ -298,6 +307,10 @@ impl BuildingDef {
             Some("HOLZFAELLER") => Some(0x62),
             Some("PFLUECKER") => Some(0x63),
             Some("PFLUECKER2") => Some(0x64),
+            Some("JAEGER") => Some(0x65),
+            Some("FISCHER") => Some(0x66),
+            Some("RIND") => Some(0x67),
+            Some("SCHAF") => Some(0x68),
             _ => None,
         }
     }
@@ -317,6 +330,55 @@ impl BuildingDef {
         self.properties
             .get("ProdKind")
             .and_then(|kind| Self::source_kind_code_for(kind))
+    }
+
+    /// `Doerrflg` at compiled definition offset `+0x47`, bit 3. It marks the
+    /// third record of a crop group — the withered field — and is authored on
+    /// exactly seven records in the shipped haeuser.cod. `FUN_0047ca80` reads
+    /// it to decide whether a completed growth phase may promote the tile, and
+    /// `FUN_0047c920` uses it to select its dry-cell recovery branch.
+    pub fn source_resource_is_dry(&self) -> bool {
+        self.properties
+            .get("Doerrflg")
+            .is_some_and(|value| value.trim() == "1")
+    }
+
+    /// Growth-timer bucket that `FUN_00462d50` writes back **over** the
+    /// authored `Interval` at compiled definition offset `+0x3a`, for every
+    /// production-kind-10 record, right after haeuser.cod is parsed
+    /// (`1602_exe.c:68880-68889`):
+    ///
+    /// ```text
+    /// per_phase_ms = (u32)Interval * 1000 / AnimAnz     // AnimAnz = def+0x78
+    /// threshold = 47000; k = 1
+    /// do { if (per_phase_ms < threshold) break; threshold += 7000; k += 1 }
+    /// while (threshold < 0x40741)
+    /// def[0x3a] = k - 1
+    /// ```
+    ///
+    /// which is the largest `k` with `40000 + 7000k <= per_phase_ms`,
+    /// saturating at 32 — `FUN_0047c760` then clamps that to 31, so the
+    /// slowest reachable clock is bucket 31 at 257 000 ms. Growth rates do
+    /// differ per crop: Weizen lands in bucket 0, the 330-interval crops in
+    /// bucket 3, forest and palms in bucket 20.
+    ///
+    /// This is deliberately *not* stored over
+    /// [`Self::source_scheduler_interval`]: the map-cell scheduler
+    /// `FUN_0047daf0` reads the same `+0x3a` field on every other production
+    /// kind, and overwriting it would corrupt those roots' cooldowns.
+    pub fn source_growth_bucket(&self) -> Option<u8> {
+        if self.source_production_kind_code() != Some(10) {
+            return None;
+        }
+        let anim_count = u32::try_from(self.anim_anz).unwrap_or(1).max(1);
+        let per_phase_ms = u32::from(self.source_scheduler_interval) * 1000 / anim_count;
+        let mut threshold = 47_000_u32;
+        let mut steps = 1_u32;
+        while per_phase_ms >= threshold && threshold < 0x4_0741 {
+            threshold += 7_000;
+            steps += 1;
+        }
+        Some((steps - 1).min(u32::from(u8::MAX)) as u8)
     }
 
     /// Runtime population-group byte at compiled definition offset `+0x2e`.
@@ -1073,6 +1135,29 @@ impl CodFile {
         self.buildings.iter().find(|b| b.source_id == source_id)
     }
 
+    /// Resolve one compiled definition **slot**.
+    ///
+    /// The runtime table is 0x88-byte records laid out in `@Nummer` order, so
+    /// the `def ± 0x88` steps taken by `FUN_0047c830` (harvest), `FUN_0047ca80`
+    /// (the growth sweep, via `def+0x10c` = next record's `Gfx`) and
+    /// `FUN_0047c920` (drought) are exactly `@Nummer ± 1`. A `Gfx ± 1` step is
+    /// **not** the same thing: adjacent records' `Gfx` values are not adjacent
+    /// — a Weizen group runs `GFXROHST+0`, `+5`, `+48`, because each record
+    /// reserves `AnimAnz` consecutive sprite slots.
+    ///
+    /// The parser emits the `@Nummer: 0` default block and the real `@Nummer:
+    /// 0` terrain record under the same number; the compiled table keeps only
+    /// the last writer of a slot, so this searches from the end.
+    pub fn building_index_by_nummer(&self, nummer: i32) -> Option<usize> {
+        self.buildings.iter().rposition(|b| b.nummer == nummer)
+    }
+
+    /// [`Self::building_index_by_nummer`] resolved to the definition itself.
+    pub fn building_by_nummer(&self, nummer: i32) -> Option<&BuildingDef> {
+        self.building_index_by_nummer(nummer)
+            .and_then(|index| self.buildings.get(index))
+    }
+
     fn building_index_by_source_id(&self, source_id: i32) -> Option<usize> {
         self.buildings.iter().position(|b| b.source_id == source_id)
     }
@@ -1628,6 +1713,104 @@ mod tests {
         assert_eq!(hut.source_operating_costs, (0, 0));
         assert_eq!(hut.size, (1, 1));
         assert_eq!(farm.source_operating_costs, (25, 5));
+    }
+
+    /// The shipped resource groups, walked through the 0x88-byte record
+    /// stride. Each `ROHSTOFF` record's `@Nummer - 1` is its `ROHSTWACHS`
+    /// growth record; the seven crops add a `Doerrflg` record at `+1`.
+    /// `FUN_00462d50` compiles each growth record's `Interval` / `AnimAnz`
+    /// into a bucket index (`1602_exe.c:68880-68889`).
+    #[test]
+    fn shipped_resource_groups_resolve_through_the_record_stride() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("extracted/haeuser.cod");
+        let Ok(data) = std::fs::read(&path) else {
+            println!("Skipping test: data corpus not found");
+            return;
+        };
+        let cod = CodFile::parse(&data).expect("parse haeuser.cod");
+
+        // `Id: IDROHST+1` is ripe Weizen. Its group is `GFXROHST+0` / `+5` /
+        // `+48`, i.e. `Gfx` gaps of -5 and +43 from the ripe record — a port
+        // that stepped `Gfx ± 1` would land on another crop's sprites.
+        let weizen = cod
+            .building_by_source_id(cod.constants["IDROHST"] + 1)
+            .expect("ripe Weizen");
+        assert_eq!(weizen.kind, "WALD");
+        assert_eq!(weizen.source_kind_code(), Some(10));
+        assert_eq!(weizen.source_production_kind_code(), Some(9));
+        assert_eq!(weizen.source_ware_slot(), Some(0x2d));
+        let growth = cod
+            .building_by_nummer(weizen.nummer - 1)
+            .expect("Weizen growth record");
+        let dry = cod
+            .building_by_nummer(weizen.nummer + 1)
+            .expect("Weizen withered record");
+        assert_eq!(growth.source_production_kind_code(), Some(10));
+        assert_eq!(dry.source_production_kind_code(), Some(10));
+        assert!(!growth.source_resource_is_dry());
+        assert!(dry.source_resource_is_dry());
+        assert_eq!(weizen.gfx - growth.gfx, 5);
+        assert_eq!(dry.gfx - weizen.gfx, 43);
+        assert_eq!(growth.anim_anz, 5);
+        assert_eq!(growth.anim_time, 0, "AnimTime: TIMENEVER is registered as 0");
+        assert_eq!(growth.source_scheduler_interval, 175);
+        assert_eq!(growth.source_growth_bucket(), Some(0));
+        // The ripe record keeps its own `+0x3a`; only kind 10 is rewritten.
+        assert_eq!(weizen.source_growth_bucket(), None);
+
+        // Forest: `Interval: 900` over `AnimAnz: 5` is 180 000 ms per phase,
+        // the largest `40000 + 7000k` that fits, k = 20.
+        let forest_growth = cod
+            .building_by_source_id(cod.constants["IDROHST"] + 2)
+            .expect("Wald growth record");
+        assert_eq!(forest_growth.source_production_kind_code(), Some(10));
+        assert_eq!(forest_growth.source_scheduler_interval, 900);
+        assert_eq!(forest_growth.anim_anz, 5);
+        assert_eq!(forest_growth.source_growth_bucket(), Some(20));
+        let forest_ripe = cod
+            .building_by_nummer(forest_growth.nummer + 1)
+            .expect("ripe forest");
+        assert_eq!(forest_ripe.source_ware_slot(), Some(0x35));
+        assert_eq!(forest_ripe.kind, "WALD");
+        // Forest is a pair: the record after the ripe one is the next
+        // variant's growth record, not a withered field.
+        assert!(!cod
+            .building_by_nummer(forest_ripe.nummer + 1)
+            .expect("next record")
+            .source_resource_is_dry());
+
+        // Pasture ships ripe as outer `Kind: BODEN`, which is why the harvest
+        // guard had to move off the outer map kind.
+        let pasture_growth = cod
+            .building_by_source_id(cod.constants["IDWEIDE"])
+            .expect("IDWEIDE growth record");
+        assert_eq!(pasture_growth.kind, "BODEN");
+        assert_eq!(pasture_growth.source_scheduler_interval, 300);
+        assert_eq!(pasture_growth.anim_anz, 1);
+        // 300 000 ms per phase saturates the loop; `FUN_0047c760` clamps 32
+        // to 31, the 257 000 ms clock.
+        assert_eq!(pasture_growth.source_growth_bucket(), Some(32));
+        let pasture_ripe = cod
+            .building_by_nummer(pasture_growth.nummer + 1)
+            .expect("ripe pasture");
+        assert_eq!(pasture_ripe.kind, "BODEN");
+        assert_eq!(pasture_ripe.source_kind_code(), Some(11));
+        assert_eq!(pasture_ripe.source_production_kind_code(), Some(9));
+        assert_eq!(pasture_ripe.source_ware_slot(), Some(0x34));
+
+        // Exactly seven `Doerrflg: 1` records, all of them crops.
+        assert_eq!(
+            cod.buildings
+                .iter()
+                .filter(|building| building.source_resource_is_dry())
+                .count(),
+            7
+        );
     }
 
     /// Shipped-corpus counterpart of the test above: `haeuser.cod` authors

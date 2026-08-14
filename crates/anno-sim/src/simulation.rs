@@ -26,8 +26,9 @@ use crate::player::{Player, PlayerState};
 use crate::population;
 use crate::production;
 use crate::source_cell::{
-    source_resource_harvest_transition, SourceMapCellState, SourceResourceHarvestTransition,
-    SourceTransferFigure,
+    source_growth_bucket_period_ms, source_harvest_regrowth_transition,
+    source_resource_harvest_transition, SourceMapCellState, SourceTransferFigure,
+    SOURCE_GROWTH_BUCKET_COUNT,
 };
 use crate::source_figure_event::SourceFigureEventRegistry;
 use crate::source_route::{
@@ -52,6 +53,125 @@ const SOURCE_KIND4_IDLE_TARGET_DELAY_TICKS: u32 = 20;
 /// constant from every successful target search (`1602_exe.c:80682`), and
 /// `FUN_0045b200` stores it at figure `+0x28` (`1602_exe.c:62990`).
 pub const SOURCE_PLANTATION_HARVEST_AMOUNT: u16 = 0x20;
+
+/// `FUN_0047daf0` reaches its nested-production allocators through a jump
+/// table at `0x47e258` indexed by a byte table at `0x47e27c`, which the switch
+/// addresses with `Kind - 1` (`mov eax, [ebx+0x1c]; dec eax; cmp eax, 0x1d;
+/// ja default; movzx edx, byte [eax + 0x47e27c]`, `0x0047def2`). Decoded from
+/// the shipped binary:
+///
+/// | nested kind | index byte | arm | allocator |
+/// | --- | --- | --- | --- |
+/// | 2 `PLANTAGE` | `01` | `0x47df1f` | `FUN_0044b7e0` |
+/// | 4 `WEIDETIER` | `03` | `0x47df5f` | `FUN_0044bb40` |
+/// | 5 `JAGDHAUS` | `08` | `0x47e234` | none — the default arm |
+/// | 6 `FISCHEREI` | `04` | `0x47df97` | `FUN_0044b9a0` |
+///
+/// Production kind 5 therefore never allocates a figure. haeuser.cod
+/// corroborates this: `WILD` appears exactly once in the whole file, as the
+/// hunting lodge's own `Rohstoff`, so no map definition is ever authored
+/// `Ware: WILD` for a hunter to walk to.
+pub const SOURCE_HUNTING_LODGE_DISPATCH_INDEX_BYTE: u8 = 0x08;
+
+/// Production-kind-4 `WEIDETIER` root reached by dispatch arm 3. Unlike kinds
+/// 2 and 6 the arm carries no idle gate, so the activity byte is deliberately
+/// not part of this predicate.
+const fn source_is_herd_root(root: SourceMapCellState) -> bool {
+    root.source_production_kind_code == 4
+        && root.source_raw_resource_ware_slot != 0
+        && root.source_plantation_worker_definition != 0
+}
+
+/// Production-kind-6 `FISCHEREI` root reached by dispatch arm 4. The arm
+/// opens with `test cl, cl / jne default` (`0x47df97`), the same idle gate
+/// production kind 2 uses.
+const fn source_is_fishery_root(root: SourceMapCellState) -> bool {
+    root.source_production_kind_code == 6
+        && root.activity == 0
+        && root.source_raw_resource_ware_slot != 0
+        && root.source_plantation_worker_definition != 0
+}
+
+/// Which compiled `Wegspeed` class the nested-production route builder feeds
+/// to `FUN_0046f920` as `param_7`. `FUN_0045b200` passes `0`
+/// (`1602_exe.c:62983`); the kind-4 grazer's `FUN_0045bcc0` passes `3`
+/// (`1602_exe.c:63432`), the civilian class.
+const fn source_worker_movement_class(production_kind: u8) -> u8 {
+    if production_kind == 4 {
+        3
+    } else {
+        0
+    }
+}
+
+/// The completion window each route builder hands `FUN_00471c50` as its last
+/// argument. `FUN_0045b200` passes `0` and therefore commits to the first
+/// candidate band it reaches (`1602_exe.c:62988`); `FUN_0045bcc0` passes
+/// `0x80` (`1602_exe.c:63459`) and `FUN_0045b730` passes `0xc0`
+/// (`1602_exe.c:63226`).
+///
+/// This port keeps every worker on `0`. The port's
+/// `search_source_high_metadata_target` models that argument as a delay that
+/// lets *later* candidates replace the selection, and feeding the source's
+/// own `0x80` / `0xc0` through it moved a fishery's pick to the far edge of
+/// its radius and stopped the worker delivering at all — so the argument does
+/// not mean here what it means in `FUN_0046c7d0`. Left decoded but unported
+/// until the callback's completion contract is re-derived; the only effect is
+/// which of several equally valid in-range cells a worker walks to.
+#[allow(dead_code)]
+const fn source_worker_target_completion_delay(production_kind: u8) -> u32 {
+    match production_kind {
+        4 => 0x80,
+        6 => 0xc0,
+        _ => 0,
+    }
+}
+
+/// `FUN_0046fb50`'s target predicate for a live static map cell: outer kind
+/// `0x13` (`MEER`) whose nested kind is `9` (`ROHSTOFF`), whose compiled
+/// `Ware` is the fishery's `Rohstoff`, and whose `0x20000000` reservation bit
+/// is clear. There is no settlement-slot comparison — the water grid never
+/// reads the tile's owner selector at all.
+const fn source_is_fishery_worker_target(
+    cell: SourceMapCellState,
+    raw_resource_ware_slot: u8,
+) -> bool {
+    cell.kind_code == 19
+        && cell.source_production_kind_code == 9
+        && cell.source_output_ware_slot == raw_resource_ware_slot
+        && !cell.source_resource_reserved
+}
+
+/// Entry count of the source growth table `DAT_00562dc8` — 0x805C slots of
+/// eight bytes each, base `0x562dc8`, end `0x5A30A8`. The top 0x5C entries
+/// exist only as probe overflow for `FUN_0047c760`'s 92-slot linear window.
+const SOURCE_GROWTH_TABLE_SLOTS: u32 = 0x805c;
+/// Slots `FUN_0047ca80` visits per call, so a full sweep takes 160 calls.
+const SOURCE_GROWTH_SWEEP_SLOTS: u32 = 0xce;
+
+/// `FUN_0047c810` (`1602_exe.c:88863`), the growth table's home slot for one
+/// map cell. Collisions are resolved by linear probing in the executable; this
+/// port keeps timer state on the cell itself and uses the home slot only to
+/// reproduce the sweep cadence, so two colliding cells simply share a slot.
+#[inline]
+const fn source_growth_table_slot(island: u8, x: u8, y: u8) -> u32 {
+    (((island & 7) as u32) * 0x40 + ((x & 0x3f) as u32)) * 0x40 + ((y & 0x3f) as u32)
+}
+
+/// Field-level form of [`Simulation::source_base_terrain_growth_factor`], so
+/// callers already holding a mutable borrow of another `Simulation` field can
+/// still read the base terrain layer.
+fn source_base_terrain_growth_factor(
+    backing_cells: &[SourceMapCellState],
+    island: u8,
+    x: u16,
+    y: u16,
+) -> u8 {
+    backing_cells
+        .iter()
+        .find(|cell| cell.matches(island, x, y))
+        .map_or(128, |cell| cell.source_resource_growth_factor)
+}
 
 /// The generic shared-table route bytes at `+0x124` and their `+0x02`
 /// cursor. Dynamic category-one through -three figures own this state even
@@ -817,6 +937,18 @@ pub struct Simulation {
     pub source_time_ticks: u32,
     /// Milliseconds not yet promoted into `source_time_ticks`.
     pub source_time_remainder_ms: u32,
+    /// `DAT_0054a2f4`: the 32 growth-clock accumulators stepped by
+    /// `FUN_0047ca80`. Bucket `i` fires every `40000 + 7000*i` ms. Saved by
+    /// the original in its `"TIMERS"` chunk (`1602_exe.c:94964-94984`).
+    pub source_growth_bucket_elapsed_ms: [u32; SOURCE_GROWTH_BUCKET_COUNT],
+    /// `DAT_00562da8`: the matching 32 three-bit counters, bumped whenever an
+    /// accumulator reaches its period. Also part of `"TIMERS"`.
+    pub source_growth_bucket_phase: [u8; SOURCE_GROWTH_BUCKET_COUNT],
+    /// `PTR_DAT_0049aec0`: the growth table's sweep cursor, in table slots.
+    /// `FUN_0047ca80` visits 206 slots per call, so a full pass over the
+    /// 32860-slot table takes 160 calls. The original neither saves the table
+    /// nor this pointer, so it is runtime-only here too.
+    pub source_growth_sweep_cursor: u32,
     /// `DAT_005dbabc`: elapsed time for `FUN_0046b3e0`'s resource phase.
     pub source_resource_environment_elapsed_ms: u32,
     /// `DAT_005dbab0`: low-three-bit resource-environment phase.
@@ -1166,6 +1298,9 @@ impl Simulation {
             source_controller_difficulty_mode: 2,
             source_time_ticks: 0,
             source_time_remainder_ms: 0,
+            source_growth_bucket_elapsed_ms: [0; SOURCE_GROWTH_BUCKET_COUNT],
+            source_growth_bucket_phase: [0; SOURCE_GROWTH_BUCKET_COUNT],
+            source_growth_sweep_cursor: 0,
             source_resource_environment_elapsed_ms: 0,
             source_resource_environment_phase: 0,
             source_resource_environment_cursor: 0,
@@ -3177,6 +3312,12 @@ impl Simulation {
     /// to port the missing draws first, then dispatch in strict source order.
     fn step(&mut self, dt_ms: u32) {
         self.advance_source_clock(dt_ms);
+        // `FUN_00489670` calls `FUN_0047ca80` first in the sub-step, ahead of
+        // `FUN_0047daf0` and `FUN_0047f8a0` (`1602_exe.c:97975-97978`).
+        // Neither the sweep (`0x47ca80-0x47cbe9`) nor the arming routine
+        // (`0x47c760-0x47c80b`) contains a `rand()` call, so placing it first
+        // does not move the documented RNG dispatch order.
+        self.tick_source_growth_timers(dt_ms);
         self.tick_source_resource_environment(dt_ms);
         self.tick_source_map_dispatch(dt_ms);
         self.tick_source_kind4_deferred_hits();
@@ -4354,6 +4495,71 @@ impl Simulation {
         }
     }
 
+    /// `Randwachs` as `FUN_004684a0` reads it: off the **base terrain layer**
+    /// `param_1[0x2bf]` (`1602_exe.c:72698`), never off the raw-resource cell's
+    /// own definition.
+    ///
+    /// That third full-size grid is allocated by `FUN_00469100`
+    /// (`1602_exe.c:73382`), written only by `FUN_00463e10` while
+    /// `FUN_00468550` replays owner-slot-7 INSELHAUS commands, and saved as
+    /// the first of the two `"INSELHAUS"` chunks — which is exactly this
+    /// port's [`Self::source_static_map_backing_cells`]. It is semantically
+    /// the right layer because `Randwachs` is authored only on *terrain*
+    /// records: `ObjFill: 0,MAXHAUS` gives every slot `Randwachs: 100`, and
+    /// only the desert markers override it with 25 / 40 / 50 / 75. No crop,
+    /// forest or pasture record authors it at all.
+    ///
+    /// A cell the loader never copied reads a zero layer word in the original,
+    /// which dereferences `Gfx: GFXBODEN = 0` — the empty-ground record, whose
+    /// inherited `Randwachs: 100` is 128 in the source's 128-scale.
+    pub fn source_base_terrain_growth_factor(&self, island: u8, x: u16, y: u16) -> u8 {
+        source_base_terrain_growth_factor(&self.source_static_map_backing_cells, island, x, y)
+    }
+
+    /// Replay `FUN_0047ca80` (`1602_exe.c:88972`), the raw-resource growth
+    /// timer, with the same `<= 200 ms` scaled slice every other source
+    /// sub-step handler receives.
+    ///
+    /// Phase A advances the 32 bucket clocks. Phase B visits 206 table slots
+    /// from the sweep cursor and steps whatever entries live in them, so a
+    /// full pass over the 32860-slot table takes 160 calls and a bucket
+    /// rollover is noticed within that window rather than instantly. The table
+    /// itself is not modelled — see
+    /// [`SourceMapCellState::source_growth_enrolled`] — but each enrolled cell
+    /// keeps its `FUN_0047c810` home slot so the sweep keeps that cadence.
+    fn tick_source_growth_timers(&mut self, dt_ms: u32) {
+        for bucket in 0..SOURCE_GROWTH_BUCKET_COUNT {
+            let elapsed = self.source_growth_bucket_elapsed_ms[bucket].wrapping_add(dt_ms);
+            if elapsed >= source_growth_bucket_period_ms(bucket) {
+                self.source_growth_bucket_elapsed_ms[bucket] = 0;
+                self.source_growth_bucket_phase[bucket] =
+                    self.source_growth_bucket_phase[bucket].wrapping_add(1) & 7;
+            } else {
+                self.source_growth_bucket_elapsed_ms[bucket] = elapsed;
+            }
+        }
+
+        let bucket_phases = self.source_growth_bucket_phase;
+        let start = self.source_growth_sweep_cursor % SOURCE_GROWTH_TABLE_SLOTS;
+        self.source_growth_sweep_cursor =
+            (start + SOURCE_GROWTH_SWEEP_SLOTS) % SOURCE_GROWTH_TABLE_SLOTS;
+        let mut changed = false;
+        for cell in &mut self.source_static_map_roots {
+            if !cell.source_growth_enrolled {
+                continue;
+            }
+            let slot = source_growth_table_slot(cell.island, cell.x, cell.y);
+            let offset = (slot + SOURCE_GROWTH_TABLE_SLOTS - start) % SOURCE_GROWTH_TABLE_SLOTS;
+            if offset >= SOURCE_GROWTH_SWEEP_SLOTS {
+                continue;
+            }
+            changed |= cell.tick_source_growth_entry(bucket_phases);
+        }
+        if changed {
+            self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+        }
+    }
+
     /// Replay the resource-cell portion of `FUN_0046b3e0`. Each invocation
     /// advances one physical island cursor; an island is scanned at most once
     /// per 30-second source phase. Its remaining branches update other
@@ -4395,12 +4601,18 @@ impl Simulation {
             )
         };
         let mut changed = false;
+        let bucket_phases = self.source_growth_bucket_phase;
         if attenuation != 0 && self.source_time_ticks < deadline {
             let resource_state = self.island_maps[map_index].source_resource_state();
             for y in 0..height {
                 let mut x = i32::from(width) - i32::from(self.next_source_rand() & 3) - 1;
                 while x >= 0 {
                     let x_u8 = x as u8;
+                    let growth_factor = self.source_base_terrain_growth_factor(
+                        island,
+                        u16::from(x_u8),
+                        u16::from(y),
+                    );
                     if let Some(cell) = self
                         .source_static_map_roots
                         .iter_mut()
@@ -4408,14 +4620,15 @@ impl Simulation {
                     {
                         let transition = source_resource_harvest_transition(
                             resource_state.resource_strength(cell.source_output_ware_slot),
-                            cell.source_resource_growth_factor,
+                            growth_factor,
                             attenuation,
                             cell.source_output_ware_slot,
                             island,
                             u16::from(x_u8),
                             u16::from(y),
                         );
-                        changed |= cell.advance_raw_resource_to_drought(transition);
+                        changed |=
+                            cell.advance_raw_resource_to_drought(transition, bucket_phases);
                     }
                     x -= 3;
                 }
@@ -4425,6 +4638,8 @@ impl Simulation {
             let resource_state = self.island_maps[map_index].source_resource_state();
             for y in 0..height {
                 for x in (0..width).rev() {
+                    let growth_factor =
+                        self.source_base_terrain_growth_factor(island, u16::from(x), u16::from(y));
                     if let Some(cell) = self
                         .source_static_map_roots
                         .iter_mut()
@@ -4432,7 +4647,7 @@ impl Simulation {
                     {
                         let transition = source_resource_harvest_transition(
                             resource_state.resource_strength(cell.source_growth_resource_ware_slot),
-                            cell.source_resource_growth_factor,
+                            growth_factor,
                             attenuation,
                             cell.source_growth_resource_ware_slot,
                             island,
@@ -5490,16 +5705,68 @@ impl Simulation {
     /// `FUN_0044b7e0`: create a production-kind-2 worker at its root. The
     /// initial `FUN_0045afd0` handler pass performs target selection later.
     fn try_spawn_source_plantation_worker(&mut self, root: SourceMapCellState) -> Option<Figure> {
-        if !root.is_type12_plantation_root() || !self.source_figure_pool_has_capacity() {
+        if !root.is_type12_plantation_root() {
             return None;
         }
-        if self.figures.iter().any(|figure| {
-            figure.is_active()
-                && figure.source_worker_route != SourceWorkerRoute::None
-                && figure.origin_island == root.island
-                && figure.origin_x == u16::from(root.x)
-                && figure.origin_y == u16::from(root.y)
-        }) {
+        // `FUN_0044b7e0` gates on `FUN_00443080`, which returns the *first*
+        // matching worker record rather than a count: one worker per root.
+        self.try_spawn_source_worker(root, 1, 1)
+    }
+
+    /// `FUN_0044bb40`: create a production-kind-4 grazer.
+    ///
+    /// Arm 3 of `FUN_0047daf0`'s dispatch table (`0x47df5f`) has **no**
+    /// `test cl, cl` idle gate, unlike arms 1 and 4, so a `WEIDETIER` root
+    /// re-dispatches on every scheduler pass regardless of its activity byte.
+    /// `FUN_0044af10(x, y, slot, Figuranz)` then censuses the live worker
+    /// records keyed on the centred home coordinate and settlement selector
+    /// and admits a new grazer only while fewer than `Figuranz` are out —
+    /// three for the sheep farm, two for the cattle farm.
+    fn try_spawn_source_herd_worker(&mut self, root: SourceMapCellState) -> Option<Figure> {
+        if !source_is_herd_root(root) {
+            return None;
+        }
+        self.try_spawn_source_worker(root, root.source_transfer_figure_limit.max(1), 0)
+    }
+
+    /// `FUN_0044b9a0`: create a production-kind-6 fisher. Arm 4 (`0x47df97`)
+    /// keeps the idle gate, and the allocator uses the same one-per-root
+    /// `FUN_00443080` census as the plantation worker.
+    fn try_spawn_source_fishery_worker(&mut self, root: SourceMapCellState) -> Option<Figure> {
+        if !source_is_fishery_root(root) {
+            return None;
+        }
+        self.try_spawn_source_worker(root, 1, 0)
+    }
+
+    /// The body shared by `FUN_0044b7e0`, `FUN_0044b9a0` and `FUN_0044bb40`.
+    /// All three resolve the centred home cell, census the live worker
+    /// records, allocate a figure through `FUN_00446ca0` and copy the root's
+    /// compiled selectors into the new worker record; they differ only in the
+    /// concurrency cap, the figure category, and the initial `FUN_00446d90`
+    /// animation selector (`1` for the plantation worker, `0` for the other
+    /// two).
+    fn try_spawn_source_worker(
+        &mut self,
+        root: SourceMapCellState,
+        concurrency: u8,
+        initial_animation_state: u8,
+    ) -> Option<Figure> {
+        if !self.source_figure_pool_has_capacity() {
+            return None;
+        }
+        let live = self
+            .figures
+            .iter()
+            .filter(|figure| {
+                figure.is_active()
+                    && figure.source_worker_route != SourceWorkerRoute::None
+                    && figure.origin_island == root.island
+                    && figure.origin_x == u16::from(root.x)
+                    && figure.origin_y == u16::from(root.y)
+            })
+            .count();
+        if live >= usize::from(concurrency.max(1)) {
             return None;
         }
         if !self
@@ -5515,7 +5782,7 @@ impl Simulation {
         );
 
         let event = self
-            .prepare_source_transfer_event_with_limit(root, 1)
+            .prepare_source_transfer_event_with_limit(root, concurrency.max(1))
             .ok()
             .flatten()?;
         if !self.activate_source_transfer_event(event) {
@@ -5548,13 +5815,22 @@ impl Simulation {
         figure.target_y = start.1;
         figure.source_worker_home_x = start.0;
         figure.source_worker_home_y = start.1;
-        figure.select_source_animation_state(1);
+        figure.select_source_animation_state(initial_animation_state);
         figure.carried_good = root.source_raw_resource_ware_slot;
         figure.source_worker_route = SourceWorkerRoute::Searching;
         figure.speed = carrier::CARRIER_SPEED;
         figure.source_move_speed = self
             .civilian_config
             .movement_speed_for_definition(definition);
+        // Figure definition `+0x36`. `FUN_0045b490` and `FUN_0045ba60` compare
+        // the worker record's accumulated `+0x28` against it after each cell
+        // and re-search while there is room; `FUN_0045afd0` has no such test,
+        // and the plantation workers author no `Maxtrag`, so both agree on a
+        // single-cell trip for production kind 2.
+        figure.source_transfer_max_load_fixed = self
+            .civilian_config
+            .max_load_for_definition(definition)
+            .saturating_mul(SOURCE_PLANTATION_HARVEST_AMOUNT);
         figure.sprite_set = definition;
         figure.base_sprite = self.civilian_config.sprite_base_for_definition(definition);
         figure.source_position_z = self
@@ -5586,16 +5862,21 @@ impl Simulation {
         else {
             return false;
         };
+        let fishery = figure.origin_production_kind == 6;
         let candidates: Vec<_> = self
             .source_static_map_roots
             .iter()
             .enumerate()
             .filter(|(_, cell)| {
                 cell.island == figure.origin_island
-                    && cell.is_plantation_worker_target(
-                        figure.origin_source_map_owner_slot,
-                        figure.carried_good,
-                    )
+                    && if fishery {
+                        source_is_fishery_worker_target(**cell, figure.carried_good)
+                    } else {
+                        cell.is_plantation_worker_target(
+                            figure.origin_source_map_owner_slot,
+                            figure.carried_good,
+                        )
+                    }
             })
             .map(|(index, cell)| {
                 (
@@ -5609,25 +5890,59 @@ impl Simulation {
             return false;
         }
         let start = (figure.tile_x, figure.tile_y);
+        // `FUN_0045b200`, `FUN_0045bcc0` and `FUN_0045b730` all centre the
+        // window on the worker record's home cell (`+0x08`/`+0x0a`), not on
+        // wherever the worker currently stands. That only becomes observable
+        // once a worker re-searches away from its root, which is the kind-4
+        // and kind-6 multi-cell trip; production kind 2 always searches from
+        // home, so its behaviour is unchanged either way.
+        let center = if fishery || figure.origin_production_kind == 4 {
+            (figure.source_worker_home_x, figure.source_worker_home_y)
+        } else {
+            start
+        };
         let Some((target_index, route, path)) = (|| {
             let map = self
                 .island_maps
                 .iter()
                 .find(|map| map.island_id == figure.origin_island)?;
-            let mut grid = map.plantation_worker_path_grid(
-                start,
-                (i32::from(root.x), i32::from(root.y)),
-                (root.footprint_width, root.footprint_height),
-                root.source_transfer_radius,
-                figure.origin_source_map_owner_slot,
-                figure.carried_good,
-                &self.source_static_map_roots,
-            );
-            for &(_, position, path_class) in &candidates {
-                let target = SourcePathTargetRect::new(position, 1, 1)?;
-                grid.set_target_region_metadata(target, (path_class & 0x7f) | 0x80);
+            let mut grid = if fishery {
+                map.fishery_worker_path_grid(
+                    center,
+                    (i32::from(root.x), i32::from(root.y)),
+                    (root.footprint_width, root.footprint_height),
+                    root.source_transfer_radius,
+                    root.source_orientation,
+                    figure.carried_good,
+                    &self.source_static_map_roots,
+                )
+            } else {
+                map.source_worker_path_grid(
+                    center,
+                    (i32::from(root.x), i32::from(root.y)),
+                    (root.footprint_width, root.footprint_height),
+                    root.source_transfer_radius,
+                    figure.origin_source_map_owner_slot,
+                    figure.carried_good,
+                    &self.source_static_map_roots,
+                    source_worker_movement_class(figure.origin_production_kind),
+                )
+            };
+            // `FUN_0046fb50` already writes its own target bit over the fixed
+            // `0x20` water class, so only the land overlay needs the caller to
+            // stamp the candidate cells.
+            if !fishery {
+                for &(_, position, path_class) in &candidates {
+                    let target = SourcePathTargetRect::new(position, 1, 1)?;
+                    grid.set_target_region_metadata(target, (path_class & 0x7f) | 0x80);
+                }
             }
-            let route = grid.search_source_high_metadata_target(start, 0).ok()?;
+            let route = grid
+                .search_source_high_metadata_target(
+                    start,
+                    source_worker_target_completion_delay(figure.origin_production_kind),
+                )
+                .ok()?;
             let target_index = candidates
                 .iter()
                 .rev()
@@ -5646,8 +5961,17 @@ impl Simulation {
         // (`1602_exe.c:62988-62990`). The search returns `0x20` — one whole
         // good in the source 1/32 fixed point — for every accepted target
         // (`local_2c = 0x20`, `1602_exe.c:80682`), so one harvested tile is
-        // worth exactly one raw unit at the root.
-        figure.cargo_fixed = SOURCE_PLANTATION_HARVEST_AMOUNT;
+        // worth exactly one raw unit at the root. `FUN_0045bcc0` and
+        // `FUN_0045b730` instead *accumulate* into `+0x28` (`+= (short)iVar6`,
+        // `1602_exe.c:63447`, `:63229`) because their workers keep collecting
+        // until the figure's `Maxtrag` is met.
+        if figure.source_transfer_max_load_fixed == 0 {
+            figure.cargo_fixed = SOURCE_PLANTATION_HARVEST_AMOUNT;
+        } else {
+            figure.cargo_fixed = figure
+                .cargo_fixed
+                .saturating_add(SOURCE_PLANTATION_HARVEST_AMOUNT);
+        }
         figure.target_x = route.position.0;
         figure.target_y = route.position.1;
         figure.supplier_x = route.position.0 as u16;
@@ -5682,20 +6006,49 @@ impl Simulation {
         else {
             return false;
         };
+        let fishery = figure.origin_production_kind == 6;
+        let center = if fishery || figure.origin_production_kind == 4 {
+            goal
+        } else {
+            start
+        };
         let Some((route_steps, path)) = self
             .island_maps
             .iter()
             .find(|map| map.island_id == figure.origin_island)
             .and_then(|map| {
-                let mut grid = map.plantation_worker_path_grid(
-                    start,
-                    (i32::from(root.x), i32::from(root.y)),
-                    (root.footprint_width, root.footprint_height),
-                    root.source_transfer_radius,
-                    figure.origin_source_map_owner_slot,
-                    figure.carried_good,
-                    &self.source_static_map_roots,
-                );
+                let mut grid = if fishery {
+                    // Ware `0` on the return leg. `FUN_0045b200` and
+                    // `FUN_0045b730` both hand `FUN_00471c50` a zero ware once
+                    // the destination is already fixed (`1602_exe.c:62998`,
+                    // `:63238`), so no cell qualifies as a callback target and
+                    // the wave runs to the marked root instead. It matters
+                    // only for the water grid, because `FUN_0046fb50` writes
+                    // its own target bits: a pier ringed by ripe `FISCHE` is
+                    // ringed by callback cells, and the port's `route_to`
+                    // blocks on every one of them, walling the fisher in with
+                    // a full load it can never deliver.
+                    map.fishery_worker_path_grid(
+                        center,
+                        (i32::from(root.x), i32::from(root.y)),
+                        (root.footprint_width, root.footprint_height),
+                        root.source_transfer_radius,
+                        root.source_orientation,
+                        0,
+                        &self.source_static_map_roots,
+                    )
+                } else {
+                    map.source_worker_path_grid(
+                        center,
+                        (i32::from(root.x), i32::from(root.y)),
+                        (root.footprint_width, root.footprint_height),
+                        root.source_transfer_radius,
+                        figure.origin_source_map_owner_slot,
+                        figure.carried_good,
+                        &self.source_static_map_roots,
+                        source_worker_movement_class(figure.origin_production_kind),
+                    )
+                };
                 let root_target = SourcePathTargetRect::new(
                     (
                         i32::from(root.source_command_anchor_x),
@@ -5999,7 +6352,10 @@ impl Simulation {
             }
         }
 
-        let plantation_roots: Vec<_> = source_dispatch_roots
+        // `FUN_0047daf0` reaches every nested-production allocator from the
+        // one dispatch table at `0x47e258`, so kinds 2, 4 and 6 are visited in
+        // the same scheduler pass over the same due roots. Kind 5 has no arm.
+        let worker_roots: Vec<_> = source_dispatch_roots
             .iter()
             .filter_map(|root| {
                 self.source_map_cell_states
@@ -6007,13 +6363,22 @@ impl Simulation {
                     .copied()
                     .find(|state| state.matches(root.island, u16::from(root.x), u16::from(root.y)))
             })
-            .filter(|root| root.is_type12_plantation_root())
+            .filter(|root| {
+                root.is_type12_plantation_root()
+                    || source_is_herd_root(*root)
+                    || source_is_fishery_root(*root)
+            })
             .collect();
-        for root in plantation_roots {
+        for root in worker_roots {
             if source_figure_slots_remaining == 0 {
                 break;
             }
-            if let Some(worker) = self.try_spawn_source_plantation_worker(root) {
+            let worker = match root.source_production_kind_code {
+                4 => self.try_spawn_source_herd_worker(root),
+                6 => self.try_spawn_source_fishery_worker(root),
+                _ => self.try_spawn_source_plantation_worker(root),
+            };
+            if let Some(worker) = worker {
                 new_carriers.push(worker);
                 source_figure_slots_remaining -= 1;
             }
@@ -7598,6 +7963,12 @@ impl Simulation {
                     1 => {
                         let local = target_local.expect("terminal target is present");
                         let mut changed = false;
+                        let bucket_phases = self.source_growth_bucket_phase;
+                        let growth_factor = self.source_base_terrain_growth_factor(
+                            figure.origin_island,
+                            u16::try_from(local.0).unwrap_or(u16::MAX),
+                            u16::try_from(local.1).unwrap_or(u16::MAX),
+                        );
                         if let Some(cell) = self.source_static_map_roots.iter_mut().find(|cell| {
                             cell.matches(
                                 figure.origin_island,
@@ -7605,16 +7976,17 @@ impl Simulation {
                                 u16::try_from(local.1).unwrap_or(u16::MAX),
                             )
                         }) {
-                            let transition = source_resource_harvest_transition(
+                            let transition = source_harvest_regrowth_transition(
                                 resource_state.resource_strength(cell.source_output_ware_slot),
-                                cell.source_resource_growth_factor,
+                                growth_factor,
                                 attenuation,
                                 cell.source_output_ware_slot,
                                 figure.origin_island,
                                 u16::try_from(local.0).unwrap_or(u16::MAX),
                                 u16::try_from(local.1).unwrap_or(u16::MAX),
                             );
-                            changed = cell.replace_harvested_raw_resource(transition);
+                            changed =
+                                cell.replace_harvested_raw_resource(transition, bucket_phases);
                         }
                         if changed {
                             self.source_map_cell_revision =
@@ -7632,6 +8004,12 @@ impl Simulation {
                     }
                     2 => {
                         let local = target_local.expect("terminal target is present");
+                        let bucket_phases = self.source_growth_bucket_phase;
+                        let growth_factor = self.source_base_terrain_growth_factor(
+                            figure.origin_island,
+                            u16::try_from(local.0).unwrap_or(u16::MAX),
+                            u16::try_from(local.1).unwrap_or(u16::MAX),
+                        );
                         if let Some(cell) = self.source_static_map_roots.iter_mut().find(|cell| {
                             cell.matches(
                                 figure.origin_island,
@@ -7639,16 +8017,16 @@ impl Simulation {
                                 u16::try_from(local.1).unwrap_or(u16::MAX),
                             )
                         }) {
-                            let transition = source_resource_harvest_transition(
+                            let transition = source_harvest_regrowth_transition(
                                 resource_state.resource_strength(cell.source_output_ware_slot),
-                                cell.source_resource_growth_factor,
+                                growth_factor,
                                 attenuation,
                                 cell.source_output_ware_slot,
                                 figure.origin_island,
                                 u16::try_from(local.0).unwrap_or(u16::MAX),
                                 u16::try_from(local.1).unwrap_or(u16::MAX),
                             );
-                            if cell.replace_harvested_raw_resource(transition) {
+                            if cell.replace_harvested_raw_resource(transition, bucket_phases) {
                                 self.source_map_cell_revision =
                                     self.source_map_cell_revision.wrapping_add(1);
                             }
@@ -7855,7 +8233,32 @@ impl Simulation {
             })
             .collect();
         for index in searching_worker_indices {
-            self.try_assign_source_plantation_worker_target(index);
+            if self.try_assign_source_plantation_worker_target(index) {
+                continue;
+            }
+            // `FUN_0045b490` only re-arms the search with `(0xffff, 0xffff)`
+            // while `FUN_0047cf70` still reports harvestable ground at the
+            // root; otherwise it sends the worker home with whatever it has
+            // (`1602_exe.c:63109-63120`). Kinds 4 and 6 are the only workers
+            // that can be searching with cargo already aboard — a production
+            // kind 2 worker only ever carries after its single target is
+            // assigned — so this is exactly that branch, and without it a
+            // part-loaded fisher whose water ran out parks forever instead of
+            // delivering.
+            let Some(figure) = self.figures.get_mut(index) else {
+                continue;
+            };
+            if figure.cargo_fixed == 0 {
+                continue;
+            }
+            figure.source_worker_route = SourceWorkerRoute::ReturningSearch;
+            figure.action = ActionType::Walking;
+            figure.target_x = figure.source_worker_home_x;
+            figure.target_y = figure.source_worker_home_y;
+            figure.path.clear();
+            figure.path_idx = 0;
+            figure.source_step_remaining = 0.0;
+            figure.source_event_route_steps.clear();
         }
         let returning_worker_indices: Vec<_> = self
             .figures
@@ -7895,7 +8298,13 @@ impl Simulation {
                         continue;
                     };
                     let target = (figure.supplier_x, figure.supplier_y);
-                    if let Some(cell) = self.source_static_map_roots.iter().find(|cell| {
+                    let growth_factor = source_base_terrain_growth_factor(
+                        &self.source_static_map_backing_cells,
+                        figure.origin_island,
+                        target.0,
+                        target.1,
+                    );
+                    if self.source_static_map_roots.iter().any(|cell| {
                         cell.matches(figure.origin_island, target.0, target.1)
                             && cell.source_resource_reserved
                     }) {
@@ -7903,9 +8312,9 @@ impl Simulation {
                             figure.origin_island,
                             target.0,
                             target.1,
-                            source_resource_harvest_transition(
+                            source_harvest_regrowth_transition(
                                 map.source_resource_strength(figure.carried_good),
-                                cell.source_resource_growth_factor,
+                                growth_factor,
                                 map.source_resource_attenuation(),
                                 figure.carried_good,
                                 figure.origin_island,
@@ -7915,9 +8324,23 @@ impl Simulation {
                         ));
                     }
                     figure.action = ActionType::Walking;
-                    figure.target_x = figure.source_worker_home_x;
-                    figure.target_y = figure.source_worker_home_y;
-                    figure.source_worker_route = SourceWorkerRoute::ReturningSearch;
+                    // `FUN_0045b490` and `FUN_0045ba60` compare the worker's
+                    // accumulated `+0x28` against the figure definition's
+                    // `Maxtrag` at `+0x36` after consuming a cell: short of it
+                    // they re-arm the search with `(0xffff, 0xffff)` and take
+                    // another cell, otherwise they head home
+                    // (`1602_exe.c:63106-63120`, `:63344-63352`).
+                    // `FUN_0045afd0` has no such branch, and the plantation
+                    // workers author no `Maxtrag`, so kind 2 always goes home.
+                    if figure.cargo_fixed < figure.source_transfer_max_load_fixed {
+                        figure.source_worker_route = SourceWorkerRoute::Searching;
+                        figure.target_x = figure.tile_x;
+                        figure.target_y = figure.tile_y;
+                    } else {
+                        figure.target_x = figure.source_worker_home_x;
+                        figure.target_y = figure.source_worker_home_y;
+                        figure.source_worker_route = SourceWorkerRoute::ReturningSearch;
+                    }
                     figure.path.clear();
                     figure.path_idx = 0;
                     figure.source_step_remaining = 0.0;
@@ -8709,13 +9132,14 @@ impl Simulation {
             }
         }
 
+        let bucket_phases = self.source_growth_bucket_phase;
         for (island, x, y, transition) in source_worker_harvests {
             if let Some(cell) = self
                 .source_static_map_roots
                 .iter_mut()
                 .find(|cell| cell.matches(island, x, y))
             {
-                if cell.replace_harvested_raw_resource(transition) {
+                if cell.replace_harvested_raw_resource(transition, bucket_phases) {
                     self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
                 }
             }
@@ -9440,6 +9864,121 @@ impl Simulation {
 mod tests {
     use super::*;
     use crate::ai::{AiController, AiPersonality, Difficulty};
+
+    /// The shipped Weizen record group, shaped like haeuser.cod: three
+    /// consecutive `@Nummer` slots, outer `Kind: WALD` throughout, nested
+    /// `ROHSTWACHS` / `ROHSTOFF` / `ROHSTWACHS + Doerrflg`, and the authored
+    /// `Gfx` values `GFXROHST+0`, `+5` and `+48`. A synthetic
+    /// `kind: "ROHSTOFF"` record with consecutive `Gfx` values, as these
+    /// fixtures used to use, is a shape the shipped data never has.
+    fn weizen_group() -> anno_formats::cod::CodFile {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+        let growth = CodBuilding {
+            nummer: 40,
+            kind: "WALD".into(),
+            gfx: 584,
+            anim_anz: 5,
+            source_scheduler_interval: 175,
+            properties: [
+                ("ProdKind".into(), "ROHSTWACHS".into()),
+                ("Ware".into(), "NOWARE".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let ripe = CodBuilding {
+            nummer: 41,
+            gfx: 589,
+            anim_anz: 1,
+            source_scheduler_interval: 0,
+            properties: [
+                ("ProdKind".into(), "ROHSTOFF".into()),
+                ("Ware".into(), "GETREIDE".into()),
+                ("Rohstoff".into(), "NOWARE".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..growth.clone()
+        };
+        let dry = CodBuilding {
+            nummer: 42,
+            gfx: 632,
+            properties: [
+                ("ProdKind".into(), "ROHSTWACHS".into()),
+                ("Ware".into(), "NOWARE".into()),
+                ("Doerrflg".into(), "1".into()),
+                ("Wegspeed".into(), "145,120,170,100".into()),
+            ]
+            .into(),
+            ..growth.clone()
+        };
+        anno_formats::cod::CodFile {
+            constants: std::collections::HashMap::new(),
+            buildings: vec![growth, ripe, dry],
+        }
+    }
+
+    /// Phase A of `FUN_0047ca80` (`1602_exe.c:88979-88991`): 32 accumulators,
+    /// bucket `i` firing every `40000 + 7000*i` ms and bumping a three-bit
+    /// counter. The loop runs `while (uVar4 < 0x40740)`, i.e. exactly 32
+    /// buckets ending at 257 000 ms.
+    #[test]
+    fn growth_bucket_clocks_fire_at_their_own_periods() {
+        let mut sim = Simulation::new();
+        // Bucket 0 fires at 40 000 ms, bucket 1 at 47 000.
+        for _ in 0..199 {
+            sim.tick(200);
+        }
+        assert_eq!(sim.source_growth_bucket_phase[0], 0);
+        assert_eq!(sim.source_growth_bucket_elapsed_ms[0], 39_800);
+        sim.tick(200);
+        assert_eq!(sim.source_growth_bucket_phase[0], 1);
+        assert_eq!(sim.source_growth_bucket_elapsed_ms[0], 0);
+        assert_eq!(sim.source_growth_bucket_phase[1], 0);
+        assert_eq!(sim.source_growth_bucket_elapsed_ms[1], 40_000);
+
+        for _ in 0..35 {
+            sim.tick(200);
+        }
+        assert_eq!(sim.source_growth_bucket_phase[1], 1, "47 000 ms");
+        assert_eq!(sim.source_growth_bucket_phase[20], 0, "180 000 ms");
+        assert_eq!(sim.source_growth_bucket_phase[31], 0, "257 000 ms");
+
+        // The counter is three-bit: `+ 1U & 7`.
+        sim.source_growth_bucket_phase[0] = 7;
+        sim.source_growth_bucket_elapsed_ms[0] = 39_999;
+        sim.tick(200);
+        assert_eq!(sim.source_growth_bucket_phase[0], 0);
+
+        // Bucket 20 is the forest clock: five rollovers ripen a field.
+        let mut sim = Simulation::new();
+        for _ in 0..900 {
+            sim.tick(200);
+        }
+        assert_eq!(sim.source_growth_bucket_phase[20], 1);
+        assert_eq!(sim.source_growth_bucket_phase[31], 0);
+        for _ in 0..385 {
+            sim.tick(200);
+        }
+        assert_eq!(sim.source_growth_bucket_phase[31], 1, "257 000 ms");
+    }
+
+    /// One map cell showing record `index` of [`weizen_group`], with its
+    /// compiled record group resolved through the 0x88-byte record stride.
+    fn weizen_cell(
+        cod: &anno_formats::cod::CodFile,
+        index: usize,
+        island: u8,
+        x: u8,
+        y: u8,
+    ) -> SourceMapCellState {
+        let definition = &cod.buildings[index];
+        let mut cell = SourceMapCellState::new_static(island, x, y, definition, 0)
+            .expect("raw-resource record defines a static source cell");
+        cell.configure_source_resource_records(cod, definition);
+        cell
+    }
 
     #[test]
     fn source_controller_construction_queue_replays_fun_00417aa0_priority_rules() {
@@ -12657,21 +13196,16 @@ mod tests {
             .into(),
             ..Default::default()
         };
-        let raw_resource = CodBuilding {
-            kind: "ROHSTOFF".into(),
-            gfx: 100,
-            source_resource_growth_factor: 128,
-            properties: [
-                ("Ware".into(), "GETREIDE".into()),
-                ("Wegspeed".into(), "145,120,170,100".into()),
-            ]
-            .into(),
-            ..Default::default()
-        };
+        // Superseded fixture: a synthetic `kind: "ROHSTOFF"` record at
+        // `gfx: 100`, which made the old outer-kind harvest guard fire and
+        // expected `source_definition_offset == 99` afterwards. Real Weizen is
+        // outer `WALD` over nested `ROHSTOFF` at `Gfx: 589`, whose growth
+        // record is one 0x88-byte record back at `Gfx: 584`.
+        let cod = weizen_group();
         let mut root = SourceMapCellState::new(0, 0, 0, &plantation, 0).unwrap();
         root.source_map_owner_slot = 0;
         root.set_footprint(3, 1);
-        let mut resource = SourceMapCellState::new_static(0, 4, 0, &raw_resource, 0).unwrap();
+        let mut resource = weizen_cell(&cod, 1, 0, 4, 0);
         resource.source_map_owner_slot = 0;
         sim.source_map_cell_states.push(root);
         sim.source_static_map_roots.push(resource);
@@ -12727,7 +13261,7 @@ mod tests {
             sim.tick_entities(100);
         }
 
-        assert_eq!(sim.source_static_map_roots[0].kind_code, 9);
+        assert_eq!(sim.source_static_map_roots[0].source_production_kind_code, 9);
         assert!(sim.source_static_map_roots[0].source_resource_reserved);
         assert_eq!(sim.figures[0].action, ActionType::CarryingGoods);
         assert_eq!(sim.figures[0].source_animation_state, 2);
@@ -12744,8 +13278,9 @@ mod tests {
         );
 
         sim.tick_entities(100);
-        assert_eq!(sim.source_static_map_roots[0].source_definition_offset, 99);
-        assert_eq!(sim.source_static_map_roots[0].kind_code, 10);
+        assert_eq!(sim.source_static_map_roots[0].source_definition_offset, 584);
+        assert_eq!(sim.source_static_map_roots[0].source_production_kind_code, 10);
+        assert!(sim.source_static_map_roots[0].source_growth_enrolled);
         assert!(!sim.source_static_map_roots[0].source_resource_reserved);
         assert_eq!(sim.figures.len(), 1);
         assert_eq!(sim.figures[0].source_animation_state, 0);
@@ -12776,6 +13311,89 @@ mod tests {
             .slot(event_slot)
             .expect("released worker event slot is retained")
             .is_free());
+    }
+
+    /// Production kind 4 differs from kinds 2 and 6 in two behavioural ways
+    /// that both come straight off the dispatch table.
+    ///
+    /// Arm 3 at `0x47df5f` opens with `mov cx, [ebx+0x3c]` — no `test cl, cl /
+    /// jne 0x47e234` idle gate, unlike arms 1 (`0x47df1f`) and 4 (`0x47df97`)
+    /// — so a `WEIDETIER` root re-dispatches on every scheduler pass whatever
+    /// its activity byte holds. And `FUN_0044bb40` gates on
+    /// `FUN_0044af10(x, y, slot, Figuranz)`, which *counts* matching worker
+    /// records rather than returning the first one the way `FUN_00443080`
+    /// does for the other two kinds, so `Figuranz` grazers run concurrently.
+    #[test]
+    fn herd_root_dispatches_figuranz_grazers_and_ignores_the_idle_gate() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let pasture = CodBuilding {
+            kind: "GEBAEUDE".into(),
+            source_transfer_radius: 3,
+            source_transfer_figure_limit: 3,
+            properties: [
+                ("ProdKind".into(), "WEIDETIER".into()),
+                ("Rohstoff".into(), "GETREIDE".into()),
+                ("Figurnr".into(), "SCHAF".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let plantation = CodBuilding {
+            properties: [
+                ("ProdKind".into(), "PLANTAGE".into()),
+                ("Rohstoff".into(), "GETREIDE".into()),
+                ("Figurnr".into(), "MAEHER".into()),
+            ]
+            .into(),
+            ..pasture.clone()
+        };
+
+        // The idle gate is the whole difference at a non-zero activity byte.
+        let mut busy_pasture = SourceMapCellState::new(0, 0, 0, &pasture, 0).unwrap();
+        busy_pasture.activity = 5;
+        assert!(source_is_herd_root(busy_pasture));
+        let mut busy_plantation = SourceMapCellState::new(0, 0, 0, &plantation, 0).unwrap();
+        busy_plantation.activity = 5;
+        assert!(!busy_plantation.is_type12_plantation_root());
+
+        let mut sim = Simulation::new();
+        sim.island_maps.push(IslandMap::new_open(0, 8, 1));
+        let cod = weizen_group();
+        let mut root = SourceMapCellState::new(0, 0, 0, &pasture, 0).unwrap();
+        root.source_map_owner_slot = 0;
+        root.set_footprint(2, 1);
+        root.activity = 5;
+        sim.source_map_cell_states.push(root);
+        for x in 3..7 {
+            let mut resource = weizen_cell(&cod, 1, 0, x, 0);
+            resource.source_map_owner_slot = 0;
+            sim.source_static_map_roots.push(resource);
+        }
+
+        // `FUN_0044af10` admits one more grazer per scheduler pass until the
+        // census reaches `Figuranz`, then stops — no dispatch ever exceeds it.
+        // Nothing here calls `tick_entities`, so every grazer stays parked at
+        // its root and the census keeps counting it.
+        let mut counts = Vec::new();
+        for _ in 0..40 {
+            sim.tick_source_map_dispatch(1_000);
+            sim.tick_production();
+            counts.push(sim.figures.len());
+        }
+        assert_eq!(counts.iter().copied().max(), Some(3), "{counts:?}");
+        assert_eq!(sim.figures.len(), 3, "{counts:?}");
+        assert!(sim
+            .figures
+            .iter()
+            .all(|figure| figure.origin_production_kind == 4
+                && figure.sprite_set == 0x68
+                && figure.source_animation_state == 0
+                && figure.source_worker_route == SourceWorkerRoute::Searching));
+        // `SCHAF` authors `Maxtrag: 4`, which `FUN_0045ba60` compares against
+        // the worker record's accumulated `+0x28` before deciding to graze
+        // another cell instead of walking home.
+        assert_eq!(sim.figures[0].source_transfer_max_load_fixed, 128);
     }
 
     #[test]
@@ -12884,7 +13502,6 @@ mod tests {
 
     #[test]
     fn source_resource_environment_scans_raw_cells_before_the_deadline() {
-        use anno_formats::cod::BuildingDef as CodBuilding;
         use anno_formats::szs::IslandSourceResourceState;
 
         let mut sim = Simulation::new();
@@ -12900,27 +13517,25 @@ mod tests {
                     ..Default::default()
                 },
             ));
-        let raw = CodBuilding {
-            kind: "ROHSTOFF".into(),
-            gfx: 100,
-            properties: [("Ware".into(), "GETREIDE".into())].into(),
-            ..Default::default()
-        };
-        sim.source_static_map_roots
-            .push(SourceMapCellState::new_static(0, 0, 0, &raw, 0).unwrap());
+        // Superseded fixture: `kind: "ROHSTOFF"` at `gfx: 100`, expecting the
+        // withered record at `101`. Real Weizen withers from `Gfx: 589` to
+        // `632` — one whole 0x88-byte record, 43 sprite slots away.
+        let cod = weizen_group();
+        sim.source_static_map_roots.push(weizen_cell(&cod, 1, 0, 0, 0));
 
         sim.tick_source_resource_environment(30_000);
 
         let cell = sim.source_static_map_roots[0];
-        assert_eq!(cell.source_definition_offset, 101);
-        assert_eq!(cell.kind_code, 10);
+        assert_eq!(cell.source_definition_offset, 632);
+        assert_eq!(cell.source_production_kind_code, 10);
         assert!(cell.source_resource_is_dry);
+        // `FUN_0047c920` re-enrols the withered field on its own `+0x3a`.
+        assert!(cell.source_growth_enrolled);
         assert_eq!(sim.island_maps[0].source_resource_attenuation(), 128);
     }
 
     #[test]
     fn source_resource_environment_decays_and_restores_dry_cells() {
-        use anno_formats::cod::BuildingDef as CodBuilding;
         use anno_formats::szs::IslandSourceResourceState;
 
         let mut sim = Simulation::new();
@@ -12936,22 +13551,23 @@ mod tests {
                     ..Default::default()
                 },
             ));
-        let raw = CodBuilding {
-            kind: "ROHSTOFF".into(),
-            gfx: 100,
-            properties: [("Ware".into(), "GETREIDE".into())].into(),
-            ..Default::default()
-        };
-        let mut dry = SourceMapCellState::new_static(0, 0, 1, &raw, 0).unwrap();
-        dry.source_resource_growth_factor = 128;
-        assert!(dry.replace_harvested_raw_resource(SourceResourceHarvestTransition::Drought));
+        // Superseded fixture: `kind: "ROHSTOFF"` at `gfx: 100` with the
+        // growth factor forced onto the cell, restoring to `100`. The factor
+        // now comes from the base terrain layer, which has no entry here and
+        // so reads the empty-ground record's 128 — the same value.
+        let cod = weizen_group();
+        let mut dry = weizen_cell(&cod, 1, 0, 0, 1);
+        assert!(dry.replace_harvested_raw_resource(
+            crate::source_cell::SourceResourceHarvestTransition::Drought,
+            [0; SOURCE_GROWTH_BUCKET_COUNT],
+        ));
         sim.source_static_map_roots.push(dry);
 
         sim.tick_source_resource_environment(30_000);
 
         let cell = sim.source_static_map_roots[0];
-        assert_eq!(cell.source_definition_offset, 100);
-        assert_eq!(cell.kind_code, 9);
+        assert_eq!(cell.source_definition_offset, 589);
+        assert_eq!(cell.source_production_kind_code, 9);
         assert!(!cell.source_resource_is_dry);
         assert_eq!(sim.island_maps[0].source_resource_attenuation(), 32);
     }

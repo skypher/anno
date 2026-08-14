@@ -9,7 +9,7 @@ use anno_formats::cod::{BuildingDef as CodBuilding, CodFile};
 use anno_formats::szs::{LandFigureDefinition, LandFigureFamily, SzsFile};
 
 use crate::building::{BuildingDef, BuildingInstance, SourceBuildingCommand};
-use crate::source_cell::SourceMapCellState;
+use crate::source_cell::{SourceMapCellState, SOURCE_GROWTH_BUCKET_COUNT};
 use crate::source_route::{
     SourceDynamicMapObject, SourceDynamicMapObjectTable, SourceTargetDescriptor,
 };
@@ -2795,6 +2795,12 @@ pub fn source_static_map_backing_cells_from_scenario(
             root.set_footprint(width, height);
             root.set_source_command(command);
             root.configure_terminal_replacement(cod);
+            root.configure_source_resource_records(cod, definition);
+            // `FUN_00481450` case 10 (`1602_exe.c:92837-92842`) arms every
+            // newly placed production-kind-10 tile, load-time INSELHAUS replay
+            // included. Both bucket clocks are zero at scenario start, which is
+            // the snapshot `FUN_0047c760` would take.
+            root.arm_placed_source_growth_timer([0; SOURCE_GROWTH_BUCKET_COUNT]);
             for dy in 0..height {
                 for dx in 0..width {
                     let x = i32::from(tile.x) + dx;
@@ -2904,6 +2910,8 @@ fn source_map_roots_from_scenario(
                         state.set_footprint(width, height);
                         state.set_source_command(command);
                         state.configure_terminal_replacement(cod);
+                        state.configure_source_resource_records(cod, definition);
+                        state.arm_placed_source_growth_timer([0; SOURCE_GROWTH_BUCKET_COUNT]);
                         state
                     },
                 );

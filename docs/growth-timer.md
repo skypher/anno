@@ -296,11 +296,46 @@ fields are equivalent unless probe-order fidelity is wanted; the only
 observable difference is the "window full → silently not enrolled"
 failure mode.
 
-The COD parser needs the §2 bucket derivation exposed as a separate field
-(do **not** overwrite `source_scheduler_interval`, which the production
-scheduler also reads), a `nummer → index` lookup so `record ± 1`
-resolves — the parser already builds `building_by_nummer` and drops it —
-and `AnimTime` (`+0x70`), currently unparsed.
+The COD parser needs the §2 bucket derivation exposed separately (do
+**not** overwrite `source_scheduler_interval`, which the production
+scheduler also reads) and a `nummer → index` lookup so `record ± 1`
+resolves.
+
+Three corrections from implementing this (`SAVE_VERSION` 141):
+
+- **`AnimTime` is already parsed** as `BuildingDef::anim_time`; an earlier
+  draft of this file said it was not. `TIMENEVER` is undefined in
+  haeuser.cod and `CodFile::eval` returns 0 for unknown names, which
+  happens to match the executable registering `TIMENEVER = 0`.
+- The parser's mid-parse `building_by_nummer` **is not reusable** as a
+  final table: slot 0 is written by both the `@Nummer: 0` default block
+  and the real terrain record. The lookup must take the *last* writer of
+  a slot, as the compiled table does.
+- The §3 pseudocode shows the phase-bit write as a statement after a
+  `continue`; in the disassembly it is the `else` arm of the promotion
+  `if`. Behaviourally identical, but the `else` is also what explains why
+  a stale non-kind-10 entry still receives phase writes.
+
+One data shape this file did not mention: the config ends with a second
+`Rohstoffe-Wald Palmen` block (`Id: IDROHST+51`) authored as **ripe-only**
+records with no preceding `ROHSTWACHS`. `FUN_0047c830`'s unconditional
+`def - 0x88` there lands on a Weideland ripe record. The port declines to
+model that — no link resolves, so those cells simply never transition —
+and treats the §5 "wither with no dry record" hazard the same way.
+
+The bucket derivation is best exposed as a **method returning
+`Option<u8>`** (`None` for non-kind-10) rather than a stored field; that
+keeps hand-built fixtures correct.
+
+On the sweep: modelling the 32860-slot table literally is unnecessary,
+but its **cadence** is not — each enrolled cell should compute its
+`FUN_0047c810` home slot, with the cursor visiting 206 slots per call, so
+a full pass still takes 160 calls. Collisions can simply share a slot.
+Beware compressing time in tests: `DAT_00562da8` is a 3-bit counter
+compared against a per-entry snapshot, so an entry whose bucket rolls a
+multiple of 8 times between visits is **skipped entirely**. That cannot
+happen at shipped rates, but it bites any test that advances the clock
+aggressively.
 
 Hook `tick_source_growth_timers(dt_ms)` in as the **first** call of
 `step()`, before `tick_source_resource_environment`, matching
