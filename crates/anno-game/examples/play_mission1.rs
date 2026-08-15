@@ -257,9 +257,11 @@ fn main() {
             },
         );
         println!("build {label} at ({x},{y}): {placed}");
-        if placed {
-            used.push((x, y, w, h));
-        }
+        // Record the tile either way. A refusal is usually the buildable-area
+        // gate — the site is outside the settlement's claim — and without
+        // remembering it `find_spot` re-proposes the same tile forever and the
+        // colony stops expanding. Extending the claim is a marketplace's job.
+        used.push((x, y, w, h));
         placed
     };
     // A harvester only works if its raw resource lies inside its own Radius:
@@ -525,6 +527,7 @@ fn main() {
     let mut huts = 4;
     let mut fisheries = 1;
     let mut cloth_lines = 1;
+    let mut markets = 1;
     for minute in 41..=120u32 {
         for _ in 0..600 {
             sim.tick(100);
@@ -565,6 +568,16 @@ fn main() {
         } else if huts < 60 {
             if build(&mut sim, &mut used, 414, &format!("hut{huts}")) {
                 huts += 1;
+            } else {
+                // Refused, almost always by the buildable-area gate: the site
+                // lies on unowned ground and this player has already settled
+                // the island (`1602_exe.c:7612-7616`). A marketplace claims
+                // every still-unowned land cell in its own radius
+                // (`FUN_0046ac60`), so it is the way to buy more room — which
+                // is exactly how the original expects a colony to grow.
+                if build(&mut sim, &mut used, 468, &format!("market{markets}")) {
+                    markets += 1;
+                }
             }
         }
         report(&sim, format!("min {minute}"));
