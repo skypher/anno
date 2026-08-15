@@ -40,7 +40,10 @@ fn main() {
     // `IslandMap::is_walkable` counts `MEER` as walkable, so siting by that
     // helper alone put the whole colony out at sea, where every Karren search
     // returns `NoRoute` and nothing the colony makes can ever be collected.
-    let open_ground = |k: u8| matches!(k, 1 | 11 | 12 | 13 | 18 | 29 | 30);
+    // Ask the engine which kinds a transfer wave walks; do not paraphrase
+    // it here. A local copy of this set drifted from the engine's and made
+    // buildable land look scarce.
+    let open_ground = anno_sim::island_map::source_transfer_wave_opens_ground_kind;
     let kind_at = |sim: &anno_sim::simulation::Simulation, x: i32, y: i32| {
         sim.island_maps[mi]
             .source_map_kind_and_owner(x, y)
@@ -521,6 +524,7 @@ fn main() {
     build(&mut sim, &mut used, 388, "weaver1");
     let mut huts = 4;
     let mut fisheries = 1;
+    let mut cloth_lines = 1;
     for minute in 41..=120u32 {
         for _ in 0..600 {
             sim.tick(100);
@@ -533,11 +537,32 @@ fn main() {
             .map(|w| w.stock(Good::Food))
             .unwrap_or(0);
         // Below a comfortable buffer, buy food capacity before housing.
+        let cloth = sim
+            .warehouses
+            .iter()
+            .find(|w| w.island_id == 10 && w.owner == 0)
+            .map(|w| w.stock(Good::Cloth))
+            .unwrap_or(0);
+        // Food first, then cloth, then housing. Settlers consume cloth, so a
+        // single sheep-and-weaver line stops covering the settler population
+        // it created — the same failure the fisheries had, one good along.
         if food < 25 && fisheries < 6 {
             if build_on_resource(&mut sim, &mut used, 270, 57, &format!("fishery{fisheries}")) {
                 fisheries += 1;
             }
-        } else if food >= 25 && huts < 40 {
+        } else if cloth < 20 && cloth_lines < 4 {
+            let sheep = build_on_resource(
+                &mut sim,
+                &mut used,
+                412,
+                52,
+                &format!("sheep{}", cloth_lines + 2),
+            );
+            let weaver = build(&mut sim, &mut used, 388, &format!("weaver{cloth_lines}"));
+            if sheep || weaver {
+                cloth_lines += 1;
+            }
+        } else if huts < 60 {
             if build(&mut sim, &mut used, 414, &format!("hut{huts}")) {
                 huts += 1;
             }

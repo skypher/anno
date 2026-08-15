@@ -281,6 +281,22 @@ const WALKABLE_KINDS: &[&str] = &[
 ///   definition (`+0x1c` == 10) that would land on its own crop or on the
 ///   ripe resource it grows into (`1602_exe.c:70066-70078`) — i.e. the
 ///   editor/terrain painter re-seeding a field that already carries it.
+/// The outer map kinds a transfer wave will walk: road, ground, ruin, plaza,
+/// bridge, beach-ruin and pier. `FUN_004704d0` (`1602_exe.c:79470-79477`)
+/// opens exactly these for the type-8 workshop carrier, and `FUN_004706e0`
+/// (`:79578`) opens the narrower `{1, 13, 18, 30}` for the type-11 city cart;
+/// every other cell keeps the `0x0c` impassable stamp the raster pre-fills.
+///
+/// This is the authority for "can a carrier get there". It exists because the
+/// set was written out as an inline literal at five separate sites in this
+/// crate and a sixth in the mission driver, which is exactly how two copies
+/// drift apart — the driver's copy was stale, and reasoning from it produced a
+/// colony "space ceiling" that was an artefact of the paraphrase rather than
+/// anything the game does.
+pub const fn source_transfer_wave_opens_ground_kind(ground_kind: u8) -> bool {
+    matches!(ground_kind, 1 | 11 | 12 | 13 | 18 | 29 | 30)
+}
+
 pub const fn source_placement_admits_ground_kind(building_kind: u8, ground_kind: u8) -> bool {
     match building_kind {
         // case 1 — STRASSE
