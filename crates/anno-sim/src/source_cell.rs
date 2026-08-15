@@ -164,11 +164,16 @@ const fn source_scheduler_enabled_default() -> bool {
     true
 }
 
-/// `FUN_0046f920` admits these outer map kinds without comparing their owner
-/// or compiled `Ware` selector. All remaining kinds need both fields to match
-/// the plantation worker's requested raw resource.
+/// `FUN_0046f920` (`1602_exe.c:78809-78815`) admits these outer map kinds
+/// without comparing their owner or compiled `Ware` selector. All remaining
+/// kinds need both fields to match the plantation worker's requested raw
+/// resource.
+///
+/// The unconditional half is bit-for-bit the type-8 transfer wave's arm, so it
+/// forwards to [`crate::island_map::source_transfer_wave_opens_ground_kind`];
+/// the name is kept because the plantation raster's `default:` arm differs.
 pub const fn source_plantation_path_kind_always_walkable(kind_code: u8) -> bool {
-    matches!(kind_code, 1 | 11 | 12 | 13 | 18 | 29 | 30)
+    crate::island_map::source_transfer_wave_opens_ground_kind(kind_code)
 }
 
 impl SourceTransferFigure {

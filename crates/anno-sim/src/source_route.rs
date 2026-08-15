@@ -2248,16 +2248,22 @@ fn source_ray_outcode(position: (i32, i32), max_x: i32, max_y: i32) -> u8 {
     code
 }
 
+/// The unconditional switch arm of `FUN_0046f230` (`1602_exe.c:78435-78441`),
+/// which is the same "fixed path terrain" set the type-8 transfer wave walks
+/// — see [`crate::island_map::source_transfer_wave_opens_ground_kind`].
 fn source_fixed_path_kind(definition: &CodBuilding) -> bool {
-    matches!(
-        definition.source_kind_code(),
-        Some(1 | 11 | 12 | 13 | 18 | 29 | 30)
-    )
+    definition
+        .source_kind_code()
+        .is_some_and(crate::island_map::source_transfer_wave_opens_ground_kind)
 }
 
-/// Return the source direction marker that `FUN_0046f460` and `FUN_0046f6d0`
-/// write for one static map cell. `None` is the explicit `MEER`/`KIRCHE`
-/// pass-through.
+/// Return the source direction marker that `FUN_0046f460`
+/// (`1602_exe.c:78548-78554`) and `FUN_0046f6d0` (`:78640-78646`) write for
+/// one static map cell. `None` is the explicit `MEER`/`KIRCHE` pass-through.
+///
+/// Both routines carry the same "fixed path terrain" arm as the type-8
+/// transfer wave, so the walkable branch defers to
+/// [`crate::island_map::source_transfer_wave_opens_ground_kind`].
 pub(crate) fn source_static_map_direction(
     definition: &CodBuilding,
     tile: IslandTile,
@@ -2267,8 +2273,11 @@ pub(crate) fn source_static_map_direction(
         return None;
     }
 
+    if crate::island_map::source_transfer_wave_opens_ground_kind(kind) {
+        return Some(0x0c);
+    }
+
     match kind {
-        1 | 11 | 12 | 13 | 18 | 29 | 30 => Some(0x0c),
         3 if tile.source_id()
             == definition.source_id + definition.size.0.saturating_mul(definition.size.1) / 2 =>
         {

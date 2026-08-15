@@ -2443,6 +2443,21 @@ fn main() {
                                     // Silent — common case while
                                     // dragging across mixed terrain.
                                 }
+                                PlaceOutcome::OutsideSettlement => {
+                                    // DIVERGENCE (quality of life): the
+                                    // original reports this refusal the same
+                                    // way it reports a terrain one — not at
+                                    // all. `FUN_004084d0` just clears
+                                    // `local_5bc` and skips the tile, and the
+                                    // build cursor (which now consults the
+                                    // same gate, below) stays red. The banner
+                                    // is ours, because "nothing happened" is a
+                                    // poor answer to a deliberate click.
+                                    save_banner = Some((
+                                        "build FAILED: outside your settlement".into(),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
                                 PlaceOutcome::NotUnlocked { infra } => {
                                     // Name the rung and quote its
                                     // `DAT_0061fbc0` threshold — the
@@ -3427,6 +3442,15 @@ fn main() {
                                 .island_maps
                                 .iter()
                                 .position(|m| m.island_id == island.number);
+                            // `local_5bc` in `FUN_004084d0` is both halves of
+                            // the per-tile verdict — the terrain table
+                            // `FUN_00464450` (`1602_exe.c:7609`) *and* the
+                            // buildable-area gate (`:7612-7616`,
+                            // `:7662-7665`) — and it is what decides whether
+                            // the tile is drawn as a placeable one. So the
+                            // cursor asks both, which is the original's whole
+                            // feedback for an out-of-settlement tile: it
+                            // simply never turns valid.
                             let can_place = island_map_idx.map_or(false, |idx| {
                                 can_place_building(
                                     island,
@@ -3437,7 +3461,16 @@ fn main() {
                                     def.width,
                                     def.height,
                                 )
-                            });
+                            }) && anno_game::game_commands::placement_area_admits(
+                                &sim,
+                                island.number,
+                                def,
+                                hover_tx,
+                                hover_ty,
+                                def.width,
+                                def.height,
+                                0,
+                            );
                             let color = if can_place {
                                 [0x00, 0xFF, 0x00, 0x80] // Green: valid
                             } else {
@@ -6838,22 +6871,29 @@ mod tests {
         sim.players.push(Player::new_human(0));
         sim.building_defs = defs.clone();
         sim.island_maps.push(island_map);
-        // The fixture's ground tiles carry map-owner selector 0, which in the
-        // executable can only mean "island settlement slot 0 exists and owns
-        // this tile" — `island + 0xac + 0` is the record `FUN_0046aec0`
-        // (`1602_exe.c:74607`) dereferences to read the settlement's player
-        // byte. Placement joins that settlement, so the record has to be here
-        // for the fixture to describe a reachable state; without it the
-        // resolver correctly reports the unsettled selector 7.
-        assert!(sim.source_cities.set_record(
-            0,
-            Some(data_bridge::SourceCityRecord {
-                island_id: 4,
-                source_owner: 0,
-                owner_slot: 0,
-                ..data_bridge::SourceCityRecord::default()
-            })
-        ));
+        // This fixture used to inject a settlement record for island 4 slot 0
+        // so that the fixture's selector-0 ground would resolve to a real
+        // settlement. With the buildable-area gate ported that state is the
+        // one placement an `HQ` can never be made in: `1602_exe.c:7662-7665`
+        // clears `local_5bc` for `def[4] == 0x23` inside your own claim, which
+        // is the one-Kontor-per-settlement rule. The record was only harmless
+        // here because the gate was missing.
+        //
+        // So the fixture now describes the *other* HQ placement, the one the
+        // gate exists to allow: a player with no settlement on this island
+        // building on ground no settlement of theirs owns. With no record for
+        // (island 4, slot 0) the resolver reports the unsettled selector 7,
+        // `FUN_0046b120` reports zero settlements and `FUN_0046b100` reports
+        // fewer than seven, so `1602_exe.c:7612-7615` accepts — and the build
+        // command carries slot bits 7 (`LAB_00408622` ORs in `0x1c000`),
+        // which is what `map_owner_slot` below now asserts.
+        //
+        // In the executable `FUN_00465170` (`1602_exe.c:70638-70647`) would go
+        // on to allocate the settlement this founding HQ creates and stamp
+        // *its* slot on the map, leaving only the command word at 7. The port
+        // does that in `found_kontor` instead of in `place_building`, so the
+        // map keeps 7 here — `docs/logistics-gaps.md` §1, unchanged by this
+        // gate.
         let mut placer = BuildingPlacer::new(&cod, &defs);
         placer.active = true;
 
@@ -6879,7 +6919,9 @@ mod tests {
                 orientation: 0,
                 variant: 0,
                 metadata: 4,
-                map_owner_slot: 0,
+                // `LAB_00408622`: a build on ground no settlement of the
+                // builder's owns carries slot bits 7.
+                map_owner_slot: 7,
                 random_seed: 9,
                 dynamic_object_owner: 0,
             })

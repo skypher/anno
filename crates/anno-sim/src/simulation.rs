@@ -1750,10 +1750,12 @@ impl Simulation {
             .copied()
             .filter(|object| object.island == island)
         {
-            debug_assert!(
-                table.insert(object),
-                "scenario dynamic HQ slots are unique per island"
-            );
+            // The insert must be evaluated unconditionally: `debug_assert!`
+            // discards its whole expression when `debug_assertions` is off,
+            // so calling it inside the macro would drop every scenario record
+            // from the table in release builds.
+            let inserted = table.insert(object);
+            debug_assert!(inserted, "scenario dynamic HQ slots are unique per island");
         }
         for building in &self.buildings {
             if !building.active || building.island_id != island {
@@ -4170,6 +4172,124 @@ impl Simulation {
             })
             .map(|(slot, _)| slot as u8)
             .unwrap_or(UNSETTLED_SLOT)
+    }
+
+    /// The source player-kind byte `DAT_005b7680[player * 0xa0]`, as the two
+    /// values the buildable-area gate and `FUN_0046b120` switch on: 0 (human)
+    /// and 0x0c (AI rival). The other authored kinds — 0x0b pirates, 0x0d
+    /// free trader, 0x0e natives — are exactly the ones both tests exclude.
+    ///
+    /// [`crate::player::PlayerState`]'s discriminants are those source bytes,
+    /// so this is a value comparison and not a naming one; the port collapses
+    /// the three non-settling factions onto `Empty` (7), which is not 0 or
+    /// 0x0c either, so their verdict is unchanged.
+    fn source_player_kind_settles(&self, player: u8) -> bool {
+        self.players.get(usize::from(player)).is_some_and(|p| {
+            matches!(
+                p.state,
+                crate::player::PlayerState::HumanActive | crate::player::PlayerState::AiActive
+            )
+        })
+    }
+
+    /// `FUN_0046b100` (`1602_exe.c:74722-74742`): how many of the island's
+    /// eight settlement pointers (`island + 0xac + i * 4`) are live.
+    ///
+    /// The port keeps the same eight per-island selectors, but as
+    /// `(island_id, source_owner)` pairs in the global city pool that
+    /// `allocate_source_city` fills, so counting the island's records counts
+    /// the same thing.
+    pub fn source_island_settlement_count(&self, island: u8) -> u32 {
+        self.source_cities
+            .active_records()
+            .into_iter()
+            .filter(|city| city.island_id == island)
+            .count() as u32
+    }
+
+    /// `FUN_0046b120` (`1602_exe.c:74747-74772`): how many of the island's
+    /// settlements belong to `player`.
+    ///
+    /// `player == 7` is the source's "any real player" sentinel — it counts
+    /// every settlement whose owner's kind byte is 0 (human) or 0x0c (AI),
+    /// i.e. every settlement a *settling* faction holds. `FUN_004084d0`
+    /// passes the actual builder, so the sentinel is dead on the gate path;
+    /// it is ported because other callers use it.
+    pub fn source_island_settlement_count_for_player(&self, island: u8, player: u8) -> u32 {
+        const ANY_REAL_PLAYER: u8 = 7;
+        self.source_cities
+            .active_records()
+            .into_iter()
+            .filter(|city| city.island_id == island)
+            .filter(|city| {
+                if player == ANY_REAL_PLAYER {
+                    self.source_player_kind_settles(city.owner_slot)
+                } else {
+                    city.owner_slot == player
+                }
+            })
+            .count() as u32
+    }
+
+    /// `FUN_004084d0`'s buildable-area gate (`1602_exe.c:7612-7616` and
+    /// `:7662-7665`), the half of the per-tile verdict `local_5bc` that the
+    /// terrain table `FUN_00464450` does not answer:
+    ///
+    /// ```text
+    /// if (slot == 7) {                                  // unowned ground
+    ///     if (((player_kind != 0 && player_kind != 0x0c)
+    ///          || FUN_0046b120(island, player) == 0)
+    ///         && FUN_0046b100(island) < 7)
+    ///         goto ACCEPT;
+    ///     buildable = 0;
+    /// } else if (foreign == 0 && def[4] == 0x23) {
+    ///     buildable = 0;
+    /// }
+    /// ```
+    ///
+    /// In words: on ground no settlement of yours owns, a build is accepted
+    /// only when the builder is not a settling faction *or* holds no
+    /// settlement at all on this island — that is how a colony is founded —
+    /// and the island still holds fewer than seven settlements. Inside your
+    /// own claim anything but a second `HQ` is accepted.
+    ///
+    /// `settlement_slot` is what [`Self::source_placement_settlement_slot`]
+    /// returned for the oriented footprint, which is already the source's
+    /// `local_5c4`: it collapses "unowned" and "someone else's" to 7. The
+    /// `foreign == 0` test in the second arm is therefore implied — a
+    /// non-7 slot can only be a settlement of this player's, because
+    /// `FUN_0046aec0` short-circuits on the first foreign tile and
+    /// `FUN_004084d0` stamps 7 whenever the record's player byte `+0x1a`
+    /// disagrees with the builder.
+    ///
+    /// **Why the cap is 7:** `FUN_00468ce0` scans eight slots and returns 7
+    /// both as a valid allocation and as its failure code, while 7 is
+    /// simultaneously the "unowned" sentinel in the map word. This `< 7` is
+    /// what keeps slot 7 unreachable, and so what keeps
+    /// `allocate_source_city`'s own `0..8` scan from ever handing out the
+    /// sentinel.
+    ///
+    /// Note that the *replay* applier `FUN_00409150` (`1602_exe.c:7874-7930`)
+    /// runs `FUN_00465170` + `FUN_00481450` without consulting any of this —
+    /// it trusts the command it was handed. This gate belongs to the
+    /// player-intent path only.
+    pub fn source_placement_area_admits(
+        &self,
+        island: u8,
+        settlement_slot: u8,
+        player: u8,
+        definition_map_kind: u8,
+    ) -> bool {
+        const UNSETTLED_SLOT: u8 = 7;
+        /// Outer `HAUS Kind: HQ`, the Kontor's `def + 0x04`.
+        const HQ_MAP_KIND: u8 = 0x23;
+        const MAX_ISLAND_SETTLEMENTS: u32 = 7;
+        if settlement_slot != UNSETTLED_SLOT {
+            return definition_map_kind != HQ_MAP_KIND;
+        }
+        (!self.source_player_kind_settles(player)
+            || self.source_island_settlement_count_for_player(island, player) == 0)
+            && self.source_island_settlement_count(island) < MAX_ISLAND_SETTLEMENTS
     }
 
     /// `FUN_0046ac60` (`1602_exe.c:74434-74512`): claim every still-unowned
@@ -16540,6 +16660,42 @@ mod tests {
         );
         assert_eq!(figure.owner, 0);
         assert_eq!(sim.source_kind4_occupants.len(), 1);
+    }
+
+    /// `FUN_00468ce0` (`1602_exe.c:73100-73146`) scans the eight pointers at
+    /// `island + 0xac` in ascending order and takes the first zero entry. That
+    /// scan runs over the island's *live* table, so a slot already held by a
+    /// scenario-loaded `Kind=HQ` object is skipped. This port rebuilds that
+    /// table on demand, so the scenario half of the reconstruction has to be
+    /// present before the first-free scan runs — otherwise a new HQ is handed
+    /// a slot the original would never have returned.
+    #[test]
+    fn dynamic_map_object_allocation_skips_scenario_held_slots() {
+        use crate::building::{BuildingDef, BuildingInstance};
+
+        let mut sim = Simulation::new();
+        sim.building_defs.push(BuildingDef {
+            kind: "HQ".into(),
+            ..BuildingDef::default()
+        });
+        sim.source_dynamic_map_objects.push(SourceDynamicMapObject {
+            island: 4,
+            slot: 0,
+            owner: 6,
+            local_position: (9, 7),
+        });
+        sim.buildings.push(BuildingInstance::new(0, 4, 11, 12, 2));
+
+        assert_eq!(
+            sim.allocate_source_dynamic_map_object_for_building(0),
+            Some(SourceDynamicMapObject {
+                island: 4,
+                slot: 1,
+                owner: 2,
+                local_position: (11, 12),
+            })
+        );
+        assert_eq!(sim.source_dynamic_map_object_table(4).objects().count(), 2);
     }
 
     #[test]

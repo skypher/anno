@@ -208,11 +208,13 @@ pub struct IslandMap {
 /// This is the port's *land-figure* raster: "may a walker stand on this
 /// cell". It is deliberately **not** the placement gate — the original has no
 /// single walkability bitmap at all. It rasterises one grid per figure class:
-/// `FUN_004704d0` (`1602_exe.c:79470-79477`) opens outer kinds
-/// `{1, 11, 12, 13, 18, 29, 30}` for a transfer wave, `FUN_0046f920` opens the
-/// fixed land terrain for a harvester, `FUN_0046fb50` opens the sea and surf
-/// ring (19-22) for a fishery worker and nothing else does, and building
-/// placement is gated separately by
+/// [`source_transfer_wave_opens_ground_kind`] (`FUN_004704d0`,
+/// `1602_exe.c:79472-79478`) is the wide set a type-8 carrier walks and which
+/// `FUN_0046f920`'s harvester grid shares,
+/// [`source_city_cart_wave_opens_ground_kind`] (`FUN_004706e0`, `:79582-
+/// 79585`) is the strictly narrower set a type-11 city cart walks,
+/// `FUN_0046fb50` opens the sea and surf ring (19-22) for a fishery worker and
+/// nothing else does, and building placement is gated separately by
 /// [`source_placement_admits_ground_kind`] (`FUN_00464660`).
 ///
 /// `MEER` was on this list with the comment "(for coastal)" — that is, purely
@@ -281,22 +283,6 @@ const WALKABLE_KINDS: &[&str] = &[
 ///   definition (`+0x1c` == 10) that would land on its own crop or on the
 ///   ripe resource it grows into (`1602_exe.c:70066-70078`) — i.e. the
 ///   editor/terrain painter re-seeding a field that already carries it.
-/// The outer map kinds a transfer wave will walk: road, ground, ruin, plaza,
-/// bridge, beach-ruin and pier. `FUN_004704d0` (`1602_exe.c:79470-79477`)
-/// opens exactly these for the type-8 workshop carrier, and `FUN_004706e0`
-/// (`:79578`) opens the narrower `{1, 13, 18, 30}` for the type-11 city cart;
-/// every other cell keeps the `0x0c` impassable stamp the raster pre-fills.
-///
-/// This is the authority for "can a carrier get there". It exists because the
-/// set was written out as an inline literal at five separate sites in this
-/// crate and a sixth in the mission driver, which is exactly how two copies
-/// drift apart — the driver's copy was stale, and reasoning from it produced a
-/// colony "space ceiling" that was an artefact of the paraphrase rather than
-/// anything the game does.
-pub const fn source_transfer_wave_opens_ground_kind(ground_kind: u8) -> bool {
-    matches!(ground_kind, 1 | 11 | 12 | 13 | 18 | 29 | 30)
-}
-
 pub const fn source_placement_admits_ground_kind(building_kind: u8, ground_kind: u8) -> bool {
     match building_kind {
         // case 1 — STRASSE
@@ -338,6 +324,65 @@ pub const fn source_placement_admits_ground_kind(building_kind: u8, ground_kind:
         // default — GEBAEUDE and everything else: free ground only.
         _ => matches!(ground_kind, 10..=12),
     }
+}
+
+/// The outer map kinds a transfer wave will walk: road (1), ground (11), ruin
+/// (12), plaza (13), bridge (18), beach-ruin (29) and pier (30). Every other
+/// cell keeps the `0x0c` impassable stamp the raster pre-fills.
+///
+/// `FUN_004704d0` (`1602_exe.c:79472-79478`) opens exactly these for the
+/// type-8 workshop carrier, reached from `FUN_00459150`. The identical switch
+/// arm is compiled into six further rasterizers, so every port site that
+/// admits "fixed path terrain" is this same rule and belongs here rather than
+/// re-stating the literal:
+///
+/// * `FUN_0046f230` (`:78435-78441`) — the generic static-island overlay
+///   ([`crate::source_route::SourcePathGrid::populate_static_island_cells`]);
+/// * `FUN_0046f460` (`:78548-78554`) — the doubled-coordinate type-4 land
+///   grid ([`IslandMap::source_land_path_grid`]);
+/// * `FUN_0046f6d0` (`:78640-78646`) — the ship-route direction-marker pass;
+/// * `FUN_0046ea40` (`:77945-77951`) — the type-4 partial-route endpoint test
+///   ([`IslandMap::source_land_partial_marker_allowed`]);
+/// * `FUN_0046f920` (`:78809-78815`) — the plantation-worker harvest grid.
+///   That routine's `default:` arm additionally admits an owner-and-`Ware`
+///   match, so the port keeps the separately named
+///   [`crate::source_cell::source_plantation_path_kind_always_walkable`] for
+///   the "always walkable, no owner test" half — it forwards here;
+/// * `FUN_004724d0` (`:81196-81202`) — the kind-13 residence transfer window
+///   ([`IslandMap::source_kind13_transfer_path_grid`]).
+///
+/// **Do not** use this for the type-11 city cart or the type-3 civilian: they
+/// take the strictly narrower
+/// [`source_city_cart_wave_opens_ground_kind`]. `FUN_0046fb50`, the fishery
+/// water grid, shares neither set — it keys off the sea and surf ring (19-22)
+/// through an unrelated switch.
+///
+/// This is the authority for "can a carrier get there". It exists because the
+/// set was written out as an inline literal at five separate sites in this
+/// crate and a sixth in the mission driver, which is exactly how two copies
+/// drift apart — the driver's copy was stale, and reasoning from it produced a
+/// colony "space ceiling" that was an artefact of the paraphrase rather than
+/// anything the game does.
+pub const fn source_transfer_wave_opens_ground_kind(ground_kind: u8) -> bool {
+    matches!(ground_kind, 1 | 11 | 12 | 13 | 18 | 29 | 30)
+}
+
+/// The narrower sibling of [`source_transfer_wave_opens_ground_kind`]: the
+/// outer map kinds a *paved-only* wave will walk — road (1), plaza (13),
+/// bridge (18) and pier (30).
+///
+/// `FUN_004706e0` (`1602_exe.c:79582-79585`) compiles this arm for the type-11
+/// city cart, reached from `FUN_004596b0`, and `FUN_0046f000` (`:78319-78322`)
+/// compiles the same arm for the `11 x 11` type-3 civilian window that
+/// `FUN_0044b140` hands to `FUN_0046c7d0`
+/// ([`IslandMap::civilian_path_grid`]).
+///
+/// The difference from the wide set is exactly `{11, 12, 29}` — bare ground,
+/// ruins and beach-ruin. A carrier crosses open terrain; a city cart and a
+/// civilian cannot leave built surfaces. Pointing a type-11 site at the wide
+/// predicate would silently widen what city carts can reach.
+pub const fn source_city_cart_wave_opens_ground_kind(ground_kind: u8) -> bool {
+    matches!(ground_kind, 1 | 13 | 18 | 30)
 }
 
 impl IslandMap {
@@ -1609,9 +1654,12 @@ impl IslandMap {
     }
 
     /// Rebuild the `11 x 11` type-3 path window passed to
-    /// `FUN_0046c7d0` by `FUN_0044b140`. The source first blocks every cell,
-    /// then permits fixed terrain kinds 1, 13, 18, and 30 plus the selected
-    /// permission-mask kinds owned by the spawning root's player.
+    /// `FUN_0046c7d0` by `FUN_0044b140`. `FUN_0046f000` (`1602_exe.c:78319-
+    /// 78322`) first blocks every cell, then permits the narrow paved-only
+    /// terrain set ([`source_city_cart_wave_opens_ground_kind`]) plus the
+    /// selected permission-mask kinds owned by the spawning root's player.
+    /// This raster is *not* the type-8 transfer wave: a civilian gets neither
+    /// bare ground nor ruins nor beach-ruin.
     pub fn civilian_path_grid(
         &self,
         center: (i32, i32),
@@ -1632,7 +1680,7 @@ impl IslandMap {
                         permission_branch,
                         cell.kind_code,
                     );
-                let fixed = matches!(cell.kind_code, 1 | 13 | 18 | 30);
+                let fixed = source_city_cart_wave_opens_ground_kind(cell.kind_code);
                 if fixed || permission_matched {
                     grid.set_traversable_cell(
                         (x, y),
@@ -1688,7 +1736,7 @@ impl IslandMap {
                 };
                 let owner_matched_kind13 = cell.production_kind_code == 13
                     && (center_cell.owner == 7 || cell.owner == center_cell.owner);
-                let fixed_kind = matches!(cell.kind_code, 1 | 11 | 12 | 13 | 18 | 29 | 30);
+                let fixed_kind = source_transfer_wave_opens_ground_kind(cell.kind_code);
                 if fixed_kind || owner_matched_kind13 {
                     grid.set_traversable_cell(
                         position,
@@ -1813,10 +1861,9 @@ impl IslandMap {
                     }
                 }
 
-                let fixed_terrain = matches!(
-                    self.civilian_path_kind(local),
-                    Some(1 | 11 | 12 | 13 | 18 | 29 | 30)
-                );
+                let fixed_terrain = self
+                    .civilian_path_kind(local)
+                    .is_some_and(source_transfer_wave_opens_ground_kind);
                 if !fixed_terrain {
                     continue;
                 }
@@ -1848,10 +1895,8 @@ impl IslandMap {
     /// accepts only the fixed terrain kinds used by `FUN_0046f460`.
     pub fn source_land_partial_marker_allowed(&self, position: (i32, i32)) -> bool {
         self.source_world_to_local(position).is_some_and(|local| {
-            matches!(
-                self.civilian_path_kind(local),
-                Some(1 | 11 | 12 | 13 | 18 | 29 | 30)
-            )
+            self.civilian_path_kind(local)
+                .is_some_and(source_transfer_wave_opens_ground_kind)
         })
     }
 
@@ -2304,6 +2349,78 @@ fn source_controller_city_construction_record(
 mod tests {
     use super::*;
     use anno_formats::szs::IslandTile;
+
+    /// Pin the wide "fixed path terrain" arm against every kind code in
+    /// `0..=63`. The seven admitted kinds are the `case` labels compiled
+    /// identically into `FUN_004704d0` (`1602_exe.c:79472-79478`),
+    /// `FUN_0046f230` (`:78435-78441`), `FUN_0046f460` (`:78548-78554`),
+    /// `FUN_0046f6d0` (`:78640-78646`), `FUN_0046ea40` (`:77945-77951`),
+    /// `FUN_0046f920` (`:78809-78815`) and `FUN_004724d0` (`:81196-81202`).
+    /// Everything else falls into those routines' `default:` arm and keeps the
+    /// `0x0c` impassable stamp unless a separate owner/permission test fires.
+    #[test]
+    fn transfer_wave_arm_matches_the_source_case_labels() {
+        const ADMITTED: [u8; 7] = [1, 11, 12, 13, 18, 29, 30];
+        for kind in 0..=63_u8 {
+            assert_eq!(
+                source_transfer_wave_opens_ground_kind(kind),
+                ADMITTED.contains(&kind),
+                "kind {kind} disagrees with the FUN_004704d0 case labels"
+            );
+        }
+        // The named rejections that matter: sea (19), the surf ring (20-22),
+        // the beach ring except STRANDRUINE (23-28), forest (10) and the
+        // kind-3 label cell, which those routines admit only through their own
+        // `case 3:` centre-cell test, never through this arm.
+        for kind in [3_u8, 10, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 34, 35, 36] {
+            assert!(!source_transfer_wave_opens_ground_kind(kind), "kind {kind}");
+        }
+    }
+
+    /// Pin the narrow paved-only arm compiled into `FUN_004706e0`
+    /// (`1602_exe.c:79582-79585`, the type-11 city cart) and `FUN_0046f000`
+    /// (`:78319-78322`, the type-3 civilian window), and pin the exact
+    /// difference from the wide arm so a future collapse onto the wrong
+    /// predicate fails here rather than silently widening what a city cart can
+    /// reach.
+    #[test]
+    fn city_cart_wave_arm_is_strictly_narrower_than_the_transfer_wave() {
+        const ADMITTED: [u8; 4] = [1, 13, 18, 30];
+        for kind in 0..=63_u8 {
+            assert_eq!(
+                source_city_cart_wave_opens_ground_kind(kind),
+                ADMITTED.contains(&kind),
+                "kind {kind} disagrees with the FUN_004706e0 case labels"
+            );
+            assert!(
+                !source_city_cart_wave_opens_ground_kind(kind)
+                    || source_transfer_wave_opens_ground_kind(kind),
+                "kind {kind} is paved-only but not transfer-walkable"
+            );
+        }
+        let widened: Vec<u8> = (0..=63_u8)
+            .filter(|&kind| {
+                source_transfer_wave_opens_ground_kind(kind)
+                    && !source_city_cart_wave_opens_ground_kind(kind)
+            })
+            .collect();
+        // BODEN, RUINE, STRANDRUINE: bare ground a carrier crosses and a city
+        // cart does not.
+        assert_eq!(widened, vec![11, 12, 29]);
+    }
+
+    /// The plantation raster's unconditional half and the mission driver's
+    /// reachability probe are the same rule, not merely a similar one.
+    #[test]
+    fn sibling_predicates_agree_with_the_transfer_wave_arm() {
+        for kind in 0..=63_u8 {
+            assert_eq!(
+                crate::source_cell::source_plantation_path_kind_always_walkable(kind),
+                source_transfer_wave_opens_ground_kind(kind),
+                "kind {kind}: FUN_0046f920's unconditional arm drifted"
+            );
+        }
+    }
 
     /// `FUN_0046fb50` (`1602_exe.c:78842`) is a water overlay whose arms have
     /// nothing in common with the land grid `FUN_0046f920`: everything starts

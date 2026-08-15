@@ -39,3 +39,15 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # The simulation is meant to be deterministic across profiles: the
+      # lockstep hashes (`Simulation::state_hash`), `replay::replay_advancing`
+      # and the headless driver all assume a debug run and a release run of the
+      # same seed agree, and every mission-driver measurement is gathered in
+      # release because debug is too slow. A defect that only shows with
+      # `debug_assertions` off — a side effect written inside `debug_assert!`,
+      # an overflow that wraps instead of panicking — is invisible to the debug
+      # run above, so the suite is run again in the profile the gameplay
+      # conclusions actually come from.
+      - name: Test (release profile)
+        run: cargo test --workspace --locked --release

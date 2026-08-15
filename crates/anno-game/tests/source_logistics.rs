@@ -55,13 +55,12 @@ const FORESTER_ID: &str = "22001";
 /// The island the campaign leaves unsettled.
 const ISLAND: u8 = 10;
 
-/// The outer map kinds `FUN_004704d0` opens for a transfer wave
-/// (`1602_exe.c:79470-79477`): `STRASSE`, `BODEN`, `RUINE`, `PLATZ`,
-/// `BRUECKE`, `STRANDRUINE`, `PIER`. Everything else — sea, the surf and
-/// beach ring, forest — is impassable unless it is a goal.
-fn source_open_path_kind(kind_code: u8) -> bool {
-    matches!(kind_code, 1 | 11 | 12 | 13 | 18 | 29 | 30)
-}
+// The outer map kinds `FUN_004704d0` opens for a transfer wave
+// (`1602_exe.c:79472-79478`): `STRASSE`, `BODEN`, `RUINE`, `PLATZ`,
+// `BRUECKE`, `STRANDRUINE`, `PIER`. Everything else — sea, the surf and
+// beach ring, forest — is impassable unless it is a goal. The engine is the
+// authority; this test must not restate the set.
+use anno_sim::island_map::source_transfer_wave_opens_ground_kind as source_open_path_kind;
 
 /// Found a Kontor on island 10 at a coastline the cart wave can actually
 /// leave, put a forester in the claimed woodland next to it, and run the

@@ -38,6 +38,44 @@ pub enum PlaceOutcome {
     NotUnlocked {
         infra: u8,
     },
+    /// Buildable-area gate: `FUN_004084d0` (`1602_exe.c:7612-7616`,
+    /// `:7662-7665`) — see [`placement_area_admits`]. Either the target
+    /// ground belongs to no settlement of this player's and the player
+    /// already holds one on this island (or the island is full at seven),
+    /// or it is inside their own claim and the definition is a second `HQ`.
+    ///
+    /// The original reports this the same way it reports a terrain refusal:
+    /// not at all. The rejected tile is skipped and the build cursor never
+    /// turns valid.
+    OutsideSettlement,
+}
+
+/// The buildable-area half of `FUN_004084d0`'s per-tile verdict, for one
+/// candidate footprint: resolve which settlement the placement would join
+/// (`FUN_0046aec0`, `1602_exe.c:7518-7535`) and hand that to
+/// [`Simulation::source_placement_area_admits`] (`:7612-7616`, `:7662-7665`).
+///
+/// `width`/`height` must be the *oriented* extents, the same pair the terrain
+/// gate is asked about — `FUN_0046aec0` votes over the footprint the rotation
+/// actually covers.
+pub fn placement_area_admits(
+    sim: &Simulation,
+    island_number: u8,
+    def: &BuildingDef,
+    tile_x: i32,
+    tile_y: i32,
+    width: u8,
+    height: u8,
+    owner: u8,
+) -> bool {
+    let slot =
+        sim.source_placement_settlement_slot(island_number, tile_x, tile_y, width, height, owner);
+    sim.source_placement_area_admits(
+        island_number,
+        slot,
+        owner,
+        def.source_kind_code().unwrap_or(u8::MAX),
+    )
 }
 
 /// The original's terrain gate for one candidate tile: `FUN_00464450`
@@ -171,6 +209,38 @@ pub fn place_building(
     ) {
         return PlaceOutcome::BlockedByTerrain;
     }
+    // `FUN_004084d0` (`1602_exe.c:7521-7535`) resolves the placement's
+    // settlement through `FUN_0046aec0`, which votes over the live
+    // settlement-slot selectors of the tiles the oriented footprint covers,
+    // and stamps 7 when that ground belongs to no settlement of this player.
+    // `FUN_00465170`'s tail then writes exactly that value over the footprint
+    // (`FUN_0046ae20`, `1602_exe.c:70702`).
+    //
+    // Reading the live map rather than the player's city record is what keeps
+    // a harvester's stamp equal to the stamp on the resource cells around it:
+    // `FUN_0046f920` compares the two by exact equality, and terrain only
+    // joins a settlement through the radius claim below.
+    let source_map_owner_slot = sim.source_placement_settlement_slot(
+        island_number,
+        tile_x,
+        tile_y,
+        gate_w,
+        gate_h,
+        owner,
+    );
+    // The buildable-area gate, the second half of `local_5bc`
+    // (`1602_exe.c:7612-7616`, `:7662-7665`). It sits here, beside the
+    // terrain gate and ahead of every mutation, because the source answers
+    // both questions per candidate tile before it charges anything: a
+    // refused tile is skipped, costs nothing, and leaves no state behind.
+    if !sim.source_placement_area_admits(
+        island_number,
+        source_map_owner_slot,
+        owner,
+        def.source_kind_code().unwrap_or(u8::MAX),
+    ) {
+        return PlaceOutcome::OutsideSettlement;
+    }
     let owner_idx = owner as usize;
     if owner_idx >= sim.players.len() || sim.players[owner_idx].gold < cost as i32 {
         return PlaceOutcome::NotEnoughGold {
@@ -216,30 +286,8 @@ pub fn place_building(
     let source_definition_offset = (cod_b.source_id - anno_formats::szs::INSELHAUS_SOURCE_ID_BASE)
         .try_into()
         .ok();
-    let (oriented_width, oriented_height) = if matches!(orient & 3, 1 | 3) {
-        (bld_h, bld_w)
-    } else {
-        (bld_w, bld_h)
-    };
-    // `FUN_004084d0` (`1602_exe.c:7521-7535`) resolves the placement's
-    // settlement through `FUN_0046aec0`, which votes over the live
-    // settlement-slot selectors of the tiles the oriented footprint covers,
-    // and stamps 7 when that ground belongs to no settlement of this player.
-    // `FUN_00465170`'s tail then writes exactly that value over the footprint
-    // (`FUN_0046ae20`, `1602_exe.c:70702`).
-    //
-    // Reading the live map rather than the player's city record is what keeps
-    // a harvester's stamp equal to the stamp on the resource cells around it:
-    // `FUN_0046f920` compares the two by exact equality, and terrain only
-    // joins a settlement through the radius claim below.
-    let source_map_owner_slot = sim.source_placement_settlement_slot(
-        island_number,
-        tile_x,
-        tile_y,
-        oriented_width,
-        oriented_height,
-        owner,
-    );
+    // The same oriented pair the terrain and area gates were asked about.
+    let (oriented_width, oriented_height) = (gate_w, gate_h);
     let source_random_seed = (sim.next_source_rand() & 0x1f) as u8;
     for dy in 0..gate_h {
         for dx in 0..gate_w {
@@ -587,6 +635,27 @@ pub fn found_kontor(
         i32::from(tile_y),
         defs[def_index].width,
         defs[def_index].height,
+    ) {
+        return false;
+    }
+    // The buildable-area gate applies here too, and it is what makes founding
+    // a *founding*. In the original there is no separate found-Kontor command
+    // at all — a Kontor placed from a docked ship is an ordinary build through
+    // `FUN_004084d0` (`docs/logistics-gaps.md` §1), so it meets exactly this
+    // test: on ground no settlement of yours owns, accepted only while you
+    // hold none on this island and the island holds fewer than seven. Inside
+    // your own claim the `def[4] == 0x23` arm (`1602_exe.c:7662-7665`) refuses
+    // it outright. Together those are the one-Kontor-per-player-per-island
+    // rule, which the port previously had nothing to enforce.
+    if !placement_area_admits(
+        sim,
+        island_number,
+        &defs[def_index],
+        i32::from(tile_x),
+        i32::from(tile_y),
+        defs[def_index].width,
+        defs[def_index].height,
+        player,
     ) {
         return false;
     }
