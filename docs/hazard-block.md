@@ -4,14 +4,16 @@ Companion to `docs/growth-timer.md` and `docs/logistics-gaps.md`. Addresses are
 VA in `extracted/1602.exe`; line numbers are `decompiled/1602_exe.c`. Claims are
 VERIFIED against the disassembly unless marked INFERRED.
 
-**Status.** §9 Stage 1 is implemented (`data_bridge.rs`, `simulation.rs`,
-`source_cell.rs`): the affliction table and registrar, `FUN_0047b540`,
-`FUN_0047f510`, the fire branch of the event block, `FUN_0047a020` type 2, the
-deferred type-7 ruin conversion, `DAT_0049af08`, and the `FUN_004722f0` area
-scan. Stage 2 (plague) and Stage 3 (vagrant, message emitters) are not, and
-their `rand()` draws are **not** made — see the deviations noted in §9.
+**Status.** §9 Stage 1 and Stage 2 are implemented (`data_bridge.rs`,
+`simulation.rs`, `source_cell.rs`): the affliction table and registrar,
+`FUN_0047b540`, `FUN_0047f510`, the fire and plague branches of the event
+block, `FUN_0047a020` types 1 and 2, the deferred type-7 ruin conversion,
+`DAT_0049af08`, `DAT_0049aed8`, `DAT_005a7758`, and both rasterisers of the
+`FUN_004722f0` area scan. Stage 3 (vagrant, message emitters) is not, and its
+`rand()` draws are **not** made — see the deviations noted in §9.
 
-**Corrections found while implementing Stage 1** are marked `[FIX]` below.
+**Corrections found while implementing** are marked `[FIX]` below; those found
+during Stage 2 specifically are marked `[FIX2]`.
 
 ## 0. Corrections to earlier notes
 
@@ -176,6 +178,10 @@ pushes a literal `0x14` for plague **and** fire alike (verified in the
 disassembly: `push 0x14` at `0x0047a3ad` and `0x0047a562`). So an ignited fire
 burns for 25 phases and a fire that spread from one burns for 20.
 
+`[FIX2]` `FUN_0047b850` — plague *ignition* — also pushes `0x14`
+(`1602_exe.c:88374`). So `0x19` is unique to fire ignition: every plague,
+however it started, lives exactly 20 phases.
+
 Hash `FUN_0047a630` (`:87204`): `((island & 3) * 8 + (x & 7)) * 8 + (y & 7)`,
 probe window `[h, min(h + 0x20, 0x120))` — 32 linear probes, clamp dead (the
 hash tops out at 255 and `255 + 0x20 = 287 < 0x120`). This is **much coarser**
@@ -237,6 +243,24 @@ results, then a 4-bit roll into `DAT_0049aed8` keyed on doctor + bathhouse
 coverage. Radius 4, houses only, target must be un-afflicted and at ≥ half
 capacity.
 
+`[FIX2]` The occupancy gate is read off the **infected** house, not the
+target: `FUN_00479f70(*pbVar6, pbVar6[1], pbVar6[2])` resolves the entry's own
+tile. The target's half-capacity test is a *separate*, later guard that costs
+no draw. A missing kind-13 record on the infected tile short-circuits before
+the first draw, so an affliction sitting on something that is not a residence
+costs nothing at all.
+
+`[FIX2]` `DAT_005a7758` is **not** authored data and is not in the executable's
+initialised sections — `0x5a7758` lands past `.data`'s `SizeOfRawData`.
+`FUN_00478470` (`:85782-85784`) builds it at startup from three
+`FUN_00403370` linear 8.8 fixed-point segments: `(0, 0x19) → 0..0x19`,
+`(0x19, 0x26) → 0x19..0x33`, `(0x26, 0x80) → 0x33..0x40`. The per-step
+increment is a truncating divide, so the ramp is
+`[0,1,2,…,25, 27,29,…,49, 51,51,…,64]` — slope 1, then 2, then a crawl. Since
+the gate is `rand() & 0x7f < ramp[i]`, the ceiling is 64/128 = 50 % per phase
+for a completely full aristocrat house, and a house at 1/16 capacity is at
+6/128 ≈ 4.7 %.
+
 **Fire spread** (`:87042-87117`) draws up to 3: a `rand() & 0x7F < 0x13`
 (19/128) gate, a uniform pick over the area scan, then a 3-bit roll into
 `DAT_0049af08` keyed on `Holz >= Ziegel`. Radius is `(w + h - 1)/4 + 2` using
@@ -256,6 +280,23 @@ therefore only ever walks between structures that physically touch, and never
 crosses a street or a patch of grass. Contrast the plague's `FUN_004724d0`,
 which opens `{1, 0x0b, 0x0c, 0x0d, 0x12, 0x1d, 0x1e}` for *travel* but reports
 only cells matching the caller's kind bitmask and city slot.
+
+`[FIX2]` Three details of `FUN_004724d0` (`:81101-81213`) the sentence above
+leaves out, and all three change the reported set:
+
+- A **candidate is opened whatever its outer kind**. The `switch` on `def+0x04`
+  falls through `default:` to `if (bVar8) goto case_1`, so a residence — outer
+  `GEBAEUDE`, not in the travel set — is both traversable and reported. Without
+  this the plague could never leave the house it started in.
+- Outer kind **3 (`TOR`) is conditionally traversable**: only when the live gfx
+  index equals `(def[0x14] * def[0x10]) / 2 + def[0x84]`, the open-gate frame.
+  Everything else in the travel set is unconditional.
+- The candidate test is `(param_4 & 1 << (def[0x1c] & 0x1f)) != 0 && (ws[0x1c]
+  == 7 || ws[0x1c] == ((map_word >> 0x13) & 7))`. `ws[0x1c]` is the **centre
+  tile's** slot, written by `FUN_004722f0`, and `7` there is a wildcard.
+- It masks the stored class (`class & 0x7f | candidate << 7`) where
+  `FUN_00472930` writes `class | 0x80` unmasked. Immaterial for shipped data,
+  where every class is `0x20`.
 
 **Expiry** (`:87119-87147`): plague just heals (`flags &= 0xFFFC`), frees the
 entry, **0 rand**, no demolition. Fire posts deferred action type 7 and
@@ -311,9 +352,18 @@ All three scan that island's slice of the kind-13 table, bounded by
 
 | | filter | attempts | roll | RNG |
 | --- | --- | --- | --- | --- |
-| `FUN_0047b850` plague | un-afflicted, tier ≥ 2, matching city slot | 4 | occupancy ≥ half, then `rand() & 0xF` into `DAT_0049aed8` | 1-8, or 0 if no candidates |
+| `FUN_0047b850` plague | un-afflicted, tier ≥ 2, matching city slot | 4 | occupancy ≥ half, then `rand() & 0xF` into `DAT_0049aed8` | 2-8, or 0 if no candidates |
 | `FUN_0047b540` fire | un-afflicted, **tier ≤ 1**, matching city slot | 3 | `rand() & 7` into `DAT_0049af08`, row `Holz >= Ziegel` | exactly 2, 4 or 6 |
 | `FUN_0047b710` vagrant | un-afflicted, tier ≥ 2, matching city slot | 3 | `rand() & 7` into `DAT_0049af18`, row = gallows bit | 2, 4 or 6 |
+
+`[FIX2]` The plague's "1-8" is off by one at the bottom. Its attempt loop
+draws the uniform pick *first* and the table index only if the occupancy gate
+passed, so an attempt costs 1 or 2 draws and the routine can only return early
+after a 2-draw attempt. **1 and 3 are both reachable as intermediate sums but
+1 is not a possible total**: the reachable budgets are `{0} ∪ {2..=8}`. A run
+of four under-occupied picks is the 4-draw floor for a routine that never
+consults the table at all. Pinned by
+`source_plague_ignition_rand_budget_is_two_to_eight`.
 
 The vagrant's `FUN_0044b620` allocates entity class `0x0f` with figure def
 `0x5c` (`PASSANT`), which self-destructs past 49 shared civilian steps and draws
@@ -343,6 +393,14 @@ DAT_0049af18  2 rows x 8    (vagrant)
 The **positions** matter, not just the counts — the index is `rand() & 15` or
 `rand() & 7`. All three verified byte-for-byte against `extracted/1602.exe`
 (2026-08-15).
+
+`[FIX2]` Re-verified independently while implementing Stage 2, by mapping
+`0x0049aed8` through the PE section table to file offset `0x9aed8` and reading
+48 bytes: the transcription above is **exactly right**, all three rows, all 48
+positions. `DAT_0049af08` and `DAT_0049af18` follow it contiguously at
+`0x9af08` and `0x9af18` and also match. The three tables live in `.data`
+(RVA `0x98000`, raw at `0x98000`) but inside its initialised prefix, which is
+why they read out of the file at all — unlike `DAT_005a7758`, which does not.
 
 Row selection. Plague: `((flags >> 9) & 1) + ((flags >> 6) & 1)` = how many of
 **doctor** (`KLINIK`, bit `0x200`) and **bathhouse** (`BADEHAUS`, bit `0x40`)
@@ -420,6 +478,31 @@ self-describing, so the `bool` → `i16` widening and the four appended map-cell
 fields cannot be read out of an older payload — `#[serde(default)]` does not
 help there.
 
+**As built (Stage 2).** `data_bridge.rs`: `SOURCE_PLAGUE_PROBABILITY_TABLE`,
+`source_plague_probability_row`, `SOURCE_PLAGUE_OCCUPANCY_RAMP` (rebuilt from
+`FUN_00403370` in a `const fn`, since the source array is uninitialised on
+disk), `source_plague_occupancy_index`,
+`source_hazard_scan_kind_is_walkable`, `SOURCE_PLAGUE_SCAN_NESTED_KIND_MASK`,
+`SOURCE_PLAGUE_SCAN_RADIUS`, and `SourceHazardScanGrid::set_open` next to the
+existing `set_burnable`. `simulation.rs`: the plague roll inside
+`tick_source_city_hazard_event`, `source_ignite_plague`,
+`source_plague_occupancy_admits`, `source_spread_plague`,
+`source_expire_plague`, and a `SourceHazardScanMode` parameter on
+`source_hazard_area_scan` selecting `FUN_00472930` or `FUN_004724d0`.
+
+No new persisted state, so **`SAVE_VERSION` is untouched** — the plague reuses
+the affliction table and the kind-13 lifecycle bits Stage 1 already saved.
+
+Pinned by `source_plague_probability_table_rows_are_pinned`,
+`source_plague_occupancy_ramp_matches_the_startup_segments`,
+`source_city_hazard_plague_gate_rand_budget`,
+`source_plague_band_is_chosen_from_citizens_not_settlers`,
+`source_plague_ignition_rand_budget_is_two_to_eight`,
+`source_plague_spreads_to_a_neighbour_and_then_heals_it` and
+`source_plague_area_scan_reports_only_same_city_residences` in
+`simulation.rs`, plus the corpus test
+`crates/anno-game/tests/source_plague.rs`.
+
 ## 9. Staging
 
 **Stage 1 — required for RNG fidelity on a ~100-inhabitant pioneer city.** At
@@ -436,10 +519,10 @@ two unconditional draws remain. Confirmed, and pinned by
 
 **Stage 1 deviations, deliberate and documented in the code:**
 
-- The plague roll (`pop[1] >= 200 && city[0x1fe] == 0`) and the vagrant roll
-  (`pop[2] >= 300`) are omitted **including their `rand()` draws**. Reaching
-  either population diverges this port's stream from the original's; that is
-  the Stage 2 / Stage 3 boundary.
+- ~~The plague roll (`pop[1] >= 200 && city[0x1fe] == 0`) and the vagrant roll
+  (`pop[2] >= 300`) are omitted **including their `rand()` draws**.~~ The
+  plague roll landed in Stage 2; only the vagrant roll (`pop[2] >= 300`) is
+  still omitted with its draws.
 - The two message emitters draw nothing and are presentation-only.
 - The kind-`0x0e` object-state branch of the registrar (`record[0x11] & 0x20`)
   has no record in this port.
@@ -459,9 +542,34 @@ two unconditional draws remain. Confirmed, and pinned by
   `FUN_00468e10` applies. Pre-existing gap in the field extraction, now
   observable; worth closing when `STADT4` parsing is revisited.
 
-**Stage 2 — 200+ residents.** Plague: `FUN_0047b850`, `FUN_0047a020` type 1,
-`DAT_0049aed8`, `DAT_005a7758`, the capacity table, the doctor/bathhouse bits,
-and `city[0x1fe]` as a real counter.
+**Stage 2 — 200+ residents. Implemented.** Plague: `FUN_0047b850`,
+`FUN_0047a020` type 1, `DAT_0049aed8`, `DAT_005a7758`, the capacity table, the
+doctor/bathhouse bits, and `city[0x1fe]` as a real counter.
+
+At `pop[2] ≈ 240` — mind that this is the *band* input, not the gate's
+`pop[1]` — the roll is `mod = 250`, threshold 13, i.e. **5.2 % per cycle**,
+rising to 7.2 % once citizens-and-above passes 400. Roughly 94 % of the rolls
+that pass then land, since four attempts at 8/16 miss only `(1/2)^4` of the
+time on an uncovered house. So a fed citizen colony sees a plague roughly
+every twenty minutes, and each one stops *all* growth in that city for 200 s.
+
+**Stage 2 deviations, deliberate and documented in the code:**
+
+- Outer kind 3 (`TOR`) is treated as blocked rather than modelling
+  `FUN_004724d0`'s open-gate gfx test, because this port carries no live gfx
+  index per cell. A plague will not walk through a city gate; a shipped
+  colony rarely has one inside a radius-4 box, but this does shift the
+  reported count — and therefore `rand() % n` — where it does.
+- The candidate city-slot test reads `SourceKind13Location::source_owner` and
+  the map cell's `source_map_owner_slot`, both snapshots of the map word taken
+  at placement, where the source re-reads the live word. Stage 1's igniter
+  already made the same trade.
+- The two message emitters still draw nothing. `city[0x1fe] > 2` is now
+  expressible, so the plague's "more than two simultaneous afflictions"
+  threshold could be wired up whenever presentation is.
+
+The remaining divergence point is **Stage 3's vagrant roll at `pop[2] >= 300`**
+and its 2/4/6 spawn draws.
 
 **Stage 3 — 300+ / cosmetic.** The vagrant spawn, `DAT_0049af18`, the gallows
 bit, and the two message emitters. Only the two `rand()` calls inside

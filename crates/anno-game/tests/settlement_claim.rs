@@ -308,6 +308,7 @@ fn place_built(
     settlement: &mut Settlement,
     corpus: &Corpus,
     def_index: usize,
+    owner: u8,
     sites: &[(i32, i32)],
 ) -> Option<(i32, i32, usize)> {
     for &(x, y) in sites {
@@ -320,7 +321,7 @@ fn place_built(
             &corpus.cod,
             def_index,
             0,
-            0,
+            owner,
             x,
             y,
         );
@@ -425,8 +426,8 @@ fn founding_claims_the_kontor_radius_into_the_settlement() {
             y,
         )
     });
-    let (hx, hy, _) =
-        place_built(&mut settlement, &corpus, hut, &hut_sites).expect("a hut fits in the city");
+    let (hx, hy, _) = place_built(&mut settlement, &corpus, hut, 0, &hut_sites)
+        .expect("a hut fits in the city");
     let record = settlement
         .sim
         .source_kind13_locations
@@ -442,6 +443,17 @@ fn founding_claims_the_kontor_radius_into_the_settlement() {
 /// Both the site inside the new settlement and the site out in the wilderness
 /// have to harvest, because in each case the harvester's own ground and its
 /// trees carry the same selector.
+///
+/// The wilderness site used to be player 0's too. With `FUN_004084d0`'s
+/// buildable-area gate ported (`1602_exe.c:7612-7616`) that is the one
+/// placement a founder can no longer make: `FUN_0046b120` reports the
+/// settlement they just founded, so unowned ground on *this* island is closed
+/// to them. The fixture only held because the gate was missing. The state it
+/// is really about — a harvester standing on selector-7 ground next to
+/// selector-7 trees — is still perfectly reachable, just not for the player
+/// who already settled here: a rival who holds nothing on island 10 passes
+/// `:7613`'s first disjunct and builds there, which is what the wilderness
+/// leg now does.
 #[test]
 fn a_forester_placed_after_founding_harvests() {
     let Some(corpus) = load_corpus() else { return };
@@ -450,11 +462,24 @@ fn a_forester_placed_after_founding_harvests() {
     let radius = corpus.cod.buildings[forester].source_transfer_radius;
 
     let inside_sites = woodland_sites(&settlement.sim, settlement.city_slot, radius);
-    let (ix, iy, inside_building) = place_built(&mut settlement, &corpus, forester, &inside_sites)
-        .expect("a forester fits in the settlement's own woodland");
+    let (ix, iy, inside_building) =
+        place_built(&mut settlement, &corpus, forester, 0, &inside_sites)
+            .expect("a forester fits in the settlement's own woodland");
+    // An AI rival with no settlement on island 10 — a settling kind, so the
+    // gate really is being satisfied and not merely skipped.
+    settlement.sim.players[1].state = anno_sim::player::PlayerState::AiActive;
+    settlement.sim.players[1].gold = 100_000;
+    settlement.sim.players[1].unlock_mask = u32::MAX;
+    assert_eq!(
+        settlement
+            .sim
+            .source_island_settlement_count_for_player(10, 1),
+        0,
+    );
     let outside_sites = woodland_sites(&settlement.sim, UNSETTLED_SLOT, radius);
-    let (ox, oy, outside_building) = place_built(&mut settlement, &corpus, forester, &outside_sites)
-        .expect("a forester fits in the unsettled woodland");
+    let (ox, oy, outside_building) =
+        place_built(&mut settlement, &corpus, forester, 1, &outside_sites)
+            .expect("a forester fits in the unsettled woodland");
 
     // `FUN_0046ae20` stamped each placement from the ground it stands on.
     let root_index = |sim: &anno_sim::simulation::Simulation, x: i32, y: i32| {

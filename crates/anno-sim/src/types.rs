@@ -30,7 +30,13 @@ pub const NUM_POP_TIERS: usize = 5;
 /// aren't shown as distinct entries in the manual. These discriminants
 /// are local simulation ids, not `text.cod [WARE]` ids; source tables
 /// that use WARE order need an explicit mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// `PartialOrd`/`Ord` follow the discriminant order above. They exist so the
+/// per-good maps on `Warehouse` can be `BTreeMap`s: bincode encodes a map by
+/// iterating it, so a `HashMap` would leak `RandomState` ordering straight
+/// into `save::state_hash` and break the lockstep comparison signal.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum Good {
     None = 0,

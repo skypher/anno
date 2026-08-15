@@ -1775,6 +1775,93 @@ pub const SOURCE_FIRE_PROBABILITY_TABLE: [[u8; 8]; 2] = [
     [0, 0, 1, 0, 1, 0, 0, 1],
 ];
 
+/// `DAT_0049aed8`: the three sixteen-entry plague probability rows, read
+/// byte for byte out of `extracted/1602.exe`. The symbol sits in `.data`
+/// (VA `0x498000`, raw at `0x98000`) inside that section's initialised
+/// prefix, so it lands at file offset `0x9aed8`; `DAT_0049af08` and
+/// `DAT_0049af18` follow it contiguously.
+///
+/// Both the ignition roll in `FUN_0047b850` (`1602_exe.c:88367-88378`) and
+/// the spread roll in `FUN_0047a020`'s type-1 branch (`:87024-87036`) index a
+/// row with `rand() & 0xf`; a nonzero byte means the plague takes. Row 0 is
+/// 8/16 = 50 %, row 1 5/16 = 31.25 %, row 2 3/16 = 18.75 % — but the
+/// *positions* are what the masked draw actually consults, not the counts.
+pub const SOURCE_PLAGUE_PROBABILITY_TABLE: [[u8; 16]; 3] = [
+    [0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1],
+    [0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1],
+    [0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+];
+
+/// The `DAT_0049aed8` row a house selects: how many of the **doctor**
+/// (`KLINIK`, lifecycle bit `0x200`) and the **bathhouse** (`BADEHAUS`, bit
+/// `0x40`) cover it, i.e. `((flags >> 9) & 1) + ((flags >> 6) & 1)`.
+///
+/// Both coverage bits come out of the ported `FUN_00482120` scan, so no
+/// coverage is row 0 (50 %), one of the two row 1 (31.25 %) and both row 2
+/// (18.75 %). Note this is the *opposite* polarity to the fire table's row
+/// index: more infrastructure means a *higher* row and a lower chance.
+pub const fn source_plague_probability_row(lifecycle_flags: u16) -> usize {
+    (((lifecycle_flags >> 9) & 1) + ((lifecycle_flags >> 6) & 1)) as usize
+}
+
+/// `DAT_005a7758`: the 129-byte occupancy ramp `FUN_0047a020`'s plague
+/// branch tests `rand() & 0x7f` against.
+///
+/// It is not authored data — `FUN_00478470` (`1602_exe.c:85782-85784`)
+/// builds it at startup from three `FUN_00403370` linear segments, so this
+/// port rebuilds it the same way rather than transcribing bytes out of a
+/// section that is uninitialised on disk. The ramp climbs 0..25 over the
+/// first 25 steps, 25..51 over the next 13, then crawls 51..64 across the
+/// remaining 90 — so a barely-occupied house almost never infects a
+/// neighbour and a full one does so at most 64/128 = 50 % per phase.
+pub const SOURCE_PLAGUE_OCCUPANCY_RAMP: [u8; 0x81] = source_plague_occupancy_ramp();
+
+const fn source_plague_occupancy_ramp() -> [u8; 0x81] {
+    let ramp = [0u8; 0x81];
+    let ramp = source_linear_ramp_segment(ramp, 0, 0x19, 0, 0x19);
+    let ramp = source_linear_ramp_segment(ramp, 0x19, 0x26, 0x19, 0x33);
+    source_linear_ramp_segment(ramp, 0x26, 0x80, 0x33, 0x40)
+}
+
+/// `FUN_00403370` (`1602_exe.c:2129-2146`): fill `[from, to)` with a linear
+/// 8.8 fixed-point ramp from `start` to `end`, clamping each byte at `0xff`,
+/// and then store `end` at index `to` as well. The per-step increment is a
+/// truncating integer division, which is why the shipped ramp's second
+/// segment lands exactly on its endpoint while the third does not.
+const fn source_linear_ramp_segment(
+    mut ramp: [u8; 0x81],
+    from: usize,
+    to: usize,
+    start: i32,
+    end: i32,
+) -> [u8; 0x81] {
+    let step = (end * 0x100 - start * 0x100) / (to - from) as i32;
+    let mut accumulator = start * 0x100;
+    let mut index = from;
+    while index < to {
+        let value = accumulator >> 8;
+        ramp[index] = if value > 0xff { 0xff } else { value as u8 };
+        accumulator += step;
+        index += 1;
+    }
+    ramp[to] = ((end * 0x100) as u32 >> 8) as u8;
+    ramp
+}
+
+/// `(amount << 7) / DAT_0061fb6c` (`1602_exe.c:87007-87008`), the index the
+/// plague spread takes into [`SOURCE_PLAGUE_OCCUPANCY_RAMP`].
+///
+/// `DAT_0061fb6c` is just `DAT_0061fa4c[4]` — the BGruppe-4 `Maxwohn << 6`,
+/// i.e. [`SOURCE_KIND13_AMOUNT_CAPACITIES`]`[4]` = 2560 — because the two
+/// symbols are 0x120 bytes apart and the table's stride is 0x48. A record's
+/// `amount` never exceeds its own tier capacity, so the quotient stays in
+/// `0..=128`; the clamp only guards the port against a caller the source
+/// would have let read past the array.
+pub fn source_plague_occupancy_index(amount: u16) -> usize {
+    let capacity = i32::from(SOURCE_KIND13_AMOUNT_CAPACITIES[4]);
+    ((i32::from(amount) << 7) / capacity).clamp(0, 0x80) as usize
+}
+
 /// `DAT_005a5100`: 0x120 eight-byte affliction records.
 pub const SOURCE_AFFLICTION_TABLE_SLOTS: usize = 0x120;
 /// Linear probe window used by `FUN_00479be0` and `FUN_00479ca0`, clamped
@@ -1975,6 +2062,36 @@ pub const fn source_hazard_scan_kind_is_burnable(kind_code: u8) -> bool {
     matches!(kind_code, 3 | 4 | 5 | 6 | 7 | 10 | 0x0e | 0x24 | 0x25)
 }
 
+/// Outer map kinds `FUN_004724d0` opens for **travel**
+/// (`1602_exe.c:81192-81199`): `STRASSE` (1), `BODEN` (0x0b), `RUINE`
+/// (0x0c), `PLATZ` (0x0d), `BRUECKE` (0x12), `STRANDRUINE` (0x1d) and
+/// `PIER` (0x1e).
+///
+/// Unlike the fire rasteriser these cells are opened but **not** reported:
+/// `FUN_004724d0` sets the candidate bit only from its `param_4` nested-kind
+/// bitmask plus the city-slot match, and a cell that is a candidate is
+/// opened by the `default` arm whatever its outer kind. So the plague walks
+/// roads, ground, squares and bridges and reports only residences — the
+/// mirror image of the fire, which walks structure to structure.
+///
+/// One arm is deliberately not modelled: outer kind 3 (`TOR`) is traversable
+/// only while its live gfx index equals `base + (w * h) / 2`, the open-gate
+/// frame, and this port carries no live gfx index per cell. Gates are
+/// therefore treated as blocked, which is the closed-gate behaviour.
+pub const fn source_hazard_scan_kind_is_walkable(kind_code: u8) -> bool {
+    matches!(kind_code, 1 | 0x0b | 0x0c | 0x0d | 0x12 | 0x1d | 0x1e)
+}
+
+/// `FUN_0047a020`'s plague branch passes `param_4 = 0x2000`
+/// (`1602_exe.c:87011`), i.e. `1 << 0x0d` — nested `HAUS_PRODTYP Kind:
+/// WOHNUNG` and nothing else. The scan reports only residences.
+pub const SOURCE_PLAGUE_SCAN_NESTED_KIND_MASK: u32 = 0x2000;
+
+/// The plague spread's `FUN_004722f0` radius is the literal `4`
+/// (`1602_exe.c:87009`), not the fire's size-derived
+/// `(w + h - 1) / 4 + 2`.
+pub const SOURCE_PLAGUE_SCAN_RADIUS: usize = 4;
+
 /// Result buffer capacity `FUN_0047a020` gives `FUN_00472b20`.
 pub const SOURCE_HAZARD_SCAN_RESULT_CAP: usize = 0x14;
 
@@ -2030,13 +2147,27 @@ impl SourceHazardScanGrid {
         }
     }
 
-    /// One admitted cell: traversable, and a scan result.
+    /// One admitted cell: traversable, and a scan result. `FUN_00472930`
+    /// writes `class | 0x80`, setting the candidate bit unconditionally on
+    /// everything it opens and without masking the class.
     pub fn set_burnable(&mut self, x: usize, y: usize, path_class: u8) {
         let Some(index) = self.index(x, y) else {
             return;
         };
         self.marks[index] = 0;
         self.costs[index] = path_class | 0x80;
+    }
+
+    /// `FUN_004724d0`'s `pbVar13[-1] = 0; *pbVar13 = class & 0x7f |
+    /// candidate << 7`: open the cell for travel and report it only when it
+    /// matched the caller's nested-kind mask and city slot. It *does* mask
+    /// the class, unlike [`Self::set_burnable`].
+    pub fn set_open(&mut self, x: usize, y: usize, path_class: u8, candidate: bool) {
+        let Some(index) = self.index(x, y) else {
+            return;
+        };
+        self.marks[index] = 0;
+        self.costs[index] = (path_class & 0x7f) | (u8::from(candidate) << 7);
     }
 
     fn index(&self, x: usize, y: usize) -> Option<usize> {
@@ -3214,7 +3345,23 @@ pub fn source_static_map_backing_cells_from_scenario(
             }
         }
     }
-    cells.into_values().collect()
+    source_cells_in_map_order(cells)
+}
+
+/// Drain a coordinate-keyed static-cell map into the row-major island order
+/// the source's `+0xaf8` array holds.
+///
+/// The key is `(island, x, y)`, so at most one record exists per cell and the
+/// ordering is free to choose — but it must not be `HashMap` iteration order.
+/// These vectors are serialized into `SaveState`, and bincode encodes a
+/// sequence by iterating it, so `RandomState` ordering would land straight in
+/// `save::state_hash` and make the lockstep comparison signal meaningless.
+fn source_cells_in_map_order(
+    cells: HashMap<(u8, u16, u16), SourceMapCellState>,
+) -> Vec<SourceMapCellState> {
+    let mut cells: Vec<SourceMapCellState> = cells.into_values().collect();
+    cells.sort_unstable_by_key(|cell| (cell.island, cell.y, cell.x));
+    cells
 }
 
 /// `FUN_00468550` copies only owner-slot-7 definitions whose outer `Kind`
@@ -3367,7 +3514,7 @@ fn source_map_roots_from_scenario(
             }
             state.set_fallback_strand_cells(selectors);
         }
-        return static_cells.into_values().collect();
+        return source_cells_in_map_order(static_cells);
     }
 
     for state in &mut states {

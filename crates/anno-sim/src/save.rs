@@ -281,7 +281,22 @@ use std::path::Path;
 ///       the kind-13 records' two affliction bits, so an original save/load
 ///       cures every plague and puts out every fire; keeping them here is a
 ///       deliberate improvement, not a reproduction.
-pub const SAVE_VERSION: u32 = 142;
+/// v143: `state_hash` became deterministic. `Warehouse`'s five per-good maps
+///       are `BTreeMap`s and the two coordinate-keyed static-cell tables in
+///       `data_bridge` are emitted in `(island, y, x)` order, so no
+///       `RandomState` iteration order reaches the serializer. The *payload*
+///       is unchanged — bincode encodes a `BTreeMap` exactly as it encoded
+///       the `HashMap`, and no field moved — so v142 stays loadable
+///       (`MIN_LOADABLE_VERSION` is deliberately left at 142). The bump is
+///       for the **hash**, which is what the number has to guard here:
+///       `state_hash` is not stored in the file, it is the per-tick lockstep
+///       signal (`docs/lockstep.md`), and a v142 build emits a different —
+///       in fact, per-process random — digest for identical state. Without a
+///       bump nothing distinguishes a capture taken before this fix from one
+///       taken after, and a stale baseline would silently "diverge" on tick
+///       zero. Byte-for-byte, a v142 save re-saved by this build also
+///       differs, since its warehouse entries are now written in good order.
+pub const SAVE_VERSION: u32 = 143;
 
 /// Oldest save version this build can still deserialize. Anything
 /// older has either a hard binary incompatibility (enum-variant
@@ -301,6 +316,9 @@ pub const SAVE_VERSION: u32 = 142;
 /// the four fields appended to `SourceMapCellState` can be read out of an
 /// older payload — `#[serde(default)]` cannot fill a field the encoding
 /// never delimits. Everything before v142 is a hard binary incompatibility.
+///
+/// v143 did not move this: the `HashMap` -> `BTreeMap` change behind it is
+/// encoding-identical, so a v142 payload still decodes exactly.
 pub const MIN_LOADABLE_VERSION: u32 = 142;
 
 /// Magic bytes prefixing every save file.
@@ -607,6 +625,16 @@ impl Simulation {
 /// Stable across processes and platforms (bincode encodes fixed-width
 /// little-endian integers), so two simulations driven with the same seed,
 /// timestep, and commands can be compared tick by tick by hash alone.
+///
+/// That stability is a property of what `SaveState` is allowed to contain,
+/// not of the hash function. bincode encodes a map or sequence by iterating
+/// it, so **no `HashMap`/`HashSet` iteration order may reach this payload**:
+/// `RandomState` is seeded per process *and* bumps a thread-local counter per
+/// `RandomState::new()`, so an unordered collection makes two warehouses built
+/// back-to-back in one run hash differently. Keep per-key state in `BTreeMap`s
+/// and sort any `Vec` drained out of a hash map before it lands on
+/// `Simulation`. `state_hash_is_stable_across_repeated_identical_construction`
+/// guards this.
 pub fn state_hash(state: &SaveState) -> u64 {
     let payload = bincode::serialize(state).expect("SaveState must serialize");
     fnv1a_64(&payload)
@@ -934,6 +962,102 @@ mod tests {
         let before = a.state_hash();
         let _ = a.next_source_rand();
         assert_ne!(a.state_hash(), before);
+    }
+
+    /// `state_hash` must depend only on the *values* in `SaveState`, never on
+    /// the iteration order of whatever collection holds them.
+    ///
+    /// The twin test above cannot catch this: its fixture has no warehouse,
+    /// so nothing in its payload was ever hash-ordered. A `HashMap` field
+    /// would not merely differ between processes — `RandomState::new()` bumps
+    /// a thread-local counter on every call, so each freshly built warehouse
+    /// gets its own iteration order and every one of these 64 constructions
+    /// hashes differently within a single run. Hence: many goods (so the maps
+    /// have something to permute), rebuilt from scratch each round (so each
+    /// gets a fresh hasher), all in one process.
+    #[test]
+    fn state_hash_is_stable_across_repeated_identical_construction() {
+        use crate::types::Good;
+        use crate::warehouse::Warehouse;
+        use std::collections::BTreeSet;
+
+        // Deliberately not in `Good` discriminant order: if a map ever
+        // regains hash ordering, insertion order must not accidentally
+        // paper over it.
+        const GOODS: [(Good, u16); 10] = [
+            (Good::Cloth, 11),
+            (Good::Wood, 5),
+            (Good::Tobacco, 19),
+            (Good::Iron, 15),
+            (Good::Food, 9),
+            (Good::Bricks, 13),
+            (Good::Alcohol, 17),
+            (Good::Tools, 7),
+            (Good::Spices, 3),
+            (Good::Jewelry, 21),
+        ];
+
+        let build = || {
+            let mut sim = Simulation::new();
+            sim.players.push(Player::new_human(0));
+            sim.players[0].gold = 500;
+            sim.seed_source_rand(1234);
+            for (island, owner) in [(1_u8, 0_u8), (2, 0)] {
+                let mut warehouse =
+                    Warehouse::new(island, owner, 10 + u16::from(island), 20 + u16::from(island));
+                for (good, amount) in GOODS {
+                    warehouse.deposit(good, amount);
+                    warehouse.reserve(good, 1);
+                    warehouse.reserve_city_good_fixed(good, 32);
+                    warehouse.deposit_city_good_fixed(good, 64, 32 * 50);
+                    warehouse.set_sell_min_keep(good, Some(amount));
+                    warehouse.set_buy_max_stock(good, Some(amount + 1));
+                    warehouse.set_sell_price(good, Some(i32::from(amount)));
+                }
+                sim.warehouses.push(warehouse);
+            }
+            sim
+        };
+
+        // Sanity-check the fixture: a hash-ordered map is only observable if
+        // the maps actually hold more than one entry.
+        let sample = build();
+        assert_eq!(sample.warehouses.len(), 2);
+        for warehouse in &sample.warehouses {
+            for (good, amount) in GOODS {
+                assert_eq!(warehouse.stock(good), amount + 2);
+            }
+        }
+
+        let mut fresh = BTreeSet::new();
+        let mut ticked = BTreeSet::new();
+        for _ in 0..64 {
+            let mut sim = build();
+            fresh.insert(sim.state_hash());
+            for _ in 0..8 {
+                sim.tick(130);
+            }
+            ticked.insert(sim.state_hash());
+        }
+        assert_eq!(
+            fresh.len(),
+            1,
+            "64 identical constructions produced {} distinct state hashes; \
+             something unordered is reaching the serializer",
+            fresh.len()
+        );
+        assert_eq!(
+            ticked.len(),
+            1,
+            "64 identical constructions produced {} distinct state hashes after \
+             ticking; something unordered is reaching the serializer",
+            ticked.len()
+        );
+
+        // The digest must still be sensitive to the values it orders.
+        let mut changed = build();
+        changed.warehouses[0].deposit(Good::Wood, 1);
+        assert!(!fresh.contains(&changed.state_hash()));
     }
 
     #[test]

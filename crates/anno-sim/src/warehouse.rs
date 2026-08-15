@@ -7,7 +7,7 @@
 //! Marketplaces extend the service radius but share the warehouse inventory.
 
 use crate::types::Good;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 fn default_capacity_fallback() -> u16 {
     30
@@ -68,12 +68,12 @@ pub struct Warehouse {
     pub city_population: [u32; 5],
 
     /// Inventory: good → (current_stock, max_capacity)
-    inventory: HashMap<Good, (u16, u16)>,
+    inventory: BTreeMap<Good, (u16, u16)>,
 
     /// Integral compatibility reservations for in-flight generic carriers.
     /// Exact source city-record reservations are retained separately below.
     #[serde(default)]
-    reservations: HashMap<Good, u16>,
+    reservations: BTreeMap<Good, u16>,
 
     /// Exact source city-record reservations at `ware * 0x0c + 0x00`.
     /// `FUN_0047d810` creates these while a type-8 carrier has committed a
@@ -81,13 +81,13 @@ pub struct Warehouse {
     /// or abandons the load. Unlike the compatibility reservation above, this
     /// map retains the source's 1/32-good amount used by `FUN_0047c080`.
     #[serde(default)]
-    city_reserved_fixed: HashMap<Good, u16>,
+    city_reserved_fixed: BTreeMap<Good, u16>,
 
     /// Exact 1/32-good city-store balances written by type-11 transfers.
     /// Ordinary warehouse stock remains integral and initializes a balance
     /// when a good has not yet been delivered by a city cart.
     #[serde(default)]
-    city_fixed_inventory: HashMap<Good, u16>,
+    city_fixed_inventory: BTreeMap<Good, u16>,
 
     /// Per-good buy/sell sliders (Anno 1602 manual section 8.1).
     /// `Sell` = "everything left of the mark stays, everything right
@@ -99,7 +99,7 @@ pub struct Warehouse {
     /// for that good (matching the original — players have to set
     /// each slider explicitly).
     #[serde(default)]
-    sliders: HashMap<Good, TradeSlider>,
+    sliders: BTreeMap<Good, TradeSlider>,
 }
 
 /// Per-good free-trader sliders. See `Warehouse::sliders` doc-comment.
@@ -155,11 +155,11 @@ impl Warehouse {
             source_path_class: default_source_path_class(),
             default_capacity,
             city_population: [0; 5],
-            inventory: HashMap::new(),
-            reservations: HashMap::new(),
-            city_reserved_fixed: HashMap::new(),
-            city_fixed_inventory: HashMap::new(),
-            sliders: HashMap::new(),
+            inventory: BTreeMap::new(),
+            reservations: BTreeMap::new(),
+            city_reserved_fixed: BTreeMap::new(),
+            city_fixed_inventory: BTreeMap::new(),
+            sliders: BTreeMap::new(),
         }
     }
 

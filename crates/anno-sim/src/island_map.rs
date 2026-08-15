@@ -2409,8 +2409,9 @@ mod tests {
         assert_eq!(widened, vec![11, 12, 29]);
     }
 
-    /// The plantation raster's unconditional half and the mission driver's
-    /// reachability probe are the same rule, not merely a similar one.
+    /// `FUN_0046f920`'s unconditional half keeps its own name because that
+    /// raster's `default:` arm differs, but the set itself is the same rule as
+    /// the transfer wave's, not merely a similar one.
     #[test]
     fn sibling_predicates_agree_with_the_transfer_wave_arm() {
         for kind in 0..=63_u8 {

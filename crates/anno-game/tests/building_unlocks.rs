@@ -242,9 +242,30 @@ fn rinderfarm_unlocks_once_the_city_reaches_thirty_inhabitants() {
             island_id: islands[island_idx].number,
             source_owner: 0,
             owner_slot: 0,
+            tile_x: tile.0 as u8,
+            tile_y: tile.1 as u8,
             tier_population: [30, 0, 0, 0, 0],
             ..SourceCityRecord::default()
         })
+    ));
+    // A settlement always owns ground: `FUN_00468ce0` stamps its founding
+    // tile and `FUN_00465170`'s kind-8 branch claims `max(Radius, 8)` around
+    // it. The record alone used to be enough here only because
+    // `FUN_004084d0`'s buildable-area gate (`1602_exe.c:7612-7616`) was not
+    // ported — with it, "this player holds a settlement on this island but
+    // owns not one tile of it" is a state the original cannot produce, and it
+    // would close the whole island to the very placement under test. So the
+    // fixture now claims the Kontor's radius around the site, and the
+    // Rinderfarm below goes up inside its own city, which is where a
+    // Rinderfarm goes.
+    assert!(loaded.sim.claim_source_settlement_area(
+        islands[island_idx].number,
+        tile.0,
+        tile.1,
+        1,
+        1,
+        16,
+        0,
     ));
     assert_eq!(
         loaded.sim.source_kind4_dispatch.active_player_slot, 0,

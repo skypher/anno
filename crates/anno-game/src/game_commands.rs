@@ -131,9 +131,19 @@ pub fn can_place_building(
 
 /// Attempt to place building definition `def_index` at `(tile_x, tile_y)`
 /// on `current_island` for `owner`. Mirrors the original click-place flow:
-/// terrain gate (`FUN_00464450`), gold cost, Bauinfra unlock mask, materials
-/// trickle. Side-effecting helper used by the game's click handler, its
-/// drag-place loop, and command replay.
+/// terrain gate (`FUN_00464450`), buildable-area gate (`FUN_004084d0`
+/// `1602_exe.c:7612-7616` / `:7662-7665`, see [`placement_area_admits`]),
+/// gold cost, Bauinfra unlock mask, materials trickle. Side-effecting helper
+/// used by the game's click handler, its drag-place loop, and command replay.
+///
+/// The original splits those responsibilities across two functions:
+/// `FUN_004084d0` is the *intent* path and carries both gates, while the
+/// replay/network applier `FUN_00409150` (`1602_exe.c:7874-7930`) calls the
+/// same installers with no gate at all — it trusts the command word it was
+/// handed, including its settlement-slot bits. The port has no separate
+/// placement applier, so every gate here is asked on both paths; keep it that
+/// way, because relaxing one of them for replay only would let a save reach a
+/// state the interactive path cannot.
 ///
 /// Note that fertility is deliberately **not** a placement gate. The
 /// original's only refusal is the Bauinfra unlock test `FUN_0042d530`

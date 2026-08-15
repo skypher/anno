@@ -293,6 +293,25 @@ pub struct SourceDeferredMapDemolition {
     pub tile_y: u8,
 }
 
+/// Which rasteriser the shared `FUN_004722f0` work struct is handed to.
+///
+/// The geometry, the flood and the appender are identical for both hazards;
+/// only the pass that fills the scratch grid differs, and it differs enough
+/// to change the reported set completely. `FUN_00472930` (fire) opens the
+/// nine structural outer kinds and reports every one of them, so a fire only
+/// walks between buildings that physically touch. `FUN_004724d0` (plague)
+/// opens roads, ground, squares, ruins, bridges and piers for *travel* and
+/// reports only cells whose nested kind is in the caller's bitmask and whose
+/// settlement slot matches the work struct's, so a plague walks the street
+/// network and infects only residences of the same city.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceHazardScanMode {
+    /// `FUN_00472930`.
+    Fire,
+    /// `FUN_004724d0` with `param_4 = 0x2000`.
+    Plague,
+}
+
 /// Terminal control record created by `FUN_00445930` when a category-one
 /// through -four figure's source energy reaches zero. `FUN_00443bf0` writes
 /// control kind `0x0c`, `FUN_0045e1f0` marks the target's terminal state and
@@ -4652,13 +4671,13 @@ impl Simulation {
     /// the block decides: `FUN_0047f510` at the top and the re-arm at the
     /// bottom. Everything in between is gated.
     ///
-    /// Stage 1 implements the fire chain. The plague roll (`pop[1] >= 200`
-    /// and no live affliction) and the vagrant roll (`pop[2] >= 300`) need
-    /// populations a first-mission colony never reaches, and are deliberately
-    /// left out **including their `rand()` draws** — reaching either
-    /// population makes this port's stream diverge from the original's, which
-    /// is the documented Stage 2/3 boundary. The two message emitters draw
-    /// nothing and are presentation-only.
+    /// Stage 1 implemented the fire chain and Stage 2 adds the plague roll.
+    /// The plague gate reads `pop[1]` — settlers and above — but picks its
+    /// band from `pop[2]`, citizens and above; the two are different fields
+    /// and the source is unambiguous about which goes where. Only the vagrant
+    /// roll (`pop[2] >= 300`) is still left out **including its `rand()`
+    /// draws**, which is the remaining Stage 3 divergence point. The two
+    /// message emitters draw nothing and are presentation-only.
     ///
     /// The fire chain is a strict `if`/`else`: at 80 or more pioneers the
     /// settler branches are never evaluated, and below 80 pioneers with fewer
@@ -4682,6 +4701,24 @@ impl Simulation {
         for group in (0..4).rev() {
             population_at_least[group] =
                 city.tier_population[group].wrapping_add(population_at_least[group + 1]);
+        }
+
+        // PLAGUE (`1602_exe.c:91456-91467`). The gate is settlers-and-above
+        // plus a city with no live affliction at all; the band comes from
+        // *citizens*-and-above. `FUN_0047f510` above only posts a deferred
+        // action, so the counter read here is still the one the source sees.
+        if population_at_least[1] >= 200 && city.active_afflictions == 0 {
+            let citizens_and_above = population_at_least[2];
+            let modulus = if citizens_and_above >= 400 {
+                180
+            } else if citizens_and_above >= 200 {
+                250
+            } else {
+                400
+            };
+            if u32::from(self.next_source_rand()) % modulus < 13 {
+                self.source_ignite_plague(city);
+            }
         }
 
         let pioneers = city.tier_population[0];
@@ -4985,26 +5022,187 @@ impl Simulation {
         false
     }
 
+    /// `FUN_0047b850` (`1602_exe.c:88325-88386`), the plague igniter.
+    ///
+    /// The candidate filter is the fire's with its tier test inverted:
+    /// records with no live affliction, **BGruppe 2 or above** and this
+    /// city's settlement slot. It then makes up to **four** attempts, and
+    /// each attempt is two-stage — a uniform pick, then an occupancy gate
+    /// `capacity / 2 <= amount` that costs nothing, and only if that passes a
+    /// `rand() & 0xf` index into `DAT_0049aed8`. So an attempt costs one draw
+    /// when the picked house is under half full and two otherwise, putting
+    /// the whole routine at 2 to 8 draws — never 1 — or exactly **zero**
+    /// when the island slice holds no eligible residence.
+    ///
+    /// The row is doctor plus bathhouse coverage, so a city that has built
+    /// both takes 18.75 % per attempt instead of 50 %.
+    fn source_ignite_plague(&mut self, city: SourceCityRecord) -> bool {
+        let island = city.island_id;
+        let candidates: Vec<SourceKind13Location> = self
+            .source_kind13_locations
+            .city_slice(island)
+            .iter()
+            .flatten()
+            .filter(|location| {
+                location.island_id == island
+                    && location.lifecycle_flags & 3 == 0
+                    && location.population_group > 1
+                    && location.source_owner == city.source_owner
+            })
+            .copied()
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
+        for _ in 0..4 {
+            let pick = candidates[usize::from(self.next_source_rand()) % candidates.len()];
+            if !Self::source_plague_occupancy_admits(pick) {
+                continue;
+            }
+            let row = crate::data_bridge::source_plague_probability_row(pick.lifecycle_flags);
+            let index = usize::from(self.next_source_rand() & 0xf);
+            if crate::data_bridge::SOURCE_PLAGUE_PROBABILITY_TABLE[row][index] != 0 {
+                self.source_register_affliction(
+                    island,
+                    pick.tile_x,
+                    pick.tile_y,
+                    crate::data_bridge::SOURCE_AFFLICTION_KIND_PLAGUE,
+                    crate::data_bridge::SOURCE_AFFLICTION_SPREAD_DURATION,
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `DAT_0061fa4c[BGruppe] / 2 <= amount`, the half-capacity occupancy
+    /// gate both plague paths apply to their target (`1602_exe.c:88368` and
+    /// `:87022`). `DAT_0061fa4c` is `Maxwohn << 6`, which is exactly
+    /// `SOURCE_KIND13_AMOUNT_CAPACITIES`. A record whose BGruppe is outside
+    /// `0..=4` would read past the source table; this port refuses it.
+    fn source_plague_occupancy_admits(location: SourceKind13Location) -> bool {
+        location
+            .source_amount_capacity()
+            .is_some_and(|capacity| capacity / 2 <= location.amount)
+    }
+
     /// `FUN_0047a020` (`1602_exe.c:86964-87157`), dispatcher slot S9.
     ///
     /// A 10 s phase clock plus eight table entries per call: a full 0x120-slot
     /// sweep takes 36 calls, well under one phase, so every live entry steps
-    /// exactly once per phase. Stage 1 implements affliction type 2 (fire);
-    /// type 1 (plague) is Stage 2 and its three draws are not made here.
+    /// exactly once per phase. Affliction types 1 (plague) and 2 (fire) both
+    /// run here; anything else is stepped and ignored, as in the source's
+    /// unhandled `switch` arms.
     fn tick_source_afflictions(&mut self, dt_ms: u32) {
         for slot in self.source_afflictions.advance(dt_ms) {
             let Some((entry, expired)) = self.source_afflictions.step_slot(slot) else {
                 continue;
             };
-            if entry.kind != crate::data_bridge::SOURCE_AFFLICTION_KIND_FIRE {
-                continue;
-            }
-            if expired {
-                self.source_expire_fire(slot, entry);
-            } else {
-                self.source_spread_fire(entry);
+            match (entry.kind, expired) {
+                (crate::data_bridge::SOURCE_AFFLICTION_KIND_PLAGUE, false) => {
+                    self.source_spread_plague(entry);
+                }
+                (crate::data_bridge::SOURCE_AFFLICTION_KIND_PLAGUE, true) => {
+                    self.source_expire_plague(slot, entry);
+                }
+                (crate::data_bridge::SOURCE_AFFLICTION_KIND_FIRE, false) => {
+                    self.source_spread_fire(entry);
+                }
+                (crate::data_bridge::SOURCE_AFFLICTION_KIND_FIRE, true) => {
+                    self.source_expire_fire(slot, entry);
+                }
+                _ => {}
             }
         }
+    }
+
+    /// The `bVar2 == 1` living branch of `FUN_0047a020` (`:86998-87041`).
+    ///
+    /// Up to three draws, and the first one is not free: the occupancy gate
+    /// is `rand() & 0x7f < DAT_005a7758[amount * 128 / 2560]` read off the
+    /// **infected** house, so a barely-tenanted plague house almost never
+    /// passes it. Then a uniform pick over the radius-4 area scan — which,
+    /// unlike the fire's, walks roads and ground and reports only residences
+    /// in this city's slot — and finally a `rand() & 0xf` index into
+    /// `DAT_0049aed8` on the target's doctor/bathhouse coverage. The target
+    /// must additionally be un-afflicted and at least half full.
+    ///
+    /// A missing kind-13 record on the infected tile short-circuits before
+    /// the first draw, exactly as `FUN_00479f70` returning null does.
+    fn source_spread_plague(&mut self, entry: crate::data_bridge::SourceAfflictionEntry) {
+        let Some(infected) =
+            self.source_kind13_locations
+                .location_at(entry.island_id, entry.tile_x, entry.tile_y)
+        else {
+            return;
+        };
+        let ramp = crate::data_bridge::SOURCE_PLAGUE_OCCUPANCY_RAMP
+            [crate::data_bridge::source_plague_occupancy_index(infected.amount)];
+        if self.next_source_rand() & 0x7f >= u16::from(ramp) {
+            return;
+        }
+        let results = self.source_hazard_area_scan(
+            entry.island_id,
+            entry.tile_x,
+            entry.tile_y,
+            crate::data_bridge::SOURCE_PLAGUE_SCAN_RADIUS,
+            SourceHazardScanMode::Plague,
+        );
+        if results.is_empty() {
+            return;
+        }
+        let pick = results[usize::from(self.next_source_rand()) % results.len()];
+        // `FUN_00463900` resolves the reported cell back to its root anchor.
+        let Some(cell) = self.source_hazard_root_at(entry.island_id, pick.0, pick.1) else {
+            return;
+        };
+        let (target_x, target_y) = (cell.source_command_anchor_x, cell.source_command_anchor_y);
+        if (entry.tile_x, entry.tile_y) == (target_x, target_y) {
+            return;
+        }
+        let Some(target) =
+            self.source_kind13_locations
+                .location_at(entry.island_id, target_x, target_y)
+        else {
+            return;
+        };
+        if target.lifecycle_flags & 3 != 0 || !Self::source_plague_occupancy_admits(target) {
+            return;
+        }
+        let row = crate::data_bridge::source_plague_probability_row(target.lifecycle_flags);
+        let index = usize::from(self.next_source_rand() & 0xf);
+        if crate::data_bridge::SOURCE_PLAGUE_PROBABILITY_TABLE[row][index] == 0 {
+            return;
+        }
+        self.source_register_affliction(
+            entry.island_id,
+            target_x,
+            target_y,
+            crate::data_bridge::SOURCE_AFFLICTION_KIND_PLAGUE,
+            crate::data_bridge::SOURCE_AFFLICTION_SPREAD_DURATION,
+        );
+    }
+
+    /// The `bVar2 == 1` expiry branch of `FUN_0047a020` (`:87119-87127`).
+    ///
+    /// A plague simply **heals**: `flags &= 0xfffc` clears the two lifecycle
+    /// bits on the kind-13 record, the table entry is freed with its
+    /// `city[0x1fe]` decrement, and that is all. It draws nothing, posts no
+    /// deferred action and — unlike the fire — never demolishes the house.
+    /// The only lasting damage is indirect: while it ran, `FUN_0047b410`
+    /// refused to grow anything in the whole city.
+    fn source_expire_plague(
+        &mut self,
+        slot: usize,
+        entry: crate::data_bridge::SourceAfflictionEntry,
+    ) {
+        if let Some(location) =
+            self.source_kind13_locations
+                .location_at_mut(entry.island_id, entry.tile_x, entry.tile_y)
+        {
+            location.lifecycle_flags &= 0xfffc;
+        }
+        self.source_clear_affliction_slot(slot);
     }
 
     /// The `bVar2 == 2` living branch of `FUN_0047a020` (`:87042-87117`).
@@ -5031,6 +5229,7 @@ impl Simulation {
             entry.tile_x,
             entry.tile_y,
             radius.max(0) as usize,
+            SourceHazardScanMode::Fire,
         );
         if results.is_empty() {
             return;
@@ -5149,6 +5348,7 @@ impl Simulation {
         root_x: u8,
         root_y: u8,
         radius: usize,
+        mode: SourceHazardScanMode,
     ) -> Vec<(u8, u8)> {
         let Some(root) = self.source_hazard_root_at(island, root_x, root_y) else {
             return Vec::new();
@@ -5156,6 +5356,10 @@ impl Simulation {
         let Some(map) = self.island_maps.iter().find(|map| map.island_id == island) else {
             return Vec::new();
         };
+        // `FUN_004722f0` stores the **centre tile's** settlement slot in the
+        // work struct's `+0x1c` byte, and `7` there is a wildcard that
+        // matches every slot.
+        let scan_owner_slot = root.source_map_owner_slot & 7;
         let oriented_width = i32::from(root.footprint_width.max(1));
         let oriented_height = i32::from(root.footprint_height.max(1));
         let radius_i32 = radius as i32;
@@ -5175,16 +5379,42 @@ impl Simulation {
                 let (Ok(tile_x), Ok(tile_y)) = (u8::try_from(x), u8::try_from(y)) else {
                     continue;
                 };
-                let (kind_code, path_class) = match self.source_hazard_root_at(island, tile_x, tile_y)
-                {
-                    Some(cell) => (cell.kind_code, cell.source_path_class_loaded_road),
-                    None => match map.source_map_kind_and_owner(x, y) {
-                        Some((kind_code, _)) => (kind_code, 0),
-                        None => continue,
-                    },
-                };
-                if crate::data_bridge::source_hazard_scan_kind_is_burnable(kind_code) {
-                    grid.set_burnable(grid_x, grid_y, path_class);
+                let (kind_code, nested_kind_code, owner_slot, path_class) =
+                    match self.source_hazard_root_at(island, tile_x, tile_y) {
+                        Some(cell) => (
+                            cell.kind_code,
+                            cell.source_production_kind_code,
+                            cell.source_map_owner_slot & 7,
+                            cell.source_path_class_loaded_road,
+                        ),
+                        None => match map.source_map_kind_and_owner(x, y) {
+                            Some((kind_code, owner_slot)) => (kind_code, 0, owner_slot & 7, 0),
+                            None => continue,
+                        },
+                    };
+                match mode {
+                    // `FUN_00472930`: one set of outer kinds, all of them
+                    // both traversable and reported.
+                    SourceHazardScanMode::Fire => {
+                        if crate::data_bridge::source_hazard_scan_kind_is_burnable(kind_code) {
+                            grid.set_burnable(grid_x, grid_y, path_class);
+                        }
+                    }
+                    // `FUN_004724d0`: a travel set and a separate candidate
+                    // test, where a candidate is opened whatever its outer
+                    // kind and a traversable cell is reported only if it is
+                    // also a candidate.
+                    SourceHazardScanMode::Plague => {
+                        let candidate = crate::data_bridge::SOURCE_PLAGUE_SCAN_NESTED_KIND_MASK
+                            & (1u32 << (nested_kind_code & 0x1f))
+                            != 0
+                            && (scan_owner_slot == 7 || scan_owner_slot == owner_slot);
+                        if candidate
+                            || crate::data_bridge::source_hazard_scan_kind_is_walkable(kind_code)
+                        {
+                            grid.set_open(grid_x, grid_y, path_class, candidate);
+                        }
+                    }
                 }
             }
         }
@@ -11300,6 +11530,28 @@ mod tests {
         sim
     }
 
+    /// A city on island 2 with `houses` fully-tenanted BGruppe-2 residences
+    /// on a plain-ground island, laid out two tiles apart so the plague's
+    /// radius-4 scan reaches every one of them across the open ground the
+    /// fire could not cross.
+    ///
+    /// Every anchor folds to its own `FUN_0047a630` bucket slot, so nothing
+    /// here exercises the probe-window-full path by accident.
+    fn plague_city(tier_population: [u32; 5], houses: usize) -> Simulation {
+        let mut sim = hazard_city(tier_population);
+        sim.island_maps.push(IslandMap::new_open(2, 16, 16));
+        let anchors: Vec<(u8, u8)> = (0..houses)
+            .map(|index| (5 + (index as u8 % 2) * 2, 5 + (index as u8 / 2) * 2))
+            .collect();
+        for &(x, y) in &anchors {
+            sim.source_static_map_roots.push(hazard_house_root(2, x, y, 3));
+            let mut house = hazard_house(2, x, y, 3, 2);
+            house.amount = crate::data_bridge::SOURCE_KIND13_AMOUNT_CAPACITIES[2];
+            assert!(sim.source_kind13_locations.insert(house));
+        }
+        sim
+    }
+
     /// How many `rand()` values a call consumed, by comparing LCG states.
     fn source_rand_draws(before: u32, after: u32) -> u32 {
         let mut probe = crate::source_rand::SourceRand::new(before);
@@ -11446,22 +11698,34 @@ mod tests {
     /// boundary, and below it a colony under both the 250 pioneer+settler and
     /// the 250 settlers-and-above thresholds draws **zero** here, leaving only
     /// the two unconditional draws.
+    ///
+    /// Four of these cases also clear the plague gate's `pop[1] >= 200`, so
+    /// they now carry its roll as well: adding Stage 2 moved
+    /// `[79, 0, 249, 0, 0]` from 2 draws to 3 and `[79, 221, 0, 0, 0]`,
+    /// `[79, 271, 0, 0, 0]`, `[79, 0, 250, 0, 0]` and `[80, 400, 400, 0, 0]`
+    /// from 3 to 4. `[79, 171, 0, 0, 0]` sits at `pop[1] = 171` and is
+    /// unmoved, which is exactly the boundary the Stage 2 divergence note
+    /// predicted. The city here holds no kind-13 records, so `FUN_0047b850`
+    /// finds no candidates and adds nothing on top of the roll.
     #[test]
     fn source_city_hazard_fire_gate_rand_budget() {
         // (tier populations, total draws for the whole event cycle)
         let cases: [([u32; 5], u32); 7] = [
             // Below every threshold: only `FUN_0047f510` and the re-arm.
             ([79, 0, 0, 0, 0], 2),
-            ([79, 0, 249, 0, 0], 2),
-            // `tier[0] + tier[1] >= 250` opens the middle branch.
+            // `pop[1] = 249` is under every fire threshold but over the
+            // plague's 200, so the only extra draw is the plague roll.
+            ([79, 0, 249, 0, 0], 3),
+            // `tier[0] + tier[1] >= 250` opens the middle branch;
+            // `pop[1] = 171` leaves the plague gate shut.
             ([79, 171, 0, 0, 0], 3),
-            ([79, 221, 0, 0, 0], 3),
-            ([79, 271, 0, 0, 0], 3),
+            ([79, 221, 0, 0, 0], 4),
+            ([79, 271, 0, 0, 0], 4),
             // `pop[1] >= 250` with a small pioneer+settler sum opens the
             // `rand() & 0xff` branch.
-            ([79, 0, 250, 0, 0], 3),
+            ([79, 0, 250, 0, 0], 4),
             // At the boundary the pioneer branch takes over.
-            ([80, 400, 400, 0, 0], 3),
+            ([80, 400, 400, 0, 0], 4),
         ];
         for (tier_population, expected) in cases {
             for seed in 1..40u32 {
@@ -11579,6 +11843,493 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `DAT_0049aed8` verbatim — the bytes read out of `extracted/1602.exe`
+    /// at RVA `0x9aed8` — and the row a house lands on for every combination
+    /// of the real `FUN_00482120` doctor and bathhouse coverage bits.
+    #[test]
+    fn source_plague_probability_table_rows_are_pinned() {
+        use crate::data_bridge::{
+            source_plague_probability_row, SOURCE_HOUSE_INFRA_LIFECYCLE_BITS,
+            SOURCE_PLAGUE_PROBABILITY_TABLE as TABLE,
+        };
+
+        assert_eq!(TABLE[0], [0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1]);
+        assert_eq!(TABLE[1], [0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1]);
+        assert_eq!(TABLE[2], [0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(TABLE[0].iter().filter(|&&hit| hit != 0).count(), 8);
+        assert_eq!(TABLE[1].iter().filter(|&&hit| hit != 0).count(), 5);
+        assert_eq!(TABLE[2].iter().filter(|&&hit| hit != 0).count(), 3);
+
+        // The row is driven by the two coverage bits the ported coverage
+        // scan already writes, not by hard-coded literals.
+        let bit = |production_kind| {
+            SOURCE_HOUSE_INFRA_LIFECYCLE_BITS
+                .iter()
+                .find(|&&(kind, _)| kind == production_kind)
+                .expect("authored coverage bit")
+                .1
+        };
+        let doctor = bit(0x16);
+        let bathhouse = bit(0x14);
+        assert_eq!(doctor, 0x0200);
+        assert_eq!(bathhouse, 0x0040);
+
+        assert_eq!(source_plague_probability_row(0), 0);
+        assert_eq!(source_plague_probability_row(doctor), 1);
+        assert_eq!(source_plague_probability_row(bathhouse), 1);
+        assert_eq!(source_plague_probability_row(doctor | bathhouse), 2);
+        // Every other coverage bit is irrelevant to the row.
+        let everything_else: u16 = SOURCE_HOUSE_INFRA_LIFECYCLE_BITS
+            .iter()
+            .filter(|&&(kind, _)| kind != 0x16 && kind != 0x14)
+            .map(|&(_, flag)| flag)
+            .fold(0, |mask, flag| mask | flag);
+        assert_eq!(source_plague_probability_row(everything_else), 0);
+        assert_eq!(
+            source_plague_probability_row(everything_else | doctor | bathhouse),
+            2,
+        );
+        // Building both halves of the health infrastructure takes a house
+        // from 8/16 to 3/16 per roll.
+        assert!(
+            TABLE[2].iter().filter(|&&hit| hit != 0).count()
+                < TABLE[0].iter().filter(|&&hit| hit != 0).count(),
+        );
+    }
+
+    /// `DAT_005a7758`, the occupancy ramp `FUN_00478470` builds at startup
+    /// out of three `FUN_00403370` segments, and the
+    /// `amount * 128 / DAT_0061fb6c` index into it.
+    #[test]
+    fn source_plague_occupancy_ramp_matches_the_startup_segments() {
+        use crate::data_bridge::{
+            source_plague_occupancy_index, SOURCE_KIND13_AMOUNT_CAPACITIES,
+            SOURCE_PLAGUE_OCCUPANCY_RAMP as RAMP,
+        };
+
+        assert_eq!(RAMP.len(), 0x81);
+        // Segment endpoints, straight off the three source calls.
+        assert_eq!(RAMP[0], 0);
+        assert_eq!(RAMP[0x19], 0x19);
+        assert_eq!(RAMP[0x26], 0x33);
+        assert_eq!(RAMP[0x80], 0x40);
+        // Slope one over the first segment, two over the second, and a crawl
+        // over the third — the truncating step is 3328 / 90 = 36/256.
+        assert_eq!(RAMP[..0x19], (0..0x19).collect::<Vec<u8>>()[..]);
+        assert_eq!(RAMP[0x1a], 0x1b);
+        assert_eq!(RAMP[0x25], 0x31);
+        assert_eq!(RAMP[0x27], 0x33);
+        assert_eq!(RAMP[0x7f], 0x3f);
+        assert!(RAMP.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        // `DAT_0061fb6c` is `DAT_0061fa4c[4]`, the BGruppe-4 `Maxwohn << 6`.
+        assert_eq!(SOURCE_KIND13_AMOUNT_CAPACITIES[4], 2560);
+        assert_eq!(source_plague_occupancy_index(0), 0);
+        assert_eq!(source_plague_occupancy_index(2560), 0x80);
+        // A full aristocrat house is the only one that reaches the top of
+        // the ramp; a full BGruppe-0 hut sits near the bottom of it.
+        assert_eq!(source_plague_occupancy_index(SOURCE_KIND13_AMOUNT_CAPACITIES[0]), 6);
+        assert_eq!(RAMP[source_plague_occupancy_index(SOURCE_KIND13_AMOUNT_CAPACITIES[0])], 6);
+        // Half of a citizen house: 480 * 128 / 2560 = 24.
+        assert_eq!(
+            source_plague_occupancy_index(SOURCE_KIND13_AMOUNT_CAPACITIES[2] / 2),
+            24,
+        );
+        assert_eq!(RAMP[24], 24);
+        // The gate is `rand() & 0x7f < ramp[..]`, so the ceiling is 64/128.
+        assert_eq!(*RAMP.iter().max().unwrap(), 0x40);
+    }
+
+    /// The plague roll's own `rand()` budget in the event block
+    /// (`1602_exe.c:91456-91467`).
+    ///
+    /// The gate is `pop[1] >= 200 && city[0x1fe] == 0`. Below either, the
+    /// block spends only its two unconditional draws; above both, it spends
+    /// exactly one more. This city holds no kind-13 record, so
+    /// `FUN_0047b850` returns without drawing and the roll's own cost is the
+    /// only thing visible. Every case is picked to leave the fire chain shut.
+    #[test]
+    fn source_city_hazard_plague_gate_rand_budget() {
+        // (tier populations, extra afflictions already live, total draws)
+        let cases: [([u32; 5], i16, u32); 6] = [
+            // `pop[1] = 199`: one short of the gate.
+            ([0, 0, 199, 0, 0], 0, 2),
+            ([0, 10, 189, 0, 0], 0, 2),
+            // `pop[1] = 200` exactly: the gate opens.
+            ([0, 1, 199, 0, 0], 0, 3),
+            ([0, 0, 249, 0, 0], 0, 3),
+            ([0, 60, 189, 0, 0], 0, 3),
+            // A city already carrying an affliction never rolls again — one
+            // plague or fire at a time locks the whole settlement out.
+            ([0, 0, 249, 0, 0], 1, 2),
+        ];
+        for (tier_population, live_afflictions, expected) in cases {
+            for seed in 1..40u32 {
+                let mut sim = hazard_city(tier_population);
+                sim.source_cities.record_mut(0).unwrap().active_afflictions = live_afflictions;
+                sim.seed_source_rand(seed);
+                let before = sim.source_rand_state();
+                sim.tick_source_city_hazard_event(0);
+                assert_eq!(
+                    source_rand_draws(before, sim.source_rand_state()),
+                    expected,
+                    "tier {tier_population:?} afflictions {live_afflictions} seed {seed}",
+                );
+            }
+        }
+    }
+
+    /// The gate reads `pop[1]` but the band comes from `pop[2]`.
+    ///
+    /// Two cities with the *same* settlers-and-above total and different
+    /// citizens-and-above totals take different moduli — 250 against 400 —
+    /// which is only possible if the band is keyed on `pop[2]`. Both leave
+    /// the fire chain shut, so the whole difference shows up as whether
+    /// `FUN_0047b850` runs at all.
+    #[test]
+    fn source_plague_band_is_chosen_from_citizens_not_settlers() {
+        // `pop[1] = 249` for both; `pop[2]` is 249 and 189.
+        let citizen_heavy = [0, 0, 249, 0, 0];
+        let settler_heavy = [0, 60, 189, 0, 0];
+
+        let mut divergent_seeds = 0;
+        for seed in 1..400u32 {
+            let mut probe = crate::source_rand::SourceRand::new(seed);
+            // `FUN_0047f510` burns the first draw; the plague roll is next.
+            probe.next();
+            let roll = u32::from(probe.next());
+            let citizen_fires = roll % 250 < 13;
+            let settler_fires = roll % 400 < 13;
+            if citizen_fires != settler_fires {
+                divergent_seeds += 1;
+            }
+            for (tier_population, expected_fires) in
+                [(citizen_heavy, citizen_fires), (settler_heavy, settler_fires)]
+            {
+                let mut sim = plague_city(tier_population, 4);
+                sim.seed_source_rand(seed);
+                let before = sim.source_rand_state();
+                sim.tick_source_city_hazard_event(0);
+                let drawn = source_rand_draws(before, sim.source_rand_state());
+                // Two unconditional draws plus the roll, plus 2..=8 more the
+                // moment the roll passes and `FUN_0047b850` runs.
+                assert_eq!(
+                    drawn > 3,
+                    expected_fires,
+                    "tier {tier_population:?} seed {seed} drew {drawn}",
+                );
+            }
+        }
+        assert!(
+            divergent_seeds > 0,
+            "the two bands must disagree somewhere, or this proves nothing",
+        );
+    }
+
+    /// `FUN_0047b850` costs 2 to 8 draws — never 1 — or exactly zero when
+    /// the island slice holds no eligible residence.
+    ///
+    /// Each of its four attempts draws a uniform pick, then an occupancy
+    /// gate that costs nothing, then a `rand() & 0xf` table index only if the
+    /// occupancy gate passed. So a run of under-occupied picks costs one draw
+    /// apiece and the floor for a routine that ever consults the table is
+    /// two.
+    #[test]
+    fn source_plague_ignition_rand_budget_is_two_to_eight() {
+        use crate::data_bridge::SOURCE_PLAGUE_PROBABILITY_TABLE as TABLE;
+
+        let city = SourceCityRecord {
+            island_id: 2,
+            source_owner: 3,
+            owner_slot: 0,
+            ..SourceCityRecord::default()
+        };
+
+        // No candidates at all: no draw.
+        let mut empty = Simulation::new();
+        empty.seed_source_rand(5);
+        let before = empty.source_rand_state();
+        assert!(!empty.source_ignite_plague(city));
+        assert_eq!(source_rand_draws(before, empty.source_rand_state()), 0);
+
+        // A tier-0 residence is a fire candidate, never a plague one: the
+        // plague filter is `1 < BGruppe`, the fire's is `BGruppe < 2`.
+        let mut pioneers_only = Simulation::new();
+        assert!(pioneers_only.source_cities.set_record(0, Some(city)));
+        pioneers_only
+            .source_static_map_roots
+            .push(hazard_house_root(2, 5, 5, 3));
+        assert!(pioneers_only
+            .source_kind13_locations
+            .insert(hazard_house(2, 5, 5, 3, 0)));
+        pioneers_only.seed_source_rand(5);
+        let before = pioneers_only.source_rand_state();
+        assert!(!pioneers_only.source_ignite_plague(city));
+        assert_eq!(
+            source_rand_draws(before, pioneers_only.source_rand_state()),
+            0,
+        );
+
+        let mut budgets = std::collections::BTreeSet::new();
+        for seed in 1..80u32 {
+            for occupied in [false, true] {
+                let mut sim = Simulation::new();
+                sim.players.push(Player::new_human(0));
+                sim.source_kind4_dispatch.active_player_slot = 0;
+                assert!(sim.source_cities.set_record(0, Some(city)));
+                sim.source_static_map_roots
+                    .push(hazard_house_root(2, 5, 5, 3));
+                let mut house = hazard_house(2, 5, 5, 3, 2);
+                // BGruppe 2 capacity is 0x3c0, so half is 0x1e0.
+                house.amount = if occupied { 0x1e0 } else { 0x1df };
+                assert!(sim.source_kind13_locations.insert(house));
+                sim.seed_source_rand(seed);
+
+                // Replay the source's own attempt loop off a private LCG.
+                let mut expected_rng = crate::source_rand::SourceRand::new(seed);
+                let mut expected_draws = 0;
+                let mut expected_hit = false;
+                for _ in 0..4 {
+                    let _pick = expected_rng.next();
+                    expected_draws += 1;
+                    if !occupied {
+                        continue;
+                    }
+                    let index = usize::from(expected_rng.next() & 0xf);
+                    expected_draws += 1;
+                    // No coverage on the seeded house, so always row 0.
+                    if TABLE[0][index] != 0 {
+                        expected_hit = true;
+                        break;
+                    }
+                }
+
+                let before = sim.source_rand_state();
+                let hit = sim.source_ignite_plague(city);
+                let drawn = source_rand_draws(before, sim.source_rand_state());
+                assert_eq!(drawn, expected_draws, "seed {seed} occupied {occupied}");
+                assert!((2..=8).contains(&drawn), "seed {seed} drew {drawn}");
+                assert_eq!(hit, expected_hit, "seed {seed} occupied {occupied}");
+                budgets.insert(drawn);
+                assert_eq!(
+                    sim.source_afflictions.active_entries().len(),
+                    usize::from(hit),
+                );
+                if hit {
+                    let entry = sim.source_afflictions.entry_at(2, 5, 5).unwrap();
+                    assert_eq!(
+                        entry.kind,
+                        crate::data_bridge::SOURCE_AFFLICTION_KIND_PLAGUE,
+                    );
+                    // Both `FUN_0047b850` and the spread push a literal 0x14,
+                    // unlike the fire's 0x19 on ignition.
+                    assert_eq!(
+                        entry.duration_phases,
+                        crate::data_bridge::SOURCE_AFFLICTION_SPREAD_DURATION,
+                    );
+                    let city = sim.source_cities.record(0).unwrap();
+                    assert_eq!(city.active_afflictions, 1);
+                    assert!(city.growth_blocked());
+                    assert_eq!(
+                        sim.source_kind13_locations
+                            .location_at(2, 5, 5)
+                            .unwrap()
+                            .lifecycle_flags
+                            & 3,
+                        1,
+                    );
+                }
+            }
+        }
+        // The under-occupied arm pins the four-draw floor and the occupied
+        // arm reaches the even budgets; 1 is unreachable either way.
+        assert!(budgets.contains(&2));
+        assert!(budgets.contains(&4));
+        assert!(!budgets.contains(&1));
+        assert!(!budgets.contains(&3));
+    }
+
+    /// The `FUN_0047a020` type-1 spread and its expiry.
+    ///
+    /// The spread's own occupancy gate is read off the **infected** house,
+    /// the target must be un-afflicted and at least half full, and expiry
+    /// heals (`flags &= 0xfffc`) rather than posting the fire's deferred
+    /// demolition.
+    #[test]
+    fn source_plague_spreads_to_a_neighbour_and_then_heals_it() {
+        use crate::data_bridge::{
+            SOURCE_AFFLICTION_KIND_PLAGUE, SOURCE_AFFLICTION_PHASE_MS,
+            SOURCE_AFFLICTION_SPREAD_DURATION,
+        };
+
+        // An infected house too empty to pass the ramp never spreads, and
+        // spends exactly the one gate draw doing so.
+        let mut starved = plague_city([0, 0, 400, 0, 0], 2);
+        starved
+            .source_kind13_locations
+            .location_at_mut(2, 5, 5)
+            .unwrap()
+            .amount = 0;
+        assert!(starved.source_register_affliction(
+            2,
+            5,
+            5,
+            SOURCE_AFFLICTION_KIND_PLAGUE,
+            SOURCE_AFFLICTION_SPREAD_DURATION,
+        ));
+        starved.seed_source_rand(9);
+        let entry = starved.source_afflictions.entry_at(2, 5, 5).unwrap();
+        let before = starved.source_rand_state();
+        starved.source_spread_plague(entry);
+        assert_eq!(source_rand_draws(before, starved.source_rand_state()), 1);
+        assert_eq!(starved.source_afflictions.active_entries().len(), 1);
+
+        // A full one does, given enough phases.
+        let mut sim = plague_city([0, 0, 400, 0, 0], 4);
+        assert!(sim.source_register_affliction(
+            2,
+            5,
+            5,
+            SOURCE_AFFLICTION_KIND_PLAGUE,
+            SOURCE_AFFLICTION_SPREAD_DURATION,
+        ));
+        assert_eq!(sim.source_cities.record(0).unwrap().active_afflictions, 1);
+        assert!(sim.source_cities.record(0).unwrap().growth_blocked());
+        sim.seed_source_rand(4);
+
+        let mut spread = None;
+        for _ in 0..(u32::from(SOURCE_AFFLICTION_SPREAD_DURATION) - 1) {
+            sim.tick_source_afflictions(SOURCE_AFFLICTION_PHASE_MS);
+            for _ in 0..40 {
+                sim.tick_source_afflictions(1);
+            }
+            spread = sim
+                .source_afflictions
+                .active_entries()
+                .into_iter()
+                .find(|entry| (entry.tile_x, entry.tile_y) != (5, 5));
+            if spread.is_some() {
+                break;
+            }
+        }
+        let spread = spread.expect("the plague must reach a neighbouring residence");
+        assert_eq!(spread.kind, SOURCE_AFFLICTION_KIND_PLAGUE);
+        assert_eq!(spread.duration_phases, SOURCE_AFFLICTION_SPREAD_DURATION);
+        assert_eq!(
+            sim.source_kind13_locations
+                .location_at(2, spread.tile_x, spread.tile_y)
+                .unwrap()
+                .lifecycle_flags
+                & 3,
+            1,
+        );
+        assert!(sim.source_cities.record(0).unwrap().active_afflictions >= 2);
+        assert_eq!(
+            sim.source_kind13_locations.active_locations().len(),
+            4,
+            "spreading never removes a residence",
+        );
+        assert!(sim.source_deferred_map_demolitions.is_empty());
+
+        // Expiry, on a colony with nowhere left to spread so the timing is
+        // exact: after 20 phases the entry is freed, the house is healed,
+        // nothing is demolished and the city can grow again.
+        let mut lone = plague_city([0, 0, 400, 0, 0], 1);
+        assert!(lone.source_register_affliction(
+            2,
+            5,
+            5,
+            SOURCE_AFFLICTION_KIND_PLAGUE,
+            SOURCE_AFFLICTION_SPREAD_DURATION,
+        ));
+        lone.seed_source_rand(6);
+        for _ in 0..u32::from(SOURCE_AFFLICTION_SPREAD_DURATION) {
+            assert!(!lone.source_afflictions.active_entries().is_empty());
+            lone.tick_source_afflictions(SOURCE_AFFLICTION_PHASE_MS);
+            for _ in 0..40 {
+                lone.tick_source_afflictions(1);
+            }
+        }
+        assert!(lone.source_afflictions.active_entries().is_empty());
+        assert!(
+            lone.source_deferred_map_demolitions.is_empty(),
+            "a plague never posts a type-7 demolition",
+        );
+        assert!(lone.tile_clears.is_empty(), "and never converts a ruin");
+        let healed = lone
+            .source_kind13_locations
+            .location_at(2, 5, 5)
+            .expect("the house survives its plague");
+        assert_eq!(healed.lifecycle_flags & 3, 0);
+        let city = lone.source_cities.record(0).unwrap();
+        assert_eq!(city.active_afflictions, 0);
+        assert!(!city.growth_blocked());
+    }
+
+    /// `FUN_004724d0` reports residences only, and only ones in the work
+    /// struct's own settlement slot — while opening plain ground for travel,
+    /// which is what lets a plague cross a gap the fire could not.
+    #[test]
+    fn source_plague_area_scan_reports_only_same_city_residences() {
+        use crate::data_bridge::{
+            source_hazard_scan_kind_is_burnable, source_hazard_scan_kind_is_walkable,
+            SOURCE_PLAGUE_SCAN_RADIUS,
+        };
+
+        // The travel set and the fire's structural set are disjoint.
+        for kind in 0..=40u8 {
+            assert!(
+                !(source_hazard_scan_kind_is_walkable(kind)
+                    && source_hazard_scan_kind_is_burnable(kind)),
+                "kind {kind}",
+            );
+        }
+        // `STRASSE`, `BODEN`, `RUINE`, `PLATZ`, `BRUECKE`, `STRANDRUINE`,
+        // `PIER`.
+        for kind in [1u8, 0x0b, 0x0c, 0x0d, 0x12, 0x1d, 0x1e] {
+            assert!(source_hazard_scan_kind_is_walkable(kind), "kind {kind}");
+        }
+        // `GEBAEUDE` is not traversable in its own right; a residence is
+        // opened because it is a *candidate*.
+        assert!(!source_hazard_scan_kind_is_walkable(0x0e));
+
+        let mut sim = plague_city([0, 0, 400, 0, 0], 4);
+        // A residence belonging to a different settlement slot, well inside
+        // the radius, plus one of our own two tiles further out.
+        sim.source_static_map_roots
+            .push(hazard_house_root(2, 6, 5, 5));
+        let mut foreign = hazard_house(2, 6, 5, 5, 2);
+        foreign.amount = 0x3c0;
+        assert!(sim.source_kind13_locations.insert(foreign));
+
+        let reported =
+            sim.source_hazard_area_scan(2, 5, 5, SOURCE_PLAGUE_SCAN_RADIUS, SourceHazardScanMode::Plague);
+        assert!(!reported.is_empty());
+        assert!(
+            !reported.contains(&(6, 5)),
+            "a residence in another settlement slot is never a candidate",
+        );
+        assert!(
+            !reported.contains(&(5, 5)),
+            "the origin cell clears its own candidate bit before the flood",
+        );
+        // Plain `BODEN` is opened for travel but never reported.
+        assert!(!reported.contains(&(9, 9)));
+        // Every reported cell is one of this city's residences.
+        for &(x, y) in &reported {
+            let location = sim
+                .source_kind13_locations
+                .location_at(2, x, y)
+                .expect("a reported cell is a residence");
+            assert_eq!(location.source_owner, 3);
+        }
+        // The fire rasteriser over the same geometry reports a different set
+        // entirely: every structure, and nothing that is only ground.
+        let burnable =
+            sim.source_hazard_area_scan(2, 5, 5, SOURCE_PLAGUE_SCAN_RADIUS, SourceHazardScanMode::Fire);
+        assert!(burnable.contains(&(6, 5)), "the fire ignores settlement slots");
     }
 
     /// `FUN_00479ca0` hashes only three bits per axis, so its 32-slot probe

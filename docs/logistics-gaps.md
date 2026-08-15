@@ -445,6 +445,35 @@ from `:7662-7665`. Risk MEDIUM — it rejects placements the port currently
 accepts, so AI build routines, fixtures and recorded replays that build outside a
 claim will start failing; land it with the test updates.
 
+### The area gate, ported
+
+`FUN_0046b100` and `FUN_0046b120` are `Simulation::source_island_settlement_count`
+and `::source_island_settlement_count_for_player` (the `p == 7` sentinel
+included); the rule itself is `Simulation::source_placement_area_admits`, taking
+the slot `source_placement_settlement_slot` already resolves. `place_building`
+asks it right after that resolution and ahead of every mutation, reporting
+`PlaceOutcome::OutsideSettlement`; `found_kontor` asks it too, because founding
+*is* an ordinary `FUN_004084d0` build (§1) and this is what makes it one — the
+`:7662-7665` arm plus the settled-player arm are together the
+one-Kontor-per-player-per-island rule the port had nothing to enforce. The build
+cursor asks both halves of `local_5bc`, so an out-of-settlement tile never turns
+green; the SDL binary additionally raises a banner, marked in place as a
+deliberate quality-of-life divergence.
+
+The second arm's `foreign == 0` test is implied rather than ported:
+`source_placement_settlement_slot` collapses "unowned" and "someone else's" to 7
+exactly as `local_5c4` does, so a non-7 slot can only be the builder's own.
+`FUN_004084d0`'s `0x40`-retile paths (`:7618-7659`), which are the only place
+the source re-derives `local_5c4` mid-loop and the only way `local_59c != 0`
+reaches the second arm, are not modelled at all.
+
+Two fixtures were only valid because the gate was missing, and both said so:
+`game.rs::placement_allocates_a_source_dynamic_slot_for_hq` placed a second HQ
+inside its own claim, and `building_unlocks.rs`'s Rinderfarm test gave a player a
+settlement record owning not one tile of its island. The wilderness leg of
+`settlement_claim.rs::a_forester_placed_after_founding_harvests` is now a rival's,
+because the founder can no longer build outside their own claim there.
+
 ## 7. Order
 
 | item | risk | blast radius |
@@ -454,5 +483,5 @@ claim will start failing; land it with the test updates.
 | §4 `Randwachs` layer | LOW | arid maps only; data already present |
 | §5 store capacity | MEDIUM | all deposits; split (a)+(e) from (d), (b) blocked on the OPEN question |
 | §2 type-8 radius | MEDIUM | all workshop supply; primitives exist |
-| §6 buildable gate | MEDIUM | every placement; reuses the ported claim |
+| §6 buildable gate | MEDIUM | done |
 | §3 path grid | MEDIUM→HIGH | every path search; A unblocks §2, B is the end state |
