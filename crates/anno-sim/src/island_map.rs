@@ -12,7 +12,7 @@
 
 use anno_formats::cod::BuildingDef as CodBuilding;
 use anno_formats::szs::{source_runtime_island_classification, Island, IslandSourceResourceState};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::source_cell::{source_plantation_path_kind_always_walkable, SourceMapCellState};
 use crate::source_route::{
@@ -96,6 +96,45 @@ struct SourceMapKindCell {
     map_owner: u8,
     ware_slot: u8,
     map_direction: u8,
+    /// Compiled `Wegspeed` classes for the two movement types the transfer
+    /// window rasters select out of `def[0x58 + speedtyp]`: index 0 is the
+    /// TRAEGER's `Speedtyp: 0` (`FUN_004704d0`, `1602_exe.c:79479`) and index
+    /// 1 is the KARREN's `Speedtyp: 2` (`FUN_004706e0`, `:79587`).
+    ///
+    /// The class belongs to the *definition the live map word names*, which is
+    /// why it lives beside the outer kind rather than in a grid of its own —
+    /// the original has no Wegspeed grid, it re-reads the definition on every
+    /// raster.
+    transfer_path_classes: [u8; 2],
+    /// Compiled `Radius` at definition offset `+0x20`, the byte `FUN_0044ab60`
+    /// copies into the figure-8 event record and `FUN_00459150` sizes its
+    /// scratch window from (`1602_exe.c:61664-61671`). Reached through the
+    /// live map word for the same reason the path classes are.
+    transfer_radius: u8,
+}
+
+/// The scratch grid `FUN_00459150` allocates for one transfer search
+/// (`1602_exe.c:61664-61671`). `extra_x`/`extra_y` are the source's
+/// `(size - 1) & 1` parity bits, kept because
+/// [`SourcePathGrid::block_outside_source_radius_window`] needs them to carve
+/// the same `FUN_00404d70` disc out of the rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceTransferWindow {
+    pub origin: (i32, i32),
+    pub width: usize,
+    pub height: usize,
+    pub radius: usize,
+    pub extra_x: usize,
+    pub extra_y: usize,
+}
+
+/// Every per-cell view of the one live map word `FUN_004631b0` writes, kept
+/// together so a runtime command and its removal move all of them at once.
+#[derive(Debug, Clone, Copy)]
+struct SourceLiveMapCell {
+    kind: Option<SourceMapKindCell>,
+    target_size: Option<(u16, u16)>,
+    target_root: Option<(i32, i32)>,
 }
 
 /// One six-word candidate record produced by `FUN_00415af0` for the source
@@ -149,19 +188,28 @@ pub struct IslandMap {
     /// they're available — RE: haeuser.cod `Wegspeed: 145, 120,
     /// 170, 100` (plain ground vs road quad).
     road: Vec<bool>,
-    /// Static source path overlay for KARREN `Speedtyp: 2`. Runtime cart
-    /// searches clone this and mark same-owner producer roots as callback
-    /// cells before running the source weighted wave.
-    city_cart_path_template: SourcePathGrid,
-    /// Static source path overlay for TRAEGER's inherited `Speedtyp: 0`.
-    /// Runtime type-8 dispatch clones this before applying its owner-specific
-    /// supplier markers.
-    carrier_path_template: SourcePathGrid,
     /// Live-map kind, owner, and type-3 path class replayed from the
     /// scenario's oriented INSELHAUS commands. `FUN_0044b140` samples an
     /// 11 x 11 window from this state for its kind-12 civilian route.
     civilian_path_cells: Vec<Option<SourceCivilianPathCell>>,
+    /// The live map layer `island+0xAF8`: one outer kind, settlement slot and
+    /// `Wegspeed` class per cell, last INSELHAUS command wins. Placement
+    /// rewrites it through [`IslandMap::apply_source_map_footprint`] and
+    /// demolition restores it through
+    /// [`IslandMap::clear_source_map_footprint`], because in the original this
+    /// layer is the *only* thing a path search reads.
     source_map_kind_cells: Vec<Option<SourceMapKindCell>>,
+    /// What each cell held before the runtime write that currently covers it.
+    ///
+    /// `FUN_004641d0` restores a cleared cell from the backing layer
+    /// `island+0xAFC`; the port keeps the full backing layer in
+    /// `Simulation::source_static_map_backing_cells`, but that layer only
+    /// carries the records `FUN_00480b70` admitted (plain terrain and ore, not
+    /// forest, crops or pasture), so it cannot restore a cell a player built
+    /// on a wood. This records the displaced cell itself, which is exact for
+    /// every footprint the port writes at runtime and costs one entry per
+    /// occupied cell rather than a second full grid.
+    source_map_kind_displaced: HashMap<(u16, u16), SourceLiveMapCell>,
     /// Raw type-2 `Wegspeed` values used by KARREN movement.
     city_cart_movement_speeds: Vec<u16>,
     /// Raw type-0 `Wegspeed` values used by TRAEGER movement.
@@ -467,6 +515,11 @@ impl IslandMap {
                             map_owner: tile.source_owner(),
                             ware_slot: def.source_ware_slot().unwrap_or(0),
                             map_direction: tile.orientation & 3,
+                            transfer_path_classes: def
+                                .source_path_classes()
+                                .map(|classes| [classes[0], classes[2]])
+                                .unwrap_or([0; 2]),
+                            transfer_radius: def.source_transfer_radius,
                         });
                         walkable[idx] = is_walkable;
                         road[idx] = is_road;
@@ -513,17 +566,6 @@ impl IslandMap {
             }
         }
 
-        let mut city_cart_path_template =
-            SourcePathGrid::new((0, 0), usize::from(width), usize::from(height));
-        city_cart_path_template
-            .populate_static_island_cells(island, cod_buildings, 2, |_, _| false)
-            .expect("KARREN Speedtyp is within the four Wegspeed classes");
-        let mut carrier_path_template =
-            SourcePathGrid::new((0, 0), usize::from(width), usize::from(height));
-        carrier_path_template
-            .populate_static_island_cells(island, cod_buildings, 0, |_, _| false)
-            .expect("TRAEGER Speedtyp is within the four Wegspeed classes");
-
         Self {
             island_id: island.number,
             source_world_origin,
@@ -532,10 +574,9 @@ impl IslandMap {
             walkable,
             source_runtime_occupied,
             road,
-            city_cart_path_template,
-            carrier_path_template,
             civilian_path_cells,
             source_map_kind_cells,
+            source_map_kind_displaced: HashMap::new(),
             city_cart_movement_speeds,
             carrier_movement_speeds,
             cavalry_movement_speeds,
@@ -1354,16 +1395,84 @@ impl IslandMap {
         self.road[y as usize * self.width as usize + x as usize]
     }
 
-    /// Clone the static type-2 source-grid overlay for a type-11 city-cart
-    /// search. The caller supplies its live owner-specific root markers.
-    pub fn city_cart_path_grid(&self) -> SourcePathGrid {
-        self.city_cart_path_template.clone()
+    /// The whole-island window, for a search with no `Radius` to clip it.
+    ///
+    /// The original never allocates one: `FUN_00459150` sizes its scratch grid
+    /// from the requesting root's compiled `Radius`, and a root that compiled
+    /// zero would get a degenerate `1 x 1` window that reaches nothing. The
+    /// port's synthetic maps and hand-built fixtures leave that byte at zero,
+    /// so they ask for this instead.
+    pub fn source_island_path_window(&self) -> ((i32, i32), usize, usize) {
+        ((0, 0), usize::from(self.width), usize::from(self.height))
     }
 
-    /// Clone the static type-0 source-grid overlay for a type-8 TRAEGER
-    /// search. The caller supplies the live owner-specific supplier markers.
-    pub fn carrier_path_grid(&self) -> SourcePathGrid {
-        self.carrier_path_template.clone()
+    /// Rasterise the type-11 city-cart window, `FUN_004706e0`
+    /// (`1602_exe.c:79500`). The caller supplies its live owner-specific root
+    /// markers.
+    pub fn city_cart_path_grid(
+        &self,
+        window_origin: (i32, i32),
+        width: usize,
+        height: usize,
+    ) -> SourcePathGrid {
+        self.source_transfer_window_grid(window_origin, width, height, 1)
+    }
+
+    /// Rasterise the type-8 TRAEGER window, `FUN_004704d0`
+    /// (`1602_exe.c:79393`). The caller supplies the live owner-specific
+    /// supplier markers.
+    pub fn carrier_path_grid(
+        &self,
+        window_origin: (i32, i32),
+        width: usize,
+        height: usize,
+    ) -> SourcePathGrid {
+        self.source_transfer_window_grid(window_origin, width, height, 0)
+    }
+
+    /// The shared body of `FUN_004704d0` and `FUN_004706e0`.
+    ///
+    /// Both allocate a `win_w x win_h` scratch grid, stamp the impassable
+    /// direction marker `0x0c` over every cell of it (`1602_exe.c:79439-79446`,
+    /// `:79549-79556`), and then fill only the clipped island intersection from
+    /// the **live** map layer. There is no cache and no dirty flag: the layer
+    /// is re-read on every search, which is why a road the player lays is
+    /// immediately cheaper and a building the player raises immediately blocks.
+    ///
+    /// `movement_class` indexes [`SourceMapKindCell::transfer_path_classes`];
+    /// the two rasters are otherwise the same routine, and the goal bit each
+    /// stamps is left to the caller because the port's supplier filter needs
+    /// the live root record rather than the map word.
+    ///
+    /// The `def[0x1c] ∈ 1..=8` (respectively `1..=6`) goal arm is what admits a
+    /// supplier standing on ground of a kind neither raster opens; the callers
+    /// reproduce it with [`SourcePathGrid::set_target_region_metadata`], which
+    /// clears the direction marker exactly as the source's per-cell `bVar10`
+    /// path does.
+    ///
+    /// Deliberately **not** narrowed here: `FUN_004706e0` opens only
+    /// [`source_city_cart_wave_opens_ground_kind`], so a real Karren needs a
+    /// road. Making the port's carts road-only is `docs/logistics-gaps.md`
+    /// §2b's open item, not this one — it changes which suppliers exist rather
+    /// than when the map is read — so both classes keep the wide set until that
+    /// lands.
+    fn source_transfer_window_grid(
+        &self,
+        window_origin: (i32, i32),
+        width: usize,
+        height: usize,
+        movement_class: usize,
+    ) -> SourcePathGrid {
+        let mut grid = SourcePathGrid::new(window_origin, width, height);
+        grid.rasterize_window(|position| {
+            let cell = self.source_map_kind_cell(position)?;
+            // `1602_exe.c:79456-79482`: the fixed open kinds, plus outer kind 3
+            // at the footprint's centre gfx.
+            (source_transfer_wave_opens_ground_kind(cell.kind_code)
+                || (cell.kind_code == 3 && cell.kind3_center_cell))
+                .then(|| cell.transfer_path_classes[movement_class] & 0x7f)
+        });
+        grid
     }
 
     /// Rebuild the local type-12 plantation-worker grid made by
@@ -2025,6 +2134,138 @@ impl IslandMap {
         }
     }
 
+    /// Write one live map command into the layer every path raster reads.
+    ///
+    /// `FUN_004631b0` stamps the placed definition's index, orientation and
+    /// settlement slot into `island+0xAF8` over the command's oriented
+    /// footprint, and that word is all `FUN_004704d0` / `FUN_004706e0` ever
+    /// consult. Until this existed the port's transfer rasters were built once
+    /// at load and frozen, so a road laid at runtime carried no `Wegspeed`
+    /// benefit and a building raised at runtime blocked nothing.
+    ///
+    /// The displaced cells are retained so [`Self::clear_source_map_footprint`]
+    /// can put them back.
+    pub fn apply_source_map_footprint(&mut self, root: &SourceMapCellState) {
+        let width = i32::from(root.footprint_width.max(1));
+        let height = i32::from(root.footprint_height.max(1));
+        // The unrotated compiled extents, which is what the centre-gfx index
+        // is counted in — `FUN_00463b10` walks the definition's own cell
+        // order and the command orientation only chooses the walk.
+        let definition_width = i32::from(root.source_definition_width.max(1));
+        let definition_height = i32::from(root.source_definition_height.max(1));
+        let center_index = definition_width * definition_height / 2;
+        let transfer_path_classes = [root.source_path_class, root.source_path_class_city_cart];
+        for dy in 0..height {
+            for dx in 0..width {
+                let position = (i32::from(root.x) + dx, i32::from(root.y) + dy);
+                let Some(index) = self.local_index(position) else {
+                    continue;
+                };
+                let source_cell_index = match root.source_orientation & 3 {
+                    0 => dy * definition_width + dx,
+                    1 => (definition_height - 1 - dx) * definition_width + dy,
+                    2 => (definition_height - 1 - dy) * definition_width
+                        + (definition_width - 1 - dx),
+                    _ => dx * definition_width + (definition_width - 1 - dy),
+                };
+                self.source_map_kind_displaced
+                    .entry((position.0 as u16, position.1 as u16))
+                    .or_insert(SourceLiveMapCell {
+                        kind: self.source_map_kind_cells[index],
+                        target_size: self.source_land_target_sizes[index],
+                        target_root: self.source_land_target_roots[index],
+                    });
+                self.source_map_kind_cells[index] = Some(SourceMapKindCell {
+                    kind_code: root.kind_code,
+                    kind3_center_cell: root.kind_code == 3 && source_cell_index == center_index,
+                    map_owner: root.source_map_owner_slot & 7,
+                    ware_slot: root.source_output_ware_slot,
+                    map_direction: root.source_orientation & 3,
+                    transfer_path_classes,
+                    transfer_radius: root.source_transfer_radius,
+                });
+                // `FUN_00463880` and `FUN_00463250` read the same live map
+                // word, so the oriented extents and the footprint root move
+                // with it — `FUN_004710b0` resolves an object through exactly
+                // this pair before opening its whole footprint.
+                self.source_land_target_sizes[index] = u16::try_from(width * 2)
+                    .ok()
+                    .zip(u16::try_from(height * 2).ok());
+                self.source_land_target_roots[index] =
+                    Some((i32::from(root.x), i32::from(root.y)));
+            }
+        }
+    }
+
+    /// The scratch window `FUN_00459150` allocates for a transfer search
+    /// rooted at `root` (`1602_exe.c:61664-61671`), taken from the live map
+    /// layer the way `FUN_0044ab60` takes it from the root's own definition.
+    ///
+    /// `None` when the root compiled `Radius: 0`, which the source would give
+    /// a degenerate `1 x 1` window and the port answers with its unclipped
+    /// island search instead.
+    pub fn source_transfer_window_at(&self, root: (i32, i32)) -> Option<SourceTransferWindow> {
+        let radius = usize::from(self.source_map_kind_cell(root)?.transfer_radius);
+        if radius == 0 {
+            return None;
+        }
+        let footprint = self.source_object_footprint_at(root)?;
+        let extra_x = (footprint.width.max(1) - 1) & 1;
+        let extra_y = (footprint.height.max(1) - 1) & 1;
+        Some(SourceTransferWindow {
+            origin: (
+                root.0 - i32::try_from(radius).ok()?,
+                root.1 - i32::try_from(radius).ok()?,
+            ),
+            width: extra_x + 1 + radius * 2,
+            height: extra_y + 1 + radius * 2,
+            radius,
+            extra_x,
+            extra_y,
+        })
+    }
+
+    /// `FUN_00463980`'s object resolution, as `FUN_004710b0`
+    /// (`1602_exe.c:80003-80017`) uses it: the oriented footprint of whatever
+    /// live map command covers `position`.
+    ///
+    /// Returning the single cell for a coordinate no command covers matches the
+    /// source's fallback — `FUN_004710b0` writes over the resolved extents, and
+    /// an unresolved cell has extents `1 x 1`.
+    pub fn source_object_footprint_at(&self, position: (i32, i32)) -> Option<SourcePathTargetRect> {
+        let index = self.local_index(position)?;
+        let root = self.source_land_target_roots[index].unwrap_or(position);
+        let (width, height) = self.source_land_target_sizes[index]
+            .map(|(width, height)| (usize::from(width / 2).max(1), usize::from(height / 2).max(1)))
+            .unwrap_or((1, 1));
+        SourcePathTargetRect::new(root, width, height)
+    }
+
+    /// Undo one [`Self::apply_source_map_footprint`], restoring what each cell
+    /// held before it.
+    ///
+    /// `FUN_004641d0` handles a `Ruinenr = 0xff` command by rewriting the live
+    /// cell from the backing layer `island+0xAFC` rather than by clearing it,
+    /// which is what keeps the ground under a demolished building walkable.
+    pub fn clear_source_map_footprint(&mut self, x: u16, y: u16, width: u8, height: u8) {
+        for dy in 0..i32::from(height.max(1)) {
+            for dx in 0..i32::from(width.max(1)) {
+                let position = (i32::from(x) + dx, i32::from(y) + dy);
+                let Some(index) = self.local_index(position) else {
+                    continue;
+                };
+                if let Some(displaced) = self
+                    .source_map_kind_displaced
+                    .remove(&(position.0 as u16, position.1 as u16))
+                {
+                    self.source_map_kind_cells[index] = displaced.kind;
+                    self.source_land_target_sizes[index] = displaced.target_size;
+                    self.source_land_target_roots[index] = displaced.target_root;
+                }
+            }
+        }
+    }
+
     /// Mark a tile as walkable (e.g., for warehouse placement after map creation).
     pub fn set_walkable(&mut self, x: u16, y: u16, val: bool) {
         if x < self.width && y < self.height {
@@ -2237,16 +2478,6 @@ impl IslandMap {
             walkable: vec![true; size],
             source_runtime_occupied: vec![false; size],
             road: vec![false; size],
-            city_cart_path_template: SourcePathGrid::new(
-                (0, 0),
-                usize::from(width),
-                usize::from(height),
-            ),
-            carrier_path_template: SourcePathGrid::new(
-                (0, 0),
-                usize::from(width),
-                usize::from(height),
-            ),
             civilian_path_cells: vec![
                 Some(SourceCivilianPathCell {
                     kind_code: 11,
@@ -2266,9 +2497,16 @@ impl IslandMap {
                     map_owner: 0,
                     ware_slot: 0,
                     map_direction: 0,
+                    // A synthetic island has no compiled `Wegspeed`, so its
+                    // cells take class 0. `FUN_0046f8a0` gives every class
+                    // below 32 the same `(0x40, 0x5b)` step costs as class 32,
+                    // which is what the shipped road records compile to.
+                    transfer_path_classes: [0; 2],
+                    transfer_radius: 0,
                 });
                 size
             ],
+            source_map_kind_displaced: HashMap::new(),
             city_cart_movement_speeds: vec![100; size],
             carrier_movement_speeds: vec![100; size],
             cavalry_movement_speeds: vec![100; size],
@@ -2440,6 +2678,8 @@ mod tests {
                 map_owner: 3,
                 ware_slot: 0,
                 map_direction,
+                transfer_path_classes: [0; 2],
+                transfer_radius: 0,
             })
         };
         // Sea everywhere, with the pier's own beach tile under the root.
@@ -2548,6 +2788,8 @@ mod tests {
                 map_owner: 7,
                 ware_slot: 0,
                 map_direction: 0,
+                transfer_path_classes: [0; 2],
+                transfer_radius: 0,
             })
         };
         // Open sea over the whole grid, then a plain-ground island with a
@@ -3136,6 +3378,8 @@ mod tests {
                 map_owner: 0,
                 ware_slot: 0,
                 map_direction: 0,
+                transfer_path_classes: [0; 2],
+                transfer_radius: 0,
             })
         };
         let index = |x: usize, y: usize| y * 6 + x;
@@ -3183,6 +3427,8 @@ mod tests {
                 map_owner: 2,
                 ware_slot: 0,
                 map_direction: 0,
+                transfer_path_classes: [0; 2],
+                transfer_radius: 0,
             }),
             Some(SourceMapKindCell {
                 kind_code: 25,
@@ -3190,6 +3436,8 @@ mod tests {
                 map_owner: 2,
                 ware_slot: 0,
                 map_direction: 0,
+                transfer_path_classes: [0; 2],
+                transfer_radius: 0,
             }),
             Some(SourceMapKindCell {
                 kind_code: 11,
@@ -3197,6 +3445,8 @@ mod tests {
                 map_owner: 1,
                 ware_slot: 0,
                 map_direction: 0,
+                transfer_path_classes: [0; 2],
+                transfer_radius: 0,
             }),
         ];
 
@@ -3215,6 +3465,8 @@ mod tests {
                     map_owner: 7,
                     ware_slot: 0,
                     map_direction: 0,
+                    transfer_path_classes: [0; 2],
+                    transfer_radius: 0,
                 });
             }
         }
@@ -3241,6 +3493,8 @@ mod tests {
                 map_owner,
                 ware_slot,
                 map_direction,
+                transfer_path_classes: [0; 2],
+                transfer_radius: 0,
             })
         };
         let index = |x: usize, y: usize| y * 16 + x;
@@ -3286,6 +3540,8 @@ mod tests {
                 map_owner: 0,
                 ware_slot: 0,
                 map_direction: 0,
+                transfer_path_classes: [0; 2],
+                transfer_radius: 0,
             })
         };
 
@@ -3315,6 +3571,8 @@ mod tests {
                 map_owner: 3,
                 ware_slot: 0,
                 map_direction: direction,
+                transfer_path_classes: [0; 2],
+                transfer_radius: 0,
             })
         };
 
@@ -3366,6 +3624,8 @@ mod tests {
                 map_owner,
                 ware_slot: 0,
                 map_direction: 0,
+                transfer_path_classes: [0; 2],
+                transfer_radius: 0,
             })
         };
         let index = |x: usize, y: usize| y * 16 + x;
@@ -3431,8 +3691,16 @@ mod tests {
 
         let map = IslandMap::from_island(&island, &[ground]);
 
-        assert_eq!(map.carrier_path_grid().metadata((0, 0)), Some(32));
-        assert_eq!(map.city_cart_path_grid().metadata((0, 0)), Some(48));
+        let (window, width, height) = map.source_island_path_window();
+        assert_eq!(
+            map.carrier_path_grid(window, width, height).metadata((0, 0)),
+            Some(32)
+        );
+        assert_eq!(
+            map.city_cart_path_grid(window, width, height)
+                .metadata((0, 0)),
+            Some(48)
+        );
         assert_eq!(map.carrier_movement_speed((0, 0)), Some(100));
         assert_eq!(map.city_cart_movement_speed((0, 0)), Some(150));
         assert!((map.source_terrain_height((0, 0)).unwrap() - 0.28).abs() < f32::EPSILON);

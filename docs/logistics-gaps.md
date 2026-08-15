@@ -185,12 +185,15 @@ class to `0x28`, which moves the first frontier ring one fixed-cost band later
 and merges the diagonal and cardinal neighbours into one band — four wave-order
 unit tests were re-baselined for it.
 
-**Still open (tracked here, not implemented):** the port builds
-`city_cart_path_template` from the same `source_fixed_path_kind` set as the
-carrier template, so its Karren walks over `BODEN`. Making it road-only is
-blocked on §3 — the templates are built once at load, so a road the player lays
-never enters them, and a road-only cart could then never reach anything a
-player built.
+**Still open (tracked here, not implemented):** the port rasterises the type-11
+window from the same wide `source_transfer_wave_opens_ground_kind` set as the
+carrier's, so its Karren walks over `BODEN`. §3 was the stated blocker and is
+now gone — the window is rebuilt from the live layer on every search, so a road
+the player lays does enter it — which leaves this a one-line change to
+`source_transfer_window_grid`'s predicate plus the economy re-baselining a
+road-only cart forces. It was deliberately left out of the §3 commit: that
+commit changes *when* the map is read, this one changes *which suppliers exist*,
+and landing them together would make the test movement impossible to attribute.
 
 ## 3. Carrier path templates — the framing was wrong
 
@@ -207,29 +210,68 @@ direction, low nibble cost, and read back at `:61619-61621`. The per-cell
 Because the window is at most ~33×33, "rebuild every search" is *cheaper* than
 the port's "clone the whole island grid every search".
 
-**In the port**, `IslandMap::from_island` builds eight-odd grids once per island
-at load. Only `walkable` is maintained (`set_walkable`), and no source path
-search reads it — the searches read `carrier_path_template` /
-`city_cart_path_template`, which never move. So player roads give no speed
-benefit and player buildings never block carrier routes, exactly as claimed.
+**In the port** (was), `IslandMap::from_island` built eight-odd grids once per
+island at load. Only `walkable` was maintained (`set_walkable`), and no source
+path search read it — the searches read `carrier_path_template` /
+`city_cart_path_template`, which never moved. So player roads gave no speed
+benefit and player buildings never blocked carrier routes, exactly as claimed.
 
-**Fix, option A (mechanical).** Add `apply_source_footprint` /
-`clear_source_footprint` on `IslandMap` writing exactly what the `from_island`
-loop writes, and call them from `place_building`, `found_kontor` and
-`demolish_building`. Removal must restore the *backing* definition (§4.2), which
-is what `FUN_004641d0` does for a `Ruinenr = 0xff` command. Risk MEDIUM.
+**Option B is what landed.** Both templates are gone.
+`IslandMap::source_map_kind_cells` is now the live layer `island+0xAF8` and
+carries the two `Wegspeed` classes and the `Radius` the rasters read off the
+definition the map word names; `SourcePathGrid::rasterize_window` is the shared
+body of `FUN_004704d0` / `FUN_004706e0`, and `IslandMap::carrier_path_grid` /
+`city_cart_path_grid` build one window per search out of it. `FUN_004631b0`'s
+write into that layer is `IslandMap::apply_source_map_footprint`, called from
+`Simulation::replace_source_static_map_footprint`;
+`clear_source_map_footprint`, called from `remove_source_map_footprint`, is
+`FUN_004641d0`'s restore and puts the displaced cell back. The per-search cost
+is now O(radius²) and §2's rectangular clip is the grid's own extent.
 
-**Fix, option B (faithful).** Delete both templates; give `SourcePathGrid` a
-constructor that rasterises a window directly from `source_map_kind_cells` +
-`civilian_path_cells` (the port's stand-in for `island+0xAF8`), and build per
-search. Drops ~6 grids, takes the per-search cost from O(island) to O(radius²),
-and folds §2's clip in for free. Risk HIGH — multi-day refactor.
+Two consequences follow that the templates hid, and both are now pinned by
+tests in `carrier.rs`: a road laid at runtime moves a carrier route onto it, and
+a building raised at runtime blocks one. A third falls out for free — a
+*scenario-authored* building blocks too, which it never did:
+`populate_static_island_cells` walks the command list and skips a definition
+whose kind is not fixed-path, leaving the earlier ground command's open cell
+underneath it, while the live layer is last-writer-wins.
 
-Either way the four `*_movement_speeds` grids should go: nothing in the source
-reads a speed grid, and `advance_source_carrier` should take its step cost from
-the route metadata.
+Option A (`apply`/`clear` mirroring the `from_island` loop, called from
+`place_building` / `found_kontor` / `demolish_building`) was rejected for that
+last reason: written literally it reproduces the skip, so a player's building
+still would not block. Correcting it means writing the live-layer semantics
+anyway, at which point the templates are pure duplication.
 
-Recommend A first to unblock §2 testing, B as the end state.
+**Not done, still open:** the four `*_movement_speeds` grids should go —
+nothing in the source reads a speed grid, and `advance_source_carrier` should
+take its step cost from the route metadata (`:61619-61621`) instead of a
+`carrier_movement_speed(position)` lookup. That is a change to the movement call
+sites in `simulation.rs`, not to the rasters. `populate_static_island_cells`
+(the `FUN_0046f230` port) also has no live caller left; it survives on its own
+tests.
+
+### The return leg is the same routine, not a separate one
+
+`FUN_00459150` is called on **every** step of a transfer figure's movement
+(`:61605`), and it has two arms selected by whether the event record already
+holds a destination at `+0x0c/+0x0e`:
+
+* `-1` — the outbound search: raster, `FUN_004710b0` on the figure's own tile,
+  `FUN_00471280` carve, then `FUN_00471380` to *find* a supplier, whose result
+  is stored back into `+0x0c/+0x0e`;
+* otherwise — the return (or continuing) leg (`:61688-61700`): the same raster
+  and the same carve, but `FUN_004710b0` runs **twice**, on the figure's tile
+  *and* on the stored destination, and `FUN_00471380` is passed `0, 0` for its
+  ware and amount so it only re-traces.
+
+So the window never changes across a leg: it is always
+`extra + 1 + radius * 2` centred on the event's root, with that root's compiled
+`Radius`. `source_carrier_return_path` now reproduces this —
+`IslandMap::source_transfer_window_at` reads the radius back out of the live
+layer, and both endpoints get `open_source_object_footprint`. The second
+`FUN_004710b0` is load-bearing once buildings block: a Kontor's anchor cell is
+otherwise walled in by the rest of its own 2x3 footprint, and every returning
+cart floods its whole window before failing.
 
 ## 4. `Randwachs` is read from the wrong layer
 
@@ -484,4 +526,5 @@ because the founder can no longer build outside their own claim there.
 | §5 store capacity | MEDIUM | all deposits; split (a)+(e) from (d), (b) blocked on the OPEN question |
 | §2 type-8 radius | MEDIUM | all workshop supply; primitives exist |
 | §6 buildable gate | MEDIUM | done |
-| §3 path grid | MEDIUM→HIGH | every path search; A unblocks §2, B is the end state |
+| §3 path grid | MEDIUM→HIGH | done, option B — templates deleted, windows rasterised per search from the live layer |
+| §2b road-only Karren | MEDIUM | the last §2b item; unblocked by §3 |

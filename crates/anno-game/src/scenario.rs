@@ -327,6 +327,11 @@ pub fn init_simulation(
     sim.warehouses = warehouses;
     sim.island_maps = island_maps;
     sim.configure_source_controller_active_cities();
+    // `city+0x1fa` is built up by the loader's own `FUN_00481fc0` calls, one
+    // per INSELHAUS record it installs; the port derives the same count from
+    // the finished cell table. Without it an authored city with five markets
+    // would store as if it had one.
+    sim.refresh_source_city_storage_roots();
     sim.mark_loaded_source_islands_visible();
     // Initial `FUN_00482120` coverage scan: derive each residence's
     // infrastructure lifecycle bits, market state bit, and distance-class

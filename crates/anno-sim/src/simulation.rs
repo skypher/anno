@@ -4031,10 +4031,25 @@ impl Simulation {
         };
         self.source_map_cell_states.retain(|state| !inside(state));
         self.source_static_map_roots.retain(|state| !inside(state));
+        // The live map layer `island+0xAF8` is the only thing a transfer wave
+        // reads (`docs/logistics-gaps.md` §3), so an erased command has to
+        // leave it as `FUN_004641d0` does — restored from what it displaced,
+        // not merely cleared.
+        if let Some(map) = self
+            .island_maps
+            .iter_mut()
+            .find(|map| map.island_id == island)
+        {
+            map.clear_source_map_footprint(x, y, width, height);
+        }
         if self.source_map_cell_states.len() != selector_count
             || self.source_static_map_roots.len() != static_count
         {
             self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
+            // Releasing a live record is where `FUN_004820b0` decrements
+            // `city+0x1fa` (`1602_exe.c:93216-93222`), so a demolished MARKT
+            // takes its 10 t of city storage with it.
+            self.refresh_source_city_storage_roots();
         }
     }
 
@@ -4071,6 +4086,17 @@ impl Simulation {
                 self.source_static_map_roots.push(cell);
                 wrote_cell = true;
             }
+        }
+        // `FUN_004631b0` writes the same command into the live map layer, and
+        // that layer is what `FUN_004704d0` / `FUN_004706e0` rasterise on every
+        // transfer search. Without this the port's carrier network stayed
+        // frozen at scenario load (`docs/logistics-gaps.md` §3).
+        if let Some(map) = self
+            .island_maps
+            .iter_mut()
+            .find(|map| map.island_id == root.island)
+        {
+            map.apply_source_map_footprint(&root);
         }
         if wrote_cell {
             self.source_map_cell_revision = self.source_map_cell_revision.wrapping_add(1);
@@ -6097,13 +6123,22 @@ impl Simulation {
         }) else {
             return;
         };
-        // `FUN_0047b160` commits in this order. The three gated materials
-        // are known to be available; cannon withdrawal deliberately takes
-        // the source minimum and never blocks the completed promotion.
-        warehouse.withdraw_city_good_fixed(Good::Tools, definition.tools_cost_fixed);
-        warehouse.withdraw_city_good_fixed(Good::Bricks, definition.bricks_cost_fixed);
-        warehouse.withdraw_city_good_fixed(Good::Wood, definition.wood_cost_fixed);
-        warehouse.withdraw_city_good_fixed(Good::Cannons, definition.cannons_cost_fixed);
+        // `FUN_0047b160` commits in this order, and each of its four steps is
+        // `FUN_0047a9b0(city, ware, FUN_0047aa30(city, ware, cost))`
+        // (`1602_exe.c:87938-87947`) — so each debit passes the `0x20` floor:
+        // a slot holding less than a whole good hands out nothing at all. The
+        // three gated materials are known to be available; cannon withdrawal
+        // deliberately takes the source minimum and never blocks the
+        // completed promotion.
+        for (good, cost_fixed) in [
+            (Good::Tools, definition.tools_cost_fixed),
+            (Good::Bricks, definition.bricks_cost_fixed),
+            (Good::Wood, definition.wood_cost_fixed),
+            (Good::Cannons, definition.cannons_cost_fixed),
+        ] {
+            let available = warehouse.city_available_stock_fixed(good, cost_fixed);
+            warehouse.withdraw_city_good_fixed(good, available);
+        }
         if let Some(player) = self.players.get_mut(usize::from(city_owner)) {
             player.gold = player.gold.wrapping_sub(definition.money_cost as i32);
         }
@@ -7445,9 +7480,67 @@ impl Simulation {
             .filter(|state| {
                 state.island == island_id
                     && state.source_map_owner_slot == map_owner_slot
-                    && matches!(state.source_production_kind_code, 7 | 8)
+                    && Self::source_is_city_storage_root(state)
             })
             .count()
+    }
+
+    /// The whole `+0x1fa` predicate shared by `FUN_00481fc0` (`:93194-93196`)
+    /// and `FUN_004820b0` (`:93216-93222`):
+    /// `(def[0x1c] == 7 || def[0x1c] == 8) && (def[0x6a] & 0x80) == 0`.
+    ///
+    /// Bit 7 of `def+0x6a` is `Destroyflg` (`docs/hazard-block.md` §3), and
+    /// haeuser.cod authors it on exactly one MARKT — `Zerstörter Marktplatz`,
+    /// Nr 468 — and on the four destroyed KONTOR variants, Nr 274..=277. A
+    /// burnt-out market therefore keeps standing and keeps its live record,
+    /// but stops contributing its 10 t to the city store.
+    fn source_is_city_storage_root(state: &SourceMapCellState) -> bool {
+        matches!(state.source_production_kind_code, 7 | 8) && !state.source_destroy_flag
+    }
+
+    /// Republish `city+0x1fa` onto every warehouse. The source keeps that
+    /// count incrementally on the city record; the port recomputes it from
+    /// the live cell table whenever a root is installed or released, which
+    /// reaches the same value without threading the city pointer through
+    /// every placement path.
+    pub fn refresh_source_city_storage_roots(&mut self) {
+        for index in 0..self.warehouses.len() {
+            let island_id = self.warehouses[index].island_id;
+            let owner = self.warehouses[index].owner;
+            let roots = self
+                .source_map_cell_states
+                .iter()
+                .filter(|state| {
+                    state.island == island_id
+                        && Self::source_is_city_storage_root(state)
+                        && Self::source_city_player_owner_in(
+                            &self.source_cities,
+                            island_id,
+                            state.source_map_owner_slot,
+                        ) == Some(owner)
+                })
+                .count();
+            self.warehouses[index].set_city_transfer_root_count(roots);
+        }
+    }
+
+    /// `FUN_00481450` case 8 runs `FUN_00481ee0` (`1602_exe.c:93084`) on every
+    /// accepted KONTOR tile, and its first statement is
+    /// `city[0x20] = def[0x30]` — the placed definition's compiled
+    /// `Maxlager`. Building the `KONTOR_2` (75) or `KONTOR_3` (100) over an
+    /// existing Kontor is what raises a city's base storage in the original;
+    /// nothing else writes that field.
+    pub fn apply_source_kontor_storage_base(
+        &mut self,
+        island_id: u8,
+        owner: u8,
+        maxlager_fixed: u16,
+    ) {
+        for warehouse in &mut self.warehouses {
+            if warehouse.active && warehouse.island_id == island_id && warehouse.owner == owner {
+                warehouse.set_source_storage_base_fixed(maxlager_fixed);
+            }
+        }
     }
 
     /// `FUN_004596b0` identifies a city by the root's map-owner byte, then
@@ -11615,6 +11708,7 @@ mod tests {
             source_plantation_worker_definition: 0,
             source_resource_reserved: false,
             source_path_class: 0,
+            source_path_class_city_cart: 0,
             source_resource_growth_factor: 0,
             source_damage_threshold: 0,
             source_damage_accumulator: 0,
@@ -14930,6 +15024,102 @@ mod tests {
 
         assert_eq!(sim.source_city_transfer_root_count(5, 2), 2);
         assert_eq!(sim.source_city_transfer_root_count(5, 3), 1);
+    }
+
+    /// `FUN_00481fc0` (`1602_exe.c:93194-93196`) counts a kind-7/8 root into
+    /// `city+0x1fa` only while `(def[0x6a] & 0x80) == 0`. That bit is
+    /// `Destroyflg`, and `Zerstörter Marktplatz` (haeuser.cod Nr 468,
+    /// `Kind: GEBAEUDE`, nested `HAUS_PRODTYP Kind: MARKT`) is the one MARKT
+    /// in the shipped data that carries it — so a burnt-out marketplace
+    /// still occupies its tiles but stops paying its 10 t into the store.
+    #[test]
+    fn type11_city_capacity_excludes_a_ruined_market_root() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let market = CodBuilding {
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "MARKT".into())].into(),
+            ..Default::default()
+        };
+        let ruined_market = CodBuilding {
+            kind: "GEBAEUDE".into(),
+            properties: [
+                ("ProdKind".into(), "MARKT".into()),
+                ("Destroyflg".into(), "1".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mut sim = Simulation::new();
+        let mut live = SourceMapCellState::new(5, 1, 1, &market, 0).unwrap();
+        live.source_map_owner_slot = 2;
+        let mut burnt = SourceMapCellState::new(5, 2, 1, &ruined_market, 0).unwrap();
+        burnt.source_map_owner_slot = 2;
+        assert!(!live.source_destroy_flag);
+        assert!(burnt.source_destroy_flag);
+        sim.source_map_cell_states = vec![live, burnt];
+
+        // Both are live records and both are production kind 7; only the
+        // one that is not a ruin reaches `city+0x1fa`.
+        assert_eq!(sim.source_city_transfer_root_count(5, 2), 1);
+    }
+
+    /// The cached `city+0x1fa` on the warehouse has to agree with the live
+    /// count, because `Warehouse::deposit` caps every ship unload against it.
+    #[test]
+    fn city_storage_root_refresh_publishes_the_live_count_onto_the_warehouse() {
+        use anno_formats::cod::BuildingDef as CodBuilding;
+
+        let market = CodBuilding {
+            kind: "GEBAEUDE".into(),
+            properties: [("ProdKind".into(), "MARKT".into())].into(),
+            ..Default::default()
+        };
+        let mut sim = Simulation::new();
+        sim.warehouses.push(Warehouse::with_capacity(5, 2, 1, 1, 50));
+        sim.warehouses.push(Warehouse::with_capacity(5, 3, 9, 9, 50));
+
+        let mut first = SourceMapCellState::new(5, 1, 1, &market, 0).unwrap();
+        first.source_map_owner_slot = 2;
+        let mut second = SourceMapCellState::new(5, 2, 1, &market, 0).unwrap();
+        second.source_map_owner_slot = 2;
+        let mut other_owner = SourceMapCellState::new(5, 3, 1, &market, 0).unwrap();
+        other_owner.source_map_owner_slot = 3;
+        let mut other_island = SourceMapCellState::new(6, 4, 1, &market, 0).unwrap();
+        other_island.source_map_owner_slot = 2;
+        sim.source_map_cell_states = vec![first, second, other_owner, other_island];
+
+        sim.refresh_source_city_storage_roots();
+
+        assert_eq!(sim.warehouses[0].city_transfer_root_count, 2);
+        assert_eq!(sim.warehouses[0].city_capacity_fixed(), 1_920);
+        assert_eq!(sim.warehouses[0].deposit(Good::Cloth, 99), 60);
+        assert_eq!(sim.warehouses[1].city_transfer_root_count, 1);
+        assert_eq!(sim.warehouses[1].deposit(Good::Cloth, 99), 50);
+
+        // `FUN_004820b0` (`:93216-93222`) gives the room back on release.
+        sim.remove_source_map_footprint(5, 2, 1, 1, 1);
+        assert_eq!(sim.warehouses[0].city_transfer_root_count, 1);
+        assert_eq!(sim.warehouses[0].city_capacity_fixed(), 1_600);
+    }
+
+    /// `FUN_00481ee0` (`:93084`) restamps `city+0x20` from the placed KONTOR
+    /// definition's compiled `Maxlager`, and it addresses the city the
+    /// placement resolved — not every city on the island.
+    #[test]
+    fn kontor_storage_base_applies_to_the_placing_owners_city_only() {
+        let mut sim = Simulation::new();
+        sim.warehouses.push(Warehouse::with_capacity(5, 2, 1, 1, 50));
+        sim.warehouses.push(Warehouse::with_capacity(5, 3, 9, 9, 50));
+
+        // haeuser.cod Nr 272 `INFRA_KONTOR_2`: `Maxlager: 75`, compiled 2400.
+        sim.apply_source_kontor_storage_base(5, 2, 2_400);
+
+        assert_eq!(sim.warehouses[0].default_capacity, 75);
+        assert_eq!(sim.warehouses[0].city_capacity_fixed(), 2_400);
+        assert_eq!(sim.warehouses[0].deposit(Good::Wood, 99), 75);
+        assert_eq!(sim.warehouses[1].default_capacity, 50);
+        assert_eq!(sim.warehouses[1].deposit(Good::Wood, 99), 50);
     }
 
     #[test]

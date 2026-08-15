@@ -482,7 +482,6 @@ fn select_carrier_source_wave(
     // For the stock TRAEGER (`Maxtrag: 4`, `max_fixed == 128`) the clamp is
     // inert (64 == max_fixed / 2); it only bites a modded `Maxtrag > 4`.
     let minimum_fixed = (max_fixed / 2).min(0x40);
-    let mut grid = map.carrier_path_grid();
 
     // `FUN_00459150` sizes the scratch window from the requesting root's
     // oriented footprint (`1602_exe.c:61664-61671`): each axis is
@@ -497,6 +496,21 @@ fn select_carrier_source_wave(
     );
     let window_width = extra_x + 1 + radius * 2;
     let window_height = extra_y + 1 + radius * 2;
+    // The window *is* the allocation: `FUN_004704d0` rasterises it fresh from
+    // the live map layer on every search and nothing outside it exists, so the
+    // grid is built here rather than clipped out of an island-sized clone.
+    //
+    // A zero `Radius` keeps the port's unclipped search: the source would give
+    // such a root a degenerate `1 x 1` window that can reach nothing at all,
+    // and the port's synthetic maps and hand-built fixtures leave the compiled
+    // byte at zero. This mirrors the type-11 guard in
+    // `select_city_cart_source_wave`.
+    let mut grid = if source_radius == 0 {
+        let (origin, width, height) = map.source_island_path_window();
+        map.carrier_path_grid(origin, width, height)
+    } else {
+        map.carrier_path_grid(window_origin, window_width, window_height)
+    };
     // A root whose oriented footprint misses the window is never rasterised,
     // so it can never carry the goal bit. The source gets that for free — its
     // raster only ever walks window cells — while the port scans the island's
@@ -559,20 +573,11 @@ fn select_carrier_source_wave(
         grid.open_source_object_footprint(footprint);
     }
 
-    // The window is the scratch-grid allocation itself (`1602_exe.c:79439`
-    // stamps `0x0c` over every cell of it before the island intersection is
-    // filled in), so it also clips the footprint reopened above; applying it
-    // after `FUN_004710b0` reproduces that clip. `FUN_00471280` then carves
-    // the rectangle to the `FUN_00404d70` disc, which is the order
-    // `FUN_00459150` runs them in (`1602_exe.c:61675-61681`).
-    //
-    // A zero `Radius` keeps the port's unclipped search: the source would give
-    // such a root a degenerate `1 x 1` window that can reach nothing at all,
-    // and the port's synthetic maps and hand-built fixtures leave the compiled
-    // byte at zero. This mirrors the type-11 guard in
-    // `select_city_cart_source_wave`.
+    // `FUN_00471280` then carves the rectangle to the `FUN_00404d70` disc,
+    // which is the order `FUN_00459150` runs them in
+    // (`1602_exe.c:61675-61681`). The rectangular clip that used to sit here
+    // is now the grid's own extent.
     if source_radius != 0 {
-        grid.block_outside_rect(window_origin, window_width, window_height);
         grid.block_outside_source_radius_window(
             window_origin,
             window_width,
@@ -907,8 +912,18 @@ fn select_city_cart_source_wave(
     Vec<SourceRouteStep>,
     u32,
 )> {
-    let mut grid = map.city_cart_path_grid();
     let radius = i32::from(source_radius);
+    // `FUN_004706e0` rasterises its own `radius * 2 + 1` window from the live
+    // map layer (`1602_exe.c:79519`); the window is the allocation, so there is
+    // nothing outside it to clip away afterwards.
+    let mut grid = if source_radius == 0 {
+        let (origin, width, height) = map.source_island_path_window();
+        map.city_cart_path_grid(origin, width, height)
+    } else {
+        let window_origin = (start.0.checked_sub(radius)?, start.1.checked_sub(radius)?);
+        let window_size = usize::try_from(radius.checked_mul(2)?.checked_add(1)?).ok()?;
+        map.city_cart_path_grid(window_origin, window_size, window_size)
+    };
 
     // `FUN_004717b0` applies no map-kind test to a candidate producer
     // (`1602_exe.c:80578-80586`): it indexes the city eligibility table by the
@@ -962,15 +977,6 @@ fn select_city_cart_source_wave(
         usize::from(origin_footprint.1.max(1)),
     ) {
         grid.open_source_object_footprint(footprint);
-    }
-
-    // The window is the scratch-grid allocation in the source
-    // (`1602_exe.c:79546-79553`), so it also clips the footprint reopened
-    // above; applying it last reproduces that clip.
-    if source_radius != 0 {
-        let window_origin = (start.0.checked_sub(radius)?, start.1.checked_sub(radius)?);
-        let window_size = usize::try_from(radius.checked_mul(2)?.checked_add(1)?).ok()?;
-        grid.block_outside_rect(window_origin, window_size, window_size);
     }
 
     let mut selected: Option<(usize, CarrierSupplier, (i32, i32), u32)> = None;
@@ -1386,10 +1392,43 @@ fn source_carrier_return_path(
     goal: (i32, i32),
     cargo_route: CargoRoute,
 ) -> Option<(Vec<SourceRouteStep>, Vec<(i32, i32)>)> {
+    // `FUN_00459150` re-runs on every step of the leg and always allocates the
+    // same window: centred on the event's root with that root's compiled
+    // `Radius`. The return leg is its `else` arm (`1602_exe.c:61688-61700`),
+    // which differs only in already knowing the destination — so the window,
+    // the raster and the `FUN_00471280` carve are identical, and the port
+    // reads the radius back out of the live map layer rather than out of an
+    // event record it does not thread this far.
+    let window = map.source_transfer_window_at(goal);
+    let (origin, width, height) = window
+        .map(|window| (window.origin, window.width, window.height))
+        .unwrap_or_else(|| map.source_island_path_window());
     let mut grid = match cargo_route {
-        CargoRoute::InputCarrier => map.carrier_path_grid(),
-        CargoRoute::CityCart => map.city_cart_path_grid(),
+        CargoRoute::InputCarrier => map.carrier_path_grid(origin, width, height),
+        CargoRoute::CityCart => map.city_cart_path_grid(origin, width, height),
     };
+    // `FUN_00459150` runs `FUN_004710b0` **twice** once the figure already has
+    // a destination (`1602_exe.c:61691-61694`): once on the figure's own tile
+    // and once on the stored goal, before the same `FUN_00471380` flood. Both
+    // ends are objects, and no raster opens an object's own outer kind, so
+    // without the pair a carrier standing inside a 2 x 1 supplier cannot leave
+    // it and a Kontor's anchor cell is walled in by the rest of its own 2 x 3
+    // footprint — the wave then floods its whole window before failing.
+    for object in [start, goal] {
+        if let Some(footprint) = map.source_object_footprint_at(object) {
+            grid.open_source_object_footprint(footprint);
+        }
+    }
+    if let Some(window) = window {
+        grid.block_outside_source_radius_window(
+            window.origin,
+            window.width,
+            window.height,
+            window.radius,
+            window.extra_x,
+            window.extra_y,
+        );
+    }
     let steps = grid.route_to(start, goal).ok()?;
     let path = source_route_positions(start, &steps)?;
     (path.last().copied() == Some(goal) || (start == goal && path.is_empty()))
@@ -1964,10 +2003,218 @@ mod tests {
         }
     }
 
+    /// A `width x height` island whose command stream names only `cells`,
+    /// each carrying the same authored `Wegspeed` quad.
+    ///
+    /// `FUN_004704d0` stamps the `0x0c` blocker over its whole window before
+    /// filling the clipped island intersection (`1602_exe.c:79439-79446`), so
+    /// a coordinate no command covers is impassable — which is what carves the
+    /// corridors these two tests walk.
+    fn ground_island_map(width: u8, height: u8, wegspeed: &str, cells: &[(u8, u8)]) -> IslandMap {
+        let ground = anno_formats::cod::BuildingDef {
+            source_id: 20_001,
+            kind: "BODEN".to_owned(),
+            properties: [("Wegspeed".to_owned(), wegspeed.to_owned())].into(),
+            ..Default::default()
+        };
+        let island = anno_formats::szs::Island {
+            number: 0,
+            width,
+            height,
+            x_pos: 0,
+            y_pos: 0,
+            fertilities: [7; 8],
+            tiles: cells
+                .iter()
+                .map(|&(x, y)| anno_formats::szs::IslandTile {
+                    building_id: 1,
+                    x,
+                    y,
+                    orientation: 0,
+                    anim_count: 0,
+                    flags: 0,
+                })
+                .collect(),
+            city: None,
+        };
+        IslandMap::from_island(&island, &[ground])
+    }
+
+    /// One live map command of the shape `place_building` hands to
+    /// `Simulation::replace_source_static_map_footprint`, which is what calls
+    /// [`IslandMap::apply_source_map_footprint`] in the game.
+    fn runtime_map_command(kind: &str, wegspeed: &str, x: u8, y: u8) -> SourceMapCellState {
+        SourceMapCellState::new_static(
+            0,
+            x,
+            y,
+            &anno_formats::cod::BuildingDef {
+                source_id: 20_002,
+                kind: kind.to_owned(),
+                size: (1, 1),
+                properties: [("Wegspeed".to_owned(), wegspeed.to_owned())].into(),
+                ..Default::default()
+            },
+            0,
+        )
+        .expect("a named outer kind compiles to a source kind code")
+    }
+
+    /// The two consequences of `docs/logistics-gaps.md` §3, which were
+    /// unobservable while both transfer rasters were built once at load: a road
+    /// laid at runtime has to change a route, and a building raised at runtime
+    /// has to block one.
+    ///
+    /// The map is two corridors between the same endpoints, with every cell
+    /// between them left out of the command stream so no diagonal can cut
+    /// across:
+    ///
+    /// ```text
+    ///   y=0  # # # # # # #     the long way round, ten steps
+    ///   y=1  #           #
+    ///   y=2  C # # # # # S     the short way, six steps
+    /// ```
+    ///
+    /// Ground compiles `Wegspeed: 255` to path class 81, whose cardinal step
+    /// costs `81 * 2 = 162` (`FUN_0046f8a0`); a road compiles 100 to class 32
+    /// and costs `0x40`. The short corridor is therefore `80 + 5 * 162 = 890`
+    /// and the paved long one `80 + 9 * 64 = 656` — the `80` being the `0x28`
+    /// class `FUN_004710b0` pins over the requesting root's own cell.
+    #[test]
+    fn a_road_laid_after_load_moves_the_carrier_route_onto_it() {
+        const TOP: [(u8, u8); 7] = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0)];
+        const SIDES: [(u8, u8); 2] = [(0, 1), (6, 1)];
+        const BOTTOM: [(u8, u8); 7] = [(0, 2), (1, 2), (2, 2), (3, 2), (4, 2), (5, 2), (6, 2)];
+        let cells: Vec<(u8, u8)> = TOP
+            .into_iter()
+            .chain(SIDES)
+            .chain(BOTTOM)
+            .collect::<Vec<_>>();
+
+        let consumer = BuildingInstance::new(0, 0, 0, 2, 0);
+        let supplier = CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 6,
+            y: 2,
+            good: Good::Iron,
+            available: 4,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 32,
+            source_footprint: (1, 1),
+        };
+        let spawn = |map: IslandMap| {
+            let mut states = [supplier_state(6, 2, 128, Good::Iron)];
+            try_spawn_carrier(
+                &consumer,
+                &consumer_def(),
+                &[supplier],
+                &mut states,
+                &mut [],
+                &[map],
+                CarrierConfig::default(),
+            )
+            .expect("both corridors reach the supplier")
+        };
+
+        let unpaved = spawn(ground_island_map(7, 3, "255,255,255,255", &cells));
+        assert_eq!(
+            unpaved.path,
+            vec![(1, 2), (2, 2), (3, 2), (4, 2), (5, 2), (6, 2)],
+            "with one Wegspeed everywhere the wave takes the fewest steps"
+        );
+
+        let mut paved = ground_island_map(7, 3, "255,255,255,255", &cells);
+        for &(x, y) in TOP.iter().chain(&SIDES) {
+            paved.apply_source_map_footprint(&runtime_map_command(
+                "STRASSE",
+                "100,100,100,100",
+                x,
+                y,
+            ));
+        }
+        assert_eq!(
+            spawn(paved).path,
+            vec![
+                (0, 1),
+                (0, 0),
+                (1, 0),
+                (2, 0),
+                (3, 0),
+                (4, 0),
+                (5, 0),
+                (6, 0),
+                (6, 1),
+                (6, 2)
+            ],
+            "the paved detour is cheaper than the bare-ground short cut, and the \
+             raster only sees the road because it re-reads the live map layer"
+        );
+    }
+
+    /// The other half of §3: a building raised at runtime writes its own outer
+    /// kind into the live map layer, and `FUN_004704d0` opens no such kind
+    /// (`GEBAEUDE` is 14, outside `{1, 11, 12, 13, 18, 29, 30}`), so it walls
+    /// off the only corridor. Demolishing it restores the displaced ground the
+    /// way `FUN_004641d0` restores the backing record.
+    #[test]
+    fn a_building_raised_after_load_blocks_the_carrier_corridor() {
+        const CORRIDOR: [(u8, u8); 5] = [(0, 1), (1, 1), (2, 1), (3, 1), (4, 1)];
+        let consumer = BuildingInstance::new(0, 0, 0, 1, 0);
+        let supplier = CarrierSupplier {
+            island: 0,
+            owner: 0,
+            x: 4,
+            y: 1,
+            good: Good::Iron,
+            available: 4,
+            storage: CarrierSupplierStorage::SourceRoot,
+            source_path_class: 32,
+            source_footprint: (1, 1),
+        };
+        let spawn = |map: &IslandMap| {
+            let mut states = [supplier_state(4, 1, 128, Good::Iron)];
+            try_spawn_carrier(
+                &consumer,
+                &consumer_def(),
+                &[supplier],
+                &mut states,
+                &mut [],
+                std::slice::from_ref(map),
+                CarrierConfig::default(),
+            )
+        };
+
+        let mut map = ground_island_map(5, 3, "100,100,100,100", &CORRIDOR);
+        assert_eq!(
+            spawn(&map).expect("the open corridor reaches the supplier").path,
+            vec![(1, 1), (2, 1), (3, 1), (4, 1)]
+        );
+
+        map.apply_source_map_footprint(&runtime_map_command(
+            "GEBAEUDE",
+            "100,100,100,100",
+            2,
+            1,
+        ));
+        assert!(
+            spawn(&map).is_none(),
+            "a building placed mid-corridor is impassable to the transfer wave"
+        );
+
+        map.clear_source_map_footprint(2, 1, 1, 1);
+        assert_eq!(
+            spawn(&map)
+                .expect("demolition restores the ground the command displaced")
+                .path,
+            vec![(1, 1), (2, 1), (3, 1), (4, 1)]
+        );
+    }
+
     /// A square island of open ground with the listed cells left out.
-    /// `populate_static_island_cells` pre-fills the whole TRAEGER template
-    /// with the `0x0c` blocker and opens only the tiles it is given, exactly
-    /// as `FUN_004704d0` fills its window (`1602_exe.c:79439-79446`), so an
+    /// The window raster pre-fills the whole grid with the `0x0c` blocker and
+    /// opens only the cells the live map layer names, exactly as
+    /// `FUN_004704d0` fills its window (`1602_exe.c:79439-79446`), so an
     /// absent tile is impassable.
     fn open_island_map_without(size: u8, blocked: &[(u8, u8)]) -> IslandMap {
         let ground = anno_formats::cod::BuildingDef {

@@ -617,6 +617,11 @@ impl Simulation {
         self.objectives = s.objectives;
         self.source_growth_bucket_elapsed_ms = s.source_growth_bucket_elapsed_ms;
         self.source_growth_bucket_phase = s.source_growth_bucket_phase;
+        // `Warehouse::city_transfer_root_count` mirrors `city+0x1fa` and is
+        // derived from the live cell table, so it stays out of the payload
+        // (and out of `state_hash`) and is recomputed from the restored
+        // records here — the same way coverage maps are.
+        self.refresh_source_city_storage_roots();
     }
 }
 
@@ -1135,6 +1140,7 @@ mod tests {
                 source_plantation_worker_definition: 0x60,
                 source_resource_reserved: true,
                 source_path_class: 46,
+                source_path_class_city_cart: 46,
                 source_resource_growth_factor: 96,
                 source_damage_threshold: 640,
                 source_damage_accumulator: 192,
@@ -1583,6 +1589,7 @@ mod tests {
                 source_plantation_worker_definition: 0x60,
                 source_resource_reserved: true,
                 source_path_class: 46,
+                source_path_class_city_cart: 46,
                 source_resource_growth_factor: 96,
                 source_damage_threshold: 640,
                 source_damage_accumulator: 192,

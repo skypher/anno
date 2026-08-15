@@ -468,6 +468,27 @@ mod tests {
         Warehouse::new(island, owner, x, y)
     }
 
+    /// A city store already holding `amount` of `good`.
+    ///
+    /// The source has no per-good ceiling: `FUN_0047aa00` measures free space
+    /// against the whole city capacity `FUN_0047ab00` reports, so a store that
+    /// holds 200 Wool is one whose *city* base is 200 — not one carrying a
+    /// Wool-only override. `Warehouse::set_capacity` only ever moved the
+    /// display number, and now that `deposit` honours the city capacity it no
+    /// longer buys room, so these fixtures state the capacity the source way.
+    fn mk_wh_holding(
+        island: u8,
+        owner: u8,
+        x: u16,
+        y: u16,
+        good: Good,
+        amount: u16,
+    ) -> Warehouse {
+        let mut warehouse = Warehouse::with_capacity(island, owner, x, y, amount);
+        assert_eq!(warehouse.deposit(good, amount), amount);
+        warehouse
+    }
+
     #[test]
     fn default_stock_fits_handler_cargo_capacity() {
         let trader = FreeTrader::spawn_at(5, 5);
@@ -506,9 +527,7 @@ mod tests {
 
     #[test]
     fn dock_trade_buys_warehouse_surplus_when_sell_slider_set() {
-        let mut whs = vec![mk_wh(0, 0, 5, 5)];
-        whs[0].set_capacity(Good::Wool, 200);
-        whs[0].deposit(Good::Wool, 200);
+        let mut whs = vec![mk_wh_holding(0, 0, 5, 5, Good::Wool, 200)];
         // Player wants to keep 30 Wool, sell anything above.
         whs[0].set_sell_min_keep(Good::Wool, Some(30));
         let mut trader = FreeTrader::spawn_at(5, 5);
@@ -524,9 +543,7 @@ mod tests {
 
     #[test]
     fn dock_trade_buys_surplus_only_until_hold_full() {
-        let mut whs = vec![mk_wh(0, 0, 5, 5)];
-        whs[0].set_capacity(Good::Wool, 200);
-        whs[0].deposit(Good::Wool, 200);
+        let mut whs = vec![mk_wh_holding(0, 0, 5, 5, Good::Wool, 200)];
         whs[0].set_sell_min_keep(Good::Wool, Some(0));
         let mut trader = FreeTrader::spawn_at_with_capacity(5, 5, 10);
         trader.target_warehouse = Some(0);
@@ -560,9 +577,7 @@ mod tests {
     fn dock_trade_rejects_overpriced_sell_offer() {
         // Player asks more than the trader's standard sell price for
         // Wool — trader walks away.
-        let mut whs = vec![mk_wh(0, 0, 5, 5)];
-        whs[0].set_capacity(Good::Wool, 200);
-        whs[0].deposit(Good::Wool, 200);
+        let mut whs = vec![mk_wh_holding(0, 0, 5, 5, Good::Wool, 200)];
         whs[0].set_sell_min_keep(Good::Wool, Some(30));
         let standard = crate::prices::price_of(Good::Wool).sell as i32;
         whs[0].set_sell_price(Good::Wool, Some(standard + 1));

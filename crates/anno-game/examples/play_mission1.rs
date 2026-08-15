@@ -1,8 +1,57 @@
 //! Staged scripted playthrough of the first campaign mission
-//! ("Halfway there", New Horizons0.szs). Stage 1: sail, found, build the
-//! pioneer core (market + chapel + huts), and watch the settlement grow.
+//! ("Halfway there", `New Horizons0.szs`): sail, found, and grow the colony
+//! past the AUFTRAG4 goal of 100 inhabitants.
+//!
+//! This driver is a **player**, not engine code. Every rule it needs is asked
+//! of the engine rather than restated here:
+//!
+//! * `can_place_building` — terrain and footprint (`FUN_00464450`);
+//! * `source_placement_settlement_slot` + `source_placement_area_admits` —
+//!   the buildable-area gate (`1602_exe.c:7612-7616`), i.e. whose ground this
+//!   footprint stands on and whether a build is allowed there at all;
+//! * `source_transfer_wave_opens_ground_kind` — what a Karren walks;
+//! * `source_service_radius_row` — the compiled service-disc raster
+//!   (`FUN_00404d70`) that both the marketplace land claim and the
+//!   house-coverage rescan measure with;
+//! * the live kind-13 house records — `state_bits`, `lifecycle_flags` and
+//!   `source_transition_active_for_group` say which infrastructure a house is
+//!   actually missing, so the driver never has to guess.
+//!
+//! A previous version paraphrased the transfer wave's open-kind set locally,
+//! drifted from the engine's copy, and produced a false conclusion about the
+//! game. Keep asking.
 use anno_sim::commands::Command;
 use anno_sim::types::Good;
+use std::collections::HashSet;
+
+type Sim = anno_sim::simulation::Simulation;
+
+/// Placement bookkeeping for the end-of-run report.
+#[derive(Default)]
+struct Tally {
+    accepted: usize,
+    refused: usize,
+}
+
+/// Compiled outer map kind `WALD`. Forest is legally buildable — the original
+/// clears trees — but clearing it destroys the resource the forester lives on,
+/// and island 10's woodland is the colony's only wood. Letting housing take
+/// forest cells cost an earlier run its entire wood supply (wood pinned at 0,
+/// population 12 against 58 when the trees were left alone), so the woodland
+/// is treated as reserved rather than as free room.
+const FOREST_KIND: u8 = 10;
+
+const HUT: usize = 414;
+const MARKET: usize = 468;
+const CHAPEL: usize = 463;
+const FORESTER: usize = 402;
+const FISHERY: usize = 270;
+const SHEEP: usize = 412;
+const WEAVER: usize = 388;
+/// Ware slots are `0x2d + crop bit`: 52 GRAS, 53 BAUM, 57 FISCHE.
+const GRAS: u8 = 52;
+const BAUM: u8 = 53;
+const FISCHE: u8 = 57;
 
 fn main() {
     let root = std::path::Path::new("extracted");
@@ -44,7 +93,7 @@ fn main() {
     // it here. A local copy of this set drifted from the engine's and made
     // buildable land look scarce.
     let open_ground = anno_sim::island_map::source_transfer_wave_opens_ground_kind;
-    let kind_at = |sim: &anno_sim::simulation::Simulation, x: i32, y: i32| {
+    let kind_at = |sim: &Sim, x: i32, y: i32| {
         sim.island_maps[mi]
             .source_map_kind_and_owner(x, y)
             .map(|(k, _)| k)
@@ -57,14 +106,24 @@ fn main() {
     // beside it are clear (`FUN_0046c7d0`). A producer outside that component
     // is stranded however much it makes, so found where the component is
     // biggest — which is what a player picking a harbour does by eye.
-    let cart_component = |sim: &anno_sim::simulation::Simulation, anchor: (i32, i32)| {
+    //
+    // `walls` are the footprints the colony has already put down. The source
+    // wave rasterises the **live** map, so a placed building is not open ground
+    // any more: a colony that packs its houses in can cut its own producers off
+    // the Kontor without a single refusal to warn it. That is exactly what
+    // happened here — two foresters sat at `fill = 320 / cap = 320` with the
+    // warehouse's wood pinned at 0 for the rest of the run — so the component
+    // is recomputed against the live walls after every placement, and no site
+    // is taken that strands something already built.
+    let cart_component = |sim: &Sim, anchor: (i32, i32), walls: &HashSet<(i32, i32)>| {
         let kind = |x: i32, y: i32| {
             sim.island_maps[mi]
                 .source_map_kind_and_owner(x, y)
                 .map(|(k, _)| k)
                 .unwrap_or(u8::MAX)
         };
-        let mut seen = std::collections::HashSet::new();
+        let open_cell = |x: i32, y: i32| open_ground(kind(x, y)) && !walls.contains(&(x, y));
+        let mut seen = HashSet::new();
         let mut queue: Vec<(i32, i32)> = (0..3)
             .flat_map(|dy| (0..2).map(move |dx| (anchor.0 + dx, anchor.1 + dy)))
             .collect();
@@ -88,14 +147,11 @@ fn main() {
                     || next.0 >= island.width as i32
                     || next.1 >= island.height as i32
                     || seen.contains(&next)
-                    || !open_ground(kind(next.0, next.1))
+                    || !open_cell(next.0, next.1)
                 {
                     continue;
                 }
-                if dx != 0
-                    && dy != 0
-                    && !(open_ground(kind(x + dx, y)) && open_ground(kind(x, y + dy)))
-                {
+                if dx != 0 && dy != 0 && !(open_cell(x + dx, y) && open_cell(x, y + dy)) {
                     continue;
                 }
                 seen.insert(next);
@@ -128,7 +184,7 @@ fn main() {
                     3,
                 )
         })
-        .max_by_key(|&anchor| cart_component(&sim, anchor).len())
+        .max_by_key(|&anchor| cart_component(&sim, anchor, &HashSet::new()).len())
         .expect("buildable coastal anchor for the Kontor footprint");
     // The ship has to stop on navigable water within `found_kontor`'s range.
     let dock = (-8i32..=8)
@@ -170,78 +226,164 @@ fn main() {
     println!("founded at {anchor:?}: {ok}");
     assert!(ok);
 
-    // Which ground can a Karren actually reach from the Kontor? The transfer
-    // wave floods the rasterised window from the requesting root's own
-    // footprint (`FUN_004710b0`, `1602_exe.c:80003`) across the open kinds
-    // only, so a producer in a forest clearing is stranded no matter how much
-    // it makes. Flood the same kinds once, from the Kontor footprint, and
-    // refuse to build anywhere the cart cannot follow.
-    let reachable = cart_component(&sim, anchor);
-    println!("cart-reachable open ground from the Kontor: {}", reachable.len());
+    // Which ground can a Karren actually reach from the Kontor? Flood the
+    // engine's open kinds once, from the Kontor footprint, and refuse to put a
+    // producer or a market anywhere the cart cannot follow.
+    // The Kontor's own 2x3 footprint is a wall for everything that follows,
+    // but it is also where the wave starts, so it is seeded into the flood
+    // rather than into `walls`.
+    let mut walls: HashSet<(i32, i32)> = HashSet::new();
+    // Every footprint whose goods a Karren has to fetch. Houses are not in it:
+    // a house is served by the market disc, not by a cart.
+    let mut served: Vec<(i32, i32, u8, u8)> = Vec::new();
+    let mut reachable = cart_component(&sim, anchor, &walls);
+    println!(
+        "cart-reachable open ground from the Kontor: {}",
+        reachable.len()
+    );
+    if std::env::var("PROBE").is_ok() {
+        let map = &sim.island_maps[mi];
+        let mut a = 0usize;
+        let mut b = 0usize;
+        for y in 0..i32::from(island.height) {
+            for x in 0..i32::from(island.width) {
+                if map
+                    .source_map_kind_and_owner(x, y)
+                    .map(|(k, _)| k)
+                    .is_some_and(open_ground)
+                {
+                    a += 1;
+                }
+                if map.civilian_path_kind((x, y)).is_some_and(open_ground) {
+                    b += 1;
+                }
+            }
+        }
+        println!("open by overlay kind: {a}; open by civilian_path_kind: {b}");
+        for p in [(8, 31), (11, 38), (10, 34), (8, 36), (6, 45), (17, 41), (20, 34)] {
+            println!(
+                "  {p:?} overlay={:?} civilian={:?} in_component={}",
+                map.source_map_kind_and_owner(p.0, p.1).map(|(k, _)| k),
+                map.civilian_path_kind(p),
+                reachable.contains(&p),
+            );
+        }
+        return;
+    }
     // A supplier's own cell is opened by the raster as a *goal* whatever its
     // terrain (`FUN_004704d0` stamps the goal bit before the kind test), so the
     // cart only has to reach a cell adjacent to the footprint — which is what
     // lets a beach-only fishery be collected at all.
-    let cart_can_reach = |x: i32, y: i32, w: u8, h: u8| {
+    let cart_can_reach = |comp: &HashSet<(i32, i32)>, x: i32, y: i32, w: u8, h: u8| {
         (-1..=i32::from(h))
             .flat_map(|dy| (-1..=i32::from(w)).map(move |dx| (dx, dy)))
-            .any(|(dx, dy)| reachable.contains(&(x + dx, y + dy)))
+            .any(|(dx, dy)| comp.contains(&(x + dx, y + dy)))
+    };
+    // NOTE. The source re-reads the live map on every transfer search, so in
+    // the original a building the player raises immediately blocks the wave
+    // (`island_map.rs`, `source_transfer_window_grid`). This port's
+    // `place_building` never rewrites that layer — it only clears `walkable`
+    // and sets the runtime-occupied bit — so placed footprints do **not**
+    // narrow the component here. A version of this driver that vetoed any site
+    // which would have severed a producer under the source rule therefore threw
+    // away most of the island's buildable ground for nothing. The wall set is
+    // still tracked, because it is what a faithful engine would consult, but it
+    // is not used to refuse a placement.
+
+    // ------------------------------------------------------------------
+    // Placement gates — both halves asked of the engine.
+    // ------------------------------------------------------------------
+    // `can_place_building` answers terrain and occupancy only; the second,
+    // *territorial* half of the verdict lives in `source_placement_area_admits`
+    // fed by the settlement slot the oriented footprint resolves to. On ground
+    // no settlement of ours owns, a build is accepted only from a player with
+    // no settlement yet on the island — which, once the Kontor stands, is
+    // never us. So the claim is the colony's whole buildable world, and a
+    // marketplace is how it buys more of it (`FUN_0046ac60`).
+    let admitted = |sim: &Sim, def_index: usize, x: i32, y: i32| -> bool {
+        let def = &defs[def_index];
+        let (w, h) = (def.width, def.height);
+        anno_game::game_commands::can_place_building(&island, &sim.island_maps[mi], def, x, y, w, h)
+            && sim.source_placement_area_admits(
+                10,
+                sim.source_placement_settlement_slot(10, x, y, w, h, 0),
+                0,
+                def.source_kind_code().unwrap_or(u8::MAX),
+            )
+    };
+    // Forest is a hard refusal (see `FOREST_KIND`).
+    let unforested = |sim: &Sim, def_index: usize, x: i32, y: i32| -> bool {
+        let def = &defs[def_index];
+        (0..i32::from(def.height)).all(|dy| {
+            (0..i32::from(def.width)).all(|dx| {
+                sim.island_maps[mi]
+                    .source_map_kind_and_owner(x + dx, y + dy)
+                    .map(|(k, _)| k != FOREST_KIND)
+                    .unwrap_or(false)
+            })
+        })
     };
 
-    // --- Stage 1b: place market, chapel, huts on free land ---
-    let find_spot = |sim: &anno_sim::simulation::Simulation,
-                     def: &anno_sim::building::BuildingDef,
-                     w: u8,
-                     h: u8,
-                     used: &[(i32, i32, u8, u8)]| {
-        {
-            let map = &sim.island_maps[mi];
-            // Stay inside the Kontor/market service radius (16) so houses
-            // keep coverage: order candidates by distance from the anchor.
-            let mut candidates: Vec<(i32, i32)> = (2..island.height as i32 - i32::from(h) - 2)
-                .flat_map(|y| (2..island.width as i32 - i32::from(w) - 2).map(move |x| (x, y)))
-                .collect();
-            candidates.sort_by_key(|&(x, y)| (x - anchor.0).abs() + (y - anchor.1).abs());
-            candidates.into_iter().find(|&(x, y)| {
-                // The real gate, minus forest. `WALD` *is* buildable — the
-                // original clears trees — but clearing them destroys the
-                // resource the forester harvests, and island 10's woodland is
-                // the colony's only wood. Letting housing take forest cells
-                // cost this driver its entire wood supply (wood pinned at 0,
-                // population 12 against 58 when forest was left alone), so
-                // the trees are treated as reserved rather than as free room.
-                (0..i32::from(h)).all(|dy| {
-                    (0..i32::from(w)).all(|dx| {
-                        map.source_map_kind_and_owner(x + dx, y + dy)
-                            .map(|(k, _)| k != 10)
-                            .unwrap_or(false)
-                    })
-                }) && anno_game::game_commands::can_place_building(
-                    &island, map, def, x, y, w, h,
-                ) && (def.prod_kind == "WOHNUNG" || cart_can_reach(x, y, w, h))
-                    && !used.iter().any(|&(ux, uy, uw, uh)| {
-                        x < ux + i32::from(uw)
-                            && ux < x + i32::from(w)
-                            && y < uy + i32::from(uh)
-                            && uy < y + i32::from(h)
-                    })
-            })
-        }
+    // Service discs. The half-width of each row comes from the engine's own
+    // compiled raster `FUN_00404d70` — the same table `claim_source_settlement_area`
+    // hands out ground with and `refresh_source_house_infrastructure` hands out
+    // coverage with. The centre is the oriented footprint's integer centre
+    // (`1602_exe.c:74434-74512`). This is a *prediction* used for ranking;
+    // whether a tile really joined the settlement is always re-asked of
+    // `source_placement_settlement_slot` afterwards.
+    let centre_of = |x: i32, y: i32, w: u8, h: u8| {
+        (x + (i32::from(w) - 1) / 2, y + (i32::from(h) - 1) / 2)
     };
-    // The Kontor already owns its 2x3 footprint.
-    let mut used: Vec<(i32, i32, u8, u8)> = vec![(anchor.0, anchor.1, 2, 3)];
-    let build = |sim: &mut anno_sim::simulation::Simulation,
-                 used: &mut Vec<(i32, i32, u8, u8)>,
-                 def_index: u16,
-                 label: &str| {
-        let (w, h) = (
-            defs[def_index as usize].width,
-            defs[def_index as usize].height,
-        );
-        let Some((x, y)) = find_spot(sim, &defs[def_index as usize], w, h, used) else {
-            println!("no spot for {label}");
-            return false;
-        };
+    let in_disc = |rows: &[u8], centre: (i32, i32), p: (i32, i32)| {
+        let dy = (p.1 - centre.1).unsigned_abs() as usize;
+        rows.get(dy)
+            .is_some_and(|&half| (p.0 - centre.0).abs() <= i32::from(half))
+    };
+    let market_rows = anno_sim::data_bridge::source_service_radius_row(
+        cod.buildings[MARKET].source_transfer_radius,
+    );
+    let chapel_rows = anno_sim::data_bridge::source_service_radius_row(
+        cod.buildings[CHAPEL].source_transfer_radius,
+    );
+
+    // ------------------------------------------------------------------
+    // Colony state the driver keeps for itself.
+    // ------------------------------------------------------------------
+    // Pasture the sheep farms graze: 624 of island 10's 630 open-ground tiles
+    // carry a ripe GRAS cell, and a footprint deletes the static roots it
+    // covers, so housing dropped anywhere would slowly eat the wool line the
+    // way an earlier run ate the wood line. These are a *soft* reservation —
+    // preferred against, not refused — because there is no other ground.
+    let mut pasture: HashSet<(i32, i32)> = HashSet::new();
+    let mut refused_sites: HashSet<(usize, (i32, i32))> = HashSet::new();
+    let mut markets: Vec<(i32, i32)> = Vec::new();
+    let mut chapels: Vec<(i32, i32)> = Vec::new();
+    let mut tally = Tally::default();
+
+    let stock = |sim: &Sim, good: Good| -> u16 {
+        sim.warehouses
+            .iter()
+            .find(|w| w.island_id == 10 && w.owner == 0)
+            .map(|w| w.stock(good))
+            .unwrap_or(0)
+    };
+
+    // One placement, always through `apply_game_command`. On a refusal, ask the
+    // same gates again and print what each said, so a refusal is a diagnosis
+    // rather than a mystery.
+    #[allow(clippy::too_many_arguments)]
+    let build_at = |sim: &mut Sim,
+                    tally: &mut Tally,
+                    refused_sites: &mut HashSet<(usize, (i32, i32))>,
+                    walls: &mut HashSet<(i32, i32)>,
+                    served: &mut Vec<(i32, i32, u8, u8)>,
+                    reachable: &mut HashSet<(i32, i32)>,
+                    needs_cart: bool,
+                    def_index: usize,
+                    x: i32,
+                    y: i32,
+                    label: &str|
+     -> bool {
         let placed = anno_game::game_commands::apply_game_command(
             sim,
             &szs.islands,
@@ -252,143 +394,651 @@ fn main() {
                 island: 10,
                 tile_x: x as u16,
                 tile_y: y as u16,
-                def_index,
+                def_index: def_index as u16,
                 orientation: 0,
             },
         );
+        if placed {
+            tally.accepted += 1;
+            let (w, h) = (defs[def_index].width, defs[def_index].height);
+            for dy in 0..i32::from(h) {
+                for dx in 0..i32::from(w) {
+                    walls.insert((x + dx, y + dy));
+                }
+            }
+            if needs_cart {
+                served.push((x, y, w, h));
+            }
+            *reachable = cart_component(sim, anchor, walls);
+        } else {
+            tally.refused += 1;
+            refused_sites.insert((def_index, (x, y)));
+            let def = &defs[def_index];
+            let (w, h) = (def.width, def.height);
+            let terrain = anno_game::game_commands::can_place_building(
+                &island,
+                &sim.island_maps[mi],
+                def,
+                x,
+                y,
+                w,
+                h,
+            );
+            let slot = sim.source_placement_settlement_slot(10, x, y, w, h, 0);
+            let area = sim.source_placement_area_admits(
+                10,
+                slot,
+                0,
+                def.source_kind_code().unwrap_or(u8::MAX),
+            );
+            println!(
+                "  refused {label} at ({x},{y}): terrain={terrain} slot={slot} area={area} \
+                 gold={}/{} tools={}/{} bauinfra={} mask={:#x}",
+                sim.players[0].gold,
+                def.cost_gold,
+                stock(sim, Good::Tools),
+                def.cost_tools,
+                def.bauinfra,
+                sim.players[0].unlock_mask,
+            );
+        }
         println!("build {label} at ({x},{y}): {placed}");
-        // Record the tile either way. A refusal is usually the buildable-area
-        // gate — the site is outside the settlement's claim — and without
-        // remembering it `find_spot` re-proposes the same tile forever and the
-        // colony stops expanding. Extending the claim is a marketplace's job.
-        used.push((x, y, w, h));
         placed
     };
-    // A harvester only works if its raw resource lies inside its own Radius:
-    // the worker searches the static map roots for ripe (kind 9) cells whose
-    // output ware matches the building's `Rohstoff`. Island 10 carries 559
-    // BAUM (ware 53), 627 GRAS (52) and 585 FISCHE (57) cells, but none of
-    // them next to the founding beach — siting by "nearest free tile" gives a
-    // forester with no trees. Pick the spot that maximises matching cells in
-    // range while staying inside the Kontor's radius-16 coverage.
-    let build_on_resource = |sim: &mut anno_sim::simulation::Simulation,
-                             used: &mut Vec<(i32, i32, u8, u8)>,
-                             def_index: u16,
-                             ware: u8,
-                             label: &str| {
-        let def = &defs[def_index as usize];
+
+    // ------------------------------------------------------------------
+    // Site searches.
+    // ------------------------------------------------------------------
+    // Every legal 2x2 house anchor on the island, split by the engine's
+    // territorial verdict: `inside` is ground the colony may build on today,
+    // `outside` is ground a marketplace would have to buy first.
+    let survey_house_anchors = |sim: &Sim,
+                                refused_sites: &HashSet<(usize, (i32, i32))>|
+     -> (Vec<(i32, i32)>, Vec<(i32, i32)>) {
+        let def = &defs[HUT];
         let (w, h) = (def.width, def.height);
-        let radius = i32::from(def.radius).max(1);
-        let cells: Vec<(i32, i32)> = sim
-            .source_static_map_roots
-            .iter()
-            .filter(|c| {
-                c.island == 10
-                    && c.source_production_kind_code == 9
-                    && c.source_output_ware_slot == ware
-            })
-            .map(|c| (i32::from(c.x), i32::from(c.y)))
-            .collect();
-        let map = &sim.island_maps[mi];
-        let mut best: Option<(usize, (i32, i32))> = None;
-        for y in 2..island.height as i32 - i32::from(h) - 2 {
-            for x in 2..island.width as i32 - i32::from(w) - 2 {
-                // Stay inside the Kontor's radius-16 claim. A producer on
-                // unclaimed ground still harvests, but the city cart filters
-                // suppliers by settlement slot, so its output is stranded —
-                // and the original would refuse the placement outright.
-                let (dx, dy) = (x - anchor.0, y - anchor.1);
-                if dx * dx + dy * dy > 16 * 16 {
+        let kind = def.source_kind_code().unwrap_or(u8::MAX);
+        let (mut inside, mut outside) = (Vec::new(), Vec::new());
+        for y in 0..i32::from(island.height) - i32::from(h) {
+            for x in 0..i32::from(island.width) - i32::from(w) {
+                if refused_sites.contains(&(HUT, (x, y))) || !unforested(sim, HUT, x, y) {
                     continue;
                 }
-                // Ask the real terrain gate rather than a walkability guess:
-                // the fishery is `Kind: STRANDHAUS` and is admitted only on
-                // beach, which no walkability predicate describes.
-                let free = anno_game::game_commands::can_place_building(
+                if !anno_game::game_commands::can_place_building(
                     &island,
-                    map,
+                    &sim.island_maps[mi],
                     def,
                     x,
                     y,
                     w,
                     h,
-                ) && !used.iter().any(|&(ux, uy, uw, uh)| {
-                        x < ux + i32::from(uw)
-                            && ux < x + i32::from(w)
-                            && y < uy + i32::from(uh)
-                            && uy < y + i32::from(h)
-                    });
-                if !free || !cart_can_reach(x, y, w, h) {
+                ) {
                     continue;
                 }
-                // The worker's search grid is a circle of the building's
-                // compiled `Radius` (`FUN_00404d70` rows), not a box, so rank
-                // sites by cells actually inside that circle.
-                let n = cells
-                    .iter()
-                    .filter(|&&(cx, cy)| {
-                        let (dx, dy) = (cx - x, cy - y);
-                        dx * dx + dy * dy <= radius * radius
-                    })
-                    .count();
-                // Rank by resource count, then by nearness to the Kontor:
-                // a producer the Karren wave cannot reach is stranded output.
-                let reach = 64usize.saturating_sub(
-                    (x - anchor.0).abs().max((y - anchor.1).abs()).clamp(0, 63) as usize,
-                );
-                let rank = n * 64 + reach;
-                if n > 0 && best.is_none_or(|(bn, _)| rank > bn) {
-                    best = Some((rank, (x, y)));
+                let slot = sim.source_placement_settlement_slot(10, x, y, w, h, 0);
+                if sim.source_placement_area_admits(10, slot, 0, kind) {
+                    inside.push((x, y));
+                } else {
+                    outside.push((x, y));
                 }
             }
         }
-        let Some((rank, (x, y))) = best else {
+        (inside, outside)
+    };
+
+    // Pick a house site. Coverage first — a house outside a marketplace disc
+    // can never promote past pioneer (`source_transition_active_for_group(1)`
+    // wants the market bit *and* a chapel), and one outside a chapel disc is
+    // capped at two residents. Then pasture, then the engine's own market
+    // distance class, which is literally the growth-rate input
+    // (`source_kind13_variant_growth`).
+    let house_site = |anchors: &[(i32, i32)],
+                      markets: &[(i32, i32)],
+                      chapels: &[(i32, i32)],
+                      pasture: &HashSet<(i32, i32)>|
+     -> Option<(i32, i32)> {
+        anchors
+            .iter()
+            .copied()
+            .min_by_key(|&(x, y)| {
+                let c = centre_of(x, y, 2, 2);
+                let market_class = markets
+                    .iter()
+                    .filter(|&&m| in_disc(&market_rows, m, c))
+                    .map(|&m| {
+                        anno_sim::data_bridge::source_market_distance_class(
+                            (c.0 - m.0).unsigned_abs().min(255) as u8,
+                            (c.1 - m.1).unsigned_abs().min(255) as u8,
+                        )
+                    })
+                    .min();
+                let chapel_covered = chapels.iter().any(|&c0| in_disc(&chapel_rows, c0, c));
+                let grazed = (0..2)
+                    .flat_map(|dy| (0..2).map(move |dx| (dx, dy)))
+                    .filter(|&(dx, dy)| pasture.contains(&(x + dx, y + dy)))
+                    .count();
+                (
+                    u8::from(!chapel_covered),
+                    u8::from(market_class.is_none()),
+                    grazed,
+                    market_class.unwrap_or(7),
+                    (c.0 - anchor.0).abs() + (c.1 - anchor.1).abs(),
+                )
+            })
+    };
+
+    // Site a civic building deliberately: among the sites the engine admits,
+    // take the one whose service disc covers the most of `targets`. For a
+    // marketplace `targets` is either the houses the engine reports as having
+    // no market coverage, or the house anchors that are still outside the
+    // claim — the same search either way, because a MARKT both extends the
+    // territory and adds a transfer root. Markets must sit inside the
+    // cart-reachable component so the new root is itself served.
+    #[allow(clippy::too_many_arguments)]
+    let civic_site = |sim: &Sim,
+                      refused_sites: &HashSet<(usize, (i32, i32))>,
+                      pasture: &HashSet<(i32, i32)>,
+                      walls: &HashSet<(i32, i32)>,
+                      served: &[(i32, i32, u8, u8)],
+                      reachable: &HashSet<(i32, i32)>,
+                      def_index: usize,
+                      rows: &[u8],
+                      targets: &[(i32, i32)],
+                      need_cart: bool|
+     -> Option<(i32, i32)> {
+        let def = &defs[def_index];
+        let (w, h) = (def.width, def.height);
+        let mut best: Option<((usize, usize, i32), (i32, i32))> = None;
+        for y in 0..i32::from(island.height) - i32::from(h) {
+            for x in 0..i32::from(island.width) - i32::from(w) {
+                if refused_sites.contains(&(def_index, (x, y)))
+                    || !unforested(sim, def_index, x, y)
+                    || (need_cart && !cart_can_reach(reachable, x, y, w, h))
+                    || !admitted(sim, def_index, x, y)
+                {
+                    continue;
+                }
+                let c = centre_of(x, y, w, h);
+                let hits = targets.iter().filter(|&&p| in_disc(rows, c, p)).count();
+                if hits == 0 {
+                    continue;
+                }
+                let grazed = (0..i32::from(h))
+                    .flat_map(|dy| (0..i32::from(w)).map(move |dx| (dx, dy)))
+                    .filter(|&(dx, dy)| pasture.contains(&(x + dx, y + dy)))
+                    .count();
+                let key = (
+                    usize::MAX - hits,
+                    grazed,
+                    (c.0 - anchor.0).abs() + (c.1 - anchor.1).abs(),
+                );
+                if best.as_ref().is_none_or(|(bk, _)| key < *bk) {
+                    best = Some((key, (x, y)));
+                }
+            }
+        }
+        best.map(|(_, p)| p)
+    };
+
+    // A harvester only works if its raw resource lies inside its own Radius:
+    // the worker searches the static map roots for ripe (kind 9) cells whose
+    // output ware matches the building's `Rohstoff`, inside the building's
+    // compiled `Radius` measured as a circle (`FUN_00404d70` rows).
+    //
+    // Rank sites by *sustained* yield, not by the instantaneous ripe count —
+    // ranking on what happens to be ripe today is what sited two fisheries onto
+    // 5 and 7 cells and starved the colony at 46 inhabitants. A harvested cell
+    // leaves the ware entirely while it regrows (it reads back as an ordinary
+    // ware-0 root), so the live table cannot be asked how much ground a site
+    // commands; snapshot the island's authored resource layout once, before
+    // anything has been harvested, and rank against that.
+    let authored_resources: Vec<(u8, u8, (i32, i32))> = sim
+        .source_static_map_roots
+        .iter()
+        .filter(|c| c.island == 10 && c.source_output_ware_slot != 0)
+        .map(|c| {
+            (
+                c.source_output_ware_slot,
+                c.kind_code,
+                (i32::from(c.x), i32::from(c.y)),
+            )
+        })
+        .collect();
+    // Which settlement slot the colony's buildings carry. `FUN_0046f920`
+    // compares a harvest candidate's slot against the *worker's* by exact
+    // equality, so a tree standing on ground the colony has not claimed is
+    // invisible to a forester built beside it.
+    let colony_slot = sim
+        .source_cities
+        .active_records()
+        .into_iter()
+        .find(|c| c.island_id == 10 && c.owner_slot == 0)
+        .map(|c| c.source_owner)
+        .expect("the founded settlement's slot");
+    #[allow(clippy::too_many_arguments)]
+    let harvester_site = |sim: &Sim,
+                          refused_sites: &HashSet<(usize, (i32, i32))>,
+                          walls: &HashSet<(i32, i32)>,
+                          served: &[(i32, i32, u8, u8)],
+                          reachable: &HashSet<(i32, i32)>,
+                          def_index: usize,
+                          ware: u8,
+                          focus: &[(i32, i32)]|
+     -> Option<((i32, i32), usize, usize)> {
+        let def = &defs[def_index];
+        let (w, h) = (def.width, def.height);
+        let radius = i32::from(def.radius).max(1);
+        // Only cells the worker will actually accept count as yield, and the
+        // engine already owns that predicate: `FUN_0046f920` takes a cell on an
+        // always-walkable kind whatever its owner, and every other cell only
+        // when its settlement slot equals the worker's. Ranking without that
+        // test sited a forester on thirteen trees it was forbidden to touch and
+        // pinned the colony's wood at zero for the rest of the run.
+        //
+        // A cell currently absent from the root table is one this colony
+        // already harvested — it reads back as an ordinary ware-0 root while it
+        // regrows — so it still counts toward the ground the site commands. A
+        // cell that is present and refused is somebody else's, or nobody's, and
+        // counts for nothing.
+        //
+        // A fishery is the exception: its worker is nested kind 6 and searches
+        // the water grid, whose target predicate (`FUN_0046fb50`) matches on
+        // outer kind `MEER` + nested `ROHSTOFF` + `Ware` and never reads the
+        // tile's owner selector at all — which is the only reason a colony can
+        // fish, since `claim_source_settlement_area` refuses to claim `MEER`.
+        // The engine keeps that predicate private, so the one thing this driver
+        // cannot ask it is which cells a fishery may work; it asks only whether
+        // the *land* rule binds.
+        let owner_bound = cod.buildings[def_index].source_production_kind_code() != Some(6);
+        let mut live: std::collections::HashMap<(i32, i32), bool> =
+            std::collections::HashMap::new();
+        for cell in sim
+            .source_static_map_roots
+            .iter()
+            .filter(|c| c.island == 10 && c.source_output_ware_slot == ware)
+        {
+            live.insert(
+                (i32::from(cell.x), i32::from(cell.y)),
+                (!owner_bound || cell.admits_plantation_worker_path(colony_slot, ware))
+                    && cell.source_production_kind_code == 9,
+            );
+        }
+        let cells: Vec<((i32, i32), bool)> = authored_resources
+            .iter()
+            .filter(|(slot, _, _)| *slot == ware)
+            .filter_map(|&(_, _, p)| match live.get(&p) {
+                Some(true) => Some((p, true)),
+                Some(false) => None,
+                None => Some((p, false)),
+            })
+            .collect();
+        let mut best: Option<((usize, i32, usize), ((i32, i32), usize, usize))> = None;
+        for y in 0..i32::from(island.height) - i32::from(h) {
+            for x in 0..i32::from(island.width) - i32::from(w) {
+                // A harvester is the one building allowed to stand in the
+                // woods: it is sited *on* its resource, and the colony that
+                // actually kept wood, food and cloth flowing at scale put its
+                // foresters inside the tree line. Housing is still kept out —
+                // that is what protects the woodland.
+                let (dx, dy) = (x - anchor.0, y - anchor.1);
+                if refused_sites.contains(&(def_index, (x, y)))
+                    || dx * dx + dy * dy > 16 * 16
+                    || !cart_can_reach(reachable, x, y, w, h)
+                    || !admitted(sim, def_index, x, y)
+                {
+                    continue;
+                }
+                let (mut total, mut ripe) = (0usize, 0usize);
+                for &((cx, cy), is_ripe) in &cells {
+                    let (dx, dy) = (cx - x, cy - y);
+                    if dx * dx + dy * dy <= radius * radius {
+                        total += 1;
+                        ripe += usize::from(is_ripe);
+                    }
+                }
+                if ripe == 0 {
+                    continue;
+                }
+                // Bucket the yield so near-equal grounds tie and the second
+                // key decides: a grazer wants to stand next to the workshop
+                // that eats its wool, because the city cart will otherwise
+                // carry the wool off to the Kontor before the workshop's own
+                // type-8 carrier gets there and the weaving hut starves beside
+                // a full sheep farm.
+                let near = focus
+                    .iter()
+                    .map(|&(fx, fy)| (x - fx).abs().max((y - fy).abs()))
+                    .min()
+                    .unwrap_or_else(|| (x - anchor.0).abs() + (y - anchor.1).abs());
+                let key = (usize::MAX - total / 4, near, usize::MAX - ripe);
+                if best.as_ref().is_none_or(|(bk, _)| key < *bk) {
+                    best = Some((key, ((x, y), total, ripe)));
+                }
+            }
+        }
+        best.map(|(_, v)| v)
+    };
+
+    // Fence off the pasture a newly placed grazer depends on.
+    let reserve_resource = |sim: &Sim,
+                            pasture: &mut HashSet<(i32, i32)>,
+                            def_index: usize,
+                            at: (i32, i32),
+                            ware: u8| {
+        let radius = i32::from(defs[def_index].radius).max(1);
+        for cell in sim
+            .source_static_map_roots
+            .iter()
+            .filter(|c| c.island == 10 && c.source_output_ware_slot == ware)
+        {
+            let (dx, dy) = (i32::from(cell.x) - at.0, i32::from(cell.y) - at.1);
+            if dx * dx + dy * dy <= radius * radius {
+                pasture.insert((i32::from(cell.x), i32::from(cell.y)));
+            }
+        }
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    let build_harvester = |sim: &mut Sim,
+                           tally: &mut Tally,
+                           refused_sites: &mut HashSet<(usize, (i32, i32))>,
+                           pasture: &mut HashSet<(i32, i32)>,
+                           walls: &mut HashSet<(i32, i32)>,
+                           served: &mut Vec<(i32, i32, u8, u8)>,
+                           reachable: &mut HashSet<(i32, i32)>,
+                           placed_at: &mut Vec<(i32, i32)>,
+                           def_index: usize,
+                           ware: u8,
+                           focus: &[(i32, i32)],
+                           label: &str|
+     -> bool {
+        let Some(((x, y), total, ripe)) =
+            harvester_site(sim, refused_sites, walls, served, reachable, def_index, ware, focus)
+        else {
             println!("no {label} site with ware {ware} in range");
             return false;
         };
-        let n = rank / 64;
-        let placed = anno_game::game_commands::apply_game_command(
+        println!("  {label} site ({x},{y}): {total} ware-{ware} cells in range, {ripe} ripe");
+        let placed = build_at(
             sim,
-            &szs.islands,
-            &cod,
-            &defs,
-            &Command::PlaceBuilding {
-                player: 0,
-                island: 10,
-                tile_x: x as u16,
-                tile_y: y as u16,
-                def_index,
-                orientation: 0,
-            },
+            tally,
+            refused_sites,
+            walls,
+            served,
+            reachable,
+            true,
+            def_index,
+            x,
+            y,
+            label,
         );
-        println!("build {label} at ({x},{y}) with {n} ware-{ware} cells in range: {placed}");
         if placed {
-            used.push((x, y, w, h));
+            placed_at.push((x, y));
+            if ware == GRAS {
+                reserve_resource(sim, pasture, def_index, (x, y), ware);
+            }
         }
         placed
     };
 
-    // Build order is bounded by the ship's 50 wood: the forester is the only
-    // wood source and costs none, so it goes up first, then food, then the
-    // civic core, then houses, then the cloth chain. Every def here carries
-    // `Bauinfra: INFRA_NIX` and is placeable under the campaign's `0x3` mask.
-    // Ware slots are `0x2d + bit`: 52 GRAS, 53 BAUM, 57 FISCHE.
-    build_on_resource(&mut sim, &mut used, 402, 53, "forester"); //  0 wood, 2 tools
-    build_on_resource(&mut sim, &mut used, 270, 57, "fishery"); //   5 wood, 3 tools
-    build(&mut sim, &mut used, 468, "market"); // 10 wood,  4 tools
-    build(&mut sim, &mut used, 463, "chapel"); //  5 wood,  2 tools
-    for n in 0..4 {
-        build(&mut sim, &mut used, 414, &format!("hut{n}")); // 3 wood each
+    // A workshop is not sited for coverage but for its **suppliers**. The
+    // type-8 workshop carrier fetches the input ware itself, and it is racing
+    // the type-11 city cart, which will haul the same wool off to the Kontor;
+    // put the weaving hut far from its sheep and the farms fill to their cap
+    // while the weaver sits at raw = 0. Take the admitted, cart-reachable site
+    // closest to the farms it eats from.
+    #[allow(clippy::too_many_arguments)]
+    let workshop_site = |sim: &Sim,
+                         refused_sites: &HashSet<(usize, (i32, i32))>,
+                         pasture: &HashSet<(i32, i32)>,
+                         walls: &HashSet<(i32, i32)>,
+                         served: &[(i32, i32, u8, u8)],
+                         reachable: &HashSet<(i32, i32)>,
+                         def_index: usize,
+                         suppliers: &[(i32, i32)]|
+     -> Option<(i32, i32)> {
+        let def = &defs[def_index];
+        let (w, h) = (def.width, def.height);
+        let mut best: Option<((i32, i32, usize), (i32, i32))> = None;
+        for y in 0..i32::from(island.height) - i32::from(h) {
+            for x in 0..i32::from(island.width) - i32::from(w) {
+                if refused_sites.contains(&(def_index, (x, y)))
+                    || !unforested(sim, def_index, x, y)
+                    || !cart_can_reach(reachable, x, y, w, h)
+                    || !admitted(sim, def_index, x, y)
+                {
+                    continue;
+                }
+                let far = suppliers
+                    .iter()
+                    .map(|&(sx, sy)| (x - sx).abs().max((y - sy).abs()))
+                    .max()
+                    .unwrap_or(0);
+                let sum: i32 = suppliers
+                    .iter()
+                    .map(|&(sx, sy)| (x - sx).abs() + (y - sy).abs())
+                    .sum();
+                let grazed = (0..i32::from(h))
+                    .flat_map(|dy| (0..i32::from(w)).map(move |dx| (dx, dy)))
+                    .filter(|&(dx, dy)| pasture.contains(&(x + dx, y + dy)))
+                    .count();
+                let key = (far, sum, grazed);
+                if best.as_ref().is_none_or(|(bk, _)| key < *bk) {
+                    best = Some((key, (x, y)));
+                }
+            }
+        }
+        best.map(|(_, p)| p)
+    };
+
+    // What does the engine say about the colony's houses? `state_bits & 0x80`
+    // is marketplace coverage, `lifecycle_flags & 0x000c` is chapel-or-church,
+    // and `source_transition_active_for_group(1)` is the composite that decides
+    // whether a pioneer hut can ever become a settler house — 2 residents
+    // against 6. Read the verdict; do not recompute it.
+    let stuck_houses = |sim: &Sim| -> (Vec<(i32, i32)>, Vec<(i32, i32)>) {
+        let (mut no_chapel, mut no_market) = (Vec::new(), Vec::new());
+        for loc in sim.source_kind13_locations.active_locations() {
+            if loc.island_id != 10 || loc.population_group != 0 {
+                continue;
+            }
+            if loc.source_transition_active_for_group(1) {
+                continue;
+            }
+            let p = (i32::from(loc.tile_x), i32::from(loc.tile_y));
+            if loc.state_bits & 0x80 == 0 {
+                no_market.push(p);
+            } else {
+                no_chapel.push(p);
+            }
+        }
+        (no_chapel, no_market)
+    };
+
+    // ------------------------------------------------------------------
+    // Stage 1b: the opening core.
+    // ------------------------------------------------------------------
+    // Bounded by the ship's 50 wood and 60 tools — the colony has no tool
+    // smith at tier 0, so those 60 tools are the entire construction budget of
+    // the run and every rung below is priced in them. The forester goes up
+    // first: it is the only wood source and costs no wood.
+    let mut forester_sites: Vec<(i32, i32)> = Vec::new();
+    let mut fishery_sites: Vec<(i32, i32)> = Vec::new();
+    let mut sheep_sites: Vec<(i32, i32)> = Vec::new();
+    build_harvester(
+        &mut sim,
+        &mut tally,
+        &mut refused_sites,
+        &mut pasture,
+        &mut walls,
+        &mut served,
+        &mut reachable,
+        &mut forester_sites,
+        FORESTER,
+        BAUM,
+        &[],
+        "forester0",
+    );
+    build_harvester(
+        &mut sim,
+        &mut tally,
+        &mut refused_sites,
+        &mut pasture,
+        &mut walls,
+        &mut served,
+        &mut reachable,
+        &mut fishery_sites,
+        FISHERY,
+        FISCHE,
+        &[],
+        "fishery0",
+    );
+    // The first marketplace is sited for *room*, not convenience: it takes the
+    // spot whose radius-16 claim buys the most buildable ground the colony does
+    // not own yet. The Kontor's own claim is only 158 hut-legal tiles; the whole
+    // rest of the island is out of reach until a MARKT pays for it.
+    {
+        let (_, outside) = survey_house_anchors(&sim, &refused_sites);
+        if let Some((x, y)) = civic_site(
+            &sim,
+            &refused_sites,
+            &pasture,
+            &walls,
+            &served,
+            &reachable,
+            MARKET,
+            &market_rows,
+            &outside,
+            true,
+        ) {
+            if build_at(
+                &mut sim,
+                &mut tally,
+                &mut refused_sites,
+                &mut walls,
+                &mut served,
+                &mut reachable,
+                true,
+                MARKET,
+                x,
+                y,
+                "market0",
+            ) {
+                markets.push(centre_of(x, y, defs[MARKET].width, defs[MARKET].height));
+            }
+        }
+    }
+    // The chapel goes where it covers the most ground the colony can actually
+    // house people on: without it every hut is capped at two residents.
+    {
+        let (inside, _) = survey_house_anchors(&sim, &refused_sites);
+        let covered: Vec<(i32, i32)> = inside
+            .iter()
+            .copied()
+            .filter(|&(x, y)| {
+                let c = centre_of(x, y, 2, 2);
+                markets.iter().any(|&m| in_disc(&market_rows, m, c))
+            })
+            .collect();
+        if let Some((x, y)) = civic_site(
+            &sim,
+            &refused_sites,
+            &pasture,
+            &walls,
+            &served,
+            &reachable,
+            CHAPEL,
+            &chapel_rows,
+            &covered,
+            false,
+        ) {
+            if build_at(
+                &mut sim,
+                &mut tally,
+                &mut refused_sites,
+                &mut walls,
+                &mut served,
+                &mut reachable,
+                false,
+                CHAPEL,
+                x,
+                y,
+                "chapel0",
+            ) {
+                chapels.push(centre_of(x, y, defs[CHAPEL].width, defs[CHAPEL].height));
+            }
+        }
+    }
+    let mut huts = 0usize;
+    for _ in 0..4 {
+        let (inside, _) = survey_house_anchors(&sim, &refused_sites);
+        let Some((x, y)) = house_site(&inside, &markets, &chapels, &pasture) else {
+            println!("no house anchor for hut{huts}");
+            break;
+        };
+        if build_at(
+            &mut sim,
+            &mut tally,
+            &mut refused_sites,
+            &mut walls,
+            &mut served,
+            &mut reachable,
+            false,
+            HUT,
+            x,
+            y,
+            &format!("hut{huts}"),
+        ) {
+            huts += 1;
+        }
     }
     // Cloth needs no fertility and no rung: two sheep farms feed one weaver
     // (the hut consumes 2 Wool per Cloth). The farms graze ripe GRAS cells.
-    build_on_resource(&mut sim, &mut used, 412, 52, "sheep0"); //  4 wood, 2 tools
-    build_on_resource(&mut sim, &mut used, 412, 52, "sheep1"); //  4 wood, 2 tools
-    build(&mut sim, &mut used, 388, "weaver"); //  6 wood,  3 tools
+    let mut sheep = 0usize;
+    let mut weavers = 0usize;
+    let mut weaver_sites: Vec<(i32, i32)> = Vec::new();
+    for _ in 0..2 {
+        let focus = sheep_sites.clone();
+        if build_harvester(
+            &mut sim,
+            &mut tally,
+            &mut refused_sites,
+            &mut pasture,
+            &mut walls,
+            &mut served,
+            &mut reachable,
+            &mut sheep_sites,
+            SHEEP,
+            GRAS,
+            &focus,
+            &format!("sheep{sheep}"),
+        ) {
+            sheep += 1;
+        }
+    }
+    if let Some((x, y)) = workshop_site(&sim, &refused_sites, &pasture, &walls, &served, &reachable, WEAVER, &sheep_sites) {
+        if build_at(
+            &mut sim,
+            &mut tally,
+            &mut refused_sites,
+            &mut walls,
+            &mut served,
+            &mut reachable,
+            true,
+            WEAVER,
+            x,
+            y,
+            "weaver0",
+        ) {
+            weavers += 1;
+            weaver_sites.push((x, y));
+        }
+    }
 
-    // Per-producer live cell state: is it scheduled, is raw material arriving,
-    // is finished stock piling up locally instead of reaching the warehouse?
-    let cell_report = |sim: &anno_sim::simulation::Simulation| {
+    // ------------------------------------------------------------------
+    // Reporting.
+    // ------------------------------------------------------------------
+    let cell_report = |sim: &Sim| {
         for cell in sim
             .source_map_cell_states
             .iter()
@@ -423,168 +1073,434 @@ fn main() {
                 .or_default() += 1;
         }
         println!("  worker figures on island 10: {routes:?}");
-        let carts = sim
-            .figures
-            .iter()
-            .filter(|f| {
-                f.is_active()
-                    && f.origin_island == 10
-                    && f.source_worker_route == anno_sim::entity::SourceWorkerRoute::None
-            })
-            .count();
-        println!("  non-harvest figures from island 10: {carts}");
     };
 
-    // Which buildings are still owed materials / still under construction?
-    let site_report = |sim: &anno_sim::simulation::Simulation| {
-        for b in sim
-            .buildings
-            .iter()
-            .filter(|b| b.island_id == 10 && b.owner == 0)
-        {
-            if b.construction_ms_remaining > 0 || b.wood_needed > 0 || b.tools_needed > 0 {
-                println!(
-                    "  site def={} at ({},{}) build_ms={} owes wood={} tools={} bricks={}",
-                    b.def_id,
-                    b.tile_x,
-                    b.tile_y,
-                    b.construction_ms_remaining,
-                    b.wood_needed,
-                    b.tools_needed,
-                    b.bricks_needed,
-                );
-            }
-        }
-    };
-
-    // --- Stage 1c: run 10 minutes of sim and report ---
-    let report = |sim: &anno_sim::simulation::Simulation, label: String| {
+    let report = |sim: &Sim, label: String| {
         let city = sim
             .source_cities
             .active_records()
             .into_iter()
             .find(|c| c.island_id == 10 && c.owner_slot == 0)
             .unwrap();
-        let wh = sim
-            .warehouses
-            .iter()
-            .find(|w| w.island_id == 10 && w.owner == 0)
-            .unwrap();
+        let total: u32 = city.tier_population.iter().sum();
         println!(
-            "{label}: pop={:?} sat={:?} food={} wool={} cloth={} wood={} resv={:?} gold={} unlock={:#x}",
+            "{label}: pop={total} {:?} sat={:?} food={} cloth={} wood={} tools={} resv={:?} gold={} unlock={:#x}",
             city.tier_population,
             city.satisfaction_by_group,
-            wh.stock(Good::Food),
-            wh.stock(Good::Wool),
-            wh.stock(Good::Cloth),
-            wh.stock(Good::Wood),
+            stock(sim, Good::Food),
+            stock(sim, Good::Cloth),
+            stock(sim, Good::Wood),
+            stock(sim, Good::Tools),
             city.promotion_reservations,
             sim.players[0].gold,
             sim.players[0].unlock_mask,
         );
+        total
     };
+
+    let run_minute = |sim: &mut Sim| {
+        for _ in 0..600 {
+            sim.tick(100);
+            sim.drain_source_kind13_replacements(&cod);
+        }
+    };
+
     for minute in 1..=10u32 {
-        for _ in 0..600 {
-            sim.tick(100);
-            sim.drain_source_kind13_replacements(&cod);
-        }
-        report(&sim, format!("min {minute}"));
-        if minute == 1 || minute == 10 {
-            site_report(&sim);
-            cell_report(&sim);
-        }
-    }
-
-    // --- Stage 3: run the real chains ---
-    // Nothing is injected any more. Stage 2 proved the promotion gate is
-    // supply-driven by feeding the warehouse directly; this stage makes the
-    // colony earn its own cloth through sheep farm -> weaving hut, which is
-    // enough on its own because group-1 satisfaction saturates on cloth.
-    println!("--- stage 3: colony produces its own cloth ---");
-    for minute in 11..=40u32 {
-        for _ in 0..600 {
-            sim.tick(100);
-            sim.drain_source_kind13_replacements(&cod);
-        }
+        run_minute(&mut sim);
         report(&sim, format!("min {minute}"));
     }
+    cell_report(&sim);
 
-    // --- Stage 4: scale toward the goal ---
-    // The colony is self-sustaining but capped by its house count: pioneer
-    // huts hold 2 and settler houses 6, so 100 inhabitants needs far more
-    // than the opening four. Expand the core once wood is flowing, and add a
-    // second food and cloth line to carry the larger population.
-    // Expansion is paced against the food stock rather than built out in one
-    // burst. The first attempt placed twenty huts at once and the colony
-    // starved at 46 inhabitants: a harvest cell is finite now, and a fishery's
-    // sustained yield is its ripe cells divided by the 450 s a sea cell takes
-    // to ripen — so houses have to wait for the food line, not the other way
-    // round. A player paces it the same way.
-    println!("--- stage 4: expanding the colony, paced on food ---");
-    build_on_resource(&mut sim, &mut used, 402, 53, "forester1");
-    build_on_resource(&mut sim, &mut used, 412, 52, "sheep2");
-    build(&mut sim, &mut used, 388, "weaver1");
-    let mut huts = 4;
-    let mut fisheries = 1;
-    let mut cloth_lines = 1;
-    let mut markets = 1;
-    for minute in 41..=120u32 {
-        for _ in 0..600 {
-            sim.tick(100);
-            sim.drain_source_kind13_replacements(&cod);
-        }
-        let food = sim
-            .warehouses
-            .iter()
-            .find(|w| w.island_id == 10 && w.owner == 0)
-            .map(|w| w.stock(Good::Food))
+    // ------------------------------------------------------------------
+    // Stage 2+: paced expansion.
+    // ------------------------------------------------------------------
+    // One placement a minute, in a fixed priority order. Food first, then
+    // cloth, then the infrastructure that lets a hut hold six people instead of
+    // two, then housing. Building out in one burst starved the colony at 46
+    // inhabitants: a harvest cell is finite, and a fishery's sustained yield is
+    // its cells divided by the 450 s a sea cell takes to ripen, so housing has
+    // to wait on the food line and not the other way round.
+    println!("--- paced expansion ---");
+    let mut foresters = 1usize;
+    let mut fisheries = 1usize;
+    // A production line takes minutes to come online, so a bare "stock is low"
+    // test fires again on the very next minute and again on the one after that:
+    // an earlier version of this loop answered one cloth shortage with six sheep
+    // farms in six minutes, spent half the tool budget, and laid no houses at
+    // all. Build a line, then wait and watch it, the way a player does.
+    let (mut last_forester, mut last_fishery, mut last_cloth) = (0u32, 0u32, 0u32);
+    for minute in 11..=120u32 {
+        run_minute(&mut sim);
+        let pop = report(&sim, format!("min {minute}"));
+        let (food, cloth, wood, tools) = (
+            stock(&sim, Good::Food),
+            stock(&sim, Good::Cloth),
+            stock(&sim, Good::Wood),
+            stock(&sim, Good::Tools),
+        );
+        let settlers = sim
+            .source_cities
+            .active_records()
+            .into_iter()
+            .find(|c| c.island_id == 10 && c.owner_slot == 0)
+            .map(|c| c.tier_population[1])
             .unwrap_or(0);
-        // Below a comfortable buffer, buy food capacity before housing.
-        let cloth = sim
-            .warehouses
-            .iter()
-            .find(|w| w.island_id == 10 && w.owner == 0)
-            .map(|w| w.stock(Good::Cloth))
-            .unwrap_or(0);
-        // Food first, then cloth, then housing. Settlers consume cloth, so a
-        // single sheep-and-weaver line stops covering the settler population
-        // it created — the same failure the fisheries had, one good along.
-        if food < 25 && fisheries < 6 {
-            if build_on_resource(&mut sim, &mut used, 270, 57, &format!("fishery{fisheries}")) {
-                fisheries += 1;
-            }
-        } else if cloth < 20 && cloth_lines < 4 {
-            let sheep = build_on_resource(
-                &mut sim,
-                &mut used,
-                412,
-                52,
-                &format!("sheep{}", cloth_lines + 2),
+
+        // The ship still holds the tools that would not fit under the
+        // warehouse's 50-per-good cap at founding — a sixth of the run's entire
+        // construction budget. Try to land them once. `UnloadShip`'s adjacency
+        // test compares the ship's *world* position against the warehouse's
+        // *island-local* tile (`Simulation::apply_command`, the `dx > 2 ||
+        // dy > 2` arm), so for any island not sitting at the world origin it
+        // can never be satisfied: this is expected to fail, and the log line
+        // records it as an engine gap rather than as a driver bug.
+        if minute == 11 {
+            let wh = sim
+                .warehouses
+                .iter()
+                .position(|w| w.island_id == 10 && w.owner == 0)
+                .unwrap_or(0) as u32;
+            let aboard = sim.trade_ships[ship as usize].cargo_amount(Good::Tools);
+            let landed = aboard > 0
+                && sim.apply_command(&Command::UnloadShip {
+                    player: 0,
+                    ship_idx: ship,
+                    warehouse_idx: wh,
+                    good: Good::Tools,
+                    qty: aboard,
+                });
+            println!(
+                "  landing the Verena's remaining {aboard} tools: {landed}                  (ship at world ({},{}), warehouse tile ({},{}))",
+                sim.trade_ships[ship as usize].world_x,
+                sim.trade_ships[ship as usize].world_y,
+                sim.warehouses[wh as usize].tile_x,
+                sim.warehouses[wh as usize].tile_y,
             );
-            let weaver = build(&mut sim, &mut used, 388, &format!("weaver{cloth_lines}"));
-            if sheep || weaver {
-                cloth_lines += 1;
+        }
+
+        // Each rung consumes the minute only if it actually placed something.
+        // A rung that wants to build but has nowhere to put it must fall
+        // through, or the colony spends the rest of the run re-proposing an
+        // impossible fishery and never lays another house.
+        let mut placed_this_minute = false;
+
+        if !placed_this_minute
+            && wood < 8
+            && foresters < 4
+            && minute >= last_forester + 8
+            && tools >= defs[FORESTER].cost_tools
+        {
+            if build_harvester(
+                &mut sim,
+                &mut tally,
+                &mut refused_sites,
+                &mut pasture,
+                &mut walls,
+                &mut served,
+                &mut reachable,
+                &mut forester_sites,
+                FORESTER,
+                BAUM,
+                &[],
+                &format!("forester{foresters}"),
+            ) {
+                foresters += 1;
+                placed_this_minute = true;
             }
-        } else if huts < 60 {
-            if build(&mut sim, &mut used, 414, &format!("hut{huts}")) {
-                huts += 1;
-            } else {
-                // Refused, almost always by the buildable-area gate: the site
-                // lies on unowned ground and this player has already settled
-                // the island (`1602_exe.c:7612-7616`). A marketplace claims
-                // every still-unowned land cell in its own radius
-                // (`FUN_0046ac60`), so it is the way to buy more room — which
-                // is exactly how the original expects a colony to grow.
-                if build(&mut sim, &mut used, 468, &format!("market{markets}")) {
-                    markets += 1;
+            last_forester = minute;
+        }
+        // Food is the one shortage the colony must not build through. If the
+        // larder is thin and the last fishery is still bedding in, spend the
+        // minute on nothing at all rather than on another house: adding mouths
+        // to a short food line is precisely how the colony reached 46
+        // inhabitants and then died.
+        let hungry = food < 20 + pop as u16 / 4;
+        if !placed_this_minute
+            && hungry
+            && fisheries < 9
+            && minute >= last_fishery + 8
+            && tools >= defs[FISHERY].cost_tools
+        {
+            if build_harvester(
+                &mut sim,
+                &mut tally,
+                &mut refused_sites,
+                &mut pasture,
+                &mut walls,
+                &mut served,
+                &mut reachable,
+                &mut fishery_sites,
+                FISHERY,
+                FISCHE,
+                &[],
+                &format!("fishery{fisheries}"),
+            ) {
+                fisheries += 1;
+                placed_this_minute = true;
+            }
+            last_fishery = minute;
+        }
+        // Still hungry after that rung: hold off on new housing. Everything
+        // that does not add a mouth — a chapel, a marketplace that buys the
+        // coastline the next fishery needs — is still worth the minute.
+        let hold_housing = !placed_this_minute && hungry && fisheries < 9;
+        // Settlers consume cloth; a single sheep-and-weaver line stops covering
+        // the settler population it created. Keep the authored 2 wool : 1 cloth
+        // ratio by alternating farms and weaving huts. `TOOL_RESERVE` keeps one
+        // fishery's worth of tools back: the run's whole construction budget is
+        // the 60 tools the Verena carried, and food outranks everything.
+        const TOOL_RESERVE: u16 = 3;
+        if !placed_this_minute
+            && settlers > 0
+            && cloth < 10 + (settlers as u16) / 4
+            && minute >= last_cloth + 12
+        {
+            if sheep < weavers * 2 + 2
+                && sheep < 8
+                && tools >= defs[SHEEP].cost_tools + TOOL_RESERVE
+            {
+                // A new farm goes beside the weaving huts that eat its wool.
+                let focus = weaver_sites.clone();
+                if build_harvester(
+                    &mut sim,
+                    &mut tally,
+                    &mut refused_sites,
+                    &mut pasture,
+                    &mut walls,
+                    &mut served,
+                    &mut reachable,
+                    &mut sheep_sites,
+                    SHEEP,
+                    GRAS,
+                    &focus,
+                    &format!("sheep{sheep}"),
+                ) {
+                    sheep += 1;
+                    placed_this_minute = true;
+                }
+                last_cloth = minute;
+            } else if weavers < 4 && tools >= defs[WEAVER].cost_tools + TOOL_RESERVE {
+                // The new weaver serves the farms no existing weaver is next
+                // to: take the two most distant from any weaving hut.
+                let mut orphans = sheep_sites.clone();
+                orphans.sort_by_key(|&(sx, sy)| {
+                    std::cmp::Reverse(
+                        weaver_sites
+                            .iter()
+                            .map(|&(wx, wy)| (sx - wx).abs().max((sy - wy).abs()))
+                            .min()
+                            .unwrap_or(0),
+                    )
+                });
+                orphans.truncate(2);
+                if let Some((x, y)) =
+                    workshop_site(&sim, &refused_sites, &pasture, &walls, &served, &reachable, WEAVER, &orphans)
+                {
+                    if build_at(
+                        &mut sim,
+                        &mut tally,
+                        &mut refused_sites,
+                        &mut walls,
+                        &mut served,
+                        &mut reachable,
+                        true,
+                        WEAVER,
+                        x,
+                        y,
+                        &format!("weaver{weavers}"),
+                    ) {
+                        weavers += 1;
+                        weaver_sites.push((x, y));
+                        placed_this_minute = true;
+                    }
+                }
+                last_cloth = minute;
+            }
+        }
+
+        // Ask the engine which houses are stalled and what they are missing,
+        // then buy exactly that. A chapel is the cheapest population multiplier
+        // the colony can reach at this tier: two tools turn every 2-resident
+        // pioneer hut in its disc into a 6-resident settler house.
+        let (no_chapel, no_market) = stuck_houses(&sim);
+        if !placed_this_minute
+            && no_chapel.len() >= 3
+            && chapels.len() < 5
+            && tools >= defs[CHAPEL].cost_tools + TOOL_RESERVE
+        {
+            if let Some((x, y)) = civic_site(
+                &sim,
+                &refused_sites,
+                &pasture,
+                &walls,
+                &served,
+                &reachable,
+                CHAPEL,
+                &chapel_rows,
+                &no_chapel,
+                false,
+            ) {
+                println!("  {} houses stalled for want of a chapel", no_chapel.len());
+                if build_at(
+                    &mut sim,
+                    &mut tally,
+                    &mut refused_sites,
+                    &mut walls,
+                    &mut served,
+                    &mut reachable,
+                    false,
+                    CHAPEL,
+                    x,
+                    y,
+                    &format!("chapel{}", chapels.len()),
+                ) {
+                    chapels.push(centre_of(x, y, defs[CHAPEL].width, defs[CHAPEL].height));
+                    placed_this_minute = true;
                 }
             }
         }
-        report(&sim, format!("min {minute}"));
-        if minute % 20 == 0 {
+        if !placed_this_minute
+            && no_market.len() >= 3
+            && markets.len() < 4
+            && tools >= defs[MARKET].cost_tools + TOOL_RESERVE
+        {
+            if let Some((x, y)) = civic_site(
+                &sim,
+                &refused_sites,
+                &pasture,
+                &walls,
+                &served,
+                &reachable,
+                MARKET,
+                &market_rows,
+                &no_market,
+                true,
+            ) {
+                println!(
+                    "  {} houses stalled for want of a marketplace",
+                    no_market.len()
+                );
+                if build_at(
+                    &mut sim,
+                    &mut tally,
+                    &mut refused_sites,
+                    &mut walls,
+                    &mut served,
+                    &mut reachable,
+                    true,
+                    MARKET,
+                    x,
+                    y,
+                    &format!("market{}", markets.len()),
+                ) {
+                    markets.push(centre_of(x, y, defs[MARKET].width, defs[MARKET].height));
+                    placed_this_minute = true;
+                }
+            }
+        }
+
+        // Housing. Only sites the engine already admits are ever proposed, so a
+        // refusal here is news rather than routine.
+        // Housing is *not* gated on the wood in store. Wood sits near zero for
+        // most of the run because construction draws it the moment it lands
+        // (`Simulation`'s material trickle takes one unit per tick per site) —
+        // the colony that reached 70 inhabitants ran at wood = 1 for forty
+        // minutes straight. A version that refused to lay a hut until the
+        // warehouse held its three wood simply never laid another hut. One
+        // placement a minute is the pacing; the warehouse is not the brake.
+        if !placed_this_minute {
+            let (inside, outside) = survey_house_anchors(&sim, &refused_sites);
+            if let Some((x, y)) =
+                house_site(&inside, &markets, &chapels, &pasture).filter(|_| !hold_housing)
+            {
+                if build_at(
+                    &mut sim,
+                    &mut tally,
+                    &mut refused_sites,
+                    &mut walls,
+                    &mut served,
+                    &mut reachable,
+                    false,
+                    HUT,
+                    x,
+                    y,
+                    &format!("hut{huts}"),
+                ) {
+                    huts += 1;
+                    placed_this_minute = true;
+                }
+            }
+            // Out of room inside the claim. A marketplace claims every
+            // still-unowned land cell in its own radius (`FUN_0046ac60`), so it
+            // is how a colony buys ground — site it where it buys the most.
+            if !placed_this_minute
+                && !outside.is_empty()
+                && markets.len() < 4
+                && tools >= defs[MARKET].cost_tools
+            {
+                if let Some((x, y)) = civic_site(
+                    &sim,
+                    &refused_sites,
+                    &pasture,
+                    &walls,
+                    &served,
+                    &reachable,
+                    MARKET,
+                    &market_rows,
+                    &outside,
+                    true,
+                ) {
+                    println!(
+                        "  claim is full ({} anchors left outside it); buying ground",
+                        outside.len()
+                    );
+                    if build_at(
+                        &mut sim,
+                        &mut tally,
+                        &mut refused_sites,
+                        &mut walls,
+                        &mut served,
+                        &mut reachable,
+                        true,
+                        MARKET,
+                        x,
+                        y,
+                        &format!("market{}", markets.len()),
+                    ) {
+                        markets.push(centre_of(x, y, defs[MARKET].width, defs[MARKET].height));
+                        placed_this_minute = true;
+                    }
+                }
+            }
+        }
+        let _ = placed_this_minute;
+        if minute % 30 == 0 {
             cell_report(&sim);
         }
     }
+
+    cell_report(&sim);
+    let (no_chapel, no_market) = stuck_houses(&sim);
+    println!(
+        "placements: {} accepted, {} refused; {} huts, {} markets at {:?}, {} chapels at {:?}, \
+         {} foresters, {} fisheries, {} sheep farms, {} weavers",
+        tally.accepted,
+        tally.refused,
+        huts,
+        markets.len(),
+        markets,
+        chapels.len(),
+        chapels,
+        foresters,
+        fisheries,
+        sheep,
+        weavers,
+    );
+    println!(
+        "houses still stalled: {} without a chapel, {} without a market",
+        no_chapel.len(),
+        no_market.len()
+    );
     println!(
         "objectives={:?}",
         sim.objectives

@@ -345,6 +345,18 @@ pub struct SourceMapCellState {
     /// target in the source weighted path grid.
     #[serde(default)]
     pub source_path_class: u8,
+    /// Compiled `Wegspeed[2]` path class at definition offset `+0x5a`, the
+    /// KARREN entry.
+    ///
+    /// The window rasters read `def[0x58 + speedtyp] & 0x7f` off whatever
+    /// definition the live map word names (`1602_exe.c:79479`, `:79587`), so
+    /// the class a cell contributes depends on the *searching figure*, not on
+    /// the cell. A live cell record therefore has to carry every class its
+    /// rasters can select; `source_path_class` is the `Speedtyp: 0` TRAEGER
+    /// entry and this is the `Speedtyp: 2` entry `FUN_004706e0` selects for a
+    /// type-11 city cart.
+    #[serde(default)]
+    pub source_path_class_city_cart: u8,
     /// Compiled `Randwachs` at definition offset `+0x40`, in the source's
     /// 128-scale.
     ///
@@ -637,6 +649,10 @@ impl SourceMapCellState {
             source_path_class: definition
                 .source_path_classes()
                 .map(|classes| classes[0])
+                .unwrap_or_default(),
+            source_path_class_city_cart: definition
+                .source_path_classes()
+                .map(|classes| classes[2])
                 .unwrap_or_default(),
             source_resource_growth_factor: definition.source_resource_growth_factor,
             source_damage_threshold: definition.source_damage_threshold,

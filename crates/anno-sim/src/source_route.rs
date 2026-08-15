@@ -1053,6 +1053,38 @@ impl SourcePathGrid {
         Ok(())
     }
 
+    /// Fill every cell of this grid the way the transfer-window rasters
+    /// `FUN_004704d0` (`1602_exe.c:79393`) and `FUN_004706e0` (`:79500`) do.
+    ///
+    /// Both stamp the impassable direction marker `0x0c` over the whole
+    /// scratch allocation and then overwrite only the cells the live map layer
+    /// admits, so `open` returning `None` *is* the pre-fill rather than a
+    /// second pass over it. Unlike
+    /// [`Self::populate_static_island_cells`] this walks the window, not a
+    /// command list, which is what makes a later command's cell win: the
+    /// caller resolves each coordinate against the live layer once.
+    pub fn rasterize_window<F>(&mut self, mut open: F)
+    where
+        F: FnMut((i32, i32)) -> Option<u8>,
+    {
+        for y in 0..self.height {
+            let row = y * self.width;
+            for x in 0..self.width {
+                let position = (self.origin.0 + x as i32, self.origin.1 + y as i32);
+                self.cells[row + x] = match open(position) {
+                    Some(metadata) => SourcePathCell {
+                        direction: 0,
+                        metadata,
+                    },
+                    None => SourcePathCell {
+                        direction: 0x0c,
+                        metadata: 0,
+                    },
+                };
+            }
+        }
+    }
+
     /// Set a cell's source path metadata. The high bit is the source blocked
     /// flag; the lower seven bits select the cost-table entry.
     pub fn set_metadata(&mut self, position: (i32, i32), metadata: u8) -> bool {

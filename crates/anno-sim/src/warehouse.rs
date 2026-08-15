@@ -21,14 +21,29 @@ const fn default_source_path_class() -> u8 {
     32
 }
 
+/// A city always owns at least the root that created it, and
+/// `FUN_0047ab00` subtracts one root's worth of capacity before adding
+/// `city+0x20`. Counts 0 and 1 therefore describe the same store.
+const fn default_city_transfer_root_count() -> u16 {
+    1
+}
+
+/// The source's storage floor. `FUN_0047aa00` reports free space below this
+/// as zero (`1602_exe.c:87421-87423`) and `FUN_0047aa30` refuses to hand out
+/// a whole remaining stock below it (`:87442-87444`).
+pub const SOURCE_STORE_FLOOR_FIXED: u32 = 0x20;
+
 /// Source storage capacity for the first player-built Kontor.
 /// `haeuser.cod` Nr=271 (`Bauinfra: INFRA_KONTOR_1`,
 /// `ProdKind: KONTOR`) carries `Maxlager: 50`.
 pub const BASE_KONTOR_CAPACITY: u16 = 50;
 
 /// All authored Kontor `Maxlager` values from `haeuser.cod`, in
-/// Nummer order 271..=277. The first three are the upgrade ladder;
-/// 274..=277 are small/special variants with 20 t per good.
+/// Nummer order 271..=277. The first three are the upgrade ladder
+/// (`INFRA_KONTOR_1/2/3`, source ids 22103/22105/22107); 274..=277
+/// (22121..=22124) are the **destroyed** Kontor variants — they carry
+/// `Destroyflg: 1`, so `FUN_00481fc0` does not count them as storage
+/// roots even though they still stamp their 20 t base into `city+0x20`.
 pub const KONTOR_MAXLAGER_VALUES: [u16; 7] = [50, 75, 100, 20, 20, 20, 20];
 
 /// A warehouse on an island, tracking inventory for one player.
@@ -52,13 +67,31 @@ pub struct Warehouse {
     #[serde(default = "default_source_path_class")]
     pub source_path_class: u8,
 
-    /// Default per-good cap when a good has no entry yet in
-    /// `inventory`. New warehouses use the base Kontor `Maxlager`;
-    /// loaded scenario Kontors can override this with their authored
-    /// definition, and old save files without the field deserialize
-    /// through the legacy serde fallback.
+    /// Source city record `+0x20`, in whole goods rather than the source's
+    /// 1/32 scale. `FUN_00481ee0` (`1602_exe.c:93084`) rewrites it with the
+    /// placed definition's compiled `Maxlager` on **every** KONTOR
+    /// installation, so a `KONTOR_2`/`KONTOR_3` upgrade raises this base;
+    /// [`Warehouse::city_storage_capacity_fixed`] adds it to the per-root
+    /// term. It doubles as the per-good cap for a good with no `inventory`
+    /// entry yet, and old save files without the field deserialize through
+    /// the legacy serde fallback.
     #[serde(default = "default_capacity_fallback")]
     pub default_capacity: u16,
+
+    /// Source city record `+0x1fa`: the number of live MARKT/KONTOR roots
+    /// this city owns that are not themselves ruins. `FUN_00481fc0`
+    /// (`:93194-93196`) increments it and `FUN_004820b0` (`:93216-93222`)
+    /// decrements it under the predicate
+    /// `(def[0x1c] == 7 || def[0x1c] == 8) && (def[0x6a] & 0x80) == 0`.
+    ///
+    /// Cached here, exactly as the source caches it on the city record, so
+    /// that [`Warehouse::deposit`] can apply `FUN_0047ab00`'s capacity
+    /// without reaching for the island's cell table.
+    /// `Simulation::refresh_source_city_storage_roots` republishes it
+    /// whenever a root is installed or released. Derived state, so it stays
+    /// out of the save payload and is recomputed on load.
+    #[serde(skip, default = "default_city_transfer_root_count")]
+    pub city_transfer_root_count: u16,
 
     /// Population of the city represented by this warehouse, ordered by the
     /// five source BGRUPPE tiers. STADT4 seeds this for authored settlements;
@@ -154,6 +187,7 @@ impl Warehouse {
             source_footprint: default_source_footprint(),
             source_path_class: default_source_path_class(),
             default_capacity,
+            city_transfer_root_count: default_city_transfer_root_count(),
             city_population: [0; 5],
             inventory: BTreeMap::new(),
             reservations: BTreeMap::new(),
@@ -195,6 +229,56 @@ impl Warehouse {
         u32::from(self.default_capacity)
             .saturating_mul(32)
             .saturating_add(additional_roots.saturating_mul(320))
+    }
+
+    /// `FUN_0047ab00` against this city's own cached root count.
+    pub fn city_capacity_fixed(&self) -> u32 {
+        self.city_storage_capacity_fixed(usize::from(self.city_transfer_root_count))
+    }
+
+    /// Republish the cached `city+0x1fa` storage-root count.
+    pub fn set_city_transfer_root_count(&mut self, transfer_root_count: usize) {
+        self.city_transfer_root_count = u16::try_from(transfer_root_count).unwrap_or(u16::MAX);
+    }
+
+    /// Adopt a KONTOR definition's compiled `Maxlager` as this city's base
+    /// storage, the whole body of `FUN_00481ee0`'s first statement
+    /// (`1602_exe.c:93084`, `city[0x20] = def[0x30]`). The argument is the
+    /// compiled `<< 5` value; the port keeps `+0x20` in whole goods.
+    ///
+    /// Take it from `BuildingDef::storage_animation_capacity` and not from
+    /// `properties["Maxlager"]` — a definition whose `Maxlager` lives only
+    /// inside a nested `HAUS_PRODTYP` block never reaches the string map.
+    pub fn set_source_storage_base_fixed(&mut self, maxlager_fixed: u16) {
+        self.default_capacity = maxlager_fixed / 32;
+    }
+
+    /// `FUN_0047aa00` (`1602_exe.c:87414-87424`): the room one good has left
+    /// in the shared city store. Every good is measured against the *whole*
+    /// city capacity — goods do not compete for space — and a remainder
+    /// below `0x20` reads as no room at all.
+    pub fn city_free_space_fixed(&self, good: Good, city_capacity_fixed: u32) -> u32 {
+        let free = city_capacity_fixed.saturating_sub(u32::from(self.city_stock_fixed(good)));
+        if free < SOURCE_STORE_FLOOR_FIXED {
+            0
+        } else {
+            free
+        }
+    }
+
+    /// `FUN_0047aa30` (`1602_exe.c:87434-87447`): how much of `good` a
+    /// withdrawal asking for `requested_fixed` may actually take. A request
+    /// strictly below the balance is granted in full; otherwise the caller
+    /// empties the slot, and a slot holding less than `0x20` yields nothing.
+    pub fn city_available_stock_fixed(&self, good: Good, requested_fixed: u16) -> u16 {
+        let stock = self.city_stock_fixed(good);
+        if requested_fixed < stock {
+            requested_fixed
+        } else if stock >= SOURCE_STORE_FLOOR_FIXED as u16 {
+            stock
+        } else {
+            0
+        }
     }
 
     /// Slider configuration for a good (default = no trade).
@@ -269,11 +353,20 @@ impl Warehouse {
             .unwrap_or(self.default_capacity)
     }
 
-    /// Deposit goods into the warehouse. Returns amount actually deposited.
+    /// Deposit whole goods into the city store. Returns the amount actually
+    /// deposited.
+    ///
+    /// The ceiling is `FUN_0047aa00`'s — the *whole* city capacity minus this
+    /// good's own balance, per `FUN_0047ab00` — not the first Kontor's
+    /// `Maxlager`. A city that owns a second MARKT or KONTOR root really does
+    /// take 10 t more of every good, and every ship unload, free-trader
+    /// exchange and wreck salvage in the port arrives through here.
     pub fn deposit(&mut self, good: Good, amount: u16) -> u16 {
-        let cap = self.default_capacity;
-        let entry = self.inventory.entry(good).or_insert((0, cap));
-        let space = entry.1.saturating_sub(entry.0);
+        let city_capacity_fixed = self.city_capacity_fixed();
+        let space = (self.city_free_space_fixed(good, city_capacity_fixed) / 32) as u16;
+        let city_capacity = (city_capacity_fixed / 32).min(u32::from(u16::MAX)) as u16;
+        let entry = self.inventory.entry(good).or_insert((0, city_capacity));
+        entry.1 = entry.1.max(city_capacity);
         let deposited = amount.min(space);
         entry.0 += deposited;
         if let Some(fixed) = self.city_fixed_inventory.get_mut(&good) {
@@ -300,7 +393,10 @@ impl Warehouse {
     ) -> u16 {
         let capacity_fixed = city_capacity_fixed.min(u32::from(u16::MAX)) as u16;
         let current_fixed = self.city_stock_fixed(good);
-        let deposited = amount_fixed.min(capacity_fixed.saturating_sub(current_fixed));
+        // `FUN_0047aac0` asks `FUN_0047aa00` for the room, so the `0x20`
+        // floor applies: a store with fewer than 32 free units is full.
+        let free_fixed = self.city_free_space_fixed(good, u32::from(capacity_fixed)) as u16;
+        let deposited = amount_fixed.min(free_fixed);
         let updated_fixed = current_fixed.saturating_add(deposited);
         self.city_fixed_inventory.insert(good, updated_fixed);
 
@@ -475,6 +571,98 @@ mod tests {
         assert_eq!(wh.stock(Good::Wood), BASE_KONTOR_CAPACITY);
         assert_eq!(wh.source_footprint, (1, 1));
         assert_eq!(wh.source_path_class, 32);
+    }
+
+    /// `FUN_00481450` case 8 → `FUN_00481ee0` (`1602_exe.c:93084`):
+    /// `city[0x20] = def[0x30]`. The compiled `Maxlager` of the *placed*
+    /// definition becomes the base, so the upgrade ladder 50 → 75 → 100
+    /// raises it and a KONTOR_1 placed afterwards would lower it again.
+    #[test]
+    fn kontor_placement_restamps_the_city_storage_base() {
+        let mut wh = Warehouse::new(0, 0, 10, 10);
+        assert_eq!(wh.default_capacity, 50);
+        assert_eq!(wh.city_capacity_fixed(), 1_600);
+
+        // `INFRA_KONTOR_2`, haeuser.cod Nr 272 / source id 22105.
+        wh.set_source_storage_base_fixed(75 << 5);
+        assert_eq!(wh.default_capacity, 75);
+        assert_eq!(wh.city_capacity_fixed(), 2_400);
+        assert_eq!(wh.deposit(Good::Wood, 99), 75);
+
+        // `INFRA_KONTOR_3`, Nr 273 / source id 22107.
+        wh.set_source_storage_base_fixed(100 << 5);
+        assert_eq!(wh.default_capacity, 100);
+        assert_eq!(wh.city_capacity_fixed(), 3_200);
+        assert_eq!(wh.deposit(Good::Wood, 99), 25);
+        assert_eq!(wh.stock(Good::Wood), 100);
+    }
+
+    /// `FUN_0047ab00` (`:87510-87516`) is
+    /// `city[0x1fa] * 0x140 - 0x140 + city[0x20]`, and `FUN_0047aac0` stores
+    /// against exactly that. A second MARKT root is 10 t more room for
+    /// *every* good, and `deposit` is the port's only ship-unload, salvage
+    /// and free-trader entry point, so it has to see the same ceiling.
+    #[test]
+    fn deposit_honours_the_whole_city_capacity_not_the_kontor_base() {
+        let mut wh = Warehouse::with_capacity(0, 0, 10, 10, 50);
+        assert_eq!(wh.city_transfer_root_count, 1);
+        assert_eq!(wh.deposit(Good::Cloth, 99), 50);
+
+        // Two more MARKT roots: 1600 + 2 * 320 = 2240 fixed = 70 t.
+        wh.set_city_transfer_root_count(3);
+        assert_eq!(wh.city_capacity_fixed(), 2_240);
+        assert_eq!(wh.deposit(Good::Cloth, 99), 20);
+        assert_eq!(wh.stock(Good::Cloth), 70);
+        assert_eq!(wh.capacity(Good::Cloth), 70);
+        // Every good gets the whole capacity — they do not compete.
+        assert_eq!(wh.deposit(Good::Tools, 99), 70);
+
+        // And demolishing them takes the room back.
+        wh.set_city_transfer_root_count(1);
+        assert_eq!(wh.city_capacity_fixed(), 1_600);
+        assert_eq!(wh.deposit(Good::Bricks, 99), 50);
+    }
+
+    /// `FUN_0047aa00` (`:87421-87423`): `if (free < 0x20) free = 0`.
+    #[test]
+    fn free_space_below_one_whole_good_reads_as_no_room() {
+        let mut wh = Warehouse::with_capacity(0, 0, 10, 10, 50);
+        let capacity = wh.city_capacity_fixed();
+        assert_eq!(capacity, 1_600);
+
+        // 1569 leaves 31/32 of a good free, which the source calls full.
+        wh.seed_city_stock_fixed(Good::Cloth, 1_569);
+        assert_eq!(wh.city_free_space_fixed(Good::Cloth, capacity), 0);
+        assert_eq!(wh.deposit_city_good_fixed(Good::Cloth, 31, capacity), 0);
+        assert_eq!(wh.city_stock_fixed(Good::Cloth), 1_569);
+
+        // One unit less and the whole remainder is available again.
+        wh.seed_city_stock_fixed(Good::Cloth, 1_568);
+        assert_eq!(wh.city_free_space_fixed(Good::Cloth, capacity), 32);
+        assert_eq!(wh.deposit_city_good_fixed(Good::Cloth, 99, capacity), 32);
+        assert_eq!(wh.city_stock_fixed(Good::Cloth), 1_600);
+    }
+
+    /// `FUN_0047aa30` (`:87434-87447`): a request strictly below the balance
+    /// is granted in full, a request that would empty the slot is granted
+    /// only when the slot holds a whole good, and nothing else.
+    #[test]
+    fn stock_below_one_whole_good_yields_nothing_to_a_withdrawal() {
+        let mut wh = Warehouse::with_capacity(0, 0, 10, 10, 50);
+
+        wh.seed_city_stock_fixed(Good::Tools, 31);
+        assert_eq!(wh.city_available_stock_fixed(Good::Tools, 31), 0);
+        assert_eq!(wh.city_available_stock_fixed(Good::Tools, 99), 0);
+        // A partial request is still served out of a sub-unit balance.
+        assert_eq!(wh.city_available_stock_fixed(Good::Tools, 30), 30);
+
+        wh.seed_city_stock_fixed(Good::Tools, 32);
+        assert_eq!(wh.city_available_stock_fixed(Good::Tools, 32), 32);
+        assert_eq!(wh.city_available_stock_fixed(Good::Tools, 99), 32);
+        assert_eq!(wh.city_available_stock_fixed(Good::Tools, 20), 20);
+
+        wh.seed_city_stock_fixed(Good::Tools, 0);
+        assert_eq!(wh.city_available_stock_fixed(Good::Tools, 99), 0);
     }
 
     #[test]

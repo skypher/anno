@@ -390,9 +390,24 @@ pub fn place_building(
     sim.buildings.push(instance);
     if let Some(state) = source_cell_state {
         sim.source_map_cell_states.push(state);
+        // `FUN_00481fc0`'s tail (`1602_exe.c:93194-93196`): a live record for
+        // a MARKT or KONTOR that is not itself a ruin joins `city+0x1fa`,
+        // which is the per-root term of `FUN_0047ab00`'s city capacity.
+        sim.refresh_source_city_storage_roots();
     }
     if let Some(root) = source_static_root {
         sim.replace_source_static_map_footprint(root);
+    }
+    // `FUN_00481450` case 8 then runs `FUN_00481ee0` (`:93084`), which stamps
+    // this KONTOR definition's compiled `Maxlager` over the city's `+0x20`
+    // base storage. Read it from the compiled field and not from the property
+    // map: `Maxlager` inside a nested `HAUS_PRODTYP` block never lands there.
+    if cod_b.source_production_kind_code() == Some(8) {
+        sim.apply_source_kontor_storage_base(
+            island_number,
+            owner,
+            cod_b.storage_animation_capacity,
+        );
     }
     let building_index = sim.buildings.len() - 1;
     if def.kind == "HQ" {
@@ -707,14 +722,19 @@ pub fn found_kontor(
         player,
         source_time,
     );
+    // `FUN_00481ee0` (`1602_exe.c:93084`) seeds `city+0x20` from the placed
+    // KONTOR's own compiled `Maxlager`, so the founding Kontor's authored
+    // value is the city's opening base — 50 for the shipped `INFRA_KONTOR_1`,
+    // and whatever a modified haeuser.cod authors instead.
     let mut warehouse = anno_sim::warehouse::Warehouse::with_capacity(
         island_number,
         player,
         tile_x,
         tile_y,
-        anno_sim::warehouse::BASE_KONTOR_CAPACITY,
+        cod.buildings[def_index].storage_animation_capacity / 32,
     );
-    // Unload what fits (Maxlager 50 per good); overflow stays aboard.
+    // Unload what fits; overflow stays aboard. The founding Kontor is the
+    // city's only storage root, so `FUN_0047ab00` is exactly its `Maxlager`.
     let mut leftover: Vec<(anno_sim::types::Good, u16)> = Vec::new();
     for (good, amount) in &cargo {
         let stored = warehouse.deposit(*good, *amount);
@@ -793,6 +813,7 @@ pub fn found_kontor(
         state.configure_terminal_replacement(cod);
         state.configure_source_resource_records(cod, cod_b);
         sim.source_map_cell_states.push(state);
+        sim.refresh_source_city_storage_roots();
     }
     if let Some(mut state) = anno_sim::source_cell::SourceMapCellState::new_static(
         island_number,
