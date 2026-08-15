@@ -186,8 +186,12 @@ fn main() {
     };
 
     // --- Stage 1b: place market, chapel, huts on free land ---
-    let find_spot =
-        |sim: &anno_sim::simulation::Simulation, w: u8, h: u8, used: &[(i32, i32, u8, u8)]| {
+    let find_spot = |sim: &anno_sim::simulation::Simulation,
+                     def: &anno_sim::building::BuildingDef,
+                     w: u8,
+                     h: u8,
+                     used: &[(i32, i32, u8, u8)]| {
+        {
             let map = &sim.island_maps[mi];
             // Stay inside the Kontor/market service radius (16) so houses
             // keep coverage: order candidates by distance from the anchor.
@@ -196,16 +200,22 @@ fn main() {
                 .collect();
             candidates.sort_by_key(|&(x, y)| (x - anchor.0).abs() + (y - anchor.1).abs());
             candidates.into_iter().find(|&(x, y)| {
+                // The real gate, minus forest. `WALD` *is* buildable — the
+                // original clears trees — but clearing them destroys the
+                // resource the forester harvests, and island 10's woodland is
+                // the colony's only wood. Letting housing take forest cells
+                // cost this driver its entire wood supply (wood pinned at 0,
+                // population 12 against 58 when forest was left alone), so
+                // the trees are treated as reserved rather than as free room.
                 (0..i32::from(h)).all(|dy| {
                     (0..i32::from(w)).all(|dx| {
-                        map.is_walkable(x + dx, y + dy)
-                            && open_ground(
-                                map.source_map_kind_and_owner(x + dx, y + dy)
-                                    .map(|(k, _)| k)
-                                    .unwrap_or(u8::MAX),
-                            )
+                        map.source_map_kind_and_owner(x + dx, y + dy)
+                            .map(|(k, _)| k != 10)
+                            .unwrap_or(false)
                     })
-                }) && cart_can_reach(x, y, w, h)
+                }) && anno_game::game_commands::can_place_building(
+                    &island, map, def, x, y, w, h,
+                ) && cart_can_reach(x, y, w, h)
                     && !used.iter().any(|&(ux, uy, uw, uh)| {
                         x < ux + i32::from(uw)
                             && ux < x + i32::from(w)
@@ -213,7 +223,8 @@ fn main() {
                             && uy < y + i32::from(h)
                     })
             })
-        };
+        }
+    };
     // The Kontor already owns its 2x3 footprint.
     let mut used: Vec<(i32, i32, u8, u8)> = vec![(anchor.0, anchor.1, 2, 3)];
     let build = |sim: &mut anno_sim::simulation::Simulation,
@@ -224,7 +235,7 @@ fn main() {
             defs[def_index as usize].width,
             defs[def_index as usize].height,
         );
-        let Some((x, y)) = find_spot(sim, w, h, used) else {
+        let Some((x, y)) = find_spot(sim, &defs[def_index as usize], w, h, used) else {
             println!("no spot for {label}");
             return false;
         };
