@@ -215,7 +215,7 @@ fn main() {
                     })
                 }) && anno_game::game_commands::can_place_building(
                     &island, map, def, x, y, w, h,
-                ) && cart_can_reach(x, y, w, h)
+                ) && (def.prod_kind == "WOHNUNG" || cart_can_reach(x, y, w, h))
                     && !used.iter().any(|&(ux, uy, uw, uh)| {
                         x < ux + i32::from(uw)
                             && ux < x + i32::from(w)
