@@ -241,35 +241,6 @@ fn main() {
         "cart-reachable open ground from the Kontor: {}",
         reachable.len()
     );
-    if std::env::var("PROBE").is_ok() {
-        let map = &sim.island_maps[mi];
-        let mut a = 0usize;
-        let mut b = 0usize;
-        for y in 0..i32::from(island.height) {
-            for x in 0..i32::from(island.width) {
-                if map
-                    .source_map_kind_and_owner(x, y)
-                    .map(|(k, _)| k)
-                    .is_some_and(open_ground)
-                {
-                    a += 1;
-                }
-                if map.civilian_path_kind((x, y)).is_some_and(open_ground) {
-                    b += 1;
-                }
-            }
-        }
-        println!("open by overlay kind: {a}; open by civilian_path_kind: {b}");
-        for p in [(8, 31), (11, 38), (10, 34), (8, 36), (6, 45), (17, 41), (20, 34)] {
-            println!(
-                "  {p:?} overlay={:?} civilian={:?} in_component={}",
-                map.source_map_kind_and_owner(p.0, p.1).map(|(k, _)| k),
-                map.civilian_path_kind(p),
-                reachable.contains(&p),
-            );
-        }
-        return;
-    }
     // A supplier's own cell is opened by the raster as a *goal* whatever its
     // terrain (`FUN_004704d0` stamps the goal bit before the kind test), so the
     // cart only has to reach a cell adjacent to the footprint — which is what
@@ -358,6 +329,12 @@ fn main() {
     let mut refused_sites: HashSet<(usize, (i32, i32))> = HashSet::new();
     let mut markets: Vec<(i32, i32)> = Vec::new();
     let mut chapels: Vec<(i32, i32)> = Vec::new();
+    // The next marketplace's plot, held back from everything else. A MARKT is
+    // 4x3 and is the only way the colony buys ground; without a standing
+    // reservation the housing it pays for fills the last plot big enough to
+    // build the *next* one on, and the colony walls itself into its own claim
+    // with the rest of the island unclaimed. One market plot is always kept.
+    let mut plot: HashSet<(i32, i32)> = HashSet::new();
     let mut tally = Tally::default();
 
     let stock = |sim: &Sim, good: Good| -> u16 {
@@ -453,7 +430,8 @@ fn main() {
     // territorial verdict: `inside` is ground the colony may build on today,
     // `outside` is ground a marketplace would have to buy first.
     let survey_house_anchors = |sim: &Sim,
-                                refused_sites: &HashSet<(usize, (i32, i32))>|
+                                refused_sites: &HashSet<(usize, (i32, i32))>,
+                                plot: &HashSet<(i32, i32)>|
      -> (Vec<(i32, i32)>, Vec<(i32, i32)>) {
         let def = &defs[HUT];
         let (w, h) = (def.width, def.height);
@@ -461,7 +439,10 @@ fn main() {
         let (mut inside, mut outside) = (Vec::new(), Vec::new());
         for y in 0..i32::from(island.height) - i32::from(h) {
             for x in 0..i32::from(island.width) - i32::from(w) {
-                if refused_sites.contains(&(HUT, (x, y))) || !unforested(sim, HUT, x, y) {
+                if refused_sites.contains(&(HUT, (x, y)))
+                    || !unforested(sim, HUT, x, y)
+                    || (0..2).any(|dy| (0..2).any(|dx| plot.contains(&(x + dx, y + dy))))
+                {
                     continue;
                 }
                 if !anno_game::game_commands::can_place_building(
@@ -517,11 +498,19 @@ fn main() {
                     .flat_map(|dy| (0..2).map(move |dx| (dx, dy)))
                     .filter(|&(dx, dy)| pasture.contains(&(x + dx, y + dy)))
                     .count();
+                // Distance to a marketplace is the dominant term, and not by
+                // a little: the engine's market distance class feeds both
+                // `source_kind13_variant_growth` (0xa0 at class 0 down to 0x73
+                // at class 6) *and* `source_kind13_variant_decay` (0x66 up to
+                // 0xc0). A hut on the far rim of a market's disc grows two
+                // thirds as fast and decays nearly twice as fast as one beside
+                // it, which is how a sprawling colony peaks and then sheds
+                // residents while the warehouse is full. Build compactly.
                 (
-                    u8::from(!chapel_covered),
                     u8::from(market_class.is_none()),
-                    grazed,
                     market_class.unwrap_or(7),
+                    u8::from(!chapel_covered),
+                    grazed,
                     (c.0 - anchor.0).abs() + (c.1 - anchor.1).abs(),
                 )
             })
@@ -538,9 +527,8 @@ fn main() {
     let civic_site = |sim: &Sim,
                       refused_sites: &HashSet<(usize, (i32, i32))>,
                       pasture: &HashSet<(i32, i32)>,
-                      walls: &HashSet<(i32, i32)>,
-                      served: &[(i32, i32, u8, u8)],
                       reachable: &HashSet<(i32, i32)>,
+                      plot: &HashSet<(i32, i32)>,
                       def_index: usize,
                       rows: &[u8],
                       targets: &[(i32, i32)],
@@ -548,13 +536,22 @@ fn main() {
      -> Option<(i32, i32)> {
         let def = &defs[def_index];
         let (w, h) = (def.width, def.height);
+        // Two passes. A marketplace wants to sit inside the cart-reachable
+        // component so the new transfer root is itself served — but island 10's
+        // component is a single 159-cell clearing walled in by forest, and once
+        // the colony has built in it there may be no 4x3 plot left. A market
+        // that is never visited by a Karren still claims ground and still
+        // covers houses, which is most of what it is for here, so an unserved
+        // plot beats no market at all. Never silently: the caller logs which.
+        for require_cart in [need_cart, false] {
         let mut best: Option<((usize, usize, i32), (i32, i32))> = None;
         for y in 0..i32::from(island.height) - i32::from(h) {
             for x in 0..i32::from(island.width) - i32::from(w) {
                 if refused_sites.contains(&(def_index, (x, y)))
                     || !unforested(sim, def_index, x, y)
-                    || (need_cart && !cart_can_reach(reachable, x, y, w, h))
+                    || (require_cart && !cart_can_reach(reachable, x, y, w, h))
                     || !admitted(sim, def_index, x, y)
+                    || (def_index != MARKET && plot.contains(&(x, y)))
                 {
                     continue;
                 }
@@ -577,7 +574,11 @@ fn main() {
                 }
             }
         }
-        best.map(|(_, p)| p)
+        if let Some((_, p)) = best {
+            return Some(p);
+        }
+        }
+        None
     };
 
     // A harvester only works if its raw resource lies inside its own Radius:
@@ -618,8 +619,6 @@ fn main() {
     #[allow(clippy::too_many_arguments)]
     let harvester_site = |sim: &Sim,
                           refused_sites: &HashSet<(usize, (i32, i32))>,
-                          walls: &HashSet<(i32, i32)>,
-                          served: &[(i32, i32, u8, u8)],
                           reachable: &HashSet<(i32, i32)>,
                           def_index: usize,
                           ware: u8,
@@ -753,7 +752,7 @@ fn main() {
                            label: &str|
      -> bool {
         let Some(((x, y), total, ripe)) =
-            harvester_site(sim, refused_sites, walls, served, reachable, def_index, ware, focus)
+            harvester_site(sim, refused_sites, reachable, def_index, ware, focus)
         else {
             println!("no {label} site with ware {ware} in range");
             return false;
@@ -791,8 +790,6 @@ fn main() {
     let workshop_site = |sim: &Sim,
                          refused_sites: &HashSet<(usize, (i32, i32))>,
                          pasture: &HashSet<(i32, i32)>,
-                         walls: &HashSet<(i32, i32)>,
-                         served: &[(i32, i32, u8, u8)],
                          reachable: &HashSet<(i32, i32)>,
                          def_index: usize,
                          suppliers: &[(i32, i32)]|
@@ -898,14 +895,13 @@ fn main() {
     // not own yet. The Kontor's own claim is only 158 hut-legal tiles; the whole
     // rest of the island is out of reach until a MARKT pays for it.
     {
-        let (_, outside) = survey_house_anchors(&sim, &refused_sites);
+        let (_, outside) = survey_house_anchors(&sim, &refused_sites, &plot);
         if let Some((x, y)) = civic_site(
             &sim,
             &refused_sites,
             &pasture,
-            &walls,
-            &served,
             &reachable,
+            &plot,
             MARKET,
             &market_rows,
             &outside,
@@ -931,7 +927,7 @@ fn main() {
     // The chapel goes where it covers the most ground the colony can actually
     // house people on: without it every hut is capped at two residents.
     {
-        let (inside, _) = survey_house_anchors(&sim, &refused_sites);
+        let (inside, _) = survey_house_anchors(&sim, &refused_sites, &plot);
         let covered: Vec<(i32, i32)> = inside
             .iter()
             .copied()
@@ -944,9 +940,8 @@ fn main() {
             &sim,
             &refused_sites,
             &pasture,
-            &walls,
-            &served,
             &reachable,
+            &plot,
             CHAPEL,
             &chapel_rows,
             &covered,
@@ -971,7 +966,7 @@ fn main() {
     }
     let mut huts = 0usize;
     for _ in 0..4 {
-        let (inside, _) = survey_house_anchors(&sim, &refused_sites);
+        let (inside, _) = survey_house_anchors(&sim, &refused_sites, &plot);
         let Some((x, y)) = house_site(&inside, &markets, &chapels, &pasture) else {
             println!("no house anchor for hut{huts}");
             break;
@@ -1016,7 +1011,7 @@ fn main() {
             sheep += 1;
         }
     }
-    if let Some((x, y)) = workshop_site(&sim, &refused_sites, &pasture, &walls, &served, &reachable, WEAVER, &sheep_sites) {
+    if let Some((x, y)) = workshop_site(&sim, &refused_sites, &pasture, &reachable, WEAVER, &sheep_sites) {
         if build_at(
             &mut sim,
             &mut tally,
@@ -1034,6 +1029,39 @@ fn main() {
             weaver_sites.push((x, y));
         }
     }
+
+    // Hold back a plot for the next marketplace before the housing starts.
+    let reserve_next_plot = |sim: &Sim,
+                             refused_sites: &HashSet<(usize, (i32, i32))>,
+                             pasture: &HashSet<(i32, i32)>,
+                             reachable: &HashSet<(i32, i32)>,
+                             plot: &mut HashSet<(i32, i32)>| {
+        plot.clear();
+        let (_, outside) = survey_house_anchors(sim, refused_sites, plot);
+        if outside.is_empty() {
+            return;
+        }
+        let Some((x, y)) = civic_site(
+            sim,
+            refused_sites,
+            pasture,
+            reachable,
+            plot,
+            MARKET,
+            &market_rows,
+            &outside,
+            true,
+        ) else {
+            return;
+        };
+        for dy in 0..i32::from(defs[MARKET].height) {
+            for dx in 0..i32::from(defs[MARKET].width) {
+                plot.insert((x + dx, y + dy));
+            }
+        }
+        println!("  next marketplace plot reserved at ({x},{y})");
+    };
+    reserve_next_plot(&sim, &refused_sites, &pasture, &reachable, &mut plot);
 
     // ------------------------------------------------------------------
     // Reporting.
@@ -1084,9 +1112,11 @@ fn main() {
             .unwrap();
         let total: u32 = city.tier_population.iter().sum();
         println!(
-            "{label}: pop={total} {:?} sat={:?} food={} cloth={} wood={} tools={} resv={:?} gold={} unlock={:#x}",
+            "{label}: pop={total} {:?} sat={:?} overall={} feed={} food={} cloth={} wood={} tools={} resv={:?} gold={} unlock={:#x}",
             city.tier_population,
             city.satisfaction_by_group,
+            city.overall_satisfaction,
+            city.food_fulfillment,
             stock(sim, Good::Food),
             stock(sim, Good::Cloth),
             stock(sim, Good::Wood),
@@ -1214,11 +1244,17 @@ fn main() {
         // minute on nothing at all rather than on another house: adding mouths
         // to a short food line is precisely how the colony reached 46
         // inhabitants and then died.
-        let hungry = food < 20 + pop as u16 / 4;
+        // The larder has to be sized against the *population*, not against a
+        // fixed number. A run that used a flat-ish threshold kept one fishery
+        // for ninety inhabitants: the stock read comfortable at 50 while the
+        // demand cycle was quietly under-serving the houses, and the colony
+        // peaked at 96 and then shed residents back to 89. Half the population
+        // in store is the buffer that holds every hut at its cap.
+        let hungry = food < 30 + pop as u16 / 2;
         if !placed_this_minute
             && hungry
-            && fisheries < 9
-            && minute >= last_fishery + 8
+            && fisheries < 10
+            && minute >= last_fishery + 6
             && tools >= defs[FISHERY].cost_tools
         {
             if build_harvester(
@@ -1243,7 +1279,7 @@ fn main() {
         // Still hungry after that rung: hold off on new housing. Everything
         // that does not add a mouth — a chapel, a marketplace that buys the
         // coastline the next fishery needs — is still worth the minute.
-        let hold_housing = !placed_this_minute && hungry && fisheries < 9;
+        let hold_housing = !placed_this_minute && hungry && fisheries < 10;
         // Settlers consume cloth; a single sheep-and-weaver line stops covering
         // the settler population it created. Keep the authored 2 wool : 1 cloth
         // ratio by alternating farms and weaving huts. `TOOL_RESERVE` keeps one
@@ -1294,7 +1330,7 @@ fn main() {
                 });
                 orphans.truncate(2);
                 if let Some((x, y)) =
-                    workshop_site(&sim, &refused_sites, &pasture, &walls, &served, &reachable, WEAVER, &orphans)
+                    workshop_site(&sim, &refused_sites, &pasture, &reachable, WEAVER, &orphans)
                 {
                     if build_at(
                         &mut sim,
@@ -1324,17 +1360,16 @@ fn main() {
         // pioneer hut in its disc into a 6-resident settler house.
         let (no_chapel, no_market) = stuck_houses(&sim);
         if !placed_this_minute
-            && no_chapel.len() >= 3
-            && chapels.len() < 5
+            && no_chapel.len() >= 5
+            && chapels.len() < 8
             && tools >= defs[CHAPEL].cost_tools + TOOL_RESERVE
         {
             if let Some((x, y)) = civic_site(
                 &sim,
                 &refused_sites,
                 &pasture,
-                &walls,
-                &served,
                 &reachable,
+                &plot,
                 CHAPEL,
                 &chapel_rows,
                 &no_chapel,
@@ -1361,16 +1396,15 @@ fn main() {
         }
         if !placed_this_minute
             && no_market.len() >= 3
-            && markets.len() < 4
+            && markets.len() < 6
             && tools >= defs[MARKET].cost_tools + TOOL_RESERVE
         {
             if let Some((x, y)) = civic_site(
                 &sim,
                 &refused_sites,
                 &pasture,
-                &walls,
-                &served,
                 &reachable,
+                &plot,
                 MARKET,
                 &market_rows,
                 &no_market,
@@ -1395,6 +1429,13 @@ fn main() {
                 ) {
                     markets.push(centre_of(x, y, defs[MARKET].width, defs[MARKET].height));
                     placed_this_minute = true;
+                    reserve_next_plot(
+                        &sim,
+                        &refused_sites,
+                        &pasture,
+                        &reachable,
+                        &mut plot,
+                    );
                 }
             }
         }
@@ -1409,7 +1450,7 @@ fn main() {
         // warehouse held its three wood simply never laid another hut. One
         // placement a minute is the pacing; the warehouse is not the brake.
         if !placed_this_minute {
-            let (inside, outside) = survey_house_anchors(&sim, &refused_sites);
+            let (inside, outside) = survey_house_anchors(&sim, &refused_sites, &plot);
             if let Some((x, y)) =
                 house_site(&inside, &markets, &chapels, &pasture).filter(|_| !hold_housing)
             {
@@ -1435,16 +1476,15 @@ fn main() {
             // is how a colony buys ground — site it where it buys the most.
             if !placed_this_minute
                 && !outside.is_empty()
-                && markets.len() < 4
+                && markets.len() < 6
                 && tools >= defs[MARKET].cost_tools
             {
                 if let Some((x, y)) = civic_site(
                     &sim,
                     &refused_sites,
                     &pasture,
-                    &walls,
-                    &served,
                     &reachable,
+                    &plot,
                     MARKET,
                     &market_rows,
                     &outside,
@@ -1469,6 +1509,7 @@ fn main() {
                     ) {
                         markets.push(centre_of(x, y, defs[MARKET].width, defs[MARKET].height));
                         placed_this_minute = true;
+                        reserve_next_plot(&sim, &refused_sites, &pasture, &reachable, &mut plot);
                     }
                 }
             }
